@@ -1,0 +1,86 @@
+---
+type: technique
+tags: [rvv, gemm, vd4dots, im2col, conv_HWC]
+applies_to: [conv_HWC_s8_sym_bias_fast, conv_HWC_s8_sym_fast, conv_HWC_s8_sym_bias_any, conv_HWC_u8_sym_bias_fast]
+---
+
+# Tiling GEMM to VD4DOTS GEMM
+
+## Problem: ENA_TILING path vectorizes the wrong dimension
+
+The legacy `ENA_TILING` code path uses `nn_mat_mul_kernel_tiling_*` which vectorizes along the **output channel dimension** (N). For typical conv_HWC workloads with N=32 output channels:
+
+```
+vsetvli(vl, 32, e8, m2)    // max VL=256 at VLEN=1024, actual VL=32
+```
+
+**Vector utilization: 32/256 = 12.5%** at VLEN=1024.
+
+The kernel also requires:
+- A weight transpose pass (`nn_mat_mul_kernel_tiling_transpose_q7`) before GEMM
+- An intermediate i32 buffer allocation (e.g., i32[224][32] = 28KB)
+- A separate quantization pass after GEMM
+
+## Fix: Replace with im2col + vd4dots GEMM (vectorize K)
+
+Use `nn_mat_mul_kernel_q7_bias_2sft_unroll4` (or the `_2sft_unroll4` no-bias variant). This vectorizes along the **K dimension** (reduction axis = in_ch * ker_h * ker_w):
+
+```
+vsetvli(vl, K, e8, m1)    // VL=128 at VLEN=1024 for K=512; ~100% utilization
+```
+
+For K=1152 (128ch * 3x3 kernel): ~4.5 inner loop iterations per output channel group at VLEN=1024.
+
+### Kernel tiling: 4 pixels x 4 output channels
+
+The unroll4 kernel processes a 4x4 block per call:
+- 16 M1 accumulators (v0..v15)
+- 8 vector loads + 16 vd4dots per K iteration
+- Compute-to-load ratio: 2.0
+
+### im2col buffering
+
+Buffer 4 pixels of im2col before calling the GEMM. Handle leftovers with 2-pixel (`_2sft`) and 1-pixel (scalar) fallbacks:
+
+```c
+if (num_col >= 4) {
+    // call nn_mat_mul_kernel_q7_bias_2sft_unroll4 for groups of 4
+}
+if (remaining >= 2) {
+    // call nn_mat_mul_kernel_q7_bias_2sft (2-pixel kernel)
+}
+// handle 0 or 1 remaining pixels with scalar
+```
+
+## Variants
+
+| Function suffix | GEMM kernel | Notes |
+|---|---|---|
+| `s8_s8_s8_sym_bias_fast` | `nn_mat_mul_kernel_q7_bias_2sft_unroll4` | signed*signed |
+| `s8_s8_s8_sym_fast` | `nn_mat_mul_kernel_q7_2sft_unroll4` | no bias |
+| `s8_s16_s8_sym_bias_fast` | `nn_mat_mul_kernel_q7_q15_bias_2sft_unroll4` | s16 weights |
+| `u8_*_s8_sym_bias_fast` | `nn_mat_mul_kernel_u8_bias_2sft_unroll4` | unsigned input, vd4dotsu |
+
+## Results (AX45MPV VLEN=1024)
+
+| Function | Before | After | Speedup |
+|---|---|---|---|
+| conv_HWC_s8_s8_s8_sym_bias_fast | 2,292,485 | 527,219 | 4.35x |
+| conv_HWC_s8_s8_s8_sym_fast | 2,276,065 | 522,521 | 4.36x |
+| conv_HWC_s8_s16_s8_sym_bias_fast | 2,289,145 | 493,886 | 4.63x |
+| conv_HWC_u8_s8_s8_sym_bias_fast | 2,292,595 | 573,699 | 4.00x |
+
+## Diagnostic: Is ENA_TILING active?
+
+Check the linked binary's objdump for which sub-function is called:
+- `jal ... nn_mat_mul_kernel_tiling_q7` -- tiling path active (fix needed)
+- `jal ... nn_mat_mul_kernel_q7_bias_2sft_unroll4` -- already on vd4dots path
+
+`ENA_TILING` is defined unconditionally in `internal/internal_nn_math.h:2256` regardless of build flags. The `#ifdef ENA_VEC_ELEN64` guard in newer code is what routes to the vd4dots path.
+
+## Related
+
+- [[vectorize-k-vs-n]] -- explains why K > N for conv_HWC
+- [[im2col-strategies]] -- details on efficient im2col construction
+- [[anti-vd4dots-small-k]] -- when this technique should NOT be applied (small K)
+- [[conv-hwc-s8-sym-bias-fast]] -- operator page with full history

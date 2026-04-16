@@ -1,0 +1,115 @@
+"""Per-operator evaluation of ModelzooRanker on test set."""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'script'))
+
+import torch
+from collections import defaultdict
+
+from modelzoo_ranker.data.loader import load_all_models
+from modelzoo_ranker.data.split import assign_splits, DEFAULT_VAL_MODELS, DEFAULT_TEST_MODELS
+from modelzoo_ranker.data.features import (
+    compute_feature_a, compute_feature_b, FEATURE_A_DIM, FEATURE_B_DIM,
+)
+from modelzoo_ranker.model.ranker import ModelzooRanker
+from modelzoo_ranker.training.evaluator import (
+    _ndcg_at_k, _topk_hit, _topk_error, _opa,
+)
+
+DATASET_DIR = os.path.join(os.path.dirname(__file__), '..', 'dataset_modelzoo')
+ZOO_DIR = '/local/nick/AutoIREE_zoo/models'
+MODEL_PATH = os.path.join(os.path.dirname(__file__), 'modelzoo_ranker_v3', 'model.pt')
+
+# Root op name (strip suffix like -0, -1)
+def root_op(op_name: str) -> str:
+    parts = op_name.rsplit('-', 1)
+    return parts[0] if len(parts) == 2 and parts[1].isdigit() else op_name
+
+
+def main():
+    groups = load_all_models(DATASET_DIR, zoo_dir=ZOO_DIR)
+    groups = assign_splits(groups,
+                           val_models=['YOLOv8n', 'MobileNet_v3_int8'],
+                           test_models=['ResNet-50', 'DenseNet'])
+
+    test_groups = [g for g in groups if g['split'] == 'test']
+    print(f'Test groups: {len(test_groups)}')
+
+    model = ModelzooRanker()
+    model.load_state_dict(torch.load(MODEL_PATH, weights_only=True))
+    model.eval()
+
+    # Per-op metrics
+    op_metrics = defaultdict(lambda: defaultdict(list))
+
+    with torch.no_grad():
+        for g in test_groups:
+            op = root_op(g['op_name'])
+            fa = compute_feature_a(g)
+            shape = g['shape']
+            total_elements = 1
+            for d in shape:
+                total_elements *= d
+            tile_config = g.get('tile_config')
+
+            fbs = []
+            cycles_list = []
+            for cfg in g['configs']:
+                fbs.append(compute_feature_b(cfg, total_elements=total_elements,
+                                             tile_config=tile_config))
+                cycles_list.append(cfg['cycles'])
+
+            import numpy as np
+            fa_t = torch.tensor(fa, dtype=torch.float32).unsqueeze(0)
+            fb_t = torch.tensor(np.stack(fbs), dtype=torch.float32).unsqueeze(0)
+            cyc_t = torch.tensor(cycles_list, dtype=torch.float64)
+            mask_t = torch.ones(1, len(fbs), dtype=torch.bool)
+
+            scores = model(fa_t, fb_t, mask_t).squeeze(0)
+            s = scores
+            order = s.argsort(descending=True)
+            gains = cyc_t[0] / cyc_t
+
+            op_metrics[op]['ndcg@5'].append(_ndcg_at_k(order, gains, 5))
+            op_metrics[op]['top1_acc'].append(_topk_hit(order, 1))
+            op_metrics[op]['top3_acc'].append(_topk_hit(order, 3))
+            op_metrics[op]['top5_acc'].append(_topk_hit(order, 5))
+            op_metrics[op]['top1_error'].append(_topk_error(order, cyc_t, 1))
+            op_metrics[op]['top3_error'].append(_topk_error(order, cyc_t, 3))
+            op_metrics[op]['top5_error'].append(_topk_error(order, cyc_t, 5))
+            op_metrics[op]['opa'].append(_opa(s))
+
+    # Print table
+    metrics_keys = ['opa', 'top1_acc', 'top3_acc', 'top5_acc',
+                    'top1_error', 'top3_error', 'top5_error', 'ndcg@5']
+    header = f'{"Op Type":<42} {"N":>4}'
+    for k in metrics_keys:
+        header += f' {k:>11}'
+    print()
+    print(header)
+    print('-' * len(header))
+
+    all_vals = defaultdict(list)
+    for op in sorted(op_metrics.keys()):
+        n = len(op_metrics[op]['opa'])
+        row = f'{op:<42} {n:>4}'
+        for k in metrics_keys:
+            vals = op_metrics[op][k]
+            avg = sum(vals) / len(vals)
+            row += f' {avg:>11.4f}'
+            all_vals[k].extend(vals)
+        print(row)
+
+    # Overall
+    print('-' * len(header))
+    n_total = len(all_vals['opa'])
+    row = f'{"OVERALL":<42} {n_total:>4}'
+    for k in metrics_keys:
+        avg = sum(all_vals[k]) / len(all_vals[k])
+        row += f' {avg:>11.4f}'
+    print(row)
+
+
+if __name__ == '__main__':
+    main()

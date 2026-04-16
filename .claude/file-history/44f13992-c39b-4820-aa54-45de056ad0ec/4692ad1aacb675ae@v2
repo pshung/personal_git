@@ -1,0 +1,668 @@
+#!/usr/bin/env python3
+"""ADX builder: compile MLIR subgraph to bare-metal ELF via 4-stage pipeline.
+
+Pipeline:
+  MLIR → [iree-compile --compile-to=executable-configurations] → benchmark subgraph MLIR
+       → [iree-compile -compile-from=executable-sources --output-format=vm-c]
+                                      → host-c.h + kernel.h + kernel.o
+       → [clang dispatch_driver.c]   → entry.o
+       → [clang++ static link]       → *.adx
+       → [GDB]                       → bare-metal RISC-V (optional, --run)
+
+Usage:
+  python3 script/adx_builder.py <mlir_file> -o <output_dir> --config config/AX45_1024.toml
+  python3 script/adx_builder.py <mlir_file> -o <output_dir> --config config/AX45_1024.toml --run
+"""
+
+import argparse
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        tomllib = None
+
+REPO_ROOT = Path(__file__).parent.parent
+IREE_COMPILE = Path("/home/nick/work/AIAutoIREE/third-party/iree-build/tools/iree-compile")
+BARE_METAL_SRC = REPO_ROOT / "bare-metal" / "src"
+BARE_METAL_LD = REPO_ROOT / "bare-metal" / "utility" / "ae350-NN-xip_x.ld"
+BARE_METAL_GDB_SCRIPT = REPO_ROOT / "bare-metal" / "gdb" / "gdb_45.script"
+
+
+def load_config(toml_path: str) -> dict:
+    """Load and validate TOML config. Raises if required keys are missing."""
+    if tomllib is None:
+        raise ImportError("tomllib (Python 3.11+) or tomli package required")
+    with open(toml_path, "rb") as f:
+        cfg = tomllib.load(f)
+    llvm = cfg.get("build", {}).get("llvm", {})
+    for k in ("triple", "cpu", "attr", "vlen"):
+        if k not in llvm:
+            raise ValueError(f"Missing config key: build.llvm.{k}")
+    runtime = cfg.get("runtime", {})
+    for k in ("iree_src_dir", "iree_lib_dir"):
+        if k not in runtime:
+            raise ValueError(f"Missing config key: runtime.{k}")
+    return cfg
+
+
+def _base_riscv_flags(cfg: dict) -> list[str]:
+    """Common RISC-V iree-compile flags shared by both compilation steps."""
+    llvm = cfg["build"]["llvm"]
+    triple = llvm["triple"]
+    cpu = llvm["cpu"]
+    attr = llvm["attr"]
+    vlen = int(llvm["vlen"])
+    return [
+        "-iree-input-type=auto",
+        "--iree-llvmcpu-stack-allocation-limit=0x999999",
+        "--iree-hal-target-device=local",
+        "--iree-hal-local-target-device-backends=llvm-cpu",
+        f"-iree-llvmcpu-target-triple={triple}",
+        f"-iree-llvmcpu-target-cpu={cpu}",
+        f"-iree-llvmcpu-target-cpu-features={attr}",
+        f"-iree-llvmcpu-target-vector-width-in-bytes={vlen // 8}",
+        "--iree-llvmcpu-loop-interleaving",
+        "--iree-llvmcpu-loop-vectorization",
+        "--iree-llvmcpu-loop-unrolling",
+        "--iree-llvmcpu-slp-vectorization",
+        "-riscv-v-fixed-length-vector-lmul-max=8",
+        f"-riscv-v-vector-bits-min={vlen}",
+        "--iree-global-opt-propagate-transposes=False",
+        "-iree-llvmcpu-link-embedded=false",
+        "-iree-llvmcpu-link-static",
+        "--iree-llvmcpu-optimization-remarks=stack-frame-layout",
+    ]
+
+
+def stage1_dump_benchmarks(mlir_file: Path, benchmarks_dir: Path, cfg: dict) -> Path:
+    """Stage 1a: compile to executable-configurations and dump benchmark MLIRs.
+
+    Returns: path to the first *_static_benchmark.mlir found.
+    """
+    if not IREE_COMPILE.exists():
+        raise FileNotFoundError(f"iree-compile not found: {IREE_COMPILE}")
+
+    benchmarks_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        str(IREE_COMPILE),
+        str(mlir_file),
+        "--compile-to=executable-configurations",
+        f"--iree-hal-dump-executable-benchmarks-to={benchmarks_dir}",
+    ] + _base_riscv_flags(cfg) + [
+        "--output-format=vm-c",
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"iree-compile (dump) stderr:\n{result.stderr}", file=sys.stderr)
+        raise subprocess.CalledProcessError(result.returncode, cmd)
+
+    benchmark_files = sorted(benchmarks_dir.glob("*_static_benchmark.mlir"))
+    if not benchmark_files:
+        raise FileNotFoundError(
+            f"No *_static_benchmark.mlir found in {benchmarks_dir}"
+        )
+    return benchmark_files[0]
+
+
+def stage1_compile_vmc(
+    benchmark_mlir: Path, temp_dir: Path, cfg: dict
+) -> tuple[Path, Path, Path, str]:
+    """Stage 1b: compile benchmark MLIR from executable-sources to vm-c.
+
+    Returns: (host_c_h, kernel_h, kernel_o, stderr_text)
+    """
+    host_c_h = temp_dir / "host-c.h"
+    kernel_o = temp_dir / "kernel.o"
+    kernel_h = temp_dir / "kernel.h"
+
+    cmd = [
+        str(IREE_COMPILE),
+        str(benchmark_mlir),
+        "-o", str(host_c_h),
+    ] + _base_riscv_flags(cfg) + [
+        "--output-format=vm-c",
+        "-compile-from=executable-sources",
+        # Must be a relative path (iree-compile limitation); run cwd=temp_dir
+        "--iree-llvmcpu-static-library-output-path=kernel.o",
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(temp_dir))
+    if result.returncode != 0:
+        print(f"iree-compile (vm-c) stderr:\n{result.stderr}", file=sys.stderr)
+        raise subprocess.CalledProcessError(result.returncode, cmd)
+
+    if not host_c_h.exists():
+        raise FileNotFoundError(f"Stage 1b output missing: {host_c_h}")
+
+    # iree-compile may drop the stem and produce ".o"/".h" instead of "kernel.o"/"kernel.h"
+    if not kernel_o.exists():
+        dotfile_o = temp_dir / ".o"
+        if dotfile_o.exists():
+            dotfile_o.rename(kernel_o)
+        else:
+            raise FileNotFoundError(f"Stage 1b output missing: {kernel_o}")
+    if not kernel_h.exists():
+        dotfile_h = temp_dir / ".h"
+        if dotfile_h.exists():
+            dotfile_h.rename(kernel_h)
+        # kernel.h absence is non-fatal — entry func detection uses benchmark MLIR
+
+    return host_c_h, kernel_h, kernel_o, result.stderr or ""
+
+
+def _detect_entry_func_from_benchmark(benchmark_mlir: Path) -> str:
+    """Extract entry function from benchmark MLIR as 'module.<func>'.
+
+    Looks for the public benchmark entry: util.func public @<name>(%arg0: i32)
+    The module name defaults to 'module' when the top-level module is unnamed.
+    """
+    content = benchmark_mlir.read_text()
+    # Named module: module @name { ... }
+    module_m = re.search(r'^module\s+@(\w+)', content, re.MULTILINE)
+    module_name = module_m.group(1) if module_m else "module"
+    # Public benchmark entry function takes i32 count
+    func_m = re.search(r'util\.func\s+public\s+@(\w+)\s*\(\s*%\w+\s*:\s*i32\s*\)', content)
+    if not func_m:
+        raise ValueError(f"Could not detect util.func public @name(i32) in {benchmark_mlir}")
+    return f"{module_name}.{func_m.group(1)}"
+
+
+def _parse_query_name(kernel_h: Path) -> str:
+    """Extract HAL library query function name from kernel.h."""
+    lines = kernel_h.read_text().splitlines()
+    for idx, line in enumerate(lines):
+        if re.match(r'^const\s+iree_hal_executable_library_header_t\*\*', line):
+            for next_line in lines[idx + 1:]:
+                if re.match(r'^\s*$', next_line):
+                    break
+                words = next_line.strip().split()
+                if words:
+                    return words[0].replace('(', '')
+            break
+    raise ValueError(f"Could not find HAL query function declaration in {kernel_h}")
+
+
+def stage2_compile_entry(
+    kernel_h: Path, entry_func: str, temp_dir: Path, cfg: dict
+) -> Path:
+    """Stage 2: compile dispatch_driver.c → entry.o."""
+    if not kernel_h.exists():
+        raise FileNotFoundError(f"kernel.h not found: {kernel_h}")
+
+    query_name = _parse_query_name(kernel_h)
+
+    # Append libraries[] array declaration to kernel.h
+    append_code = (
+        "\nconst iree_hal_executable_library_query_fn_t libraries[] = {\n"
+        f"    {query_name},\n"
+        "};\n"
+    )
+    with open(kernel_h, "a") as f:
+        f.write(append_code)
+
+    toolchain_bin = cfg["build"]["riscv_toolchain"]
+    iree_src_dir = cfg["runtime"]["iree_src_dir"]
+    clang = Path(toolchain_bin) / "clang"
+    dispatch_driver_c = BARE_METAL_SRC / "dispatch_driver.c"
+    entry_o = temp_dir / "entry.o"
+
+    cmd = [
+        str(clang),
+        str(dispatch_driver_c),
+        "-c",
+        "-o", str(entry_o),
+        f"-I{temp_dir}",
+        f"-I{BARE_METAL_SRC}",
+        f"-I{iree_src_dir}",
+        "-mabi=lp64d",
+        "-DIREE_PLATFORM_GENERIC=1",
+        "-DEMITC_IMPLEMENTATION",
+        "-DPF_COUNTER",
+        f"-DQUERY={query_name}",
+        f'-D_FUNC="{entry_func}"',
+        "-O3",
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"clang stderr:\n{result.stderr}", file=sys.stderr)
+        raise subprocess.CalledProcessError(result.returncode, cmd)
+
+    return entry_o
+
+
+def stage3_link_adx(entry_o: Path, kernel_o: Path, out_adx: Path, cfg: dict) -> Path:
+    """Stage 3: link entry.o + kernel.o + static libs → .adx ELF."""
+    toolchain_bin = cfg["build"]["riscv_toolchain"]
+    iree_lib_dir = cfg["runtime"]["iree_lib_dir"]
+    clangpp = Path(toolchain_bin) / "clang++"
+
+    lib_files = sorted(Path(iree_lib_dir).rglob("lib*.a"))
+    if not lib_files:
+        raise FileNotFoundError(f"No lib*.a found in {iree_lib_dir}")
+
+    cmd = [
+        str(clangpp),
+        "-o", str(out_adx),
+        "-T", str(BARE_METAL_LD),
+        "-mvh",
+        str(entry_o),
+        str(kernel_o),
+        "-lm",
+        "-Wl,--start-group",
+        *[str(f) for f in lib_files],
+        "-Wl,--end-group",
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"clang++ stderr:\n{result.stderr}", file=sys.stderr)
+        raise subprocess.CalledProcessError(result.returncode, cmd)
+
+    return out_adx
+
+
+def _boardfarm_get_iceman_port(remote: str, board_id: int, account: str, password: str) -> int | None:
+    """Query boardfarm API for the current iceman port of board_id.
+
+    Returns the port int if iceman is running, None if not running or board not found.
+    """
+    try:
+        import urllib.request
+        import urllib.error
+        import json
+        import ssl
+        import base64
+
+        url = f"https://{remote}/api/v2/my_boards/"
+        token = base64.b64encode(f"{account}:{password}".encode()).decode()
+        req = urllib.request.Request(url, headers={"Authorization": f"Basic {token}"})
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+            data = json.loads(resp.read())
+        results = data.get("results", [])
+        for board in results:
+            if board.get("id") == board_id:
+                port_str = board.get("iceman_port")
+                if port_str:
+                    return int(port_str.split(":")[1])
+                return None
+        print(f"  [boardfarm] warning: board_id={board_id} not found in results", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"  [boardfarm] GET my_boards failed: {e}", file=sys.stderr)
+        return None
+
+
+def _boardfarm_launch_iceman(remote: str, board_id: int, port: int, account: str, password: str) -> bool:
+    """POST launch_iceman for board_id. Returns True on HTTP 200."""
+    try:
+        import urllib.request
+        import urllib.parse
+        import ssl
+        import base64
+
+        url = f"https://{remote}/api/v2/my_boards/{board_id}/launch_iceman/"
+        token = base64.b64encode(f"{account}:{password}".encode()).decode()
+        body = urllib.parse.urlencode({"iceman_flag": f"-p {port} -D -Z v5"}).encode()
+        req = urllib.request.Request(url, data=body, headers={
+            "Authorization": f"Basic {token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        })
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+            return resp.status == 200
+    except Exception as e:
+        print(f"  [boardfarm] launch_iceman failed: {e}", file=sys.stderr)
+        return False
+
+
+def _boardfarm_reconnect(remote: str, board_id: int, port: int, account: str, password: str,
+                         max_attempts: int = 3) -> int | None:
+    """Try to recover iceman: query current port, or launch and poll.
+
+    Returns new port int on success, None on failure.
+    """
+    print(f"  [boardfarm] reconnecting board_id={board_id} on {remote} ...", file=sys.stderr)
+
+    # Step 1: maybe iceman is already running on a different port
+    new_port = _boardfarm_get_iceman_port(remote, board_id, account, password)
+    if new_port is not None:
+        print(f"  [boardfarm] iceman already running on port {new_port}", file=sys.stderr)
+        return new_port
+
+    # Step 2: launch iceman, poll for port
+    for attempt in range(1, max_attempts + 1):
+        print(f"  [boardfarm] launch_iceman attempt {attempt}/{max_attempts} ...", file=sys.stderr)
+        _boardfarm_launch_iceman(remote, board_id, port, account, password)
+        time.sleep(60)
+        new_port = _boardfarm_get_iceman_port(remote, board_id, account, password)
+        if new_port is not None:
+            print(f"  [boardfarm] iceman started on port {new_port}", file=sys.stderr)
+            return new_port
+
+    print(f"  [boardfarm] failed to start iceman after {max_attempts} attempts", file=sys.stderr)
+    return None
+
+
+def _is_connection_error(output: str) -> bool:
+    return (
+        "Connection timed out" in output
+        or "Connection refused" in output
+        or "Network is unreachable" in output
+        or "could not connect" in output
+    )
+
+
+def load_boards(cfg: dict) -> list[dict]:
+    """Return list of board configs from cfg.
+
+    Supports two TOML formats:
+      - New:  [[target.boards]]  (array of board dicts); shared fields
+              (gdb, boardfarm_account, boardfarm_password) may be placed
+              in [target] and are inherited by each board unless overridden.
+      - Old:  [target.gdb]       (single board, for backward compat)
+    """
+    target = cfg.get("target", {})
+    boards = target.get("boards")
+    if boards:
+        # Shared fields from [target] inherited by each board
+        shared = {k: v for k, v in target.items()
+                  if k not in ("boards", "device", "gdb") and not isinstance(v, (dict, list))}
+        if "gdb" in target:
+            shared["gdb"] = target["gdb"]
+        return [{**shared, **board} for board in boards]
+    # Fall back to legacy [target.gdb]
+    gdb_cfg = target.get("gdb", {})
+    if gdb_cfg:
+        return [gdb_cfg]
+    return []
+
+
+def stage4_run_gdb(adx_path: Path, cfg_or_board: dict, timeout: float | None = None) -> str:
+    """Stage 4: upload and execute via GDB. Returns stdout+stderr.
+
+    Accepts either a full cfg dict (uses first board) or a board dict directly.
+    Automatically reconnects via boardfarm API on connection failure.
+    Raises subprocess.TimeoutExpired if timeout (seconds) is exceeded.
+    """
+    # Accept either full cfg or a board dict
+    if "target" in cfg_or_board or "build" in cfg_or_board:
+        boards = load_boards(cfg_or_board)
+        board = boards[0] if boards else {}
+    else:
+        board = cfg_or_board
+
+    gdb = board.get("gdb")
+    remote = board.get("remote", "")
+    port = board.get("port")
+    board_id = board.get("board_id", 0)
+    account = board.get("boardfarm_account") or os.environ.get("AUTOIREE_BOARDFARM_ACCOUNT", "")
+    password = board.get("boardfarm_password") or os.environ.get("AUTOIREE_BOARDFARM_PASSWORD", "")
+
+    boardfarm_enabled = bool(board_id) and "boards.andestech.com" in remote and account and password
+
+    max_retries = 3 if boardfarm_enabled else 1
+    for attempt in range(max_retries):
+        cmd = [
+            gdb,
+            str(adx_path),
+            "-batch",
+            "-ex", f"target remote {remote}:{port}",
+            "-x", str(BARE_METAL_GDB_SCRIPT),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        output = result.stdout + result.stderr
+
+        if not _is_connection_error(output) or not boardfarm_enabled:
+            return output
+
+        print(f"  [gdb] connection error on attempt {attempt + 1}, trying boardfarm reconnect ...",
+              file=sys.stderr)
+        new_port = _boardfarm_reconnect(remote, board_id, port, account, password)
+        if new_port is None:
+            return output
+        port = new_port
+
+    return output
+
+
+_WRITER_SENTINEL = None  # sentinel to stop writer thread
+
+
+def run_adx_files_parallel(
+    adx_files: list,
+    cfg: dict,
+    result_file: Path | None = None,
+    on_result=None,
+) -> list[tuple]:
+    """Run adx_files across all configured boards in parallel.
+
+    Distributes work via a shared work queue: each board runs one file at a
+    time, picks the next from the queue when done.
+
+    Results (adx_path, output) are pushed to a result_queue consumed by a
+    single dedicated writer thread — no lock needed on the file.
+
+    If result_file is given, the writer appends TSV rows:
+        <adx_name>\\t<Pass|Timeout|Fail>\\t<cycles or "">
+
+    Returns list of (adx_path, output) tuples in completion order.
+    """
+    import threading
+
+    boards = load_boards(cfg)
+    if not boards:
+        raise ValueError("No boards configured in [target.gdb] or [[target.boards]]")
+
+    work_queue: queue.Queue = queue.Queue()
+    for adx in adx_files:
+        work_queue.put(adx)
+
+    result_queue: queue.Queue = queue.Queue()
+    results: list[tuple] = []
+
+    def _status_and_cycles(output: str) -> tuple[str, str]:
+        cycles = _parse_cycle_count(output)
+        if cycles:
+            return "Pass", cycles
+        if "timed out" in output.lower() or "timeout" in output.lower():
+            return "Timeout", ""
+        return "Fail", ""
+
+    def _writer():
+        """Single thread that drains result_queue and writes to file."""
+        fh = open(result_file, "a") if result_file else None
+        if fh:
+            fh.write("adx_file\tstatus\tcycles\n")
+        while True:
+            item = result_queue.get()
+            if item is _WRITER_SENTINEL:
+                break
+            adx, output, board = item
+            results.append((adx, output))
+            status, cycles = _status_and_cycles(output)
+            if fh:
+                fh.write(f"{adx.name}\t{status}\t{cycles}\n")
+                fh.flush()
+            if on_result:
+                on_result(adx, status, cycles, output, board)
+        if fh:
+            fh.close()
+
+    writer_thread = threading.Thread(target=_writer, daemon=True)
+    writer_thread.start()
+
+    def worker(board: dict):
+        while True:
+            try:
+                adx = work_queue.get_nowait()
+            except queue.Empty:
+                break
+            output = stage4_run_gdb(adx, board)
+            result_queue.put((adx, output, board))
+            work_queue.task_done()
+
+    with ThreadPoolExecutor(max_workers=len(boards)) as executor:
+        futures = [executor.submit(worker, board) for board in boards]
+        for f in as_completed(futures):
+            f.result()  # re-raise any exception
+
+    result_queue.put(_WRITER_SENTINEL)  # signal writer to stop
+    writer_thread.join()
+
+    return results
+
+
+def _parse_cycle_count(gdb_output: str) -> str | None:
+    """Extract cycle count from GDB stdout."""
+    m = re.search(r'The cycle count is (\d+)', gdb_output)
+    return m.group(1) if m else None
+
+
+def compile_mlir_to_adx(mlir_file: Path, output_dir: Path, cfg: dict) -> tuple[Path, str]:
+    """Compile a single MLIR file to a bare-metal .adx ELF.
+
+    Returns: (adx_path, compile_stderr) where compile_stderr contains
+    optimization remarks for spill detection.
+    """
+    mlir_file = mlir_file.resolve()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = mlir_file.stem
+    temp_dir = (output_dir / "temp" / stem).resolve()
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    benchmarks_dir = temp_dir / "benchmarks"
+
+    benchmark_mlir = stage1_dump_benchmarks(mlir_file, benchmarks_dir, cfg)
+    entry_func = _detect_entry_func_from_benchmark(benchmark_mlir)
+    host_c_h, kernel_h, kernel_o, compile_stderr = stage1_compile_vmc(benchmark_mlir, temp_dir, cfg)
+    entry_o = stage2_compile_entry(kernel_h, entry_func, temp_dir, cfg)
+    out_adx = output_dir / f"{stem}.adx"
+    stage3_link_adx(entry_o, kernel_o, out_adx, cfg)
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    return out_adx, compile_stderr
+
+
+def cmd_compile(args):
+    mlir_file = args.mlir_file.resolve()
+    if not mlir_file.exists():
+        sys.exit(f"Error: MLIR file not found: {mlir_file}")
+
+    output_dir = args.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = mlir_file.stem
+    temp_dir = (output_dir / "temp" / stem).resolve()
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    benchmarks_dir = temp_dir / "benchmarks"
+
+    cfg = load_config(args.config)
+
+    print("Stage 1a: iree-compile → benchmark MLIR ...")
+    benchmark_mlir = stage1_dump_benchmarks(mlir_file, benchmarks_dir, cfg)
+    print(f"  benchmark: {benchmark_mlir.name}")
+
+    entry_func = args.entry_func or _detect_entry_func_from_benchmark(benchmark_mlir)
+    print(f"  entry func: {entry_func}")
+
+    print("Stage 1b: iree-compile → vm-c ...")
+    host_c_h, kernel_h, kernel_o, _stderr = stage1_compile_vmc(benchmark_mlir, temp_dir, cfg)
+    print(f"  host-c.h : {host_c_h.name}")
+    print(f"  kernel.h : {kernel_h.name}")
+    print(f"  kernel.o : {kernel_o.name}")
+
+    print("Stage 2: clang dispatch_driver.c → entry.o ...")
+    entry_o = stage2_compile_entry(kernel_h, entry_func, temp_dir, cfg)
+    print(f"  entry.o  : {entry_o.name}")
+
+    out_adx = output_dir / f"{stem}.adx"
+    print(f"Stage 3: clang++ link → {out_adx.name} ...")
+    stage3_link_adx(entry_o, kernel_o, out_adx, cfg)
+
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    print(f"Done: {out_adx}")
+
+
+def cmd_run(args):
+    cfg = load_config(args.config)
+
+    # Collect .adx files from file args or directory
+    adx_files = []
+    for path in args.adx_paths:
+        p = Path(path).resolve()
+        if p.is_dir():
+            adx_files.extend(sorted(p.glob("*.adx")))
+        elif p.suffix == ".adx":
+            adx_files.append(p)
+        else:
+            sys.exit(f"Error: expected .adx file or directory, got: {p}")
+
+    if not adx_files:
+        sys.exit("Error: no .adx files found")
+
+    boards = load_boards(cfg)
+    print(f"Running {len(adx_files)} file(s) on {len(boards)} board(s) in parallel ...\n")
+
+    results = run_adx_files_parallel(adx_files, cfg)
+    for adx, output in sorted(results, key=lambda x: x[0].name):
+        cycles = _parse_cycle_count(output)
+        if cycles:
+            print(f"  {adx.name}: cycles = {cycles}")
+        else:
+            hint = next((l for l in output.splitlines() if l.strip()), "no output")
+            print(f"  {adx.name}: FAILED ({hint})")
+            print(output, file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="ADX build and run pipeline for RISC-V bare-metal"
+    )
+    sub = parser.add_subparsers(dest="task", required=True)
+
+    # --- compile ---
+    p_compile = sub.add_parser("compile", help="Compile MLIR to .adx ELF")
+    p_compile.add_argument("mlir_file", type=Path, help="Input MLIR file")
+    p_compile.add_argument("-o", "--output-dir", type=Path, required=True,
+                           help="Output directory for .adx file")
+    p_compile.add_argument("--config", default="config/AX45_1024.toml",
+                           help="TOML config (default: config/AX45_1024.toml)")
+    p_compile.add_argument("--entry-func", default=None,
+                           help="Entry function name (overrides auto-detection)")
+
+    # --- run ---
+    p_run = sub.add_parser("run", help="Run .adx file(s) via GDB")
+    p_run.add_argument("adx_paths", nargs="+",
+                       help=".adx file(s) or directory containing .adx files")
+    p_run.add_argument("--config", default="config/AX45_1024.toml",
+                       help="TOML config (default: config/AX45_1024.toml)")
+
+    args = parser.parse_args()
+    if args.task == "compile":
+        cmd_compile(args)
+    elif args.task == "run":
+        cmd_run(args)
+
+
+if __name__ == "__main__":
+    main()

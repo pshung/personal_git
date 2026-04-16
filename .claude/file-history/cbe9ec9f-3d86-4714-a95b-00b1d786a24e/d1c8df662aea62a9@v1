@@ -1,0 +1,88 @@
+# Code Size Optimization Plan — RISC-V Soft-Float libm Assembly
+
+## Phase 1: Quick Wins (High Impact, Low Risk)
+
+
+### 1.3 Tail-call conversions
+- Some functions end with `call helper; lw ra; addi sp; ret`
+- If the call is the last action, convert to `tail helper` (or `j helper`)
+- Eliminates need to save/restore `ra` and potentially the entire stack frame
+- **Files to audit**: sf_atan.s, sf_exp.s, sf_log.s, sf_log10.s, sf_sqrt.s
+  (thin wrappers around andes_* helpers)
+- **Savings**: ~4-8 bytes per converted call site
+
+---
+
+## Phase 2: Targeted Refactoring (Medium Impact)
+
+### 2.1 Eliminate redundant `__clzsi2` calls
+- sf_fmod.s calls `__clzsi2` three times
+- sf_ldexp.s calls `__clzsi2` twice
+- Cache CLZ result in a saved register instead of recomputing
+- **Savings**: ~12-20 bytes per file
+
+### 2.2 sf_fpclassify.s — reuse repeated constants
+- Loads `lui #524288` (0x80000) three times, other large constants repeated
+- Load once into a register and reuse throughout
+- **Savings**: ~10-15 bytes
+
+### 2.3 Consolidate sf_ceil.s / sf_floor.s
+- Both files (~57-59 lines) share nearly identical exponent extraction and
+  mantissa manipulation logic
+- Option A: Extract shared helper routine
+- Option B: Implement ceil in terms of floor: `ceil(x) = -floor(-x)` for
+  non-integer values
+- **Savings**: ~30-40 bytes combined
+
+### 2.4 Remove redundant `mv` chains around helper calls
+- Pattern in sf_sin.s, sf_cos.s, sf_tan.s, others:
+  ```
+  mv x9, x10       # save arg
+  call helper
+  mv x10, x9       # restore (sometimes dead after)
+  ```
+- Reorganize register allocation to pass arguments directly
+- ~6 occurrences across codebase
+- **Savings**: ~2-4 bytes per occurrence
+
+---
+
+## Phase 3: Structural Optimization (Higher Impact, Higher Risk)
+
+### 3.1 Merge sin/cos shared logic
+- sf_sin.s (106 lines) and sf_cos.s (105 lines) are structurally near-identical
+- Both call `__gf_fpreduct` then evaluate polynomials with different coefficient
+  tables (`__gf_fpsincof` / `__gf_fpcoscof`)
+- A unified sincos core with a phase offset parameter could cut combined size ~40%
+- **Risk**: must preserve accuracy; needs full test-all validation
+- **Savings**: ~50-80 bytes combined
+
+### 3.2 Reduce stack frame sizes in complex functions
+- sf_tanh.s: 96-byte frame (largest)
+- sf_pow.s: 96-byte frame
+- sf_sinh.s: 64-byte frame
+- Audit actual register liveness — some saved registers may not need saving
+- **Savings**: ~8-16 bytes per function where frame shrinks
+
+### 3.3 Share exp computation in hyperbolic functions
+- sf_cosh.s, sf_sinh.s, sf_tanh.s all call `__gf_fpexexp` with similar setup
+- Could factor a shared hyperbolic helper that computes exp(x) once and derives
+  cosh/sinh/tanh from it
+- **Risk**: changes calling convention of internal helpers
+- **Savings**: ~40-60 bytes across the three files
+
+---
+
+## Validation
+
+Every change must pass:
+```sh
+make clean && make test-all
+```
+
+For phases 2-3, also verify with:
+```sh
+make size    # before and after, compare .text sizes
+```
+
+---

@@ -1,0 +1,63 @@
+---
+type: operator
+tags: [fc, rvv, zvqmac, kws]
+applies_to: [fc_s8_s8_s8_sft_bias_fast]
+status: algorithm round 1 improved 1.07-1.16x
+---
+
+# riscv_nn_fc_s8_s8_s8_sft_bias_fast
+
+s8 input, s8 weight, s8 output FC matrix-vector with shift-based quantization. Used by KWS-DNN (all 4 IP layers).
+
+## Active path (AX45MPV: ENA_VEC_ISA + RVV>=1.0 + ENA_VEC_ISA_ZVQMAC)
+
+- `nn_dup_s8_x4_reordered` pre-expands input to 4x-interleaved scratch buffer.
+- Weight pre-converted by `riscv_nn_fc_s8_wt_converter` into 4-row-interleaved 16-byte blocks, each 4-row group occupying `size*4` bytes.
+- **Round 1 (2026-04-14)**: outer loop processes **8 rows per iteration** (2 converted blocks). One shared input VLB feeds two VQMACC_VV targeting V8-V15 (group A acc) and V24-V31 (group B acc). Group A epilogue (4 masked VREDSUM + 3 VSLIDEUP + tail K + quantize + VSB) runs first, then group B reuses V16-V19 bias scratch registers.
+- Tail paths: `(wt_row_num>>2)&1` single 4-row-group uses original code; `wt_row_num&3` single-row rows unchanged.
+
+## Register map (8-row path)
+
+| Reg | Role |
+|---|---|
+| V0 | mask copy target |
+| V1 | tail-K weight M1 (E8 vl=4) |
+| V2-V3 | shared input M2 |
+| V4-V5 | group A weight M2 |
+| V6-V7 | group B weight M2 |
+| V8-V15 | group A accumulator M8 (E32) |
+| V16-V19 | bias scratch, reused A then B |
+| V20-V23 | precomputed reduction masks |
+| V24-V31 | group B accumulator M8 (E32) |
+
+Fits in 32 vregs without spills.
+
+## Performance (AX45MPV VLEN=1024)
+
+Unit test size=1024, N=128:
+- Baseline: 37,517 cyc / 6,446 inst / IPC 0.17
+- Round 1: 35,111 cyc / 4,992 inst / IPC 0.14
+- Speedup 1.069x; instruction count -22.6% but IPC drops because back-to-back VQMACC_VV on same M2 inputs serialize in VPU.
+
+KWS-DNN (driver: `Examples/ARM/arm_nn_examples/kws_dnn/`):
+- IP1 (K=250, N=144): 16,757 -> 15,563 (1.077x)
+- IP2/IP3 (K=144, N=144): 10,786/11,025 -> 9,265/9,541 (1.164x/1.156x)
+- IP4 (K=144, N=12): 4,381 -> 4,336 (1.010x)
+- Model total: 43,387 -> 39,190 cyc (1.107x)
+
+IP4 is near-flat because 3 row-groups = 1 batched + 1 single tail, dominated by the epilogue reduction chain.
+
+## Why speedup is modest
+
+- Epilogue reduction chain (4 MSK_VREDSUM + 3 VSLIDEUP per 4 rows) is unchanged and remains the dominant stall source. Algorithm-level restructuring of the epilogue requires changing the converter's 4-row-interleaved weight layout (see [[fc-mat-vec-s16-s16-s8-sft-bias-fast]]).
+- Back-to-back VQMACC_VV on same M2 inputs create VQ->VD dependency stalls (observed IPC 0.17 -> 0.14). Separating dependencies would need alternating register usage or inserting unrelated work.
+
+## Remaining opportunities
+
+- **Micro-arch round**: profile the VREDSUM serial chain + VMV_S_X scalar dependency under vsim; reschedule epilogue to interleave with next inner loop's preamble.
+- **New API variant**: a raw-row-major N-vectorize `..._fast_rowmajor` with VQMACC_VX could yield 2-3x for this workload but requires changing the API contract or adding a new function (out of single-function /optimize scope).
+
+## Related
+
+- [[fc-mat-vec-s16-s16-s8-sft-bias-fast]] - sister function, same weight-layout constraint, algorithm exhausted at round 0.
+- [[vectorize-k-vs-n]] - K-vectorize (current) is forced by the converter contract; N-vectorize would need different weights.

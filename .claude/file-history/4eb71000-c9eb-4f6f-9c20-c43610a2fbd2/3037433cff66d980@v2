@@ -1,0 +1,78 @@
+"""Tests for modelzoo_ranker.model — ModelzooRanker and loss."""
+import torch
+
+from modelzoo_ranker.model.ranker import ModelzooRanker
+from modelzoo_ranker.model.loss import top_k_listmle_loss
+from modelzoo_ranker.data.features import FEATURE_A_DIM, FEATURE_B_DIM
+
+
+class TestModelzooRanker:
+    def test_forward_output_shape(self):
+        """Forward pass produces [B, S] scores."""
+        model = ModelzooRanker()
+        B, S = 4, 5
+        fa = torch.randn(B, FEATURE_A_DIM)
+        fb = torch.randn(B, S, FEATURE_B_DIM)
+        mask = torch.ones(B, S, dtype=torch.bool)
+        scores = model(fa, fb, mask)
+        assert scores.shape == (B, S)
+
+    def test_gradient_flow(self):
+        """All parameters receive finite gradients after backward pass."""
+        model = ModelzooRanker()
+        B, S = 4, 3
+        fa = torch.randn(B, FEATURE_A_DIM)
+        fb = torch.randn(B, S, FEATURE_B_DIM)
+        mask = torch.ones(B, S, dtype=torch.bool)
+        scores = model(fa, fb, mask)
+        loss = top_k_listmle_loss(scores, mask, k=3)
+        loss.backward()
+        for name, p in model.named_parameters():
+            assert p.grad is not None, f'{name} has no gradient'
+            assert torch.isfinite(p.grad).all(), f'{name} has non-finite gradient'
+
+    def test_has_skip_projection(self):
+        """Model has a skip projection layer for residual connection."""
+        model = ModelzooRanker()
+        assert hasattr(model, 'skip'), 'Model should have skip projection'
+        # Skip projects from in_dim to hidden//2
+        in_dim = FEATURE_A_DIM + FEATURE_B_DIM
+        assert model.skip.in_features == in_dim
+        assert model.skip.out_features == 64  # hidden//2
+
+
+class TestLoss:
+    def test_listmle_loss_finite(self):
+        """Loss is a finite scalar."""
+        B, S = 4, 5
+        scores = torch.randn(B, S, requires_grad=True)
+        mask = torch.ones(B, S, dtype=torch.bool)
+        mask[:, -1] = False  # one padded position
+        loss = top_k_listmle_loss(scores, mask, k=3)
+        assert loss.dim() == 0  # scalar
+        assert torch.isfinite(loss)
+
+    def test_group_size_weighting(self):
+        """Larger groups contribute more to loss when sizes provided."""
+        torch.manual_seed(42)
+        B, S = 4, 10
+        scores = torch.randn(B, S, requires_grad=True)
+        mask = torch.ones(B, S, dtype=torch.bool)
+        # Group 0 has 2 items, group 1 has 10 items
+        mask[0, 2:] = False
+        mask[1, :] = True
+        sizes = torch.tensor([2, 10, 10, 10], dtype=torch.long)
+        loss_weighted = top_k_listmle_loss(scores, mask, k=5, sizes=sizes)
+        loss_unweighted = top_k_listmle_loss(scores, mask, k=5)
+        assert torch.isfinite(loss_weighted)
+        # Weighted and unweighted should differ when group sizes differ
+        assert not torch.allclose(loss_weighted, loss_unweighted)
+
+    def test_group_size_weighting_none_is_uniform(self):
+        """Without sizes, all groups contribute equally (backward compat)."""
+        B, S = 3, 5
+        scores = torch.randn(B, S, requires_grad=True)
+        mask = torch.ones(B, S, dtype=torch.bool)
+        loss1 = top_k_listmle_loss(scores, mask, k=3)
+        loss2 = top_k_listmle_loss(scores, mask, k=3, sizes=None)
+        assert torch.allclose(loss1, loss2)

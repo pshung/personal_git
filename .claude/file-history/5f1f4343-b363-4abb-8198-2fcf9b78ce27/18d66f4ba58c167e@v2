@@ -1,0 +1,64 @@
+---
+type: operator
+function: riscv_nn_conv_HWC_s8_s8_s8_RGB_sym_bias_fast
+source: Source/ConvolutionFunctions/riscv_nn_conv_HWC_s8_s8_s8_RGB_sym_bias_fast.c
+tags: [conv, s8, rgb, sym, bias, rvv, direct-conv, small-k]
+current_speedup: 2.57x
+baseline_cycles: 820897
+current_cycles: 319234
+---
+
+# conv_HWC_s8_s8_s8_RGB_sym_bias_fast
+
+## What This Function Does
+
+Convolution for 3-channel (RGB) input tensors. Specialized for in_ch=3 (1-3 input channels). Common as the first layer of a CNN processing raw image data.
+
+Key difference from general conv_HWC: K = in_ch * ker_h * ker_w = **3 * 3 * 3 = 27**.
+
+This small K is the defining characteristic that drives a different optimization strategy than other conv_HWC functions.
+
+## Active Code Path
+
+`#ifdef ENA_VEC_ISA` block. Direct convolution (no im2col, no GEMM sub-function call).
+
+## Optimization History
+
+| Date | Commit | Approach | Cycles | Speedup | Notes |
+|---|---|---|---|---|---|
+| pre-2026-03-23 | baseline | ENA_TILING GEMM (vectorize N) | 820,897 | 1.00x | VL=N/256 << 100% |
+| 2026-03-23 | 4197132c | Replace with direct conv (no GEMM) | 307,830 | 2.67x | K=27 too small for vd4dots |
+| 2026-03-24 | 0bbb5ecc | Bug fix: channel truncation at small VLEN | 319,234 | 2.57x final | Previous code truncated channels at VLEN<1024 |
+
+Note: Final speedup (2.57x) is slightly less than the initial 2.67x due to the correctness bug fix adding a small overhead for small-VLEN portability.
+
+## Why NOT vd4dots (Anti-Pattern Avoided)
+
+For K=27, vd4dots would give:
+```
+vsetvli(vl, 27, e8, m1)   // VL=27 out of 128 possible at VLEN=1024 → 21% utilization
+```
+
+Even worse: 27 is not divisible by 4 (the vd4dots group size), requiring a partial-group handler.
+
+The VREDSUM overhead for each output channel would dominate the tiny dot product work.
+
+**Direct convolution with scalar/vector loads for 3 input channels is faster** because:
+- No im2col buffer allocation
+- No GEMM function call overhead
+- No VREDSUM reduction
+- Simpler register usage
+
+## The Bug Fixed (commit 0bbb5ecc)
+
+The original direct conv implementation loaded `in_tensor_ch` channels per iteration but used a fixed VL based on in_tensor_ch. At VLEN < 1024, VL could be smaller than in_tensor_ch, causing the loop to process fewer channels than expected (channel truncation).
+
+Fix: Proper vsetvli with actual hardware VL, loop over remaining channels.
+
+## Current State (2026-03-24)
+
+At 2.57x, this is likely close to optimal for an RGB convolution. The inner loop is direct and simple. Potential micro-arch improvements (scheduling, dual-issue) would be the next avenue.
+
+## Key Techniques Applied
+
+- [[anti-vd4dots-small-k]] -- explains why direct conv beats vd4dots for K=27

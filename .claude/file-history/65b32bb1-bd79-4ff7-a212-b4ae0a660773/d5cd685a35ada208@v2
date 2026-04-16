@@ -1,0 +1,156 @@
+# Plan: Latency-optimized IEEE-754 `sinf` for RV32 soft-float
+
+## Context
+
+Goal: reduce the end-to-end latency of `sinf` on RV32 soft-float while tightening IEEE-754 conformance, using Sollya to generate a larger minimax coefficient table. The user has Sollya installed and is willing to trade `.rodata` size for fewer serial Horner steps.
+
+Current `sinf` (GoFast) is size-optimized, not latency-optimized, and has notable accuracy gaps. Before writing any new kernel we must (a) recover the existing algorithm exactly, and (b) nail down the target microarchitecture's instruction latencies so we can pick the polynomial shape that minimizes the critical path rather than the op count.
+
+---
+
+## Phase 1 - Recovered GoFast `sinf` algorithm
+
+Files (all in `libm/machine/riscv/`):
+
+| Role | File | Key lines |
+|---|---|---|
+| Entry / dispatch / repack | `sf_sin.s` | 5-83 |
+| Argument reduction | `andes_fpreduct.s` | 5-102 |
+| Sin kernel coefficients | `andes_fpsincof.s` | 7-11 |
+| Cos kernel coefficients | `andes_fpcoscof.s` | 7-12 |
+
+### Data representation
+- Soft-float: the argument lives in `x10` as raw IEEE-754 binary32 bits; no F registers used.
+- After reduction, the working value is a Q1.31 fixed-point mantissa `m` with an implicit leading 1, paired with a biased exponent in `x15` (bias 127). Squared values use `mulhu` so the product stays Q1.31 (upper 32 of a 64-bit multiply).
+
+### Argument reduction (`__gf_fpreduct`)
+1. Extract `e = ((x>>23) & 0xff)`, form explicit mantissa `m = (x<<8) | 0x80000000`.
+2. Fast paths:
+   - `e < 126` (i.e. `|x| < 0.5`): return with `k = 0` and a negative-exponent sentinel. `sinf` then returns `x` **unchanged** - no polynomial kernel is run. This is the dominant accuracy bug: at `|x|` near 0.5, `|x - sin x| ~ 0.021`, many thousands of ULPs.
+   - `e - 126 > 31` (i.e. `|x| >= 2^32`): return `qNaN (0xFFC00000)` and `k = -1`. `sinf` propagates the NaN. This is non-conforming: IEEE-754 requires a finite result in `[-1, 1]` for finite inputs.
+3. Otherwise, bit-serial long division of the 64-bit mantissa by a truncated 64-bit `pi/2 = 0x10B4611A_6487ED51` (Q1.62). `e - 125` iterations of shift / trial-subtract / restore build the integer quotient `k = floor(|x|/(pi/2))` into `x12` and the residual into `x10:x11`.
+4. Post-loop fix-up: if `k` is odd, replace residual with `pi/2 - residual`; then left-normalize so the high bit of the residual is 1, decrementing the exponent `x11` on each shift.
+
+Precision: strict single. No second-word correction, no Payne-Hanek; bits are lost near cancellation (argument close to a multiple of `pi/2`).
+
+### Quadrant handling (`sf_sin.s`)
+- Sign of result: `sign(x) XOR bit1(k)` - the XOR uses `k << 29` masked with `0x80000000`.
+- Kernel selection by `((k - 1) & 2) == 0`:
+  - `k in {0, 3}` -> sin kernel (odd polynomial in `r`).
+  - `k in {1, 2}` -> cos kernel (even polynomial in `r`).
+- `r^2` is formed by `mulhu(m, m)` then right-shifted by `2*(126 - e)` so the squared value lands in the polynomial's fixed-point scale. If the shift is `>= 32`, `r^2` is forced to zero (argument too small to matter inside the kernel).
+
+### Sin kernel (4 coefficients, degree-7 odd polynomial)
+Horner loop `.Lb7`:
+```
+acc = coef[i] - mulhu(acc, r2)         # per iteration
+```
+Termination is a **sentinel trick**: the leading coefficient word has its MSB set (`0x8000006E ~ 1.0`), so `bgez` falls through once the table is consumed.
+
+Coefficients from `andes_fpsincof.s` (Q1.31 fixed point, leading coefficient last):
+| Word | Hex | Implied rational | Polynomial term |
+|---|---|---|---|
+| 423543 | `0x00067677` | ~ 1/5040 | x^7 |
+| 17896787 | `0x01111113` | ~ 1/120 | x^5 |
+| 357914404 | `0x15555564` | ~ 1/6 | x^3 |
+| 2147483758 | `0x8000006E` | ~ 1.0 (sentinel) | x^1 |
+
+Evaluates `sin(r) ~= r * (1 - r^2/6 + r^4/120 - r^6/5040)` (minimax-tuned, not pure Taylor). After the loop, `x * acc` reinjects the leading `r` factor.
+
+### Cos kernel (5 coefficients, degree-8 even polynomial)
+Same Horner shape, but starts from the first word directly (no leading multiply by `r`). Coefficients from `andes_fpcoscof.s`:
+| Word | Hex | Implied rational | Polynomial term |
+|---|---|---|---|
+| 52916 | `0x0000CEB4` | ~ 1/40320 | x^8 |
+| 2983549 | `0x002D82BD` | ~ 1/720 | x^6 |
+| 89479223 | `0x05555577` | ~ 1/24 | x^4 |
+| 1073741961 | `0x40000089` | ~ 1/2 | x^2 |
+| 2147483716 | `0x80000044` | ~ 1.0 (sentinel) | x^0 |
+
+Evaluates `cos(r) ~= 1 - r^2/2 + r^4/24 - r^6/720 + r^8/40320`.
+
+### Reassembly
+Shift-normalize `acc`, pack mantissa into bits [22:0], OR in `exponent << 23` and the precomputed sign bit. No round-to-nearest injection - the low bits of `acc` are simply discarded, giving up to ~1 ULP of truncation bias.
+
+### Extended-precision helpers
+`sinf` does **not** use any of `__gf_exmul / __gf_exadd / __gf_exsub / __gf_p4..p8` - those are reserved for `exp`, `log`, `pow`, `atan`. The sinf hot path is pure 32-bit-mantissa Horner with `mulhu`.
+
+### Critical-path sketch (sin branch)
+Per Horner iteration: `mulhu -> sub` (the load of the next coef is off the critical path if decoupled). 4 iterations:
+```
+r2 -> mulhu -> sub -> mulhu -> sub -> mulhu -> sub -> mulhu -> sub -> mulhu(x,acc)
+```
+Critical length ~= `5 * mulhu_lat + 4 * sub_lat`. On a 4-cycle `mulhu` core this is ~24 cycles just for the kernel arithmetic, plus reduction (bit-serial, dominant for `|x| > 2`).
+
+### IEEE-754 compliance gaps (current implementation)
+1. **`|x| < 0.5` identity shortcut** - skips the kernel entirely. Worst-case error near `x = 0.5` is ~0.021, far outside 1 ULP.
+2. **NaN for `|x| >= 2^32`** - should return a value in `[-1, 1]`.
+3. **No Payne-Hanek** - for arguments near a multiple of `pi/2`, the 64-bit reduction loses ULPs.
+4. **Truncating pack** - final mantissa is shifted, not rounded.
+5. **Kernel polynomial is single-precision only** - internal accumulator carries ~31 bits; cannot tighten below ~1 ULP without a wider accumulator or a compensated evaluation.
+
+---
+
+## Phase 2 - What we want next: latency-optimized IEEE-754 kernel
+
+### Broad approach (sketch only; we will refine after you answer the questions below)
+1. **Fix reduction accuracy first.** Use a Cody-Waite / double-word `pi/2` split or a small Payne-Hanek table so the reduced argument `r` is accurate to ~40-48 bits. Without this, no kernel improvement matters.
+2. **Replace bit-serial division with a single-multiply reduction** for `|x|` up to some threshold (e.g. `2^20`): multiply by `2/pi` in fixed point, extract integer (`k`) and fractional parts, then reconstruct `r = frac * pi/2` using a double-word `pi/2`. This collapses hundreds of cycles of `.Lb1` into ~3 multiplies.
+3. **Enlarge the sin/cos coefficient tables** (Sollya `fpminimax` on `[-pi/4, pi/4]`):
+   - Degree 9 odd for sin, degree 10 even for cos, minimax over Q1.31 (or Q2.30) fixed-point with explicit ULP targets. Sollya's `fpminimax(..., [|31,31,31,...|], ...)` will directly emit rounded fixed-point constants.
+4. **Break the Horner dependency chain** using Estrin's scheme or a 2-way split: compute `r4 = r2*r2` once, then evaluate `(c0 + c1*r2) + r4*(c2 + c3*r2) + r8*(...)`. This halves the serial chain length at the cost of one extra `mulhu` and a second accumulator register. On a deeply pipelined `mulhu` unit this is the single biggest latency win.
+5. **Drop the sentinel-terminated loop** in favour of fully unrolled straight-line code - removes branch + load-latency stalls and lets the scheduler interleave independent multiplies.
+6. **Inject round-to-nearest-even** at the final mantissa pack (add `0x100` before the `>> 9` for a 23-bit result, with overflow fold-up).
+7. **Keep `sinf(x) = x` identity only for `|x| < 2^-12`** (below which `x - x^3/6` rounds to `x`), not `|x| < 0.5`.
+
+### Critical files to be modified (during implementation phase, not now)
+- `libm/machine/riscv/sf_sin.s` - rewrite kernel dispatch, unroll, Estrin split, rounding.
+- `libm/machine/riscv/andes_fpreduct.s` - replace bit-serial divide with multiply-based reduction (or add a fast path and keep slow path as fallback).
+- `libm/machine/riscv/andes_fpsincof.s`, `andes_fpcoscof.s` - regenerate with Sollya at higher degree.
+- Possibly new helper `andes_fpreduct_fast.s` if we keep both paths.
+
+### Verification (for implementation phase)
+- `make test-sinf` (Makefile in this directory) - accuracy diff vs newlib reference for the existing sweep.
+- Add a dense sweep over `[-2*pi, 2*pi]` plus stress points near multiples of `pi/2`, plus `|x| in [2^10, 2^20]`, plus subnormals, +/-0, +/-Inf, NaN.
+- `make bench-sinf` - FPGA cycle counts, compare opt vs ref.
+- Track max ULP error via Sollya `supnorm` on the polynomial before we even build - decouple polynomial error from reduction error.
+
+---
+
+## Phase 3 - Information I need from you before picking the polynomial
+
+The latency-optimal coefficient count and Horner/Estrin split depend entirely on the target pipeline. Please provide:
+
+### A. Target microarchitecture
+1. Which Andes core is the primary target? (e.g. N22, A25, D25F, AX25, A27, N45) - I can look up documented pipeline specs if you name it.
+2. Pipeline depth and issue width (in-order single-issue vs in-order dual-issue vs OoO).
+3. Is there a hardware FPU available at all, or is this strictly soft-float everywhere? (Affects whether we consider a single-precision FMA path.)
+
+### B. Instruction latencies (cycles, result-to-use)
+1. `mul` latency.
+2. `mulh` / `mulhu` latency (and whether `mul` + `mulh` to the same operands fuse into one issue slot).
+3. `mulhsu` latency.
+4. Load-use latency (word load -> ALU consumer).
+5. Taken-branch penalty / branch mispredict penalty.
+6. ALU op latency (`add`, `sub`, `sll`, `srl`, `and`, `or`) - usually 1, confirm.
+7. If Zbb is available: `clz`, `ctz`, `cpop`, `max`, `min` latencies. (Zbb `clz` would replace the left-normalize loop in reduct.)
+8. If Zba is available: `sh1add`, `sh2add`, `sh3add` latencies.
+
+### C. Throughput
+1. How many independent multiplies can be in flight simultaneously? (Fully pipelined vs blocking multiplier.)
+2. Any structural hazards between `mul` and `mulh` (some cores serialize them).
+
+### D. ISA extensions present
+- RV32IM only, or RV32IMC, +Zba, +Zbb, +Zbs, +Zicond, +Zifencei, +Zicsr ... ?
+- If Zicond: we can replace the quadrant branches with `czero.eqz` / `czero.nez`.
+
+### E. Accuracy target and budget
+1. Target max error: correctly rounded (<= 0.5 ULP), faithfully rounded (<= 1 ULP), or a looser bound like <= 2 ULP?
+2. Code-size budget: how many extra bytes of `.text` + `.rodata` are acceptable for a latency win? (E.g. is +256 B ok? +1 KB?)
+3. Is growth of the reduction table (for Payne-Hanek style) acceptable? A 3-word `2/pi` table is ~12 B; full Payne-Hanek for `|x| < 2^32` is ~48-96 B.
+
+### F. Input distribution
+1. What is the expected argument range for the hot workload? (Purely `[-pi, pi]`? Or large `|x|` from time integration?) This decides whether reduction or kernel dominates.
+2. Is latency for small `|x|` (`< 1`) or large `|x|` more important?
+
+Once I have at minimum items **A**, **B.1-B.5**, **D** (extensions), and **E.1-E.2**, I can choose the polynomial degree, Horner-vs-Estrin split, and unroll factor, and then drive Sollya to emit the coefficient table.

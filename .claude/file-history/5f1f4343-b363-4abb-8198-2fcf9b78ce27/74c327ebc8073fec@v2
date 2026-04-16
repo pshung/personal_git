@@ -1,0 +1,67 @@
+---
+type: anti-pattern
+tags: [rvv, vd4dots, conv_HWC_RGB, small-k]
+symptom: Tempted to apply vd4dots GEMM to a conv with small kernel (K=3)
+---
+
+# Anti-Pattern: VD4DOTS for Small-K Convolutions
+
+## When NOT to Use VD4DOTS
+
+VD4DOTS is a dot-product instruction that groups 4 consecutive int8 elements. It provides peak efficiency when K is large relative to VLEN. When K is small, it degenerates:
+
+**K=3 (RGB convolution, 1x1 kernel with 3 input channels):**
+```
+vsetvli(vl, 3, e8, m1)    // VL=3, not 128
+// Only 3/4 of a vd4dots "group" is valid
+// Instruction overhead dominates
+```
+
+VL=3 out of 128 possible at VLEN=1024: **2.3% utilization**.
+
+## The Case: conv_HWC_s8_s8_s8_RGB_sym_bias_fast
+
+This function convolves a 3-channel (RGB) input with a 3x3 kernel:
+- K = in_ch * ker_h * ker_w = **3 * 3 * 3 = 27**
+
+Even K=27 gives only 27/128 = 21% utilization for vd4dots. The VREDSUM reduction overhead becomes significant relative to the dot product work.
+
+### What Worked Instead: Direct Convolution
+
+Replace the tiling GEMM + im2col entirely with a direct convolution loop:
+- Iterate over spatial positions and channels directly
+- Use scalar loads for the 3-input-channel case
+- No im2col buffer allocation needed
+- Simpler code with no GEMM kernel call
+
+**Result:** 2.57x speedup (820,897 -> 319,234 cycles) using direct conv vs tiling GEMM.
+
+## Diagnostic: How to Spot This Case
+
+Check K before applying vd4dots:
+```
+K = in_ch * ker_h * ker_w
+```
+
+Rule of thumb:
+- K >= 64: vd4dots is efficient (>= 50% VL utilization at VLEN=1024/M1)
+- K < 32: direct conv or VQMACC-based approach likely better
+- K in [32, 64]: marginal -- measure both
+
+Also check: if N (output channels) >> K, tiling GEMM (vectorize N) may win even for moderate K.
+
+## The Underlying Reason
+
+VD4DOTS' advantage is amortizing VREDSUM overhead across a large K. The VREDSUM per output channel per pixel (K elements -> 1 int32 result) is fixed cost. When K is small:
+
+```
+overhead_fraction = VREDSUM_cost / (K / VL * vd4dots_cost)
+```
+
+For K=27, VL=128: only 1 partial VD4DOTS instruction per K iteration, plus 1 VREDSUM. The ratio is unfavorable.
+
+## Related
+
+- [[vectorize-k-vs-n]] -- when K is large, vd4dots wins
+- [[tiling-gemm-to-vd4dots]] -- the general technique (requires large K)
+- [[conv-hwc-rgb-sym-bias-fast]] -- operator page where this anti-pattern was confirmed

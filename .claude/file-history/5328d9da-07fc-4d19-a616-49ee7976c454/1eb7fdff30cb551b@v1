@@ -1,0 +1,89 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What This Directory Is
+
+RISC-V architecture-specific math library (`libm`) optimizations for picolibc. These replace generic C implementations from `libm/common/` and `libm/math/` with hand-tuned assembly or hardware-FPU-aware C code.
+
+See `README.md` in this directory for detailed function listings and build configuration matrix.
+
+## Build System
+
+This directory is built as part of the top-level picolibc Meson build. There is no standalone build. The `meson.build` here populates `srcs_libm_machine` which gets compiled into the libm static library.
+
+A separate `CMakeLists.txt` exists for CMake-based builds but only includes a minimal subset (C files, no assembly, no configuration branching).
+
+### Key build flags (set in top-level `meson.build`, consumed here)
+
+- `is_softfp` — software floating-point ABI (no hardware FPU)
+- `is_double_abi` — hardware double-precision FPU
+- `is_riscv64` — 64-bit RISC-V
+- `is_rvm` — M-extension (hardware multiply/divide)
+- `is_rv32e` — RV32E reduced 16-register ISA
+
+### Per-target library quirk
+
+For soft-float RV32 configs (both standard and RV32E), `sf_sincos.c` is compiled as a separate per-target `static_library` via the `foreach params : targets` loop, not added to `srcs_libm_machine`. This is because it needs per-multilib `c_args`. The resulting `lib_machine<target>` libraries are linked via `link_whole` elsewhere.
+
+### Internal call graph
+
+Assembly math functions call shared Andes helper routines (`andes_*.s`). Key dependency chains:
+- Trig functions → `__gf_dpreduct`/`__gf_fpreduct` (argument reduction) → `__gf_exmul`/`__gf_exadd` (extended precision) → polynomial evaluators (`__gf_p4`–`__gf_p8`)
+- `exp`/`log`/`pow` → `__gf_dpexexp`/`__gf_dpexlog` → extended precision helpers
+- All assembly shares coefficient tables: `__gf_dpsincon`, `__gf_dpcoscon`, `__gf_fpsincof`, `__gf_fpcoscof`, etc.
+
+
+## Standalone Test Builds (outside Meson)
+
+For quick accuracy/correctness testing of individual assembly routines, use the standalone `Makefile` in this directory. It compiles test C files and links them against the relevant assembly objects directly.
+
+### Toolchain
+
+Use the Andes `nds32le-elf-mculib-v5` toolchain for RV32 soft-float builds:
+
+```
+/local/nick/SW_Release/build-ast542/build-toolchain/linux/nds32le-elf-mculib-v5/bin/riscv32-elf-gcc
+```
+
+- GCC 14.2.0, bare-metal (`riscv32-elf`)
+- Ships with newlib (provides printf, math reference functions, etc.)
+- `-mvh` flag enables Andes virtual hosting (semihosting) for I/O via QEMU/GDB
+- Target flags: `-march=rv32im -mabi=ilp32` for soft-float M-extension builds
+
+### QEMU
+
+Use the Andes QEMU v5 build for running test ELFs:
+
+- RV32: `/local/nick/qemu_v5/build/qemu-system-riscv32`
+- RV64: `/local/nick/qemu_v5/build/qemu-system-riscv64`
+
+QEMU 9.2.0 (Andes fork, v9.2.0-401-g4581fc99a4). Run via the Makefile targets below -- do not invoke QEMU directly.
+
+### Makefile targets
+
+```sh
+make                        # build all opt and ref ELFs (default: XLEN=32)
+make XLEN=64                # build for RV64 toolchain
+make test-all               # build, run all funcs in QEMU, diff opt vs ref
+make test-sinf              # build and test a single function
+make size-all               # report .text size for every assembly function
+make size-sinf              # report .text size for one function
+make clean                  # remove all build artifacts
+make list                   # show all available per-function targets
+```
+
+For each function with assembly, the Makefile builds `test/<func>_opt.elf` (linked with Andes assembly + `libandes.a`) and `test/<func>_ref.elf` (linked with toolchain libm only), runs both through QEMU, and diffs the outputs. Functions without assembly (e.g. `acosh`, `hypot`) get a ref-only run.
+
+### Unconditionally compiled sources
+
+Regardless of build configuration, the following C files are always included: `s_copysign`, `s_finite`, `s_fma`, `s_isinf`, `s_isnan`, `s_llrint`, `s_llround`, and their `sf_` (float) counterparts plus `sf_fmax`, `sf_fmin`, `sf_lrint`, `sf_lround`.
+
+## Naming Conventions
+
+- `e_` — IEEE error-handling wrapper functions (e.g., `e_sqrt` wraps the core sqrt)
+- `s_` — double-precision standard functions
+- `sf_` — single-precision (float) standard functions
+- `k_` — kernel helpers (internal, e.g., `k_sin`, `k_cos`)
+- `er_` — reentrant variants (e.g., `er_lgamma`)
+- `andes_` — shared assembly building blocks (not standalone math functions)

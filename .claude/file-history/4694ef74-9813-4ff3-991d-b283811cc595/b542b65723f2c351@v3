@@ -1,0 +1,738 @@
+# Implementation Plan: Autonomous Agentic libnn Optimization Workflow
+
+## Context
+
+libnn functions have multi-variant C implementations (plain C / DSP / RVV). Optimizing a function means writing a better RVV implementation for a specific FPGA target. Currently this is manual: read source, write code, build, test on QEMU, profile on FPGA, iterate.
+
+This plan builds tooling so Claude Code can autonomously execute this optimization loop given a configuration file and a specified libnn function or a complete model calling libnn functions. The optimization is specialized for a **designated target configuration** (CPU, VLEN, cache hierarchy, ISA extensions) and **known static-time input shapes** (batch size, spatial dimensions, channel counts, kernel sizes, etc.) declared in the task spec. Dynamic shapes are not supported -- each optimization run targets a fixed set of input dimensions, enabling aggressive tiling, unrolling, and register allocation decisions that would not be valid for arbitrary shapes.
+
+**The baseline source code is never modified.** Instead, the agent creates a new C file containing a macro-guarded optimized implementation. The optimized variant is activated via a compile-time macro (e.g., `-DOPT_CONV_HWC_S8_S8_S8_SYM_BIAS_FAST`), leaving the original function untouched. This keeps the optimization isolated, diffable, and easy to revert or A/B test against the baseline.
+
+The FPGA configuration (Verilog `.inc` file like `ax45mpv_v1024_8mb_config.inc`) provides the ground truth for target features: VLEN, DLEN, L2 cache size, ISA extensions, etc. Cache sizes are especially important since the library's tiling GEMM currently hardcodes L1=512KB -- the actual L2=8MB and L1 D-cache=32KB from the config should drive tiling parameter selection.
+
+The tooling lives in `opt/` at the repo root.
+
+## Final Directory Structure
+
+```
+agentic_libnn_opt/
+  roadmap.md                              # High-level vision document
+  opt/
+    __init__.py
+    __main__.py                           # python -m opt entry point
+    cli.py                                # Click CLI
+    config.py                             # Config schema + loader (Pydantic)
+    feature_extractor.py                  # Parse .cfg/.conf -> TargetFeatures
+    flag_mapper.py                        # TargetFeatures -> compiler flags
+    runner.py                             # Subprocess wrapper (build/test/perf)
+    parser.py                             # Parse QEMU/FPGA/objdump output
+    task_spec.py                          # Single-func + model task specs
+    state.py                              # Optimization state + journal
+    workflow.py                           # Agent loop controller
+    shell/
+      build.sh                            # Thin wrapper around ../../build.sh
+      rebuild_single.sh                   # Thin wrapper around ../../qemu-validate/rebuild_single.sh
+      qemu_test.sh                        # Thin wrapper around ../../qemu-validate/run_qemu_test.sh
+      fpga_perf.sh                        # Thin wrapper around ../../test_perf.sh single-func mode
+    models/
+      example_yolov8n_s8.toml             # Example model definition
+    config.toml                           # Default user config
+  tests/
+    __init__.py
+    conftest.py                           # Shared fixtures (paths, sample configs)
+    test_config.py
+    test_feature_extractor.py
+    test_flag_mapper.py
+    test_runner.py
+    test_parser.py
+    test_task_spec.py
+    test_state.py
+    test_workflow.py
+  .optstate/                              # gitignored: runtime state
+    journal.jsonl
+    baselines/
+```
+
+## Dependencies
+
+- Python 3.11+ (tomllib in stdlib)
+- `pydantic` - config/state validation
+- `click` - CLI
+- `tomlkit` - TOML read/write (already installed)
+- No other new dependencies
+
+---
+
+## Step 1: Project Scaffold and roadmap.md
+
+**Feature name:** `project-scaffold`
+
+**Description:** Create the `opt/` package directory structure, `tests/` directory, `.optstate/` gitignore entry, `pyproject.toml` for the package, and `roadmap.md` describing the project vision.
+
+**Key files to create/modify:**
+- `roadmap.md` - high-level vision document
+- `opt/__init__.py` - empty package init
+- `opt/__main__.py` - stub: `print("opt: not yet implemented")`
+- `tests/__init__.py` - empty
+- `tests/conftest.py` - shared fixtures (repo root path, sample config path)
+- `pyproject.toml` - package metadata, dependencies (pydantic, click, tomlkit)
+- `.gitignore` - add `.optstate/` entry
+
+**Dependencies:** None
+
+**Test cases:**
+1. `python -m opt` prints stub message and exits 0
+2. `python -m pytest tests/ --collect-only` discovers test directory (0 tests, no errors)
+3. `roadmap.md` exists and is non-empty
+
+**Verification:**
+```bash
+python -m opt
+python -m pytest tests/ --collect-only
+test -f roadmap.md
+```
+
+---
+
+## Step 2: Configuration Schema and Loader
+
+**Feature name:** `config-schema`
+
+**Description:** Define the TOML configuration file format and Pydantic models for validation. The config specifies toolchain path, target CPU, QEMU path, and FPGA address. Loader reads `opt/config.toml`, validates all fields, and returns a typed `Config` object.
+
+**Key files to create/modify:**
+- `opt/config.py` - Pydantic models: `ToolchainConfig`, `TargetConfig`, `QemuConfig`, `FpgaConfig`, `AgentConfig`, top-level `Config`
+- `opt/config.toml` - default config populated with current AX45MPV values
+- `tests/test_config.py` - unit tests
+
+**Dependencies:** Step 1
+
+**Config format:**
+```toml
+[toolchain]
+bin_dir = "/local/nick/SW_Release_cp/ast530/nds64le-elf-newlib-v5d/bin"
+prefix = "riscv64-elf-"
+compiler = "gcc"
+
+[target]
+cpu = "AX45MPV"
+fpga_config = "ax45mpv_v1024_8mb_config.inc"  # Verilog .inc with `define macros
+qemu_cfg = "project/ax45mpv/qemu_cfg/zve64d/ADP-AE350-AX45MPV-1C_dw0_mw1.cfg"  # for QEMU machine setup
+
+[qemu]
+binary = "/local/nick/qemu_andes/build/qemu-system-riscv64"
+vlen = 1024
+timeout = 120
+use_strace = true
+
+[fpga]
+host = "sw-boards.andestech.com"
+port = 1116
+timeout = 300
+
+[agent]
+max_iterations = 10
+min_improvement_pct = 2.0
+dry_run = false
+```
+
+**Test cases:**
+1. Load valid `config.toml` -> all fields populated with correct types
+2. Load config with missing `[toolchain]` section -> `ValidationError` with clear message
+3. Load config with invalid `cpu = "INVALID_CPU"` -> error listing valid CPU names
+4. Load config with missing optional `[agent]` section -> defaults applied (`max_iterations=10`, `dry_run=false`)
+5. `Config.repo_root` returns absolute path to the repo root
+
+**Verification:**
+```bash
+python -m pytest tests/test_config.py -v
+```
+
+---
+
+## Step 3: FPGA Config Feature Extractor
+
+**Feature name:** `feature-extractor`
+
+**Description:** Parse FPGA Verilog config files (`.inc` format with `` `define `` macros) to extract CPU hardware features. The primary config file is `ax45mpv_v1024_8mb_config.inc`. Returns a `TargetFeatures` dataclass with all optimization-relevant hardware parameters.
+
+**Key files to create/modify:**
+- `opt/feature_extractor.py` - parser for Verilog `.inc` format, `TargetFeatures` dataclass
+- `tests/test_feature_extractor.py` - unit tests using the real `.inc` file in the repo
+
+**Dependencies:** Step 2 (uses `Config.target.fpga_config` path)
+
+**Source file to parse:** `ax45mpv_v1024_8mb_config.inc` (Verilog `define` macros)
+
+**Extracted fields (optimization-critical):**
+
+Vector unit:
+- `vlen: int` (from `NDS_VLEN`) - vector register length in bits
+- `dlen: int` (from `NDS_DLEN`) - datapath width
+- `elen: int` (from `NDS_ELEN`) - max element length
+- `felen: int` (from `NDS_FELEN`) - max FP element length
+- `vpermut_dlen: int` (from `NDS_VPERMUT_DLEN`) - permutation datapath width
+- `rvv_support: bool` (from `NDS_RVV_SUPPORT`)
+- `vdot_support: bool` (from `NDS_VECTOR_VDOT_SUPPORT`)
+- `qmac_support: bool` (from `NDS_QMAC_SUPPORT`)
+- `packed_fp16_support: bool` (from `NDS_VECTOR_PACKED_FP16_SUPPORT`)
+- `int4_vload_support: bool` (from `NDS_INT4_VECTOR_LOAD_SUPPORT`)
+- `vsint_support: bool` (from `NDS_VECTOR_SINT_SUPPORT`) - segment load/store
+- `vlsu_mshr_depth: int` (from `NDS_VLSU_MSHR_DEPTH`)
+- `vlsu_buf_depth: int` (from `NDS_VLSU_BUF_DEPTH`)
+
+Cache hierarchy (critical for tiling decisions):
+- `l2_cache_kb: int` (from `NDS_L2C_CACHE_SIZE_KB`) - L2 size in KB
+- `l2_ways: int` (from `NDS_L2C_WAY`)
+- `l2_data_width: int` (from `NDS_L2_DATA_WIDTH`)
+- `dcache_kb: int` (from `NDS_DCACHE_SIZE_KB`) - L1 D-cache in KB
+- `dcache_ways: int` (from `NDS_DCACHE_WAY`)
+- `icache_kb: int` (from `NDS_ICACHE_SIZE_KB`)
+- `cache_line_size: int` (from `NDS_CACHE_LINE_SIZE`)
+
+ISA extensions:
+- `isa_base: str` (from `NDS_ISA_BASE`) - "rv64i" or "rv32i"
+- `fpu_type: str` (from `NDS_FPU_TYPE`) - "dp", "sp", or "none"
+- `fp16_support: bool` (from `NDS_FP16_SUPPORT`)
+- `bf16_support: bool` (from `NDS_BFLOAT16_SUPPORT`)
+- `zfbfmin_support: bool` (from `NDS_ZFBFMIN_SUPPORT`)
+- `zvfbfmin_support: bool` (from `NDS_ZVFBFMIN_SUPPORT`)
+- `zvfbfwma_support: bool` (from `NDS_ZVFBFWMA_SUPPORT`)
+- `rvb_support: bool` (from `NDS_RVB_SUPPORT`) - bit manipulation
+- `dsp_support: bool` (from `NDS_DSP_SUPPORT`)
+- `ace_support: bool` (from `NDS_ACE_SUPPORT`)
+
+Bus:
+- `bus_width: int` (from `NDS_BIU_DATA_WIDTH`)
+
+**Test cases:**
+1. Parse `ax45mpv_v1024_8mb_config.inc` -> `vlen=1024, dlen=1024, elen=64, l2_cache_kb=8192, dcache_kb=32`
+2. `vdot_support=True`, `qmac_support=True`, `rvv_support=True`
+3. `dsp_support=False`, `ace_support=False` (not present on this config)
+4. `cache_line_size=64`, `l2_ways=16`, `dcache_ways=4`
+5. Parse non-existent file -> `FileNotFoundError` with path in message
+6. `TargetFeatures.total_l1_cache_kb` property returns `icache_kb + dcache_kb`
+7. `TargetFeatures.has_vector` property returns True when `rvv_support=True`
+
+**Verification:**
+```bash
+python -m pytest tests/test_feature_extractor.py -v
+```
+
+---
+
+## Step 4: Feature-to-Compiler-Flags Mapper
+
+**Feature name:** `flag-mapper`
+
+**Description:** Convert `TargetFeatures` to the exact compiler flags that `build.sh` uses. This is the bridge between hardware config and build system. The mapping must match `build.sh` line-for-line for each CPU variant.
+
+**Key files to create/modify:**
+- `opt/flag_mapper.py` - `map_features_to_flags(cpu: str, features: TargetFeatures) -> list[str]`
+- `tests/test_flag_mapper.py`
+
+**Dependencies:** Step 3 (consumes `TargetFeatures`)
+
+**Mapping rules (from `build.sh` lines 82-97 for AX45MPV + features from `.inc`):**
+- Base: `-O3 -ffunction-sections -fdata-sections -Wall -Werror`
+- `cpu contains "45"` -> `-mtune=andes-45-series -fno-strict-aliasing -DENA_45_SERIES_OPT`
+- `rvv_support=True` -> `-mext-vector -DENA_VEC_ISA -fno-tree-slp-vectorize -fno-tree-vectorize`
+- `vlen` from `.inc` -> `-DMAX_VLEN=<vlen>` (e.g., 1024)
+- `vdot_support=True` -> `-DENA_NDS_V5_VEC_DOT_PROD`
+- `qmac_support=True` -> enables QMAC code paths
+- `fp16_support=True` -> `-mzfh` (enables f16 source files in Makefile_lib.mak)
+- `bf16_support=True` -> BF16 conversion paths
+- `dsp_support=True` -> `-mext-dsp -DENA_DSP_ISA`
+- `ace_support=True` -> `-DENA_ACE_RVV`
+- RVV version -> `-DNDS_VEC_RVV_VERSION=1000` (currently hardcoded for RVV 1.0)
+- Cache sizes exposed as `TargetFeatures` fields for tiling parameter tuning
+
+**Test cases:**
+1. AX45MPV features -> flags contain `-DENA_VEC_ISA -DMAX_VLEN=1024 -DNDS_VEC_RVV_VERSION=1000 -DENA_NDS_V5_VEC_DOT_PROD`
+2. Non-vector target -> flags do NOT contain `-DENA_VEC_ISA`
+3. Flags include base optimization flags (`-O3 -Wall -Werror`)
+4. Integration: build with generated flags, compare `libnn.objdump` symbol list to build.sh-generated one (identical)
+
+**Verification:**
+```bash
+python -m pytest tests/test_flag_mapper.py -v
+```
+
+---
+
+## Step 5: Shell Wrappers
+
+**Feature name:** `shell-wrappers`
+
+**Description:** Thin shell scripts in `opt/shell/` that set up PATH from config and delegate to existing scripts. Each wrapper reads environment variables set by the Python runner.
+
+**Key files to create:**
+- `opt/shell/build.sh` - sets PATH, calls `../../build.sh $CPU "$EXTRA_FLAGS" $COMPILER`
+- `opt/shell/rebuild_single.sh` - sets PATH, calls `../../qemu-validate/rebuild_single.sh $SOURCE_FILE`
+- `opt/shell/qemu_test.sh` - sets PATH + QEMU vars, calls `../../qemu-validate/run_qemu_test.sh $FUNC --strace --vlen $VLEN`
+- `opt/shell/fpga_perf.sh` - sets MYPC/MYPORT, calls `../../test_perf.sh ax45mpv $COMPILER BOARD $FUNC`
+
+**Dependencies:** Step 2 (reads config for paths)
+
+**Test cases:**
+1. `opt/shell/build.sh` with valid config env vars -> builds `libnn.a` at repo root
+2. `opt/shell/qemu_test.sh` with `FUNC=relu_s8` -> exits 0, output contains "pass"
+3. All shell scripts are executable (`chmod +x`)
+4. Each script fails cleanly if required env vars are unset
+
+**Verification:**
+```bash
+# After setting env vars from config:
+OPT_TOOLCHAIN_BIN=/local/nick/SW_Release_cp/ast530/nds64le-elf-newlib-v5d/bin \
+  bash opt/shell/build.sh AX45MPV
+```
+
+---
+
+## Step 6: Command Runner
+
+**Feature name:** `command-runner`
+
+**Description:** Python module that invokes shell wrappers via `subprocess`, captures output, and returns structured `RunResult` objects. Handles timeouts, logging, and error classification. This is the ONLY module that calls `subprocess`.
+
+**Key files to create/modify:**
+- `opt/runner.py` - `Runner` class with methods: `build()`, `rebuild_single()`, `qemu_test()`, `fpga_perf()`, `objdump_function()`
+- `tests/test_runner.py`
+
+**Dependencies:** Step 2 (Config), Step 5 (shell wrappers)
+
+**Interface:**
+```python
+@dataclass
+class RunResult:
+    command: str
+    returncode: int
+    stdout: str
+    stderr: str
+    duration_s: float
+
+class Runner:
+    def __init__(self, config: Config): ...
+    def build(self) -> RunResult: ...
+    def rebuild_single(self, source_path: str) -> RunResult: ...
+    def qemu_test(self, func_name: str, vlen: int = 1024) -> RunResult: ...
+    def fpga_perf(self, func_name: str) -> RunResult: ...
+    def objdump_function(self, func_name: str) -> str | None: ...
+```
+
+**Test cases:**
+1. `Runner.build()` -> `RunResult.returncode == 0`, `libnn.a` exists
+2. `Runner.qemu_test("relu_s8")` -> `RunResult.returncode == 0`, stdout contains "pass"
+3. `Runner.qemu_test("nonexistent_func")` -> `RunResult.returncode != 0`
+4. `Runner.objdump_function("riscv_nn_relu_s8")` -> non-empty string containing vector instructions
+5. All `RunResult` objects have `duration_s > 0`
+6. Unit tests with mocked subprocess for fast execution
+
+**Verification:**
+```bash
+python -m pytest tests/test_runner.py -v
+```
+
+---
+
+## Step 7: Output Parsers
+
+**Feature name:** `output-parsers`
+
+**Description:** Parse structured output from QEMU tests, FPGA perf tests, and objdump. Convert raw text to typed dataclasses.
+
+**Key files to create/modify:**
+- `opt/parser.py` - parse functions for each output type
+- `tests/test_parser.py`
+
+**Dependencies:** Step 6 (consumes `RunResult.stdout`)
+
+**Parsers:**
+```python
+@dataclass
+class QemuResult:
+    func_name: str
+    passed: bool
+    sub_tests: int
+    sub_passes: int
+    output: str
+
+@dataclass
+class FpgaResult:
+    func_name: str
+    cycles: int
+    instructions: int
+    passed: bool
+
+def parse_qemu_output(stdout: str, func_name: str) -> QemuResult: ...
+def parse_fpga_output(stdout: str, func_name: str) -> FpgaResult: ...
+def parse_perf_csv(csv_path: str) -> dict[str, FpgaResult]: ...
+```
+
+**Test cases:**
+1. Parse real QEMU strace output (captured sample) -> correct pass/fail
+2. Parse QEMU output with "accuracy checking fail" -> `passed=False`
+3. Parse FPGA output with `inst` and `cycle` lines -> positive integer values
+4. Parse `performance.csv` from baseline -> dict with function names as keys
+5. Parse empty/malformed output -> clear error, not crash
+
+**Verification:**
+```bash
+python -m pytest tests/test_parser.py -v
+```
+
+---
+
+## Step 8: Single-Function Task Specification
+
+**Feature name:** `task-spec-single`
+
+**Description:** TOML format for specifying a single function optimization task with input shapes. Parser validates function exists in the source tree.
+
+**Key files to create/modify:**
+- `opt/task_spec.py` - `SingleFuncTask` Pydantic model, loader
+- `tests/test_task_spec.py`
+
+**Dependencies:** Step 2 (Config for repo root path)
+
+**Format:**
+```toml
+mode = "single_function"
+function = "conv_HWC_s8_s8_s8_sym_bias_fast"
+optimization_target = "cycles"  # "cycles" or "instructions"
+
+[input_shapes]
+batch = 1
+height = 32
+width = 32
+in_channels = 64
+out_channels = 128
+kernel_h = 3
+kernel_w = 3
+```
+
+**Test cases:**
+1. Parse valid task -> all fields populated, `mode == "single_function"`
+2. `function` validated: `Source/*/riscv_nn_<function>.c` exists
+3. Parse task with unknown function -> warning with closest match suggestions
+4. Parse task without `input_shapes` -> uses shapes from existing test file `t_<func>.c`
+5. `source_path` property resolves to actual file path
+
+**Verification:**
+```bash
+python -m pytest tests/test_task_spec.py -v
+```
+
+---
+
+## Step 9: Model Task Specification
+
+**Feature name:** `task-spec-model`
+
+**Description:** TOML format for specifying a model as a list of libnn function calls with shapes and call counts. Used for model-level optimization prioritization.
+
+**Key files to create/modify:**
+- `opt/task_spec.py` - add `ModelTask` Pydantic model, `OpEntry` model
+- `opt/models/example_yolov8n_s8.toml` - example model definition
+- `tests/test_task_spec.py` - add model tests
+
+**Dependencies:** Step 8 (extends task_spec.py)
+
+**Format:**
+```toml
+mode = "model"
+name = "YOLOv8n-s8"
+optimization_target = "total_cycles"
+budget_iterations = 20
+
+[[ops]]
+func = "conv_1x1_HWC_s8_s8_s8_asym_bias_fast_any"
+call_count = 3
+[ops.shapes]
+batch = 1
+height = 80
+width = 80
+in_channels = 64
+out_channels = 64
+
+[[ops]]
+func = "conv_HWC_s8_s8_s8_asym_bias_any"
+call_count = 6
+[ops.shapes]
+batch = 1
+height = 40
+width = 40
+in_channels = 128
+out_channels = 128
+```
+
+**Test cases:**
+1. Parse valid model -> `ops` list with correct length
+2. All function names validated against source tree
+3. `total_weighted_calls` property = sum of call_counts
+4. `unique_functions` property returns deduplicated function list
+5. Parse model with 0 ops -> error "model must have at least one op"
+
+**Verification:**
+```bash
+python -m pytest tests/test_task_spec.py -v
+```
+
+---
+
+## Step 10: Optimization State and Journal
+
+**Feature name:** `opt-state`
+
+**Description:** Track optimization state across iterations. Append-only journal (`journal.jsonl`) for crash recovery. State includes current phase, iteration count, baseline/current/best cycle counts, and history.
+
+**Key files to create/modify:**
+- `opt/state.py` - `Phase` enum, `IterationRecord`, `OptimizationState` Pydantic models, `Journal` class
+- `tests/test_state.py`
+
+**Dependencies:** Step 2 (Config for `.optstate/` path)
+
+**Phase enum:**
+```python
+class Phase(str, Enum):
+    INIT = "init"              # load config, resolve source file
+    BASELINE = "baseline"      # build + test + profile baseline
+    ANALYZE = "analyze"        # gather context for agent
+    IMPLEMENT = "implement"    # agent edits source
+    BUILD = "build"            # incremental rebuild
+    VALIDATE = "validate"      # QEMU correctness check
+    MEASURE = "measure"        # FPGA performance measurement
+    EVALUATE = "evaluate"      # compare to baseline, decide next
+    DONE = "done"
+```
+
+**Test cases:**
+1. Create new state -> phase=INIT, iteration=0
+2. Advance phase INIT->BASELINE -> state updated, journal entry appended
+3. Record iteration result -> history list grows by 1
+4. Save + reload state from `.optstate/` -> identical object
+5. Journal is append-only: 3 transitions = 3 lines in `journal.jsonl`
+6. `best_improvement_pct` computed correctly from baseline and best cycles
+
+**Verification:**
+```bash
+python -m pytest tests/test_state.py -v
+```
+
+---
+
+## Step 11: Context Gatherer
+
+**Feature name:** `context-gatherer`
+
+**Description:** Collect all information needed for an optimization iteration: function source code (all variants), relevant headers, disassembly, performance data, and target features. Outputs a structured `OptimizationContext` object that the agent consumes.
+
+**Key files to create/modify:**
+- `opt/context.py` - `OptimizationContext` dataclass, `gather_context()` function
+- `tests/test_context.py`
+
+**Dependencies:** Step 3 (features), Step 6 (runner for objdump), Step 7 (parsers), Step 10 (state for baseline data)
+
+**Output structure:**
+```python
+@dataclass
+class OptimizationContext:
+    func_name: str
+    source_path: str
+    source_code: str
+    related_headers: dict[str, str]   # header_name -> content
+    disassembly: str
+    target_features: TargetFeatures
+    baseline_cycles: int | None
+    baseline_instructions: int | None
+    current_cycles: int | None
+    input_shapes: dict[str, int]
+    iteration: int
+    history: list[IterationRecord]
+```
+
+**Test cases:**
+1. Gather context for `relu_s8` -> source_code contains `#ifdef ENA_VEC_ISA`
+2. `related_headers` includes `internal_nn_math.h`
+3. `disassembly` is non-empty and contains function label
+4. `target_features.isa_v == True` for AX45MPV config
+5. Context is JSON-serializable (for passing to agent prompts)
+
+**Verification:**
+```bash
+python -m pytest tests/test_context.py -v
+```
+
+---
+
+## Step 12: Single-Function Workflow Controller
+
+**Feature name:** `workflow-single`
+
+**Description:** End-to-end optimization workflow for a single function. Drives the phase state machine: INIT -> BASELINE -> ANALYZE -> [IMPLEMENT -> BUILD -> VALIDATE -> MEASURE -> EVALUATE]* -> DONE. The IMPLEMENT phase is a hook where the agent (Claude Code) edits code.
+
+**Key files to create/modify:**
+- `opt/workflow.py` - `SingleFunctionWorkflow` class with `run()`, `step()`, `get_context()`, `report()`
+- `tests/test_workflow.py`
+
+**Dependencies:** Step 6 (runner), Step 7 (parsers), Step 8 (task spec), Step 10 (state), Step 11 (context)
+
+**Behavior:**
+1. INIT: load config, resolve source file, backup original source
+2. BASELINE: full build, QEMU test (must pass), FPGA perf (get baseline cycles)
+3. ANALYZE: gather context, present to agent
+4. IMPLEMENT: agent edits source (external - Claude Code does this)
+5. BUILD: `rebuild_single.sh` (incremental)
+6. VALIDATE: QEMU test at VLEN=1024 and VLEN=256
+7. MEASURE: FPGA perf (or skip in dry_run mode)
+8. EVALUATE: compare cycles, accept/revert, check stopping criteria
+9. Loop to ANALYZE or transition to DONE
+
+**Test cases:**
+1. `workflow.run(dry_run=True)` with no code changes -> baseline == result, 0% improvement
+2. Workflow aborts if baseline QEMU test fails
+3. Workflow reverts source if VALIDATE fails after IMPLEMENT
+4. `workflow.report()` returns markdown with function name, baseline cycles, best cycles, improvement %
+5. `workflow.step()` advances exactly one phase per call
+6. Workflow respects `max_iterations` from config
+
+**Verification:**
+```bash
+python -m pytest tests/test_workflow.py -v
+python -m opt run --task config/task_single_example.toml --dry-run
+```
+
+---
+
+## Step 13: Model Workflow Controller
+
+**Feature name:** `workflow-model`
+
+**Description:** Model-level optimization: profile all functions, rank by weighted cycle contribution (`call_count * cycles`), optimize top functions using single-function workflow, re-profile for total improvement.
+
+**Key files to create/modify:**
+- `opt/workflow.py` - add `ModelWorkflow` class
+- `tests/test_workflow.py` - add model tests
+
+**Dependencies:** Step 9 (model task spec), Step 12 (single-function workflow)
+
+**Behavior:**
+1. Load model spec
+2. For each unique function: run FPGA perf to get baseline cycles
+3. Compute weighted cost: `call_count * cycles` per function
+4. Sort descending by weighted cost
+5. Allocate iteration budget across functions proportional to cost
+6. Run single-function workflow for each (in priority order)
+7. Re-profile all functions
+8. Generate model-level report
+
+**Test cases:**
+1. Profile model -> ranked list where first entry has highest weighted cost
+2. Budget allocation: top function gets more iterations than bottom
+3. Report shows per-function and total model improvement
+4. Model workflow reuses single-function workflow (no duplication)
+5. `--dry-run` mode works end-to-end
+
+**Verification:**
+```bash
+python -m pytest tests/test_workflow.py -v -k model
+python -m opt run --task opt/models/example_yolov8n_s8.toml --dry-run
+```
+
+---
+
+## Step 14: CLI Entry Point
+
+**Feature name:** `cli`
+
+**Description:** Click-based CLI for all workflow operations. Entry point: `python -m opt <command>`.
+
+**Key files to create/modify:**
+- `opt/cli.py` - Click commands
+- `opt/__main__.py` - wire to cli
+
+**Dependencies:** Step 2 (config), Step 3 (features), Step 12 (single workflow), Step 13 (model workflow)
+
+**Commands:**
+```
+python -m opt features                            # dump parsed target features from config
+python -m opt baseline --func <name>              # capture baseline perf for one function
+python -m opt run --task <path.toml>              # run optimization (single or model)
+python -m opt run --task <path.toml> --dry-run    # skip FPGA measurements
+python -m opt status                              # show current optimization state
+python -m opt journal                             # show last 20 journal entries
+```
+
+**Test cases:**
+1. `python -m opt features` -> prints VLEN, ELEN, extensions from config
+2. `python -m opt --help` -> shows all commands
+3. `python -m opt run --task nonexistent.toml` -> clear error "file not found"
+4. `python -m opt status` with no active run -> "no active optimization"
+
+**Verification:**
+```bash
+python -m opt features
+python -m opt --help
+python -m opt status
+```
+
+---
+
+## Dependency Graph
+
+```
+Step 1  (scaffold)
+  |
+Step 2  (config)
+  |
+  +---> Step 3  (feature extractor)
+  |       |
+  |       +---> Step 4  (flag mapper)
+  |
+  +---> Step 5  (shell wrappers)
+  |       |
+  |       +---> Step 6  (command runner)
+  |               |
+  |               +---> Step 7  (output parsers)
+  |
+  +---> Step 8  (single-func task spec)
+  |       |
+  |       +---> Step 9  (model task spec)
+  |
+  +---> Step 10 (state + journal)
+  |
+  +---> Step 11 (context gatherer) --- depends on 3, 6, 7, 10
+          |
+          +---> Step 12 (single-func workflow) --- depends on 6, 7, 8, 10, 11
+                  |
+                  +---> Step 13 (model workflow) --- depends on 9, 12
+                          |
+                          +---> Step 14 (CLI) --- depends on 2, 3, 12, 13
+```
+
+**Parallel work possible:**
+- Steps 3, 5, 8, 10 can proceed in parallel after Step 2
+- Steps 4 and 6 can proceed in parallel after their respective deps
+- Steps 7 and 9 can proceed in parallel
+
+---
+
+## Verification Strategy
+
+**Unit tests:** Each step has pytest tests in `tests/`. Run with:
+```bash
+python -m pytest tests/ -v
+```
+
+**Integration tests:** Steps 5, 6, 12, 13 have integration tests that actually build/run. These are slower and require toolchain access. Mark with `@pytest.mark.integration`:
+```bash
+python -m pytest tests/ -v -m integration
+```
+
+**End-to-end test:** After Step 14:
+```bash
+# Single function dry-run
+python -m opt run --task config/task_single_example.toml --dry-run
+
+# Verify: builds libnn, runs QEMU test, prints baseline report
+```

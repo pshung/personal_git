@@ -1,0 +1,71 @@
+---
+type: anti-pattern
+tags: [rvv, lmul, memory-bound, maxpool, ipc]
+symptom: Increasing LMUL or parallelism to speed up a pooling / memory-bound function
+---
+
+# Anti-Pattern: LMUL Increase for Memory-Bound Functions
+
+## The Mistaken Reasoning
+
+"If I use M4 instead of M8, I can process 2 pixels in parallel with half the LMUL per pixel. This doubles memory-level parallelism and should reduce cycles."
+
+Or: "If I unroll the inner loop by 2x, the CPU can overlap more loads and hide latency."
+
+## Why It Fails
+
+For memory-bound functions, the bottleneck is **VLSU bandwidth**, not compute or instruction throughput.
+
+The amount of data read from memory is fixed:
+```
+bytes_loaded = input_size (same regardless of LMUL, unrolling, or parallelism)
+```
+
+Changing LMUL changes:
+- Number of instructions (fewer with higher LMUL)
+- IPC (higher with lower LMUL -- more instructions to fill slots)
+
+But the **time to transfer data** is determined by bandwidth, not instruction count.
+
+## Evidence: maxpool_HWC_s8
+
+Three failed approaches, all confirming memory-bound behavior:
+
+### Attempt 1: Unroll k_x by 2 (commit 4f167833)
+```
+M8 baseline:         25,667 cycles, 8,192 instrs, IPC=0.32
+M8 unrolled k_x=2:   26,365 cycles, 8,192 instrs, IPC=0.31
+Result: REGRESSED 3.2%
+```
+Same instruction count, same IPC, slightly more overhead (loop counter). Memory is the wall.
+
+### Attempt 2: Precomputed pointer arithmetic (commit 77473db5)
+```
+M8 baseline:         25,667 cycles, 8,192 instrs, IPC=0.32
+M8 pointer arith:    25,361 cycles, 7,168 instrs, IPC=1.2% improvement
+Result: NEUTRAL (1.2%)
+```
+Reducing scalar overhead helped marginally (less scalar-vector contention) but memory is still the limit.
+
+### Attempt 3: M4 2-pixel parallel (commit fb9cda57)
+```
+M8 baseline:         25,667 cycles, 8,192 instrs, IPC=0.32
+M4 2-pixel:          25,805 cycles, 14,584 instrs, IPC=0.57
+Result: NEUTRAL/SLIGHT REGRESSION
+```
+IPC DOUBLED (0.32 -> 0.57) -- the CPU is more "busy" -- but cycles are the same. The bandwidth wall doesn't care about instruction-level parallelism.
+
+## The Signal to Stop
+
+When multiple algorithmic changes fail to reduce cycles by more than 2-3%, and the function has:
+- Simple inner loop (load + single compute op)
+- Low baseline IPC (~0.30)
+- No arithmetic-heavy inner loop
+
+...the function is at the hardware bandwidth limit. Record this in the operator page and exit the optimization loop. Do not invest further in algorithm or uarch changes.
+
+## Related
+
+- [[memory-bound-diagnosis]] -- how to diagnose and confirm memory-bound status
+- [[lmul-selection]] -- when LMUL changes DO help
+- [[maxpool-hwc-s8]] -- operator page with all three failed attempts recorded

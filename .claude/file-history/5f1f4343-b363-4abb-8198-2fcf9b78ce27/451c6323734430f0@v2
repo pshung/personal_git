@@ -1,0 +1,71 @@
+---
+type: technique
+tags: [rvv, lmul, vl-utilization, algorithm]
+applies_to: [conv_HWC, avepool, maxpool]
+---
+
+# LMUL Selection and Vector Length Utilization
+
+## LMUL and VL at VLEN=1024
+
+| LMUL | SEW=8 max VL | SEW=16 max VL | SEW=32 max VL |
+|---|---|---|---|
+| M8 | 1024 | 512 | 256 |
+| M4 | 512 | 256 | 128 |
+| M2 | 256 | 128 | 64 |
+| M1 | 128 | 64 | 32 |
+
+VLEN=512 (vsim): half of above. VLEN=256: quarter.
+
+## Principle: Match VL to the Vectorized Dimension
+
+The critical factor is not LMUL per se but **what dimension is vectorized** and whether it fills VL.
+
+### Example: ENA_TILING path (bad)
+
+```
+vsetvli(vl, out_ch=32, e8, m2)   // max VL=256, actual VL=32 → 12.5% utilization
+```
+
+The output channel dimension (N=32) is too small to fill VL=256 at VLEN=1024.
+
+### Example: vd4dots GEMM (good)
+
+```
+vsetvli(vl, K=512, e8, m4)       // max VL=512, actual VL=512 → 100% utilization
+vsetvli(vl, K=128, e8, m1)       // max VL=128, actual VL=128 → 100% utilization
+```
+
+K (= in_ch * ker_h * ker_w) is always large for conv workloads.
+
+### Example: avepool with e16 (better than e32)
+
+```
+// Before: e32/M2 vqmacc → max VL=64 at VLEN=1024
+// After: e16/M4 vwadd → max VL=256 at VLEN=1024 → 4x more elements per instruction
+```
+
+When the intermediate sum fits in int16 (count * 127 <= 32767), use e16 instead of e32.
+
+## LMUL Selection for Register Blocking
+
+For a 4x4 tiled GEMM (4 pixels x 4 output channels), 16 accumulator registers are needed. With LMUL=M1:
+- 16 accumulators: v0..v15 (all registers consumed)
+- Each register: VL=128 partial sums at VLEN=1024
+- Compute-to-load: 16 vd4dots / 8 loads = 2.0 (good)
+
+With LMUL=M4:
+- 4 accumulators: v0, v4, v8, v12
+- Tiling degenerates to 4x1 or requires more passes over K
+
+Use M1 for vd4dots kernels to maximize tiling factor within 32-register budget.
+
+## LMUL and the Failing Pattern for Memory-Bound Functions
+
+For memory-bound functions (pooling), increasing LMUL to increase VL per instruction reduces the number of instructions but does NOT increase the memory-level parallelism. The bottleneck is bandwidth, not compute. See [[anti-lmul-reduction-memory-bound]].
+
+## Related
+
+- [[vectorize-k-vs-n]] -- choosing which dimension to vectorize
+- [[e16-accumulation]] -- using smaller SEW to get larger VL
+- [[anti-lmul-reduction-memory-bound]] -- when LMUL changes don't help

@@ -1,0 +1,110 @@
+################################################################################
+# CIFAR-10 CNN example — build and run on Andes QEMU / FPGA (AX45MPV, VLEN=1024)
+#
+#   make            — build cifar10.elf (QEMU/correctness)
+#   make run        — run on QEMU (strace mode, captures semihosting output)
+#   make perf       — build and run on FPGA, report total inst+cycle count
+#   make perf-layers — build and run on FPGA, report per-layer inst+cycle breakdown
+#   make clean      — remove build artifacts
+################################################################################
+
+LIBNN_ROOT := ../../../..
+TOOLCHAIN_BIN := /local/nick/SW_Release_cp/ast530/nds64le-elf-newlib-v5d/bin
+CC := $(TOOLCHAIN_BIN)/riscv64-elf-gcc
+
+QEMU := /local/nick/qemu_v5/build/qemu-system-riscv64
+QEMU_CFG := $(LIBNN_ROOT)/project/ax45mpv/qemu_cfg/zve64d/ADP-AE350-AX45MPV-1C_dw0_mw1.cfg
+VLEN := 1024
+QEMU_TIMEOUT := 30
+
+BOARD_WRAPPER := $(LIBNN_ROOT)/project/ax45mpv/riscv64-sim-wrapper-on-board
+export MYPC  ?= sw-boards.andestech.com
+export MYPORT ?= 1116
+
+BUILD_DIR := build
+ELF       := $(BUILD_DIR)/cifar10.elf
+ELF_PERF  := $(BUILD_DIR)/cifar10_perf.elf
+ELF_LAYERS := $(BUILD_DIR)/cifar10_layers.elf
+SRC_ORIG  := nds_nn_examples_cifar10.c
+SRC_PATCHED := $(BUILD_DIR)/nds_nn_examples_cifar10_patched.c
+
+CFLAGS := -O3 -Wall -ffunction-sections -fdata-sections -Wl,-gc-sections
+CFLAGS += -mvh -mzfh -DENA_FS_VS
+CFLAGS += -mtune=andes-45-series -mext-vector=zve64d
+CFLAGS += -DENA_VEC_ISA -DNDS_VEC_RVV_VERSION=1000 -DMAX_VLEN=$(VLEN)
+CFLAGS += -DFAST_VERSION
+
+INCS := -I$(BUILD_DIR)/shim
+INCS += -I$(LIBNN_ROOT)/Include
+INCS += -I$(LIBNN_ROOT)/internal
+INCS += -I.
+INCS += -I$(LIBNN_ROOT)/Examples/unit_func/include
+
+LIBS := $(LIBNN_ROOT)/libnn.a -lm
+
+# Shim headers: map old nds_nn_*.h names to current riscv_nn_*.h
+SHIM_HEADERS := $(addprefix $(BUILD_DIR)/shim/nds_nn_, \
+	softmax.h activation.h pooling.h fully_connected.h convolution.h)
+
+# Extra flags shared by both perf builds
+PERF_CFLAGS := -DPF_COUNTER -DENA_CACHEABLE_ENV_SETUP
+
+.PHONY: all run perf perf-layers clean
+
+all: $(ELF)
+
+$(ELF): $(SRC_PATCHED) $(SHIM_HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCS) -o $@ $(SRC_PATCHED) $(LIBS)
+	@echo "Built: $@"
+
+# Patch: add missing batch=1 argument to riscv_nn_maxpool_HWC_s8 calls
+$(SRC_PATCHED): $(SRC_ORIG) | $(BUILD_DIR)
+	sed \
+	  -e 's/riscv_nn_maxpool_HWC_s8(\(img_buffer[12]\), \(CONV[123]_OUT_DIM\)/riscv_nn_maxpool_HWC_s8(\1, 1, \2/g' \
+	  $< > $@
+
+# Generate shim headers
+$(BUILD_DIR)/shim/nds_nn_%.h: | $(BUILD_DIR)/shim
+	echo '#include "riscv_nn_$*.h"' > $@
+
+$(BUILD_DIR)/shim:
+	mkdir -p $@
+
+$(BUILD_DIR):
+	mkdir -p $@
+
+run: $(ELF)
+	@echo "[run] QEMU VLEN=$(VLEN) (timeout=$(QEMU_TIMEOUT)s, strace mode)"
+	@STRACE_LOG=$(BUILD_DIR)/strace.log; \
+	strace -f -e trace=write -o $$STRACE_LOG \
+	  $(QEMU) -readconfig $(QEMU_CFG) -M andes_ae350 \
+	  -cpu andes-ax45mpv,vext_spec=v1.0,vlen=$(VLEN) \
+	  -nographic -semihosting -bios $(ELF) > /dev/null 2>&1 & \
+	SPID=$$!; \
+	sleep $(QEMU_TIMEOUT); \
+	kill $$SPID 2>/dev/null || true; \
+	wait $$SPID 2>/dev/null || true; \
+	echo "[output]"; \
+	grep -E 'write\((9|1),' $$STRACE_LOG \
+	  | sed "s/.*write([0-9]*, \"//; s/\\\\n\".*//; s/\".*//"
+
+$(ELF_PERF): $(SRC_PATCHED) $(SHIM_HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(PERF_CFLAGS) $(INCS) -o $@ $(SRC_PATCHED) $(LIBS)
+	@echo "Built: $@"
+
+$(ELF_LAYERS): $(SRC_PATCHED) $(SHIM_HEADERS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(PERF_CFLAGS) -DFUNCTION_PF_ANALYZE $(INCS) -o $@ $(SRC_PATCHED) $(LIBS)
+	@echo "Built: $@"
+
+perf: $(ELF_PERF)
+	@echo "[perf] Running on FPGA board $(MYPC):$(MYPORT)"
+	@rm -f $(LIBNN_ROOT)/project/ax45mpv/First_Reset_done
+	PATH=$(TOOLCHAIN_BIN):$$PATH $(BOARD_WRAPPER) $(ELF_PERF)
+
+perf-layers: $(ELF_LAYERS)
+	@echo "[perf-layers] Running on FPGA board $(MYPC):$(MYPORT)"
+	@rm -f $(LIBNN_ROOT)/project/ax45mpv/First_Reset_done
+	PATH=$(TOOLCHAIN_BIN):$$PATH $(BOARD_WRAPPER) $(ELF_LAYERS)
+
+clean:
+	rm -rf $(BUILD_DIR)

@@ -1,0 +1,347 @@
+"""Analytical cost model for pruning tile configurations.
+
+Rejects obviously bad configs using hard constraints based on
+VLEN, L2 cache size, register pressure, and vector utilization.
+"""
+from __future__ import annotations
+
+import math
+import random
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from auto_iree.space import ConfigEntity, MultiConfigSpace, OpInfo
+    from auto_iree.utils import TilingJSON
+
+PARALLEL = "parallel"
+REDUCTION = "reduction"
+
+
+@dataclass
+class HardwareParams:
+    vlen: int           # bits (e.g. 1024)
+    l2_cache_size: int  # bytes (e.g. 8388608 = 8MB)
+    sew: int = 32       # element width bits (f32=32, i8=8)
+
+    @property
+    def vlmax_lmul1(self) -> int:
+        """Number of elements per vector register at LMUL=1."""
+        return self.vlen // self.sew
+
+    @property
+    def sew_bytes(self) -> int:
+        return self.sew // 8
+
+
+@dataclass
+class FilterResult:
+    index: int
+    passed: bool
+    reject_reason: str | None = None
+
+
+def infer_sew_from_mlir(mlir_path: Path) -> int:
+    """Parse benchmark MLIR for memref element type and return SEW in bits."""
+    try:
+        text = mlir_path.read_text()
+    except (OSError, IOError):
+        return 32  # default to f32
+
+    # Look for memref<...xf32>, memref<...xi8>, etc.
+    match = re.search(r'memref<[^>]*x(f\d+|i\d+)>', text)
+    if match:
+        dtype = match.group(1)
+        bits = int(re.search(r'\d+', dtype).group())
+        return bits
+    return 32
+
+
+def estimate_vector_utilization(tile_sizes: list[list[int]],
+                                iteration_type: list[str],
+                                hw: HardwareParams) -> float:
+    """Estimate vector utilization as fraction 0.0-1.0.
+
+    Uses the innermost parallel tile dimension from the last tile level
+    vs VLMAX at LMUL=1.
+    """
+    vlmax = hw.vlmax_lmul1
+    if vlmax == 0:
+        return 0.0
+
+    # Find innermost parallel dimension's tile size from last tile level
+    inner_tile = 0
+    for dim_idx in range(len(iteration_type) - 1, -1, -1):
+        if iteration_type[dim_idx] == PARALLEL:
+            # Use the last (innermost) tile level for this dimension
+            for level in reversed(tile_sizes):
+                val = level[dim_idx] if dim_idx < len(level) else 0
+                if val > 0:
+                    inner_tile = val
+                    break
+            if inner_tile > 0:
+                break
+
+    if inner_tile == 0:
+        return 0.0
+
+    # Utilization = how well the tile fills vector registers
+    # If tile >= vlmax, full utilization of at least one register
+    if inner_tile >= vlmax:
+        return 1.0
+
+    return inner_tile / vlmax
+
+
+def estimate_lmul(tile_sizes: list[list[int]],
+                  iteration_type: list[str],
+                  hw: HardwareParams) -> int:
+    """Estimate LMUL needed for the innermost vector tile.
+
+    Returns clamped to {1, 2, 4, 8}.
+    """
+    vlmax = hw.vlmax_lmul1
+    if vlmax == 0:
+        return 1
+
+    # Find innermost parallel tile from last tile level
+    inner_tile = 0
+    for dim_idx in range(len(iteration_type) - 1, -1, -1):
+        if iteration_type[dim_idx] == PARALLEL:
+            for level in reversed(tile_sizes):
+                val = level[dim_idx] if dim_idx < len(level) else 0
+                if val > 0:
+                    inner_tile = val
+                    break
+            if inner_tile > 0:
+                break
+
+    if inner_tile == 0:
+        return 1
+
+    raw_lmul = math.ceil(inner_tile / vlmax)
+    # Clamp to valid LMUL values
+    for valid in [1, 2, 4, 8]:
+        if raw_lmul <= valid:
+            return valid
+    return 8
+
+
+def estimate_working_set_bytes(iteration_space: list[int],
+                               iteration_type: list[str],
+                               tile_sizes: list[list[int]],
+                               sew_bytes: int,
+                               num_operands: int = 3) -> int:
+    """Estimate working set size in bytes for a tiled computation.
+
+    Uses the outermost tile level to determine the tile footprint.
+    """
+    if not tile_sizes or not iteration_space:
+        return 0
+
+    # Use the outermost (first) tile level
+    outer_tiles = tile_sizes[0]
+
+    # Effective tile size per dimension: tile_size if > 0, else full dimension
+    effective = []
+    for i, dim_size in enumerate(iteration_space):
+        tile = outer_tiles[i] if i < len(outer_tiles) else 0
+        effective.append(tile if tile > 0 else dim_size)
+
+    product = 1
+    for e in effective:
+        product *= e
+
+    return product * sew_bytes * num_operands
+
+
+def check_register_pressure(tile_sizes: list[list[int]],
+                            iteration_type: list[str],
+                            iteration_space: list[int],
+                            hw: HardwareParams) -> bool:
+    """Check if register pressure is acceptable. Returns True if OK.
+
+    For matmul-like ops (M, N, K): accumulator needs
+    (M_tile * N_tile / vlmax) vector registers.
+    With LMUL, available = 32 / LMUL.
+    """
+    lmul = estimate_lmul(tile_sizes, iteration_type, hw)
+    available_vregs = 32 // lmul
+    vlmax = hw.vlmax_lmul1 * lmul
+
+    if vlmax == 0:
+        return True
+
+    # Find parallel tile sizes from innermost tile level
+    parallel_tiles = []
+    if tile_sizes:
+        inner_level = tile_sizes[-1]
+        for i, it in enumerate(iteration_type):
+            if it == PARALLEL:
+                val = inner_level[i] if i < len(inner_level) else 0
+                if val > 0:
+                    parallel_tiles.append(val)
+
+    if len(parallel_tiles) < 2:
+        return True  # Not enough dims to cause pressure
+
+    # Accumulator registers needed: product of parallel tiles / vlmax
+    accum_elements = 1
+    for t in parallel_tiles:
+        accum_elements *= t
+    accum_vregs = math.ceil(accum_elements / vlmax)
+
+    # Need room for input registers too (at least 2 for A and B operands)
+    return accum_vregs + 2 <= available_vregs
+
+
+def check_untiled_reduction(iteration_space: list[int],
+                            iteration_type: list[str],
+                            tile_sizes: list[list[int]],
+                            threshold: int = 64) -> bool:
+    """Reject if a reduction dim > threshold is completely untiled.
+
+    Returns True if acceptable (no problematic untiled reductions).
+    """
+    for i, it in enumerate(iteration_type):
+        if it != REDUCTION:
+            continue
+        dim_size = iteration_space[i]
+        if dim_size <= threshold:
+            continue
+
+        # Check if any tile level tiles this reduction dimension
+        tiled = False
+        for level in tile_sizes:
+            if i < len(level) and level[i] > 0:
+                tiled = True
+                break
+
+        if not tiled:
+            return False
+
+    return True
+
+
+def identify_dominant_op(tiling_json: TilingJSON) -> str:
+    """For multi-op dispatches: find the op with reduction dims, or largest iteration space."""
+    best_op = None
+    best_score = -1
+
+    for opname in tiling_json:
+        it = tiling_json.query_iteration_type(opname)
+        is_ = tiling_json.query_iteration_space(opname)
+
+        # Prefer ops with reduction dimensions
+        has_reduction = REDUCTION in it
+        space_size = 1
+        for d in is_:
+            space_size *= d
+
+        score = space_size
+        if has_reduction:
+            score *= 1000  # heavily prefer reduction ops
+
+        if score > best_score:
+            best_score = score
+            best_op = opname
+
+    return best_op
+
+
+def _get_tile_sizes_from_config(config: ConfigEntity, opname: str) -> list[list[int]]:
+    """Extract tile sizes for a specific op from a ConfigEntity."""
+    iree_format = config.to_iree_format()
+    # Keys in iree_format are like "linalg.generic-0"
+    for key, tiles in iree_format.items():
+        if key.startswith(opname.split('-')[0]):
+            return tiles
+    # Fallback: return first op's tiles
+    for key, tiles in iree_format.items():
+        return tiles
+    return []
+
+
+def _get_op_info_from_tiling_json(tiling_json: TilingJSON, opname: str):
+    """Get iteration space and type for an op from TilingJSON."""
+    iteration_space = tiling_json.query_iteration_space(opname)
+    iteration_type = tiling_json.query_iteration_type(opname)
+    return iteration_space, iteration_type
+
+
+def filter_config_entity(config: ConfigEntity,
+                         tiling_json: TilingJSON,
+                         hw: HardwareParams) -> FilterResult:
+    """Apply all filters to one ConfigEntity."""
+    dominant = identify_dominant_op(tiling_json)
+    if dominant is None:
+        return FilterResult(config.index, True)
+
+    iteration_space, iteration_type = _get_op_info_from_tiling_json(tiling_json, dominant)
+    tile_sizes = _get_tile_sizes_from_config(config, dominant)
+
+    if not tile_sizes:
+        return FilterResult(config.index, True)
+
+    # 1. Vector utilization < 50% → reject
+    util = estimate_vector_utilization(tile_sizes, iteration_type, hw)
+    if util < 0.5:
+        return FilterResult(config.index, False, f"vector_util={util:.2f}<0.50")
+
+    # 2. Working set > L2 cache → reject
+    if hw.l2_cache_size > 0:
+        ws = estimate_working_set_bytes(
+            iteration_space, iteration_type, tile_sizes, hw.sew_bytes)
+        if ws > hw.l2_cache_size:
+            return FilterResult(config.index, False,
+                                f"working_set={ws}>{hw.l2_cache_size}")
+
+    # 3. Register pressure → reject
+    if not check_register_pressure(tile_sizes, iteration_type, iteration_space, hw):
+        return FilterResult(config.index, False, "register_pressure")
+
+    # 4. Untiled large reduction → reject
+    if not check_untiled_reduction(iteration_space, iteration_type, tile_sizes):
+        return FilterResult(config.index, False, "untiled_reduction")
+
+    # 5. LMUL > 4 → reject
+    lmul = estimate_lmul(tile_sizes, iteration_type, hw)
+    if lmul > 4:
+        return FilterResult(config.index, False, f"lmul={lmul}>4")
+
+    return FilterResult(config.index, True)
+
+
+def filter_configs(config_space: MultiConfigSpace,
+                   tiling_json: TilingJSON,
+                   hw: HardwareParams,
+                   max_survivors: int = 10) -> list[FilterResult]:
+    """Iterate space, apply filters, return survivors.
+
+    For spaces > 5000: random sample instead of exhaustive.
+    """
+    space_size = len(config_space)
+    results: list[FilterResult] = []
+
+    if space_size <= 5000:
+        indices = range(space_size)
+    else:
+        indices = sorted(random.sample(range(space_size), 5000))
+
+    survivors = 0
+    for idx in indices:
+        if not config_space.is_index_valid(idx):
+            continue
+        config = config_space.get(idx)
+        result = filter_config_entity(config, tiling_json, hw)
+        if result.passed:
+            results.append(result)
+            survivors += 1
+            if survivors >= max_survivors:
+                break
+        else:
+            results.append(result)
+
+    return results

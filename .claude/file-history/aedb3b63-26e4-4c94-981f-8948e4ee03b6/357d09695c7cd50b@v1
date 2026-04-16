@@ -1,0 +1,238 @@
+/*
+ * sin() test harness — prints (input_hex, output_hex) pairs.
+ *
+ * Build two versions:
+ *   1. Linked with optimized Andes assembly sin  (test_sin_opt.elf)
+ *   2. Linked with toolchain's default sin       (test_sin_ref.elf)
+ * Run both, diff the output to find discrepancies.
+ */
+
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <float.h>
+
+#ifdef EN_PERF
+#define PF_COUNTER
+#include "nds_pfcounter.h"
+#endif
+
+static inline uint64_t d2u(double d)
+{
+    union { double d; uint64_t u; } x;
+    x.d = d;
+    return x.u;
+}
+
+static inline double u2d(uint64_t u)
+{
+    union { double d; uint64_t u; } x;
+    x.u = u;
+    return x.d;
+}
+
+#ifndef EN_PERF
+static void emit(double x)
+{
+    double r = sin(x);
+    printf("%016llx %016llx\n", (unsigned long long)d2u(x), (unsigned long long)d2u(r));
+}
+
+static void emit_u(uint64_t bits)
+{
+    emit(u2d(bits));
+}
+
+/* ------------------------------------------------------------------ */
+/* Test points                                                         */
+/* ------------------------------------------------------------------ */
+
+/* 1. Special values */
+static void test_special(void)
+{
+    /* Zeros */
+    emit(0.0);
+    emit(-0.0);
+
+    /* NaN */
+    emit_u(0x7ff8000000000000ULL); /* qNaN */
+    emit_u(0x7ff0000000000001ULL); /* sNaN */
+    emit_u(0xfff8000000000000ULL); /* -NaN */
+
+    /* Infinity */
+    emit_u(0x7ff0000000000000ULL); /* +Inf */
+    emit_u(0xfff0000000000000ULL); /* -Inf */
+}
+
+/* 2. Tiny values: sin(x) ~ x */
+static void test_tiny(void)
+{
+    emit_u(0x0000000000000001ULL); /* min denorm */
+    emit_u(0x8000000000000001ULL);
+    emit_u(0x0008000000000000ULL); /* mid denorm */
+    emit_u(0x8008000000000000ULL);
+    emit_u(0x000fffffffffffffULL); /* max denorm */
+    emit_u(0x800fffffffffffffULL);
+    emit(DBL_MIN);
+    emit(-DBL_MIN);
+    emit(1.0e-200);
+    emit(-1.0e-200);
+}
+
+/* 3. Known mathematical values */
+static void test_known(void)
+{
+    double pi   = 3.14159265358979323846;
+    double pi_2 = 1.57079632679489661923;
+    double pi_3 = 1.04719755119659774615;
+    double pi_4 = 0.78539816339744830962;
+    double pi_6 = 0.52359877559829887308;
+
+    emit(pi_6);
+    emit(pi_4);
+    emit(pi_3);
+    emit(pi_2);
+    emit(pi);
+    emit(2.0 * pi);
+    emit(-pi_6);
+    emit(-pi_4);
+    emit(-pi_2);
+    emit(-pi);
+    emit(3.0 * pi_2);
+    emit(pi_2 + 0.001);
+    emit(pi + 0.001);
+    emit(pi - 0.001);
+}
+
+/* 4. Large arguments */
+static void test_large(void)
+{
+    double vals[] = {
+        10.0, 100.0, 1000.0, 100000.0, 1000000.0,
+        -10.0, -1000.0,
+        3.14159265 * 100.0,
+        3.14159265 * 1000.0,
+        1.0e10, 1.0e20,
+        -1.0e10, -1.0e20,
+        DBL_MAX, -DBL_MAX,
+    };
+    int n = sizeof(vals) / sizeof(vals[0]);
+    for (int i = 0; i < n; i++)
+        emit(vals[i]);
+}
+
+/* 5. Quadrant transitions */
+static void test_quadrant(void)
+{
+    double pi_2 = 1.5707963267948966;
+    double offsets[] = { -1e-5, 0.0, 1e-5 };
+    int noff = sizeof(offsets) / sizeof(offsets[0]);
+
+    for (int k = 1; k <= 8; k++) {
+        double boundary = (double)k * pi_2;
+        for (int j = 0; j < noff; j++)
+            emit(boundary + offsets[j]);
+    }
+}
+
+/* 6. Worst-case argument reduction */
+static void test_hard(void)
+{
+    double cases[] = {
+        u2d(0x400921fb54442d18ULL), /* pi as double */
+        u2d(0x401921fb54442d18ULL), /* 2*pi as double */
+        u2d(0x4096cbe3f9990046ULL), /* 3*pi/2 */
+        4.0, 16.0, 64.0, 256.0,
+    };
+    int n = sizeof(cases) / sizeof(cases[0]);
+    for (int i = 0; i < n; i++) {
+        emit(cases[i]);
+        emit(-cases[i]);
+    }
+}
+
+/* 7. Sweep [0, 4*pi] and [-4*pi, 0] in 200 steps each */
+static void test_sweep(void)
+{
+    double hi = 4.0 * 3.14159265358979323846;
+    int nsteps = 200;
+    double step = hi / (double)nsteps;
+
+    /* [0, 4*pi] */
+    for (int i = 0; i <= nsteps; i++)
+        emit((double)i * step);
+
+    /* [-4*pi, 0] */
+    for (int i = 0; i <= nsteps; i++)
+        emit(-hi + (double)i * step);
+}
+
+/* 8. Sample [0, pi/4] every 4503599627370496 ULP (~200 cases) */
+static void test_exhaustive_small(void)
+{
+    uint64_t end = 0x3fe921fb54442d18ULL; /* pi/4 */
+    for (uint64_t b = 0; b <= end; b += 4503599627370496ULL)
+        emit_u(b);
+}
+
+/* 9. Random sweep: 300 evenly spaced inputs */
+static void test_random_300(void)
+{
+    double lo = -6.283185307179586;  /* -2*pi */
+    double hi =  6.283185307179586;  /* +2*pi */
+    int n = 300;
+    for (int i = 0; i < n; i++) {
+        double x = lo + (hi - lo) * (double)i / (double)(n - 1);
+        emit(x);
+    }
+}
+#endif
+
+/* ------------------------------------------------------------------ */
+
+#ifdef EN_PERF
+/*
+ * perf(x) -- exercise the hot kernel path N times and print the result.
+ *
+ * Critical path for sin():
+ *   __gf_dpreduct  (argument reduction)
+ *   -> __gf_exmul  (extended-precision multiply)
+ *   -> __gf_sigmax(__gf_dpsincon, degree 5)  (polynomial kernel)
+ *   -> __gf_exmul  (scale result)
+ *
+ * This path is taken when the reduced quadrant index q satisfies
+ * (q-1)&2 != 0, i.e. q == 0 or q == 3.  x = 1.0 falls in quadrant 0.
+ */
+static void perf(double x)
+{
+    volatile double acc = 0.0;
+    startPFM;
+    for (int i = 0; i < 100; i++)
+        acc += sin(x+i);
+    stopPFM;
+    readResult();
+    printf("perf %016llx: %016llx\n",
+           (unsigned long long)d2u(x),
+           (unsigned long long)d2u((double)acc));
+}
+#endif /* EN_PERF */
+
+/* ------------------------------------------------------------------ */
+
+int main(void)
+{
+#ifdef EN_PERF
+    perf(1.0); /* quadrant 0: hits sin-polynomial kernel path */
+#else
+    test_special();
+    test_tiny();
+    test_known();
+    test_large();
+    test_quadrant();
+    test_hard();
+    test_sweep();
+    test_exhaustive_small();
+    test_random_300();
+#endif
+    return 0;
+}

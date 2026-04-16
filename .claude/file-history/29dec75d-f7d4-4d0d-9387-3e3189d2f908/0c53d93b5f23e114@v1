@@ -1,0 +1,169 @@
+# Plan: Libm Accuracy Test Suite for Andes-Overridden Functions
+
+## Context
+
+We want to agentically optimize the Andes RISC-V assembly libm functions. To do that safely, we need accuracy tests that cover edge cases for every overridden function. Currently picolibc only has a linkage test (`math-funcs.c`) — no correctness or accuracy verification.
+
+The tests will be **standalone C files** (not using picolibc's meson test framework), so we can compile and run each one individually on QEMU during the optimization loop.
+
+## Andes-Overridden Functions (riscv64, hardfp, double ABI)
+
+From `libm/machine/riscv/meson.build` and `hardfloat/` directory:
+
+### Double-precision (8 functions)
+| Function | Source | Override |
+|----------|--------|----------|
+| sin | hardfloat/s_sin.c | Custom with `__riscv_fabs`, `__riscv_fclass` |
+| cos | hardfloat/s_cos.c | Same pattern as sin |
+| sincos | hardfloat/s_sincos.c | Combined sin+cos |
+| atan | hardfloat/s_atan.c | |
+| fabs | hardfloat/s_fabs.c | Uses `__riscv_fabs` intrinsic |
+| k_sin | hardfloat/k_sin.c | Kernel helper (internal) |
+| k_cos | hardfloat/k_cos.c | Kernel helper (internal) |
+| e_rem_pio2 | hardfloat/e_rem_pio2.c | Range reduction (internal) |
+
+### Single-precision (8 functions)
+| Function | Source |
+|----------|--------|
+| sinf | hardfloat/sf_sin.c | ARM Optimized Routines based, polynomial approx |
+| cosf | hardfloat/sf_cos.c |
+| sincosf | hardfloat/sf_sincos.c (C file, separate build) |
+| atanf | hardfloat/sf_atan.c |
+| logf | hardfloat/sf_log.c |
+| expf | hardfloat/sf_exp.c |
+| powf | hardfloat/sf_pow.c |
+| fabsf | hardfloat/sf_fabs.c |
+
+### Common C overrides (both precisions, ~20 functions)
+| Function | Type |
+|----------|------|
+| copysign/copysignf | Bit manipulation |
+| finite/finitef | Classification |
+| isinf/isinff | Classification |
+| isnan/isnanf | Classification |
+| fpclassify (double/float) | Classification |
+| fma/fmaf | Fused multiply-add |
+| fmax/fmin, fmaxf/fminf | Min/max |
+| sqrt/sqrtf | Square root |
+| lrint/lrintf, llrint/llrintf | Rounding to int |
+| lround/lroundf, llround/llroundf | Rounding to int |
+
+## Test Design
+
+### Structure
+```
+test/libm-accuracy/
+  test-sin.c          # sin + sinf
+  test-cos.c          # cos + cosf
+  test-sincos.c       # sincos + sincosf
+  test-atan.c         # atan + atanf
+  test-exp.c          # expf (float only for riscv64)
+  test-log.c          # logf (float only for riscv64)
+  test-pow.c          # powf (float only for riscv64)
+  test-fabs.c         # fabs + fabsf
+  test-sqrt.c         # sqrt + sqrtf
+  test-fma.c          # fma + fmaf
+  test-fmax-fmin.c    # fmax/fmin + fmaxf/fminf
+  test-copysign.c     # copysign + copysignf
+  test-classify.c     # finite, isinf, isnan, fpclassify (both)
+  test-round.c        # lrint/llrint/lround/llround (both)
+  test-common.h       # Shared macros: CHECK_DOUBLE, CHECK_FLOAT, CHECK_INT, etc.
+  run-all.sh          # Compile and run all tests via QEMU
+  Makefile            # Build rules using picolibc specs
+```
+
+### Reference Values: Precomputed Golden Values
+- Generate on host using Python + mpmath (arbitrary precision)
+- Script: `test/libm-accuracy/gen-golden.py` — generates C header with test vectors
+- Each function gets a struct array: `{ input, expected_output, max_ulp }`
+
+### Edge Cases Per Category
+
+**Trig (sin, cos, sincos, atan):**
+- Zero: ±0.0
+- Tiny: subnormal, 1e-300, -1e-300
+- Special angles: π/6, π/4, π/3, π/2, π, 3π/2, 2π
+- Large args: 1e10, 1e20, 1e100 (tests range reduction)
+- Near multiples of π/2 (cancellation-sensitive)
+- ±Inf → NaN
+- NaN → NaN
+
+**Exp/Log (expf, logf, powf):**
+- Zero, ±Inf, NaN
+- exp(0)=1, exp(1)=e, exp(-inf)=0, exp(+inf)=+inf
+- log(1)=0, log(e)=1, log(0)=-inf, log(-1)=NaN
+- pow(0,0), pow(1,inf), pow(2,10)=1024
+- Near overflow/underflow boundaries
+
+**Basic (fabs, sqrt, copysign, fmax/fmin):**
+- ±0.0, ±Inf, NaN
+- sqrt(0), sqrt(1), sqrt(4), sqrt(inf), sqrt(-1)=NaN
+- copysign with NaN, ±0
+- fmax/fmin with NaN (IEEE 754: return the non-NaN)
+
+**Classification (finite, isinf, isnan, fpclassify):**
+- Normal, subnormal, zero, inf, NaN for each
+
+**Rounding (lrint, llrint, lround, llround):**
+- Exact integers, halfway cases (x.5), near INT_MAX/INT_MIN
+- ±0.0, ±Inf, NaN
+- Rounding mode sensitivity (for lrint)
+
+### test-common.h Macros
+```c
+#define CHECK_DOUBLE(func, input, expected, max_ulp)
+#define CHECK_FLOAT(func, input, expected, max_ulp)
+#define CHECK_DOUBLE_NAN(func, input)
+#define CHECK_DOUBLE_INF(func, input, sign)
+#define CHECK_INT(func, input, expected)
+```
+
+Each macro:
+- Calls the function
+- Compares result against expected (bit-exact or within ULP tolerance)
+- Prints PASS/FAIL with function name, input, expected, got, ULP error
+- Increments pass/fail counters
+
+### ULP Calculation
+```c
+// Compare two doubles, return ULP distance
+uint64_t ulp_distance_double(double a, double b);
+uint32_t ulp_distance_float(float a, float b);
+```
+
+### Tolerances
+- **fabs, copysign, fmax/fmin, classify, rounding**: Exact (0 ULP)
+- **sqrt, fma**: 0.5 ULP (correctly rounded per IEEE 754)
+- **sin, cos, atan, exp, log, pow**: ≤ 1 ULP (faithfully rounded)
+- **sincos**: same as sin/cos individually
+
+## Build & Run
+
+### Standalone (outside meson)
+```sh
+# Compile one test
+riscv64-elf-gcc --specs=picolibc.specs -o test-sin test-sin.c -lm
+# Run via QEMU
+qemu-system-riscv64 -M virt -semihosting -bios none -nographic -kernel test-sin
+```
+
+### Integration with build_mculib3.sh
+Add `--test-accuracy` option that:
+1. Builds picolibc normally
+2. Compiles each test-*.c against the built picolibc
+3. Runs each on QEMU
+4. Reports summary
+
+## Implementation Steps
+
+1. Create `test/libm-accuracy/test-common.h` — ULP comparison, CHECK macros, main framework
+2. Create `test/libm-accuracy/gen-golden.py` — generates golden values using mpmath
+3. Create test files one by one, starting with `test-sin.c` as the template
+4. Create `Makefile` and `run-all.sh`
+5. Verify all tests pass against current (unoptimized) build
+6. Add `--test-accuracy` to `build_mculib3.sh`
+
+## Verification
+1. Build picolibc with `--test`  (existing meson tests still pass)
+2. Run `run-all.sh` — all accuracy tests pass
+3. Intentionally break one function (e.g., return 0 from sin) — verify test catches it

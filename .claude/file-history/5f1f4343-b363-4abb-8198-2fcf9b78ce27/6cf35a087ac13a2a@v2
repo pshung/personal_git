@@ -1,0 +1,98 @@
+---
+type: operator
+function: riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any_dilated
+source: Source/ConvolutionFunctions/riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any_dilated.c
+tags: [conv, s8, asym, bias, any, dilated, rvv, im2col]
+current_speedup: 1.30x
+baseline_cycles: 1822840
+current_cycles: 1398877
+---
+
+# conv_HWC_s8_s8_s8_asym_bias_any_dilated
+
+## Function Signature
+
+```c
+riscv_nn_status riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any_dilated(
+    const int8_t *in_tensor,
+    const uint16_t in_tensor_dim,
+    const uint16_t in_tensor_ch,
+    const int8_t *filt,
+    const uint16_t out_tensor_ch,
+    const uint16_t filt_dim,
+    const uint16_t padding,
+    const uint16_t stride,
+    const uint16_t dilation,
+    const int16_t in_offset,
+    ...
+    const uint8_t groups,
+    int8_t *out_tensor,
+    ...
+);
+```
+
+## What Dilated Convolution Adds
+
+Dilation inserts zeros between kernel elements, expanding the receptive field without increasing parameter count. The im2col step must account for dilation strides:
+```
+src_ptr += dil_x * in_tensor_ch   (instead of += in_tensor_ch)
+src_row += dil_y * in_tensor_dim_x * in_tensor_ch   (instead of += in_tensor_dim_x * in_tensor_ch)
+```
+
+This means boundary checks are needed for every kernel position (positions can be far out-of-bounds with large dilation).
+
+## Active Code Path
+
+`#ifdef ENA_VEC_ISA` block. Uses `nn_mat_mult_kernel_s8_offset_*` GEMM variants.
+
+## Optimization History
+
+| Date | Commit | Approach | Cycles | Speedup | Notes |
+|---|---|---|---|---|---|
+| pre-2026-03-24 | baseline | groups>1 path (generic) | 1,822,840 | 1.00x | groups=1 test case |
+| 2026-03-24 | 0d1682ca | groups==1 fast path: 4-pixel unroll4 GEMM | ~1,736,990 | 1.05x | buffer_size updated for 4 cols |
+| 2026-03-24 | c05de8ad | pad=0 fast path: no boundary checks, precomputed dilation strides | 1,398,877 | 1.24x | eliminates 4 checks/kernel pos |
+
+Cumulative speedup: 1.30x (1,822,840 -> 1,398,877 cycles)
+
+## Key Optimization: pad=0 Fast Path
+
+For `groups==1 && pad_x==0 && pad_y==0` (common in practice -- zero-padding not used with dilation):
+
+**Before:** Inner im2col loop with 4 boundary checks per kernel position:
+```c
+if (k_x * dil_x + col >= 0 && k_x * dil_x + col < in_tensor_dim_x &&
+    k_y * dil_y + row >= 0 && k_y * dil_y + row < in_tensor_dim_y) {
+    nn_dup_s8(in_tensor_ch, src, dst);
+} else {
+    nn_set_val_s8(in_tensor_ch, 0, dst);  // zero padding
+}
+```
+
+**After:** No boundary checks, direct pointer arithmetic with precomputed strides:
+```c
+// Precompute:
+int dil_col_stride = dil_x * in_tensor_ch;
+int dil_row_stride = dil_y * in_tensor_dim_x * in_tensor_ch;
+
+// Inner loop: just increment pointer, no checks
+src_ptr += dil_col_stride;   // advance one kernel column
+```
+
+## Why 1.30x (Not 4-5x)
+
+The test case uses `out_tensor_ch=16` -- only 4 channel groups per GEMM call. The GEMM kernel is underutilized relative to large-channel convolutions. The main cost is the im2col boundary checking and dilation address computation.
+
+Further improvements limited by:
+- Small out_tensor_ch (16) in the perf test case
+- Dilation strides inherently prevent bulk row copy optimization (rows are not contiguous)
+- The GEMM itself is already on the unroll4 path
+
+## Current State (2026-03-24)
+
+1.30x cumulative. Diminishing returns from additional im2col specializations. The perf test case's small out_tensor_ch limits GEMM efficiency gains.
+
+## Key Techniques Applied
+
+- [[im2col-strategies]] -- pad=0 fast path (Strategy 2)
+- [[tiling-gemm-to-vd4dots]] -- unroll4 GEMM upgrade

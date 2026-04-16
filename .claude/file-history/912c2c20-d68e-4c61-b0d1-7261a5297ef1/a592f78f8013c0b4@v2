@@ -1,0 +1,91 @@
+# libm_gen: Configurable sinf Code-Gen Pipeline
+
+Generates RISC-V soft-float `sinf` assembly (and its `cosf` path) from a
+TOML config describing the target microarchitecture, polynomial shape, and
+reduction strategy.
+
+## Prerequisites
+
+- Python >= 3.11 (for `tomllib`)
+- [Sollya](https://www.sollya.org/) on `PATH` (for non-baseline configs)
+- Andes RV32 toolchain (for `make test-sinf`)
+- QEMU / FPGA board (for benchmarks)
+
+## Quick start
+
+```sh
+# Run from libm/machine/riscv/
+cd libm/machine/riscv
+
+# Sanity check: reproduce GoFast baseline (no Sollya needed)
+python tools/libm_gen/gen_sinf.py tools/libm_gen/configs/baseline.toml
+# Diff the generated coeff table against the original:
+diff gen/baseline/andes_fpsincof.s andes_fpsincof.s
+# Test the generated assembly:
+make GEN=baseline test-sinf
+
+# New config with Sollya-computed degree-9 minimax coefficients:
+python tools/libm_gen/gen_sinf.py tools/libm_gen/configs/d9_estrin2.toml
+make GEN=d9_estrin2 test-sinf
+
+# Full pipeline (gen + test + bench + report):
+python tools/libm_gen/run_experiment.py tools/libm_gen/configs/d9_estrin2.toml
+
+# Sweep mode (all configs in a directory):
+python tools/libm_gen/run_experiment.py tools/libm_gen/configs/sweep/
+# Results in gen/sweep.csv
+```
+
+## Config schema (TOML)
+
+Key sections:
+
+| Section | Key | Description |
+|---------|-----|-------------|
+| top | `name` | Unique ID; output goes to `gen/<name>/` |
+| top | `function` | `sinf` (cosf/tanf planned) |
+| `[kernel]` | `sin_degree` | Odd degree: 7, 9, 11 |
+| `[kernel]` | `cos_degree` | Even degree: 8, 10, 12 |
+| `[kernel]` | `evaluation` | `horner`, `estrin2`, `estrin4` |
+| `[kernel]` | `unroll` | `true` = no loop; `false` = sentinel loop |
+| `[reduction]` | `strategy` | `bit_serial` (others planned) |
+| `[reduction]` | `huge_arg_policy` | `return_nan` or `reduce` |
+| `[coeffs_override]` | `sin_q31` / `cos_q31` | Bypass Sollya (baseline only) |
+
+See `configs/baseline.toml` for a fully annotated example.
+
+## Output files (`gen/<name>/`)
+
+| File | Description |
+|------|-------------|
+| `sf_sin.s` | Main `sinf` kernel (replaces `sf_sin.s`) |
+| `andes_fpsincof.s` | Sin coefficient table |
+| `andes_fpcoscof.s` | Cos coefficient table |
+| `andes_fpreduct.s` | Argument reduction (replaces `andes_fpreduct.s`) |
+| `coeffs.json` | Computed coefficients + Sollya supnorm |
+| `config.toml` | Config snapshot for reproducibility |
+| `report.json` | Accuracy, size, and cycle-count results (after run_experiment.py) |
+
+## Q1.31 polynomial arithmetic
+
+The kernel uses `mulhu` (upper 32 bits of 32x32 unsigned multiply) throughout.
+After `__gf_fpreduct`, x^2 is in Q0.32 format (value = register / 2^32).
+Each Horner step: `acc = c[k] - mulhu(x2, acc)` where all `c[k]` are Q1.31
+integers (= coefficient * 2^31). The constant term c[0] >= 2^31 acts as the
+loop sentinel (MSB set) in looped Horner mode.
+
+Sollya computes `fpminimax(sin(sqrt(u))/sqrt(u), [|0,1,...,n|], [|DD,...|], [0,(pi/4)^2])`
+and the generator converts each floating-point coefficient to Q1.31 via
+`round(abs(coeff) * 2^31)`.
+
+## Makefile integration
+
+```sh
+make GEN=<name> test-sinf   # accuracy test (opt vs ref diff)
+make GEN=<name> bench-sinf  # cycle count on FPGA via GDB
+make GEN=<name> size-sinf   # .text size
+```
+
+The `GEN=` override replaces `sf_sin.s`, `andes_fpreduct.s`,
+`andes_fpsincof.s`, and `andes_fpcoscof.s` with the generated versions
+from `gen/<name>/`. All other assembly is unchanged.

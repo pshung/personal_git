@@ -1,0 +1,277 @@
+"""Tests for utility/parse_history.py — standalone history.log tile config parser.
+
+Covers:
+1. Tile config conversion for all tile_level variants (1,2,3,4,6)
+2. CSV output format with known input records
+3. --dispatch filtering
+4. Handling of failed records (cycles = 1e9)
+5. Multi-dispatch file parsing
+"""
+
+import csv
+import io
+import json
+import textwrap
+
+import pytest
+
+from utility.parse_history import (
+    convert_to_iree_format,
+    parse_history_lines,
+    format_csv,
+)
+
+
+# --- Helper to build a minimal history.log JSON record ---
+
+def make_record(
+    dispatch="module_main_dispatch_0",
+    ops=None,
+    configs=None,
+    config_index=0,
+    costs=None,
+    error_no=0,
+):
+    """Build a JSON-serializable history.log record dict."""
+    if ops is None:
+        ops = [["linalg.generic-0", [512, 32], ["parallel", "parallel"], [2, 0]]]
+    if configs is None:
+        configs = [
+            [0, 0, "ts", [[512, 32]]],
+            [0, 1, "ts", [[1, 0]]],
+        ]
+    if costs is None:
+        costs = [1000000]
+
+    return {
+        "input": ("target_str", "workload_hash", dispatch, [], {}),
+        "config": {"index": config_index, "ops": ops, "configs": configs},
+        "result": [costs if error_no == 0 else [1e9], error_no, 0.5, 1700000000.0],
+        "version": 0.1,
+        "autoiree_version": "0.0.1",
+    }
+
+
+class TestConvertToIreeFormat:
+    """Test tile config conversion for all tile_level variants."""
+
+    def test_tile_levels_sum_2_parallel_only(self):
+        """tile_levels=(2,0): 2 parallel levels, sizes[0]->level[0], sizes[1]->level[1].
+
+        Op has 2 axes (rank=2), each axis has 2 tile sizes.
+        """
+        ops = [["linalg.generic-0", [512, 32], ["parallel", "parallel"], [2, 0]]]
+        configs = [
+            [0, 0, "ts", [[64, 4]]],   # axis 0: sizes=[64, 4]
+            [0, 1, "ts", [[16, 2]]],    # axis 1: sizes=[16, 2]
+        ]
+        result = convert_to_iree_format(ops, configs)
+        # level[0] = [64, 16], level[1] = [4, 2]
+        assert result == {"linalg.generic-0": [[64, 16], [4, 2]]}
+
+    def test_tile_levels_sum_1_parallel_only(self):
+        """tile_levels=(1,0): 1 parallel level, sizes[0]->level[0].
+
+        Op has 2 axes (rank=2), each axis has 1 tile size.
+        """
+        ops = [["linalg.generic-0", [256, 64], ["parallel", "parallel"], [1, 0]]]
+        configs = [
+            [0, 0, "ts", [[128]]],  # axis 0
+            [0, 1, "ts", [[32]]],   # axis 1
+        ]
+        result = convert_to_iree_format(ops, configs)
+        assert result == {"linalg.generic-0": [[128, 32]]}
+
+    def test_tile_levels_sum_3_parallel_and_reduction(self):
+        """tile_levels=(2,1): 2 parallel levels + 1 reduction level.
+
+        sizes[0],sizes[1] for parallel -> level[0],[1]; sizes[0] for reduction -> level[2].
+        """
+        ops = [["linalg.matmul-0", [64, 64, 32], ["parallel", "parallel", "reduction"], [2, 1]]]
+        configs = [
+            [0, 0, "ts", [[32, 8]]],    # parallel axis 0
+            [0, 1, "ts", [[16, 4]]],     # parallel axis 1
+            [0, 2, "ts", [[16]]],        # reduction axis 2
+        ]
+        result = convert_to_iree_format(ops, configs)
+        # level[0]=[32,16,0], level[1]=[8,4,0], level[2]=[0,0,16]
+        assert result == {"linalg.matmul-0": [[32, 16, 0], [8, 4, 0], [0, 0, 16]]}
+
+    def test_tile_levels_sum_4_parallel_and_reduction(self):
+        """tile_levels=(3,1): 3 parallel levels + 1 reduction level.
+
+        Parallel sizes[0,1,2] -> level[0,1,3]; reduction sizes[0] -> level[2].
+        """
+        ops = [["linalg.conv-0", [1, 8, 8, 16, 3], ["parallel", "parallel", "parallel", "parallel", "reduction"], [3, 1]]]
+        configs = [
+            [0, 0, "ts", [[1, 1, 1]]],
+            [0, 1, "ts", [[4, 2, 1]]],
+            [0, 2, "ts", [[4, 2, 1]]],
+            [0, 3, "ts", [[8, 4, 2]]],
+            [0, 4, "ts", [[3]]],         # reduction
+        ]
+        result = convert_to_iree_format(ops, configs)
+        # level[0]=[1,4,4,8,0], level[1]=[1,2,2,4,0], level[2]=[0,0,0,0,3], level[3]=[1,1,1,2,0]
+        assert result == {
+            "linalg.conv-0": [
+                [1, 4, 4, 8, 0],
+                [1, 2, 2, 4, 0],
+                [0, 0, 0, 0, 3],
+                [1, 1, 1, 2, 0],
+            ]
+        }
+
+    def test_tile_levels_sum_6_parallel_and_reduction(self):
+        """tile_levels=(4,2): 4 parallel levels + 2 reduction levels.
+
+        Parallel sizes[0..3] -> level[0,1,3,5]; reduction sizes[0,1] -> level[2,4].
+        """
+        ops = [["linalg.conv-0", [1, 4, 4, 8, 3], ["parallel", "parallel", "parallel", "parallel", "reduction"], [4, 2]]]
+        configs = [
+            [0, 0, "ts", [[1, 1, 1, 1]]],    # parallel axis 0
+            [0, 1, "ts", [[2, 1, 1, 1]]],     # parallel axis 1
+            [0, 2, "ts", [[2, 1, 1, 1]]],     # parallel axis 2
+            [0, 3, "ts", [[4, 2, 1, 1]]],     # parallel axis 3
+            [0, 4, "ts", [[3, 1]]],            # reduction axis 4
+        ]
+        result = convert_to_iree_format(ops, configs)
+        # level[0]=[1,2,2,4,0], level[1]=[1,1,1,2,0], level[2]=[0,0,0,0,3],
+        # level[3]=[1,1,1,1,0], level[4]=[0,0,0,0,1], level[5]=[1,1,1,1,0]
+        assert result == {
+            "linalg.conv-0": [
+                [1, 2, 2, 4, 0],
+                [1, 1, 1, 2, 0],
+                [0, 0, 0, 0, 3],
+                [1, 1, 1, 1, 0],
+                [0, 0, 0, 0, 1],
+                [1, 1, 1, 1, 0],
+            ]
+        }
+
+
+class TestParseHistoryLines:
+    """Test parsing JSON lines into structured records."""
+
+    def test_single_record(self):
+        """Parse a single valid JSON line into a record dict."""
+        rec = make_record(
+            dispatch="module_main_dispatch_0",
+            config_index=5,
+            costs=[2792690],
+        )
+        lines = [json.dumps(rec)]
+        results = parse_history_lines(lines)
+        assert len(results) == 1
+        r = results[0]
+        assert r["dispatch"] == "module_main_dispatch_0"
+        assert r["config_index"] == 5
+        assert r["cycles"] == 2792690
+        assert r["status"] == "OK"
+
+    def test_failed_record_has_fail_status(self):
+        """Records with error_no != 0 should have status=FAIL and cycles=1e9."""
+        rec = make_record(error_no=1, costs=[1e9])
+        lines = [json.dumps(rec)]
+        results = parse_history_lines(lines)
+        assert len(results) == 1
+        assert results[0]["status"] == "FAIL"
+        assert results[0]["cycles"] == 1e9
+
+    def test_dispatch_filter(self):
+        """--dispatch filter should only return matching records."""
+        rec0 = make_record(dispatch="module_main_dispatch_0")
+        rec1 = make_record(dispatch="module_main_dispatch_1")
+        lines = [json.dumps(rec0), json.dumps(rec1)]
+        results = parse_history_lines(lines, dispatch_filter="module_main_dispatch_1")
+        assert len(results) == 1
+        assert results[0]["dispatch"] == "module_main_dispatch_1"
+
+    def test_multi_dispatch_parsing(self):
+        """Multiple dispatches in one file should all be parsed."""
+        rec0 = make_record(dispatch="module_main_dispatch_0", costs=[1000])
+        rec1 = make_record(dispatch="module_main_dispatch_1", costs=[2000])
+        rec2 = make_record(dispatch="module_main_dispatch_0", costs=[900])
+        lines = [json.dumps(r) for r in [rec0, rec1, rec2]]
+        results = parse_history_lines(lines)
+        assert len(results) == 3
+        dispatches = [r["dispatch"] for r in results]
+        assert dispatches.count("module_main_dispatch_0") == 2
+        assert dispatches.count("module_main_dispatch_1") == 1
+
+
+class TestFormatCsv:
+    """Test CSV output formatting."""
+
+    def test_csv_header_and_row(self):
+        """CSV output should have correct header and data rows."""
+        ops = [["linalg.generic-0", [512, 32], ["parallel", "parallel"], [2, 0]]]
+        configs = [
+            [0, 0, "ts", [[64, 4]]],
+            [0, 1, "ts", [[16, 2]]],
+        ]
+        rec = make_record(
+            dispatch="module_main_dispatch_0",
+            ops=ops,
+            configs=configs,
+            config_index=42,
+            costs=[500000],
+        )
+        lines = [json.dumps(rec)]
+        records = parse_history_lines(lines)
+        output = format_csv(records)
+
+        reader = csv.DictReader(io.StringIO(output))
+        rows = list(reader)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["Dispatch"] == "module_main_dispatch_0"
+        assert row["OpName"] == "linalg.generic-0"
+        assert row["ConfigIndex"] == "42"
+        assert row["LoweringConfig"] == "[[64, 16], [4, 2]]"
+        assert row["Cycles"] == "500000"
+        assert row["Status"] == "OK"
+
+    def test_csv_multiple_ops_per_dispatch(self):
+        """When a config has multiple ops, each op gets its own CSV row."""
+        ops = [
+            ["linalg.generic-0", [64, 32], ["parallel", "parallel"], [2, 0]],
+            ["linalg.generic-1", [128], ["parallel"], [1, 0]],
+        ]
+        configs = [
+            [0, 0, "ts", [[32, 8]]],
+            [0, 1, "ts", [[16, 4]]],
+            [1, 0, "ts", [[64]]],
+        ]
+        rec = make_record(
+            dispatch="module_main_dispatch_0",
+            ops=ops,
+            configs=configs,
+            config_index=10,
+            costs=[300000],
+        )
+        lines = [json.dumps(rec)]
+        records = parse_history_lines(lines)
+        output = format_csv(records)
+
+        reader = csv.DictReader(io.StringIO(output))
+        rows = list(reader)
+        assert len(rows) == 2
+        assert rows[0]["OpName"] == "linalg.generic-0"
+        assert rows[1]["OpName"] == "linalg.generic-1"
+        assert rows[1]["LoweringConfig"] == "[[64]]"
+
+
+class TestEmptyAndEdgeCases:
+    """Test edge cases like empty files and blank lines."""
+
+    def test_empty_input(self):
+        """Empty input should produce no records."""
+        results = parse_history_lines([])
+        assert results == []
+
+    def test_blank_lines_skipped(self):
+        """Blank lines in input should be silently skipped."""
+        rec = make_record(costs=[100])
+        lines = ["", json.dumps(rec), "  ", ""]
+        results = parse_history_lines(lines)
+        assert len(results) == 1

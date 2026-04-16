@@ -1,0 +1,215 @@
+---
+name: optimize-libnn
+description: "End-to-end optimization loop for libnn RVV functions on AX45MPV. Use when optimizing a function, analyzing performance, or running the idea→implement→verify→benchmark→learn cycle. Triggers on: optimize, improve performance, speed up, reduce cycles, RVV optimization, next optimization target, learn from benchmark."
+---
+
+# libnn RVV Optimization Loop
+
+Systematic optimization workflow: **Idea → Implement → Verify (QEMU) → Benchmark (FPGA) → Analyze → Learn**
+
+Every iteration — whether it improves or regresses — MUST end with a lesson stored in the optimization database. Bad results are as valuable as good ones.
+
+## Phase 1: Idea
+
+### Find optimization targets
+
+```bash
+# Search past lessons for relevant experience
+.venv/bin/python3 scripts/optdb.py search "convolution small channels"
+
+# Check full-suite performance data for hot functions
+python3 scripts/compare_perf.py old/performance.csv new/performance.csv --top 20
+
+# Review assembly of candidate function
+grep -n "<function_name>" libnn.objdump
+```
+
+### Common optimization patterns (from experience DB)
+
+Before proposing a new approach, search the vector DB:
+```bash
+.venv/bin/python3 scripts/optdb.py search "<your optimization idea>"
+```
+
+Key patterns discovered so far:
+- **Vectorization axis**: When out_ch is small relative to VLEN, vectorize along reduction dimension instead of output channels
+- **Existing kernels**: Search codebase for existing optimized kernels before writing new ones (e.g., nn_mat_mult_kernel_s8_offset_v2 already had vd4dots)
+- **Dispatch thresholds**: Add runtime dispatch (if/else) to select best kernel based on tensor dimensions
+
+### Validate the idea
+
+Before implementing, answer:
+1. What is the current bottleneck? (compute-bound vs memory-bound)
+2. What % of vector capacity is utilized? (VLEN × LMUL vs actual elements)
+3. Does an existing kernel already solve this pattern?
+4. What speedup do you expect, and why?
+
+## Phase 2: Implement
+
+### Edit source code
+
+Source files are under `Source/<Category>/`. Key conventions:
+- Vector code is guarded by `#ifdef ENA_VEC_ISA` and `NDS_VEC_RVV_VERSION`
+- Use macros from `internal/internal_vec_i_v1_0.h` for ACE instructions (e.g., `NDS_VEC_VD4DOTS_VV`)
+- Target VLEN=1024, but code must handle any VLEN via strip-mining
+
+### Build the library
+
+```bash
+cd /home/nick/work/libnn/qemu-validate
+bash build_libnn.sh --verbose
+```
+
+Build must succeed with zero warnings (`-Wall -Werror`).
+
+## Phase 3: Verify (QEMU)
+
+Functional correctness check — MUST pass before FPGA benchmarking.
+
+```bash
+cd /home/nick/work/libnn/qemu-validate
+bash run_qemu_test.sh <function_name> --strace
+```
+
+**IMPORTANT**: Always use `--strace` when running from Claude Code (QEMU semihosting output goes to a non-stdout fd in sandboxed environments).
+
+Expected output: `accuracy checking pass` for all sub-tests (typically 3).
+
+If FAIL: fix the code and re-verify. Do NOT proceed to FPGA with failing tests.
+
+## Phase 4: Benchmark (FPGA)
+
+Cycle-accurate measurement on real hardware.
+
+### A/B comparison
+
+```bash
+cd /home/nick/work/libnn/qemu-validate
+
+# Baseline (before optimization — skip if you already have baseline numbers)
+# git stash; bash build_libnn.sh --verbose
+# bash run_fpga_test.sh <function_name> --perf --tag baseline
+# git stash pop
+
+# Optimized
+bash build_libnn.sh --verbose
+bash run_fpga_test.sh <function_name> --perf --tag optimized
+
+# Compare
+cat work/<function_name>_baseline.log
+cat work/<function_name>_optimized.log
+```
+
+### Reading results
+
+```
+test:   <function_name>
+tag:    optimized
+inst:   1039912          ← instruction count
+cycles: 2187394          ← cycle count (THIS is the ground truth)
+result: PASS             ← must be PASS
+```
+
+Board variance is typically <1%. If >5%, suspect thermal or contention (try different port).
+
+## Phase 5: Analyze — THE CRITICAL STEP
+
+Whether the result is good or bad, you MUST analyze WHY.
+
+### If improved: understand the real cause
+
+Don't assume — verify:
+1. **Review objdump**: Did the compiler emit what you expected?
+   ```bash
+   grep -n "<function_name>" libnn.objdump
+   # Check hot loop: correct LMUL? expected instructions? good scheduling?
+   ```
+
+2. **Check instruction reduction**: Fewer instructions often matters more than better compute utilization
+   ```
+   Baseline:  inst=3826922  cycles=5456391
+   Optimized: inst=1039912  cycles=2187394
+   → 3.68x fewer instructions, 2.49x fewer cycles
+   ```
+
+3. **vsim pipeline profiling** (optional, for deeper understanding):
+   ```bash
+   cd qemu-validate/vsim-bench
+   bash run_vsim_pipeline.sh test_program.c --pipeline
+   # Note: vsim is core-only, no memory model. Use for relative pipeline insight only.
+   ```
+
+### If regressed or no improvement: understand why the idea failed
+
+This is MORE valuable than a success — it prevents repeating the same mistake.
+
+Common failure causes:
+- Compiler didn't emit expected code (check objdump)
+- Memory-bound: better compute doesn't help if loads dominate
+- Register pressure: high LMUL causes spills that negate compute gains
+- Branch misprediction from added dispatch logic
+- im2col overhead dominates (copying data costs more than computing)
+
+## Phase 6: Learn — Store in Vector Database
+
+**MANDATORY**: Every optimization attempt gets a database entry.
+
+```bash
+cd /home/nick/work/libnn
+
+# Success example
+.venv/bin/python3 scripts/optdb.py add \
+    --title "Vectorize conv GEMM along reduction axis for small out_ch" \
+    --category vectorization \
+    --tags "vd4dots,gemm,conv,axis-selection" \
+    --function "riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any" \
+    --speedup "2.49x" \
+    --fpga-cycles "5456391 → 2187394" \
+    --text "When out_tensor_ch=16 with VLEN=1024, vectorizing across channels wastes 87.5% of vector capacity. Switching to vectorize along col (reduction) dimension with vd4dots gave 2.49x speedup. Key: reused existing v2 kernel, just added dispatch."
+
+# Failure example
+.venv/bin/python3 scripts/optdb.py add \
+    --title "LMUL=8 vd4dots attempt — no improvement due to register pressure" \
+    --category vectorization \
+    --tags "lmul,register-pressure,failure" \
+    --function "nn_mat_mult_kernel_s8_offset_v2" \
+    --speedup "1.0x (no change)" \
+    --text "Tried LMUL=8 to process more elements per vd4dots. Compiler spilled registers due to needing 8 register groups × 4 accumulators = 32 registers (entire VRF). Spill/reload overhead negated compute gains. Lesson: LMUL=4 is the sweet spot for 2×2 tiling — uses all 32 registers without spills."
+```
+
+### Categories
+
+| Category | When to use |
+|----------|-------------|
+| `vectorization` | Changed vectorization strategy (axis, LMUL, tiling) |
+| `pipeline` | Pipeline stall analysis, FU utilization findings |
+| `memory` | Cache behavior, prefetch, data layout changes |
+| `algorithm` | Changed algorithm (dispatch logic, loop structure) |
+| `toolchain` | Compiler flags, assembler quirks, build issues |
+| `measurement` | Benchmarking methodology, measurement artifacts |
+
+### Search before starting
+
+Always check existing lessons before starting a new optimization:
+```bash
+.venv/bin/python3 scripts/optdb.py search "your optimization idea"
+.venv/bin/python3 scripts/optdb.py search "function_name bottleneck"
+```
+
+## Quick Reference
+
+| Step | Command | Must pass? |
+|------|---------|------------|
+| Build | `bash qemu-validate/build_libnn.sh --verbose` | Yes (0 warnings) |
+| Verify | `bash qemu-validate/run_qemu_test.sh <func> --strace` | Yes (all pass) |
+| Benchmark | `bash qemu-validate/run_fpga_test.sh <func> --perf --tag <name>` | Result: PASS |
+| Analyze asm | `grep -n "<func>" libnn.objdump` | — |
+| Pipeline | `bash qemu-validate/vsim-bench/run_vsim_pipeline.sh <prog> --pipeline` | — |
+| Learn | `.venv/bin/python3 scripts/optdb.py add --title "..." ...` | MANDATORY |
+| Search | `.venv/bin/python3 scripts/optdb.py search "query"` | — |
+
+## The Rule
+
+> No optimization attempt is wasted if you record what you learned.
+> A failed experiment that's stored prevents future engineers from repeating it.
+> A successful experiment that's stored compounds into the next breakthrough.

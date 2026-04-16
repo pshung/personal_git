@@ -1,0 +1,162 @@
+/*****************************************************************************
+ * test_vd4dots_loop.c — vsim pipeline microbenchmark for vd4dots inner loop
+ *
+ * Isolates the critical hot loop of nn_mat_mult_kernel_s8_offset_v2:
+ *   - 4x vle8.v loads (e8, m4)
+ *   - 4x vd4dots.vv   (e32, m4)
+ * Processing 2 output channels × 2 output pixels per iteration.
+ *
+ * Parameters match the real conv workload:
+ *   col = 144 (reduction dimension = in_ch * ker_h * ker_w = 16*3*3)
+ *
+ * The requantize step is skipped (it uses vwmul which needs ELEN>32).
+ * Pipeline behavior of the dot product loop is the main optimization target.
+ ****************************************************************************/
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+#define COL      144    /* reduction dimension */
+#define OUT_CH   16     /* output channels */
+#define NUM_ROWS 8      /* output pixels per GEMM batch */
+
+/* Buffers */
+static int8_t im2col[NUM_ROWS * COL];
+static int8_t weights[OUT_CH * COL];
+static int32_t accum[NUM_ROWS * OUT_CH];
+
+/*
+ * Mimics the hot loop from nn_mat_mult_kernel_s8_offset_v2:
+ *   For each pair of (output pixels, output channels):
+ *     load im2col row for pixel 0 and pixel 1
+ *     load weight row for channel 0 and channel 1
+ *     vd4dots accumulate: 4 combinations (2 pixels × 2 channels)
+ *
+ * This is the exact loop at .L36 in the v2 kernel objdump.
+ */
+static void vd4dots_gemm_2x2(
+    const int8_t *input_a,    /* im2col: NUM_ROWS rows × COL cols */
+    const int8_t *input_b,    /* weights: OUT_CH rows × COL cols */
+    int32_t *output,          /* accumulator output */
+    int num_rows,
+    int num_ch,
+    int col)
+{
+    const int8_t *pA = input_a;
+
+    for (int row = 0; row < num_rows; row += 2) {
+        const int8_t *pB = input_b;
+
+        for (int ch = 0; ch < num_ch; ch += 2) {
+            const int8_t *pA0 = pA;
+            const int8_t *pA1 = pA + col;
+            const int8_t *pB0 = pB;
+            const int8_t *pB1 = pB + col;
+            int remaining = col;
+
+            /* Zero accumulators — v0, v4, v8, v12 (e32, m4) */
+            int32_t acc00 = 0, acc01 = 0, acc10 = 0, acc11 = 0;
+
+            /*
+             * Hot loop: process COL elements in chunks of VLMAX(e8,m4)
+             * With VLEN=512, VLMAX = 512/8 * 4 = 256 elements
+             * With VLEN=1024, VLMAX = 1024/8 * 4 = 512 elements
+             * For COL=144, this is 1 iteration (fits in single pass)
+             */
+            __asm__ volatile (
+                /* Set up: zero accumulator vector registers */
+                "vsetvli t0, %[col], e32, m4, tu, mu\n\t"
+                "vand.vi v0, v0, 0\n\t"
+                "vand.vi v4, v4, 0\n\t"
+                "vand.vi v8, v8, 0\n\t"
+                "vand.vi v12, v12, 0\n\t"
+
+                /* Load + dot product loop */
+                "mv t1, %[col]\n\t"          /* remaining = col */
+                "vsetvli zero, zero, e8, m4, tu, mu\n\t"
+                "csrr t6, vlenb\n\t"         /* t6 = VLEN/8 */
+                "slli t6, t6, 2\n\t"         /* t6 = VLMAX for e8,m4 */
+
+                "1:\n\t"
+                /* Strip-mining loop body — matches .L36 exactly */
+                "vsetvli a5, t1, e8, m4, tu, mu\n\t"
+                "vle8.v v16, (%[pA0])\n\t"
+                "vle8.v v24, (%[pB0])\n\t"
+                "vle8.v v28, (%[pB1])\n\t"
+                "vle8.v v20, (%[pA1])\n\t"
+                "add %[pA0], %[pA0], a5\n\t"
+                "add %[pA1], %[pA1], a5\n\t"
+                "add %[pB0], %[pB0], a5\n\t"
+                "add %[pB1], %[pB1], a5\n\t"
+                "sub t1, t1, a5\n\t"
+                "vsetvli a5, a5, e32, m4, tu, mu\n\t"
+                /* 4× vd4dots: 2 pixels × 2 channels */
+                "vd4dots.vv v0,  v16, v24\n\t"
+                "vd4dots.vv v4,  v16, v28\n\t"
+                "vd4dots.vv v8,  v20, v24\n\t"
+                "vd4dots.vv v12, v20, v28\n\t"
+                "bgt t1, zero, 1b\n\t"
+
+                /* Reduce each accumulator to scalar */
+                "vsetvli a5, %[one], e32, m1, tu, mu\n\t"
+                "vand.vi v31, v31, 0\n\t"
+                "vsetvli a5, %[col], e32, m4, tu, mu\n\t"
+                "vredsum.vs v0, v0, v31\n\t"
+                "vredsum.vs v1, v4, v31\n\t"
+                "vredsum.vs v2, v8, v31\n\t"
+                "vredsum.vs v3, v12, v31\n\t"
+                "vmv.x.s %[acc00], v0\n\t"
+                "vmv.x.s %[acc01], v1\n\t"
+                "vmv.x.s %[acc10], v2\n\t"
+                "vmv.x.s %[acc11], v3\n\t"
+
+                : [acc00] "=r" (acc00), [acc01] "=r" (acc01),
+                  [acc10] "=r" (acc10), [acc11] "=r" (acc11),
+                  [pA0] "+r" (pA0), [pA1] "+r" (pA1),
+                  [pB0] "+r" (pB0), [pB1] "+r" (pB1)
+                : [col] "r" (col), [one] "r" (1)
+                : "t0", "t1", "t6", "a5", "memory",
+                  "v0","v1","v2","v3","v4","v8","v12",
+                  "v16","v17","v18","v19","v20","v21","v22","v23",
+                  "v24","v25","v26","v27","v28","v29","v30","v31"
+            );
+
+            output[row * num_ch + ch]       = acc00;
+            output[row * num_ch + ch + 1]   = acc01;
+            output[(row+1) * num_ch + ch]   = acc10;
+            output[(row+1) * num_ch + ch + 1] = acc11;
+
+            pB += 2 * col;
+        }
+        pA += 2 * col;
+    }
+}
+
+int main(void)
+{
+    /* Fill with simple deterministic data */
+    for (int i = 0; i < NUM_ROWS * COL; i++)
+        im2col[i] = (int8_t)((i * 7 + 3) % 127);
+    for (int i = 0; i < OUT_CH * COL; i++)
+        weights[i] = (int8_t)((i * 13 + 5) % 127);
+    memset(accum, 0, sizeof(accum));
+
+    printf("=== vd4dots GEMM loop pipeline test ===\n");
+    printf("out_ch=%d  col=%d  rows=%d\n", OUT_CH, COL, NUM_ROWS);
+    printf("VLMAX(e8,m4) with VLEN=512: 256 elements\n");
+    printf("col=144 fits in 1 loop iteration\n\n");
+
+    vd4dots_gemm_2x2(im2col, weights, accum, NUM_ROWS, OUT_CH, COL);
+
+    /* Print some results to verify */
+    printf("accum[0..3] = %d %d %d %d\n",
+           accum[0], accum[1], accum[2], accum[3]);
+
+    /* Verify non-zero */
+    int nz = 0;
+    for (int i = 0; i < NUM_ROWS * OUT_CH; i++)
+        if (accum[i] != 0) nz++;
+    printf("nonzero: %d / %d\n", nz, NUM_ROWS * OUT_CH);
+
+    return 0;
+}

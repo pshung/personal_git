@@ -1,0 +1,93 @@
+# Tiling Principles: generic_reduction
+
+## Hardware Context
+- VLEN=1024 bits, f32 → VLMAX=32 elements at LMUL=1
+- L2 cache: 8MB
+- Valid LMUL: 1, 2, 4, 8
+
+## Op Signature
+- `linalg.generic` with at least one reduction dimension
+- Common patterns:
+  - `arith.mulf-arith.addf-linalg.yield` (98 cases) — dot product / matmul-like
+  - `arith.extsi-arith.addi-linalg.yield` (27 cases) — integer accumulation
+  - `arith.addf-linalg.yield` (20 cases) — simple sum reduction
+  - `arith.maxnumf-linalg.yield` (12 cases) — max reduction
+  - `arith.subf-math.exp-arith.addf` (12 cases) — softmax-like
+- rank/tilingLevels varies: [2-5, 4-8+]
+
+## Tile Size Format
+Depends on rank and number of tiling levels. For 3D PPR (parallel, parallel, reduction):
+```
+[[L0_d0, L0_d1, L0_d2],  # Distribution
+ [L1_d0, L1_d1, L1_d2],  # Vector parallel
+ [L2_d0, L2_d1, L2_d2],  # Reduction/cache
+ ...]
+```
+
+## Core Principles
+
+### 1. Pattern: PPR (parallel, parallel, reduction) — matmul-like
+- 124 cases with 3D PPR pattern
+- Behaves very similarly to explicit matmul
+- Parallel dims: vectorize innermost parallel (multiples of 32)
+- Reduction dim: tile to 8-32 at L0
+
+### 2. Pattern: PR (parallel, reduction) — vector reduction
+- 85 cases with 2D PR
+- L0_d0 (parallel): small (1-4) or moderate (16-64)
+- L0_d1 (reduction): often 0 or 1 (untiled)
+- L1_d0: 0-1
+- L1_d1: 0 or 128
+
+### 3. Instruction sequence matters
+- `mulf-addf` (dot product): treat like matmul, tile reduction
+- `addf` (sum): reduction can be untiled (0) — simple accumulation
+- `maxnumf` (max): reduction can be untiled
+- Complex sequences (softmax, quantization): more careful tiling needed
+
+### 4. Multi-op dispatches dominate the highest speedups
+- The 60-170x speedups are from MobileNet_v3 fused dispatches
+- These contain fill + generic_reduction + elementwise in one dispatch
+- All ops in the dispatch share the same tile config
+- The reduction op's needs should drive the tiling decision
+
+### 5. L2 (reduction/cache level) patterns
+- For PPR 3D: L2 reduction dim sometimes gets 8-64 (for cache blocking)
+- Most cases: L2 = all zeros
+- When used, L2 reduction = 16 or 32
+
+## Decision Template
+Given iteration_space and iteration_type:
+
+**For PPR (matmul-like):**
+- Follow matmul principles (see matmul.md)
+- L0: [small, 0 or mult_32, 8-32]
+- L1: [1-4, 0 or 32-128, 1-8]
+
+**For PR (vector reduction):**
+- L0: [moderate, 0 or 1]
+- L1: [0-1, 0 or 128]
+
+**For PPPR (batch + matmul-like):**
+- L0: [1, small, mult_32, 8-32]
+- L1: [1, 1-4, 32-128, 1-8]
+
+## Examples from Zoo
+
+| Model | Shape | Pattern | Instr | Speedup |
+|-------|-------|---------|-------|---------|
+| MobileNet_v3 | [196,80,200] | PPR | mulf-addf | 137x (fused) |
+| MobileNet_v3 | [196,112,672] | PPR | mulf-addf | 131x (fused) |
+| MobileNet_v3 | [28,28,120,40] | PPPR | mulf-addf | 130x (fused) |
+| MobileNet_v3 | [784,40,120] | PPR | mulf-addf | 67x (fused) |
+| ResNet-50 | [196,256,1024] | PPR | varies | ~5x |
+
+### Key Observation
+- Generic reductions with mulf-addf are essentially matmul and should be tiled accordingly
+- IREE defaults leave reduction untiled (0) but best configs tile to 16-32
+- Fused dispatches benefit enormously from proper reduction tiling
+
+## Confidence Criteria
+- **HIGH**: PPR with mulf-addf, dimensions ≥ 32
+- **MEDIUM**: PR reductions, non-standard instruction sequences
+- **LOW**: Complex multi-operation sequences, very small dimensions, rank 1

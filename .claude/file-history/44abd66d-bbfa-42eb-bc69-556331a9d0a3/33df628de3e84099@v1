@@ -1,0 +1,106 @@
+# Plan: Runtime dispatch for conv_1x1_HWC_s8_s8_s8_asym_bias_fast_any
+
+## Context
+
+The VD4DOTS optimization (commit dc9f3d62) gave a 2.6x speedup on the single perf test shape (M=448, N=32, K=512). However, profiling all 9 test shapes revealed two regressions:
+
+- **Test 4** (K=7, N=7): VD4DOTS is 1.6x slower — K too small to fill vector registers
+- **Test 9** (M=323, N=2050, K=1031): VD4DOTS is 1.6x slower — VREDSUM overhead scales as O(M*N), totaling ~655K VREDSUM instructions
+
+The VQMACC tiling path wins when N is large because it vectorizes along N (VL=256 fully utilized at N>=256) and requires no VREDSUM. VD4DOTS wins when N is small because VQMACC underutilizes vectors (VL clamped to N).
+
+**Goal:** Add runtime dispatch to select the best kernel based on shape, handling all cases well.
+
+## Key Finding
+
+Both kernel paths are already compiled into `libnn.a` for AX45MPV:
+- Tiling helpers: guarded by `ENA_VEC_ISA && ENA_TILING` (both always defined)
+- VD4DOTS helper: guarded by `ENA_VEC_ELEN64` (auto-detected, defined for AX45MPV)
+- Declarations in `riscv_nn_support.h` are unconditional
+
+So runtime dispatch only requires changes to the conv1x1 function and its buffer size function.
+
+## Files to Modify
+
+1. **`Source/ConvolutionFunctions/riscv_nn_conv_1x1_HWC_s8_s8_s8_asym_bias_fast_any.c`**
+   - Main function: add runtime dispatch in the `ENA_VEC_ELEN64` path (line 282)
+   - `get_buffer_size`: return tiling buffer size unconditionally (since tiling path may be used at runtime)
+
+2. **No other files need changes** — helper functions and declarations already exist.
+
+## Implementation
+
+### Step 1: Modify `get_buffer_size` (line 757)
+
+Current guard: `ENA_TILING && !ENA_VEC_ELEN64` — returns 0 when `ENA_VEC_ELEN64` is defined.
+
+Change to: `ENA_TILING` (remove `!ENA_VEC_ELEN64` exclusion). This way the tiling buffer is always allocated, since the runtime dispatch may choose the tiling path.
+
+### Step 2: Add runtime dispatch in `ENA_VEC_ELEN64` path (line 282)
+
+After the contri_buf precomputation (which is shared by both paths), add a runtime check:
+
+```c
+// Threshold: when N is large, VQMACC tiling is faster because
+// it avoids O(M*N) VREDSUM overhead. VQMACC vectorizes along N
+// and is fully utilized when N >= VLMAX (256 at LMUL=2, VLEN=1024).
+const long n_threshold = 128;
+
+if (out_tensor_ch >= n_threshold)
+{
+    // Large N: use VQMACC tiling path (transpose + tiled GEMM)
+    // — vectorizes N dimension, no VREDSUM needed
+    // Reuse existing helpers: nn_mat_mul_kernel_tiling_transpose_q7,
+    //   nn_mat_mul_kernel_tiling_asym_s8_s8_s8
+    <tiling path code from the ENA_TILING block, lines 173-281>
+}
+else
+{
+    // Small/medium N: use direct VD4DOTS path
+    // — vectorizes K dimension, VREDSUM overhead is small
+    <existing VD4DOTS code, lines 403-460>
+}
+```
+
+The tiling path code to copy is the portion AFTER contri_buf computation:
+- Lines 173-194: tiling_size, buffer setup, alignment
+- Line 197: `nn_mat_mul_kernel_tiling_transpose_q7(ker_weight, src2, out_tensor_ch, in_tensor_ch)`
+- Lines 199-281: stride==1 and stride!=1 branches calling `nn_mat_mul_kernel_tiling_asym_s8_s8_s8`
+
+Note: The contri_buf computation at the top of the `ENA_VEC_ELEN64` path (lines 289-401) already uses VD4DOTS and works for both dispatch targets — it just computes `bias + in_offset * sum(weights)` per output channel.
+
+### Step 3: Handle tiny K case
+
+For very small K (e.g., K=7 in test 4), VD4DOTS loses because VL is tiny and VREDSUM dominates. The VQMACC path would also be poor (K too small for any vectorization). For K < 32, the plain scalar `nn_mat_mult_nt_t_s8_v2` fallback within the existing function handles this adequately — the absolute cycle count is tiny (16K cycles) so it's not worth special-casing.
+
+No change needed for tiny K.
+
+## Dispatch Summary
+
+```
+if (out_tensor_ch >= 128):
+    → VQMACC tiling (transpose weights, tiled GEMM, no VREDSUM)
+else:
+    → Direct VD4DOTS (no transpose, inline quantize, VREDSUM)
+```
+
+## Verification
+
+### Step 1: QEMU correctness (all 9 tests + test-3)
+```bash
+/usr/bin/bash /home/nick/work/libnn/qemu-validate/build_libnn.sh
+/usr/bin/bash /home/nick/work/libnn/qemu-validate/run_qemu_test.sh conv_1x1_HWC_s8_s8_s8_asym_bias_fast_any --strace --vlen 1024
+```
+
+### Step 2: Rebuild and profile all 9 shapes on FPGA
+Remove `#if !ENA_MEASURE_PERF` guard temporarily, run:
+```bash
+/usr/bin/bash build.sh AX45MPV
+mkdir -p build_perf_dispatch && cd build_perf_dispatch
+/usr/bin/bash ../test_perf.sh ax45mpv riscv64-elf-gcc BOARD conv_1x1_HWC_s8_s8_s8_asym_bias_fast_any
+```
+
+### Expected results
+- Tests 1-8 (N<=32): same as current VD4DOTS (no regression)
+- Test 9 (N=2050): close to baseline VQMACC tiling (~21M cycles instead of ~34M)
+- Test 3 (perf shape, N=32): same as current VD4DOTS (~427K cycles)

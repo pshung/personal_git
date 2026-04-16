@@ -1,0 +1,1082 @@
+/******************************************************************************
+ * Copyright (C) 2010-2025 Arm Limited or its affiliates. All rights reserved.*
+ * Copyright (C) 2018-2025 Andes Technology Corporation. All rights reserved. *
+ *                                                                            *
+ * SPDX-License-Identifier: Apache-2.0                                        *
+ *                                                                            *
+ * Licensed under the Apache License, Version 2.0 (the License); you may      *
+ * not use this file except in compliance with the License.                   *
+ * You may obtain a copy of the License at                                    *
+ *                                                                            *
+ * www.apache.org/licenses/LICENSE-2.0                                        *
+ *                                                                            *
+ * Unless required by applicable law or agreed to in writing, software        *
+ * distributed under the License is distributed on an AS IS BASIS, WITHOUT    *
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.           *
+ * See the License for the specific language governing permissions and        *
+ * limitations under the License.                                             *
+ ******************************************************************************/
+
+/** @file*/
+
+#include "internal_nn_math.h"
+#include "riscv_nn_support.h"
+
+//// FullyConnected Functions
+
+int32_t riscv_nn_fc_s8_s8_s8_sft_bias_fast(const q7_t * in_vec,
+                        const q7_t * wt_mat,
+                        const uint16_t size,
+                        const uint16_t wt_row_num,
+                        const uint16_t bias_lshift,
+                        const uint16_t out_rshift,
+                        const q7_t * bias,
+                        q7_t * out_vec,
+                        q15_t * in_tmp_buf)
+{
+#ifdef ENA_EMPTY_FUN
+    //empty body
+#elif defined(ENA_VEC_ISA) && (NDS_VEC_RVV_VERSION >= 100) && defined(ENA_VEC_ISA_ZVQMAC) && defined(ENA_VEC_INTRINSIC)
+    const q7_t *pB = wt_mat;
+    const q7_t *pBias = bias;
+    q7_t *pO = out_vec;
+    const q7_t *pA;
+    int32_t vl;
+    uint32_t rowCnt = wt_row_num >> 2;
+    uint32_t colCnt = (size >> 2) << 4;
+
+    nn_dup_s8_x4_reordered(in_vec, (q7_t*)in_tmp_buf, size);
+
+    //generate acc reduction mask
+    //Note. each element only occupy 1 bit
+    const uint64_t base_mask = 0x1111111111111111;
+    const uint64_t mask_1 = 0x1817161514111211;
+    const uint64_t mask_2 = 0x1817161511131112;
+    const uint64_t mask_3 = 0x1811161115141312;
+    const uint64_t mask_4 = 0x1118111615141312;
+    vl = __riscv_vsetvl_e64m8((colCnt+7)>>3);
+    vuint64m2_t vBase_mask_u64 = __riscv_vundefined_u64m2();
+    vuint64m2_t vA1 = __riscv_vundefined_u64m2();
+    vuint64m2_t vA2 = __riscv_vundefined_u64m2();
+    vuint64m2_t vA3 = __riscv_vundefined_u64m2();
+    vuint64m2_t vA4 = __riscv_vundefined_u64m2();
+    vBase_mask_u64 = __riscv_vmv_v_tu(vBase_mask_u64, base_mask, vl);
+    vA1 = __riscv_vmv_v_tu(vA1, mask_1, vl);
+    vA2 = __riscv_vmv_v_tu(vA2, mask_2, vl);
+    vA3 = __riscv_vmv_v_tu(vA3, mask_3, vl);
+    vA4 = __riscv_vmv_v_tu(vA4, mask_4, vl);
+    vuint8m2_t vBase_interpret = __riscv_vreinterpret_u8m2(vBase_mask_u64);
+    vuint8m2_t vInterpret_1 = __riscv_vreinterpret_u8m2(vA1);
+    vuint8m2_t vInterpret_2 = __riscv_vreinterpret_u8m2(vA2);
+    vuint8m2_t vInterpret_3 = __riscv_vreinterpret_u8m2(vA3);
+    vuint8m2_t vInterpret_4 = __riscv_vreinterpret_u8m2(vA4);
+    vl = __riscv_vsetvl_e8m2(colCnt);
+    vbool4_t vMask1_b4 = __riscv_vmseq(vBase_interpret, vInterpret_1, vl);   //8n   8n+1 index mask (for acc1)
+    vbool4_t vMask2_b4 = __riscv_vmseq(vBase_interpret, vInterpret_2, vl);   //8n+2 8n+3 index mask (for acc2)
+    vbool4_t vMask3_b4 = __riscv_vmseq(vBase_interpret, vInterpret_3, vl);   //8n+4 8n+5 index mask (for acc3)
+    vbool4_t vMask4_b4 = __riscv_vmseq(vBase_interpret, vInterpret_4, vl);   //8n+6 8n+7 index mask (for acc4)
+
+    while (rowCnt)
+    {
+        //set SEW for 1st time VMV_S_X
+        //LMUL=8 is just for clear v8~v15 (vmv ignores LMUL)
+        vl = __riscv_vsetvl_e32m8(colCnt);
+
+        uint32_t colCnt2 = colCnt;
+        pA = (q7_t*)in_tmp_buf;
+        /* init sum with bias */
+        int32_t sum  = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        int32_t sum2 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        int32_t sum3 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        int32_t sum4 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+
+        //init
+        vint32m1_t vSum1_i32 = __riscv_vmv_s_x_i32m1(sum, vl);
+        vint32m1_t vSum2_i32 = __riscv_vmv_s_x_i32m1(sum2, vl);
+        vint32m1_t vSum3_i32 = __riscv_vmv_s_x_i32m1(sum3, vl);
+        vint32m1_t vSum4_i32 = __riscv_vmv_s_x_i32m1(sum4, vl);
+        //clear acc
+        vint32m8_t vAcc_i32 = __riscv_vundefined_i32m8();
+        vAcc_i32 = __riscv_vand_tu(vAcc_i32, vAcc_i32, 0, vl);
+
+        while(colCnt2)
+        {
+            vl = __riscv_vsetvl_e8m2(colCnt2);
+            vint8m2_t vpA_i8 = __riscv_vundefined_i8m2();
+            vint8m2_t vpB_i8m2 = __riscv_vundefined_i8m2();
+            vpA_i8 = __riscv_vle8_tu(vpA_i8, pA, vl);
+            vpB_i8m2 = __riscv_vle8_tu(vpB_i8m2, pB, vl);
+            vAcc_i32 = __riscv_vqmacc_vv_i32m8_tu(vAcc_i32, vpA_i8, vpB_i8m2, vl);
+            colCnt2 -= vl;
+            pA += vl;
+            pB += vl;
+        }
+
+        vl = __riscv_vsetvl_e32m8(colCnt);  //note the avl here
+        vint32m1_t vRedsum1_i32 = __riscv_vredsum(vMask1_b4, vAcc_i32, vSum1_i32, vl);
+        vint32m1_t vRedsum2_i32 = __riscv_vredsum(vMask2_b4, vAcc_i32, vSum2_i32, vl);
+        vint32m1_t vRedsum3_i32 = __riscv_vredsum(vMask3_b4, vAcc_i32, vSum3_i32, vl);
+        vint32m1_t vRedsum4_i32 = __riscv_vredsum(vMask4_b4, vAcc_i32, vSum4_i32, vl);
+
+        //rest part
+        vl = __riscv_vsetvl_e32m1(4);     //4: 4 acc
+        vRedsum1_i32 = __riscv_vslideup(vRedsum1_i32, vRedsum2_i32, 1, vl);
+        vRedsum1_i32 = __riscv_vslideup(vRedsum1_i32, vRedsum3_i32, 2, vl);
+        vRedsum1_i32 = __riscv_vslideup(vRedsum1_i32, vRedsum4_i32, 3, vl);
+
+        vl = __riscv_vsetvl_e8mf4(4);     //4: 4 acc
+        colCnt2 = size & 0x3;
+        while(colCnt2)
+        {
+            q7_t inV = *pA++;
+            vint8mf4_t vpB_i8mf4 = __riscv_vundefined_i8mf4();
+            vpB_i8mf4 = __riscv_vle8_tu(vpB_i8mf4, pB, vl);
+            vRedsum1_i32 = __riscv_vqmacc_vx_i32m1_tu(vRedsum1_i32, inV, vpB_i8mf4, vl);
+            pB += 4;
+            colCnt2--;
+        }
+
+        vl = __riscv_vsetvl_e32m1(4);     //4: 4 acc
+        vRedsum1_i32 = __riscv_vsra(vRedsum1_i32, out_rshift, vl);
+        vRedsum1_i32 = __riscv_vmax(vRedsum1_i32, Q7_MIN, vl);
+        vRedsum1_i32 = __riscv_vmin(vRedsum1_i32, Q7_MAX, vl);
+
+        vl = __riscv_vsetvl_e16mf2(4);
+        vint16mf2_t vResult_i16 = __riscv_vundefined_i16mf2();
+        vResult_i16 = __riscv_vnsra(vRedsum1_i32, 0, vl);
+        vl = __riscv_vsetvl_e8mf4(4);
+        vint8mf4_t vResult_i8 = __riscv_vundefined_i8mf4();
+        vResult_i8 = __riscv_vnsra(vResult_i16, 0, vl);
+        __riscv_vse8(pO, vResult_i8, vl);
+        pO += 4;
+        rowCnt--;
+    }
+
+    vl = __riscv_vsetvl_e32m8(size);
+    rowCnt = wt_row_num & 0x3;
+    while (rowCnt)
+    {
+        int32_t sum = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        pA = in_vec;
+        colCnt = size;
+
+        vint32m8_t vAcc_i32 = __riscv_vundefined_i32m8();
+        //init
+        vint32m1_t vSum1_i32 = __riscv_vmv_s_x_i32m1(sum, vl);
+        //clear acc
+        vAcc_i32 = __riscv_vand_tu(vAcc_i32, vAcc_i32, 0, vl);
+
+        while (colCnt != 0)
+        {
+            vl = __riscv_vsetvl_e8m2(colCnt);
+            vint8m2_t vpA_i8 = __riscv_vundefined_i8m2();
+            vint8m2_t vpB_i8m2 = __riscv_vundefined_i8m2();
+            vpA_i8 = __riscv_vle8_tu(vpA_i8, pA, vl);
+            vpB_i8m2 = __riscv_vle8_tu(vpB_i8m2, pB, vl);
+            vAcc_i32 = __riscv_vqmacc_vv_i32m8_tu(vAcc_i32, vpA_i8, vpB_i8m2, vl);
+            pB += vl;
+            pA += vl;
+            colCnt -= vl;
+        }
+
+        vl = __riscv_vsetvl_e32m8(size);
+        vint32m1_t vRedsum1_i32 = __riscv_vredsum(vAcc_i32, vSum1_i32, vl);
+        sum = __riscv_vmv_x(vRedsum1_i32);
+        *pO++ = NDS_ISA_SATS((sum >> out_rshift), 8);
+        rowCnt--;
+    }
+#elif defined(ENA_VEC_ISA) && (NDS_VEC_RVV_VERSION >= 100) && defined(ENA_VEC_ISA_ZVQMAC)
+    const q7_t *pB = wt_mat;
+    const q7_t *pBias = bias;
+    q7_t *pO = out_vec;
+    const q7_t *pA;
+    int32_t vl;
+    uint32_t rowCnt = wt_row_num >> 2;
+    uint32_t colCnt = (size >> 2) << 4;
+
+    nn_dup_s8_x4_reordered(in_vec, (q7_t*)in_tmp_buf, size);
+
+    //generate acc reduction mask
+    //Note. each element only occupy 1 bit
+    NDS_VEC_VSETVLI_E8(vl, (colCnt+7)>>3);
+    NDS_VEC_VAND_VX(NDS_VEC_V0, NDS_VEC_V0, 0);
+    NDS_VEC_VOR_VX(NDS_VEC_V20, NDS_VEC_V0, 0x05);   //8n   8n+2 index mask (for acc1)
+    NDS_VEC_VOR_VX(NDS_VEC_V21, NDS_VEC_V0, 0x0A);   //8n+1 8n+3 index mask (for acc2)
+    NDS_VEC_VOR_VX(NDS_VEC_V22, NDS_VEC_V0, 0x50);   //8n+4 8n+6 index mask (for acc3)
+    NDS_VEC_VOR_VX(NDS_VEC_V23, NDS_VEC_V0, 0xA0);   //8n+5 8n+7 index mask (for acc4)
+
+    while (rowCnt)
+    {
+        //set SEW for 1st time VMV_S_X
+        //LMUL=8 is just for clear v8~v15 (vmv ignores LMUL)
+        NDS_VEC_VSETVLI(vl, colCnt, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M8);
+
+        uint32_t colCnt2 = colCnt;
+        pA = (q7_t*)in_tmp_buf;
+        /* init sum with bias */
+        int32_t sum  = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        int32_t sum2 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        int32_t sum3 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        int32_t sum4 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+
+        //init
+        NDS_VEC_VMV_S_X(NDS_VEC_V16, sum);
+        NDS_VEC_VMV_S_X(NDS_VEC_V17, sum2);
+        NDS_VEC_VMV_S_X(NDS_VEC_V18, sum3);
+        NDS_VEC_VMV_S_X(NDS_VEC_V19, sum4);
+        //clear v8~v15 (tmp acc)
+        NDS_VEC_VAND_VX(NDS_VEC_V8, NDS_VEC_V8, 0);
+
+        while(colCnt2)
+        {
+            NDS_VEC_VSETVLI(vl, colCnt2, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M2);
+            NDS_VEC_VLB_V(NDS_VEC_V2, pA);
+            NDS_VEC_VLB_V(NDS_VEC_V4, pB);
+            NDS_VEC_VQMACC_VV(NDS_VEC_V8, NDS_VEC_V2, NDS_VEC_V4);
+            colCnt2 -= vl;
+            pA += vl;
+            pB += vl;
+        }
+
+        NDS_VEC_VSETVLI(vl, colCnt, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M8);  //note the avl here
+        NDS_VEC_VMCPY_M(NDS_VEC_V0, NDS_VEC_V20);
+        NDS_VEC_MSK_VREDSUM_VS(NDS_VEC_V16, NDS_VEC_V8, NDS_VEC_V16);
+        NDS_VEC_VMCPY_M(NDS_VEC_V0, NDS_VEC_V21);
+        NDS_VEC_MSK_VREDSUM_VS(NDS_VEC_V17, NDS_VEC_V8, NDS_VEC_V17);
+        NDS_VEC_VMCPY_M(NDS_VEC_V0, NDS_VEC_V22);
+        NDS_VEC_MSK_VREDSUM_VS(NDS_VEC_V18, NDS_VEC_V8, NDS_VEC_V18);
+        NDS_VEC_VMCPY_M(NDS_VEC_V0, NDS_VEC_V23);
+        NDS_VEC_MSK_VREDSUM_VS(NDS_VEC_V19, NDS_VEC_V8, NDS_VEC_V19);
+
+        //rest part
+        NDS_VEC_VSETVLI_E32(vl, 4);     //4: 4 acc
+        NDS_VEC_VSLIDEUP_VI(NDS_VEC_V16, NDS_VEC_V17, 1);
+        NDS_VEC_VSLIDEUP_VI(NDS_VEC_V16, NDS_VEC_V18, 2);
+        NDS_VEC_VSLIDEUP_VI(NDS_VEC_V16, NDS_VEC_V19, 3);
+
+        NDS_VEC_VSETVLI_E8(vl, 4);     //4: 4 acc
+        colCnt2 = size & 0x3;
+        while(colCnt2)
+        {
+            q7_t inV = *pA++;
+            NDS_VEC_VLB_V(NDS_VEC_V1, pB);
+            NDS_VEC_VQMACC_VX(NDS_VEC_V16, inV, NDS_VEC_V1);
+            pB += 4;
+            colCnt2--;
+        }
+
+        NDS_VEC_VSETVLI_E32(vl, 4);     //4: 4 acc
+        NDS_VEC_VSRA_VX(NDS_VEC_V16, NDS_VEC_V16, out_rshift);
+        NDS_VEC_VMAX_VX(NDS_VEC_V16, NDS_VEC_V16, Q7_MIN);
+        NDS_VEC_VMIN_VX(NDS_VEC_V16, NDS_VEC_V16, Q7_MAX);
+
+        NDS_VEC_VSETVLI_E16(vl, vl);
+        NDS_VEC_VNSRA_WI(NDS_VEC_V16, NDS_VEC_V16, 0);
+        NDS_VEC_VSETVLI_E8(vl, vl);
+        NDS_VEC_VNSRA_WI(NDS_VEC_V16, NDS_VEC_V16, 0);
+        NDS_VEC_VSB_V(NDS_VEC_V16, pO);
+        pO += 4;
+        rowCnt--;
+    }
+
+    NDS_VEC_VSETVLI(vl, size, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M8);
+    rowCnt = wt_row_num & 0x3;
+    while (rowCnt)
+    {
+        int32_t sum = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        pA = in_vec;
+        colCnt = size;
+
+        //init
+        NDS_VEC_VMV_S_X(NDS_VEC_V0, sum);
+        //clear v8~v15
+        NDS_VEC_VAND_VI(NDS_VEC_V8, NDS_VEC_V8, 0x0);
+
+        while (colCnt != 0)
+        {
+            NDS_VEC_VSETVLI(vl, colCnt, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M2);
+            NDS_VEC_VLB_V(NDS_VEC_V2, pA);
+            NDS_VEC_VLB_V(NDS_VEC_V4, pB);
+            NDS_VEC_VQMACC_VV(NDS_VEC_V8, NDS_VEC_V2, NDS_VEC_V4);
+            pB += vl;
+            pA += vl;
+            colCnt -= vl;
+        }
+
+        NDS_VEC_VSETVLI(vl, size, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M8);
+        NDS_VEC_VREDSUM_VS(NDS_VEC_V0, NDS_VEC_V8, NDS_VEC_V0);
+        NDS_VEC_VMV_X_S(sum, NDS_VEC_V0);
+        *pO++ = NDS_ISA_SATS((sum >> out_rshift), 8);
+        rowCnt--;
+    }
+#elif defined(ENA_VEC_ISA) && (NDS_VEC_RVV_VERSION >= 100)   //vwmacc
+    const q7_t *pB = wt_mat;
+    const q7_t *pBias = bias;
+    q7_t *pO = out_vec;
+    const q7_t *pA;
+    int32_t vl;
+    uint32_t rowCnt = wt_row_num >> 2;
+    uint32_t colCnt = (size >> 2) << 4;
+
+    nn_dup_s8_x4_reordered(in_vec, (q7_t*)in_tmp_buf, size);
+
+    //generate acc reduction mask
+    //(following generating mask codes could be optimized later if SEW>32 is supported)
+    NDS_VEC_VSETVLI_E16(vl, colCnt);
+    NDS_VEC_VID_V(NDS_VEC_V0);
+    NDS_VEC_VAND_VI(NDS_VEC_V0, NDS_VEC_V0, 0x7);           //index mod 8
+    NDS_VEC_VMSLE_VI(NDS_VEC_V1, NDS_VEC_V0, 0x3);          //8n ~ 8n+3
+    NDS_VEC_VMSGT_VI(NDS_VEC_V2, NDS_VEC_V0, 0x3);          //8n+4 ~ 8n+7
+    NDS_VEC_VSETVLI_E32(vl, colCnt>>1);
+    NDS_VEC_VAND_VX(NDS_VEC_V10, NDS_VEC_V1, 0x0000FFFF);   //8n   8n+2 index mask (for acc1)
+    NDS_VEC_VAND_VX(NDS_VEC_V11, NDS_VEC_V1, 0xFFFF0000);   //8n+1 8n+3 index mask (for acc2)
+    NDS_VEC_VAND_VX(NDS_VEC_V12, NDS_VEC_V2, 0x0000FFFF);   //8n+4 8n+6 index mask (for acc3)
+    NDS_VEC_VAND_VX(NDS_VEC_V13, NDS_VEC_V2, 0xFFFF0000);   //8n+5 8n+7 index mask (for acc4)
+
+
+    while (rowCnt)
+    {
+        //set SEW for 1st time VMV_S_X
+        //LMUL=2 is just for clear v4~v5 (vmv ignores LMUL)
+        NDS_VEC_VSETVLI_E32_M2(vl, colCnt);
+
+        uint32_t colCnt2 = colCnt;
+        pA = (q7_t*)in_tmp_buf;
+        /* init sum with bias */
+        int32_t sum  = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        int32_t sum2 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        int32_t sum3 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        int32_t sum4 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+
+        //init
+        NDS_VEC_VMV_S_X(NDS_VEC_V6, sum);
+        NDS_VEC_VMV_S_X(NDS_VEC_V7, sum2);
+        NDS_VEC_VMV_S_X(NDS_VEC_V8, sum3);
+        NDS_VEC_VMV_S_X(NDS_VEC_V9, sum4);
+        //clear v4~v5 (tmp acc)
+        NDS_VEC_VAND_VX(NDS_VEC_V4, NDS_VEC_V4, 0);
+
+        while(colCnt2)
+        {
+            NDS_VEC_VSETVLI_E16(vl, colCnt2);
+            NDS_VEC_VLB_V(NDS_VEC_V1, pA);
+            NDS_VEC_VLB_V(NDS_VEC_V2, pB);
+            NDS_VEC_VWMACC_VV(NDS_VEC_V4, NDS_VEC_V1, NDS_VEC_V2);
+            colCnt2 -= vl;
+            pA += vl;
+            pB += vl;
+        }
+
+        NDS_VEC_VSETVLI_E32_M2(vl, colCnt);   //note the avl here
+        NDS_VEC_VMCPY_M(NDS_VEC_V0, NDS_VEC_V10);
+        NDS_VEC_MSK_VREDSUM_VS(NDS_VEC_V6, NDS_VEC_V4, NDS_VEC_V6);
+        NDS_VEC_VMCPY_M(NDS_VEC_V0, NDS_VEC_V11);
+        NDS_VEC_MSK_VREDSUM_VS(NDS_VEC_V7, NDS_VEC_V4, NDS_VEC_V7);
+        NDS_VEC_VMCPY_M(NDS_VEC_V0, NDS_VEC_V12);
+        NDS_VEC_MSK_VREDSUM_VS(NDS_VEC_V8, NDS_VEC_V4, NDS_VEC_V8);
+        NDS_VEC_VMCPY_M(NDS_VEC_V0, NDS_VEC_V13);
+        NDS_VEC_MSK_VREDSUM_VS(NDS_VEC_V9, NDS_VEC_V4, NDS_VEC_V9);
+
+        //rest part
+        NDS_VEC_VSETVLI_E32(vl, 4);     //4: 4 acc
+        NDS_VEC_VSLIDEUP_VI(NDS_VEC_V6, NDS_VEC_V7, 1);
+        NDS_VEC_VSLIDEUP_VI(NDS_VEC_V6, NDS_VEC_V8, 2);
+        NDS_VEC_VSLIDEUP_VI(NDS_VEC_V6, NDS_VEC_V9, 3);
+
+        colCnt2 = size & 0x3;
+        while(colCnt2)
+        {
+            q7_t inV = *pA++;
+            NDS_VEC_VLB_V(NDS_VEC_V3, pB);
+            NDS_VEC_VMACC_VX(NDS_VEC_V6, inV, NDS_VEC_V3);
+            pB += 4;
+            colCnt2--;
+        }
+
+        NDS_VEC_VSRA_VX(NDS_VEC_V6, NDS_VEC_V6, out_rshift);
+        NDS_VEC_VMAX_VX(NDS_VEC_V6, NDS_VEC_V6, Q7_MIN);
+        NDS_VEC_VMIN_VX(NDS_VEC_V6, NDS_VEC_V6, Q7_MAX);
+        NDS_VEC_VSB_V(NDS_VEC_V6, pO);
+        pO += 4;
+        rowCnt--;
+    }
+
+    NDS_VEC_VSETVLI_E32_M2(vl, size);
+    rowCnt = wt_row_num & 0x3;
+    while (rowCnt)
+    {
+        int32_t sum = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        pA = in_vec;
+        colCnt = size;
+
+        //init
+        NDS_VEC_VMV_S_X(NDS_VEC_V6, sum);
+        //clear v4~v5
+        NDS_VEC_VAND_VI(NDS_VEC_V4, NDS_VEC_V4, 0x0);
+
+        while (colCnt != 0)
+        {
+            NDS_VEC_VSETVLI_E16(vl, colCnt);
+            NDS_VEC_VLB_V(NDS_VEC_V1, pA);
+            NDS_VEC_VLB_V(NDS_VEC_V2, pB);
+            NDS_VEC_VWMACC_VV(NDS_VEC_V4, NDS_VEC_V1, NDS_VEC_V2);
+            pB += vl;
+            pA += vl;
+            colCnt -= vl;
+        }
+
+        NDS_VEC_VSETVLI_E32_M2(vl, size);
+        NDS_VEC_VREDSUM_VS(NDS_VEC_V6, NDS_VEC_V4, NDS_VEC_V6);
+        NDS_VEC_VMV_X_S(sum, NDS_VEC_V6);
+        *pO++ = NDS_ISA_SATS((sum >> out_rshift), 8);
+        rowCnt--;
+    }
+#elif defined(ENA_VEC_ISA) && (NDS_VEC_RVV_VERSION == 80)   //vwmacc
+    const q7_t *pB = wt_mat;
+    const q7_t *pBias = bias;
+    q7_t *pO = out_vec;
+    const q7_t *pA;
+    int32_t vl;
+    uint32_t rowCnt = wt_row_num >> 2;
+    uint32_t colCnt = (size >> 2) << 4;
+
+    nn_dup_s8_x4_reordered(in_vec, (q7_t*)in_tmp_buf, size);
+
+    //generate acc reduction mask
+    //(following generating mask codes could be optimized later if SEW>32 is supported)
+    NDS_VEC_VSETVLI_E8(vl, colCnt);
+    NDS_VEC_VID_V(NDS_VEC_V0);
+    NDS_VEC_VAND_VI(NDS_VEC_V0, NDS_VEC_V0, 0x7);           //index mod 8
+    NDS_VEC_VMSLE_VI(NDS_VEC_V1, NDS_VEC_V0, 0x3);          //8n ~ 8n+3
+    NDS_VEC_VMSGT_VI(NDS_VEC_V2, NDS_VEC_V0, 0x3);          //8n+4 ~ 8n+7
+    NDS_VEC_VSETVLI_E32(vl, colCnt>>1);
+    NDS_VEC_VAND_VX(NDS_VEC_V12, NDS_VEC_V1, 0x00FF00FF);   //8n   8n+2 index mask (for acc1)
+    NDS_VEC_VAND_VX(NDS_VEC_V13, NDS_VEC_V1, 0xFF00FF00);   //8n+1 8n+3 index mask (for acc2)
+    NDS_VEC_VAND_VX(NDS_VEC_V14, NDS_VEC_V2, 0x00FF00FF);   //8n+4 8n+6 index mask (for acc3)
+    NDS_VEC_VAND_VX(NDS_VEC_V15, NDS_VEC_V2, 0xFF00FF00);   //8n+5 8n+7 index mask (for acc4)
+
+    while (rowCnt)
+    {
+        //set SEW for 1st time VMV_S_X
+        //LMUL=4 is just for clear v4~v7 (vmv ignores LMUL)
+        NDS_VEC_VSETVLI_E32_M4(vl, colCnt);
+
+        uint32_t colCnt2 = colCnt;
+        pA = (q7_t*)in_tmp_buf;
+        /* init sum with bias */
+        int32_t sum  = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        int32_t sum2 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        int32_t sum3 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        int32_t sum4 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+
+        //init
+        NDS_VEC_VMV_S_X(NDS_VEC_V8, sum);
+        NDS_VEC_VMV_S_X(NDS_VEC_V9, sum2);
+        NDS_VEC_VMV_S_X(NDS_VEC_V10, sum3);
+        NDS_VEC_VMV_S_X(NDS_VEC_V11, sum4);
+        //clear v4~v7 (tmp acc)
+        NDS_VEC_VAND_VX(NDS_VEC_V4, NDS_VEC_V4, 0);
+
+        while(colCnt2)
+        {
+            NDS_VEC_VSETVLI_E8(vl, colCnt2);
+            NDS_VEC_VLB_V(NDS_VEC_V1, pA);
+            NDS_VEC_VLB_V(NDS_VEC_V2, pB);
+            NDS_VEC_VQMACC_VV(NDS_VEC_V4, NDS_VEC_V1, NDS_VEC_V2);
+            colCnt2 -= vl;
+            pA += vl;
+            pB += vl;
+        }
+
+        NDS_VEC_VSETVLI_E32_M4(vl, colCnt);   //note the avl here
+        NDS_VEC_VMCPY_M(NDS_VEC_V0, NDS_VEC_V12);
+        NDS_VEC_MSK_VREDSUM_VS(NDS_VEC_V8, NDS_VEC_V4, NDS_VEC_V8);
+        NDS_VEC_VMCPY_M(NDS_VEC_V0, NDS_VEC_V13);
+        NDS_VEC_MSK_VREDSUM_VS(NDS_VEC_V9, NDS_VEC_V4, NDS_VEC_V9);
+        NDS_VEC_VMCPY_M(NDS_VEC_V0, NDS_VEC_V14);
+        NDS_VEC_MSK_VREDSUM_VS(NDS_VEC_V10, NDS_VEC_V4, NDS_VEC_V10);
+        NDS_VEC_VMCPY_M(NDS_VEC_V0, NDS_VEC_V15);
+        NDS_VEC_MSK_VREDSUM_VS(NDS_VEC_V11, NDS_VEC_V4, NDS_VEC_V11);
+
+        //rest part
+        NDS_VEC_VSETVLI_E32(vl, 4);     //4: 4 acc
+        NDS_VEC_VSLIDEUP_VI(NDS_VEC_V8, NDS_VEC_V9, 1);
+        NDS_VEC_VSLIDEUP_VI(NDS_VEC_V8, NDS_VEC_V10, 2);
+        NDS_VEC_VSLIDEUP_VI(NDS_VEC_V8, NDS_VEC_V11, 3);
+
+        colCnt2 = size & 0x3;
+        while(colCnt2)
+        {
+            q7_t inV = *pA++;
+            NDS_VEC_VLB_V(NDS_VEC_V1, pB);
+            NDS_VEC_VMACC_VX(NDS_VEC_V8, inV, NDS_VEC_V1);
+            pB += 4;
+            colCnt2--;
+        }
+
+        NDS_VEC_VSRA_VX(NDS_VEC_V8, NDS_VEC_V8, out_rshift);
+        NDS_VEC_VMAX_VX(NDS_VEC_V8, NDS_VEC_V8, Q7_MIN);
+        NDS_VEC_VMIN_VX(NDS_VEC_V8, NDS_VEC_V8, Q7_MAX);
+        NDS_VEC_VSB_V(NDS_VEC_V8, pO);
+        pO += 4;
+        rowCnt--;
+    }
+
+    NDS_VEC_VSETVLI_E32_M4(vl, size);
+    rowCnt = wt_row_num & 0x3;
+    while (rowCnt)
+    {
+        int32_t sum = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        pA = in_vec;
+        colCnt = size;
+
+        //init
+        NDS_VEC_VMV_S_X(NDS_VEC_V0, sum);
+        //clear v4~v7
+        NDS_VEC_VAND_VI(NDS_VEC_V4, NDS_VEC_V4, 0x0);
+
+        while (colCnt != 0)
+        {
+            NDS_VEC_VSETVLI_E8(vl, colCnt);
+            NDS_VEC_VLB_V(NDS_VEC_V1, pA);
+            NDS_VEC_VLB_V(NDS_VEC_V2, pB);
+            NDS_VEC_VQMACC_VV(NDS_VEC_V4, NDS_VEC_V1, NDS_VEC_V2);
+            pB += vl;
+            pA += vl;
+            colCnt -= vl;
+        }
+
+        NDS_VEC_VSETVLI_E32_M4(vl, size);
+        NDS_VEC_VREDSUM_VS(NDS_VEC_V0, NDS_VEC_V4, NDS_VEC_V0);
+        NDS_VEC_VMV_X_S(sum, NDS_VEC_V0);
+        *pO++ = NDS_ISA_SATS((sum >> out_rshift), 8);
+        rowCnt--;
+    }
+#elif defined(ENA_DSP_ISA_64)   //V5 64, DX25
+    uint16_t  rowCnt = wt_row_num >> 2;
+    const q7_t *pB = wt_mat;
+    const q7_t *pA;
+    q7_t     *pO = out_vec;
+    const q7_t *pBias = bias;
+
+    while (rowCnt)
+    {
+        q63_t   sum_q31x2_1 = 0;
+        q63_t   sum_q31x2_2 = 0;
+        q63_t   sum_q31x2_3 = 0;
+        q63_t   sum_q31x2_4 = 0;
+
+        uint16_t  colCnt = size >> 3;
+        pA = in_vec;
+
+        q63_t slot4_A0, slot4_A1;
+        q63_t slot4_B0, slot4_B1;
+        q63_t slot4_AB, slot4_AB0, slot4_AB1, slot4_AB2, slot4_AB3;
+
+        q63_t inM11, inM12, inM21, inM22;
+        while (colCnt)
+        {
+            /*
+            // 32-bit type
+            slot4_A = *__SIMD32(pA)++;
+            inM11 = *__SIMD32(pB)++;
+            inM12 = *__SIMD32(pB)++;
+            inM13 = *__SIMD32(pB)++;
+            inM14 = *__SIMD32(pB)++;
+
+            //  7  6  5  4 |  3 2 1 0
+            //   /   \ /   |  /  \ /
+            // 14 13 12 11 | 10 9 8 0  // << 8 ; A0
+
+            //  0  7  6  5 |  4  3 2 1 // >> 8 ; A1
+            //   /   \ /   |   /  \ /
+            // 15 14 13 12 | 11 10 9 8
+
+            slot4_A0 = NDS_DSP_BPICK(inM11, inM13 << 8, 0x00ff00ff);
+            slot4_A1 = NDS_DSP_BPICK(inM11 >> 8, inM13, 0x00ff00ff);
+            slot4_A2 = NDS_DSP_BPICK(inM12, inM14 << 8, 0x00ff00ff);
+            slot4_A3 = NDS_DSP_BPICK(inM12 >> 8, inM14, 0x00ff00ff);
+
+            slot4_B0 = NDS_DSP_BPICK(inM21, inM23 << 8, 0x00ff00ff);
+            slot4_B1 = NDS_DSP_BPICK(inM21 >> 8, inM23, 0x00ff00ff);
+            slot4_B2 = NDS_DSP_BPICK(inM22, inM24 << 8, 0x00ff00ff);
+            slot4_B3 = NDS_DSP_BPICK(inM22 >> 8, inM24, 0x00ff00ff);
+            */
+
+            slot4_AB = *__SIMD64(pA)++;
+            inM11 = *__SIMD64(pB)++;
+            inM12 = *__SIMD64(pB)++;
+            inM21 = *__SIMD64(pB)++;
+            inM22 = *__SIMD64(pB)++;
+
+            // 64-bit type
+            slot4_A0 = NDS_DSP_BPICK(inM11, inM12 << 8, 0x00ff00ff00ff00ff);
+            slot4_A1 = NDS_DSP_BPICK(inM11 >> 8, inM12, 0x00ff00ff00ff00ff);
+            slot4_B0 = NDS_DSP_BPICK(inM21, inM22 << 8, 0x00ff00ff00ff00ff);
+            slot4_B1 = NDS_DSP_BPICK(inM21 >> 8, inM22, 0x00ff00ff00ff00ff);
+
+            //  7  6  5  4  3 2 1 0
+            //   /   \ /    /  \ /
+            // 14 13 12 11 10 9 8 0  // << 8 ; A0
+
+            //  0  7  6  5  4  3 2 1 // >> 8 ; A1
+            //   /   \ /     /  \ /
+            // 15 14 13 12 11 10 9 8
+
+            slot4_AB0 = NDS_DSP_PKBB32(slot4_B0, slot4_A0); //0,8,2,10
+            slot4_AB1 = NDS_DSP_PKBB32(slot4_B1, slot4_A1); //1,9,3,11
+            slot4_AB2 = NDS_DSP_PKTT32(slot4_B0, slot4_A0); //4,12,6,14
+            slot4_AB3 = NDS_DSP_PKTT32(slot4_B1, slot4_A1); //5,13,7,15
+            sum_q31x2_1  = NDS_DSP_SMAQA(sum_q31x2_1 ,  slot4_AB, slot4_AB0);
+            sum_q31x2_2 = NDS_DSP_SMAQA(sum_q31x2_2,  slot4_AB, slot4_AB1);
+            sum_q31x2_3 = NDS_DSP_SMAQA(sum_q31x2_3,  slot4_AB, slot4_AB2);
+            sum_q31x2_4 = NDS_DSP_SMAQA(sum_q31x2_4,  slot4_AB, slot4_AB3);
+
+            colCnt--;
+        }
+
+        sum_q31x2_1 = PADD_S32(sum_q31x2_1);
+        sum_q31x2_2 = PADD_S32(sum_q31x2_2);
+        sum_q31x2_3 = PADD_S32(sum_q31x2_3);
+        sum_q31x2_4 = PADD_S32(sum_q31x2_4);
+
+        if ((size & 0x7) > 3)
+        {
+            q31_t slot4_A = *__SIMD32(pA)++;
+            q31_t inM11 = *__SIMD32(pB)++;
+            q31_t inM12 = *__SIMD32(pB)++;
+            q31_t inM13 = *__SIMD32(pB)++;
+            q31_t inM14 = *__SIMD32(pB)++;
+
+            q31_t slot4_A0 = NDS_DSP_BPICK(inM11, inM13 << 8, 0x00ff00ff);
+            q31_t slot4_A1 = NDS_DSP_BPICK(inM11 >> 8, inM13, 0x00ff00ff);
+            q31_t slot4_A2 = NDS_DSP_BPICK(inM12, inM14 << 8, 0x00ff00ff);
+            q31_t slot4_A3 = NDS_DSP_BPICK(inM12 >> 8, inM14, 0x00ff00ff);
+
+            sum_q31x2_1 = NDS_DSP_SMAQA(sum_q31x2_1,  slot4_A, slot4_A0);
+            sum_q31x2_2 = NDS_DSP_SMAQA(sum_q31x2_2,  slot4_A, slot4_A1);
+            sum_q31x2_3 = NDS_DSP_SMAQA(sum_q31x2_3,  slot4_A, slot4_A2);
+            sum_q31x2_4 = NDS_DSP_SMAQA(sum_q31x2_4,  slot4_A, slot4_A3);
+
+            colCnt--;
+        }
+
+        colCnt = size & 0x3;
+        while (colCnt)
+        {
+            q7_t      inA = *pA++;
+            q7_t      inB = *pB++;
+            sum_q31x2_1 += inA * inB;
+            inB = *pB++;
+            sum_q31x2_2 += inA * inB;
+            inB = *pB++;
+            sum_q31x2_3 += inA * inB;
+            inB = *pB++;
+            sum_q31x2_4 += inA * inB;
+            colCnt--;
+        }
+
+        q31_t sum_q31_1 = sum_q31x2_1;
+        q31_t sum_q31_2 = sum_q31x2_2;
+        q31_t sum_q31_3 = sum_q31x2_3;
+        q31_t sum_q31_4 = sum_q31x2_4;
+
+        sum_q31_1 += (q31_t)(*pBias++) << bias_lshift;
+        sum_q31_2 += (q31_t)(*pBias++) << bias_lshift;
+        sum_q31_3 += (q31_t)(*pBias++) << bias_lshift;
+        sum_q31_4 += (q31_t)(*pBias++) << bias_lshift;
+        sum_q31_1 = NDS_DSP_SRA_U(sum_q31_1, out_rshift);
+        sum_q31_2 = NDS_DSP_SRA_U(sum_q31_2, out_rshift);
+        sum_q31_3 = NDS_DSP_SRA_U(sum_q31_3, out_rshift);
+        sum_q31_4 = NDS_DSP_SRA_U(sum_q31_4, out_rshift);
+        *pO++ = NDS_DSP_SATS(sum_q31_1, 8);
+        *pO++ = NDS_DSP_SATS(sum_q31_2, 8);
+        *pO++ = NDS_DSP_SATS(sum_q31_3, 8);
+        *pO++ = NDS_DSP_SATS(sum_q31_4, 8);
+
+        rowCnt--;
+    }
+
+    /* left-over part of the rows */
+    rowCnt = wt_row_num & 0x3;
+    while (rowCnt)
+    {
+        q63_t     sum_q31x2 = 0;
+        uint16_t  colCnt = size >> 3;
+
+        pA = in_vec;
+        while (colCnt)
+        {
+            q63_t tinV1 = *__SIMD64(pA)++;
+            q63_t tinV2 = *__SIMD64(pB)++;
+            sum_q31x2 = NDS_DSP_SMAQA(sum_q31x2, tinV1, tinV2);
+            colCnt--;
+        }
+
+        sum_q31x2 = PADD_S32(sum_q31x2);
+
+        colCnt = size & 0x7;
+        while (colCnt)
+        {
+            q7_t      inV = *pA++;
+            q7_t      inM = *pB++;
+            sum_q31x2 += inV * inM;
+            colCnt--;
+        }
+
+        q31_t sum_q31 = sum_q31x2;
+        sum_q31 += ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        *pO++ = (NDS_DSP_SATS((sum_q31 >> out_rshift), 8));
+
+        rowCnt--;
+    }
+#elif defined(ENA_DSP_ISA_V5) //V5 32, D25
+    uint16_t  rowCnt = wt_row_num >> 2;
+    const q7_t *pB = wt_mat;
+    const q7_t *pA;
+    q7_t     *pO = out_vec;
+    const q7_t *pBias = bias;
+
+    while (rowCnt)
+    {
+        q31_t     sum =  ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        q31_t     sum2 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        q31_t     sum3 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        q31_t     sum4 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+
+        uint16_t  colCnt = size >> 2;
+
+        pA = in_vec;
+
+        q31_t slot4_A;
+        q31_t slot4_B;
+        q31_t inM11, inM12, inM13, inM14;
+        while (colCnt)
+        {
+            slot4_A = *__SIMD32(pA)++;
+            inM11 = *__SIMD32(pB)++;
+            inM12 = *__SIMD32(pB)++;
+            inM13 = *__SIMD32(pB)++;
+            inM14 = *__SIMD32(pB)++;
+
+            /*  e.g.
+            *  inM11  3  2  1  7
+            *  inM13 11 10  9  8
+            *         low  //NDS_DSP_BPICK(inM11, inM13 << 8, 0x00ff00ff);
+            *  3  2  1  7  // inM11;
+            * 10  9  8  0  // inM13 << 8 -> 10  9  8  0;
+            *              // 0x00ff00ff;
+            * 10  2  8  7  //
+            */
+
+            slot4_B = NDS_DSP_BPICK(inM11, inM13 << 8, 0x00ff00ff);
+            sum = NDS_DSP_SMAQA(sum,  slot4_A, slot4_B);
+
+            slot4_B = NDS_DSP_BPICK(inM11 >> 8, inM13, 0x00ff00ff);
+            sum2 = NDS_DSP_SMAQA(sum2,  slot4_A, slot4_B);
+
+            slot4_B = NDS_DSP_BPICK(inM12, inM14 << 8, 0x00ff00ff);
+            sum3 = NDS_DSP_SMAQA(sum3,  slot4_A, slot4_B);
+
+            slot4_B = NDS_DSP_BPICK(inM12 >> 8, inM14, 0x00ff00ff);
+            sum4 = NDS_DSP_SMAQA(sum4,  slot4_A, slot4_B);
+
+            colCnt--;
+        }
+
+        colCnt = size & 0x3;
+        while (colCnt)
+        {
+            q7_t      inA = *pA++;
+            q7_t      inB = *pB++;
+            sum += inA * inB;
+            inB = *pB++;
+            sum2 += inA * inB;
+            inB = *pB++;
+            sum3 += inA * inB;
+            inB = *pB++;
+            sum4 += inA * inB;
+
+            colCnt--;
+        }
+
+        *pO++ = (q7_t) NDS_DSP_SATS((sum >> out_rshift), 8);
+        *pO++ = (q7_t) NDS_DSP_SATS((sum2 >> out_rshift), 8);
+        *pO++ = (q7_t) NDS_DSP_SATS((sum3 >> out_rshift), 8);
+        *pO++ = (q7_t) NDS_DSP_SATS((sum4 >> out_rshift), 8);
+        rowCnt--;
+    }
+
+    /* left-over part of the rows */
+
+    rowCnt = wt_row_num & 0x3;
+
+    while (rowCnt)
+    {
+        q31_t     sum = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        uint16_t  colCnt = size >> 2;
+
+        pA = in_vec;
+        while (colCnt)
+        {
+            q31_t tinV1 = *__SIMD32(pA)++;
+            q31_t tinV2 = *__SIMD32(pB)++;
+            sum = NDS_DSP_SMAQA(sum, tinV1, tinV2);
+            colCnt--;
+        }
+
+        colCnt = size & 0x3;
+        while (colCnt)
+        {
+            q7_t      inV = *pA++;
+            q7_t      inM = *pB++;
+            sum += inV * inM;
+            colCnt--;
+        }
+
+        *pO++ = (q7_t) (NDS_DSP_SATS((sum >> out_rshift), 8));
+
+        rowCnt--;
+    }
+#elif defined(ENA_DSP_ISA) //V3 32, D10
+    const q7_t *pB = wt_mat;
+    q7_t     *pO = out_vec;
+    const q7_t *pBias = bias;
+    q15_t    *pA;
+    long  rowCnt = wt_row_num >> 2;
+
+    nn_dup_s8_s16_reordered(in_vec, in_tmp_buf, size);
+
+    while (rowCnt)
+    {
+        /* init sum with bias */
+        q31_t     sum =  ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        q31_t     sum2 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        q31_t     sum3 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        q31_t     sum4 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+
+        uint16_t  colCnt = size >> 2;
+        pA = in_tmp_buf;
+
+        while (colCnt)
+        {
+            long     inM11, inM12, inM13, inM14;
+            long     inV;
+
+            inV = *__SIMD32(pA)++;
+            inM11 = *__SIMD32(pB)++;
+            inM12 = NDS_DSP_SUNPKD831(inM11);
+            inM11 = NDS_DSP_SUNPKD820(inM11);
+#if !ENA_DSP_BE
+            sum = NDS_DSP_KMADA(sum, inM11, inV);
+            sum2 = NDS_DSP_KMADA(sum2, inM12, inV);
+#else
+            sum = NDS_DSP_KMADA(sum, inM12, inV);
+            sum2 = NDS_DSP_KMADA(sum2, inM11, inV);
+#endif
+
+            inM13 = *__SIMD32(pB)++;
+            inM14 = NDS_DSP_SUNPKD831(inM13);
+            inM13 = NDS_DSP_SUNPKD820(inM13);
+#if !ENA_DSP_BE
+            sum3 = NDS_DSP_KMADA(sum3, inM13, inV);
+            sum4 = NDS_DSP_KMADA(sum4, inM14, inV);
+#else
+            sum3 = NDS_DSP_KMADA(sum3, inM14, inV);
+            sum4 = NDS_DSP_KMADA(sum4, inM13, inV);
+#endif
+
+            inV = *__SIMD32(pA)++;
+            inM11 = *__SIMD32(pB)++;
+            inM12 = NDS_DSP_SUNPKD831(inM11);
+            inM11 = NDS_DSP_SUNPKD820(inM11);
+#if !ENA_DSP_BE
+            sum = NDS_DSP_KMADA(sum, inM11, inV);
+            sum2 = NDS_DSP_KMADA(sum2, inM12, inV);
+#else
+            sum = NDS_DSP_KMADA(sum, inM12, inV);
+            sum2 = NDS_DSP_KMADA(sum2, inM11, inV);
+#endif
+
+            inM13 = *__SIMD32(pB)++;
+            inM14 = NDS_DSP_SUNPKD831(inM13);
+            inM13 = NDS_DSP_SUNPKD820(inM13);
+#if !ENA_DSP_BE
+            sum3 = NDS_DSP_KMADA(sum3, inM13, inV);
+            sum4 = NDS_DSP_KMADA(sum4, inM14, inV);
+#else
+            sum3 = NDS_DSP_KMADA(sum3, inM14, inV);
+            sum4 = NDS_DSP_KMADA(sum4, inM13, inV);
+#endif
+            colCnt--;
+        }
+
+        colCnt = size & 0x3;
+        while (colCnt)
+        {
+            q15_t     inV = *pA++;
+            q7_t      inM = *pB++;
+            q7_t      inM2 = *pB++;
+            q7_t      inM3 = *pB++;
+            q7_t      inM4 = *pB++;
+
+            sum += inV * inM;
+            sum2 += inV * inM2;
+            sum3 += inV * inM3;
+            sum4 += inV * inM4;
+            colCnt--;
+        }                       /* while over colCnt */
+
+        *pO++ = (q7_t) (NDS_DSP_SATS((sum >> out_rshift), 8));
+        *pO++ = (q7_t) (NDS_DSP_SATS((sum2 >> out_rshift), 8));
+        *pO++ = (q7_t) (NDS_DSP_SATS((sum3 >> out_rshift), 8));
+        *pO++ = (q7_t) (NDS_DSP_SATS((sum4 >> out_rshift), 8));
+
+        /* adjust the pointers and counters */
+        rowCnt--;
+    }
+
+    /* left-over part of the rows */
+    rowCnt = wt_row_num & 0x3;
+
+    while (rowCnt)
+    {
+        q31_t     sum = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        uint16_t  colCnt = size >> 2;
+
+        pA = in_tmp_buf;
+
+        while (colCnt)
+        {
+            q31_t     inV1, inV2, inM11, inM12;
+
+            pB = (q7_t *) read_and_pad_reordered((void *)pB, &inM11, &inM12);
+
+            inV1 = *__SIMD32(pA)++;
+            sum = NDS_DSP_KMADA(sum, inV1, inM11);
+
+            inV2 = *__SIMD32(pA)++;
+            sum = NDS_DSP_KMADA(sum, inV2, inM12);
+
+            colCnt--;
+        }
+
+        /* left-over of the vector */
+        colCnt = size & 0x3;
+        while (colCnt)
+        {
+            q15_t     inV = *pA++;
+            q7_t      inM = *pB++;
+            sum += inV * inM;
+            colCnt--;
+        }
+
+        *pO++ = (q7_t) (NDS_DSP_SATS((sum >> out_rshift), 8));
+
+        rowCnt--;
+    }
+#else // general
+    uint16_t  rowCnt = wt_row_num >> 2;
+    const q7_t *pB = wt_mat;
+    const q7_t *pA;
+    q7_t     *pO = out_vec;
+    const q7_t *pBias = bias;
+
+    while (rowCnt)
+    {
+        q31_t     sum =  ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        q31_t     sum2 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        q31_t     sum3 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        q31_t     sum4 = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+
+        uint16_t  colCnt = size >> 2;
+
+        pA = in_vec;
+
+        while (colCnt)
+        {
+            q7_t      inA1 = *pA++;
+            q7_t      inA3 = *pA++;
+            q7_t      inA2 = *pA++;
+            q7_t      inA4 = *pA++;
+
+            q7_t      inB1 = *pB++;
+            q7_t      inB3 = *pB++;
+            q7_t      inB2 = *pB++;
+            q7_t      inB4 = *pB++;
+
+            sum += inA1 * inB1 + inA2 * inB2;
+            sum2 += inA1 * inB3 + inA2 * inB4;
+
+            inB1 = *pB++;
+            inB3 = *pB++;
+            inB2 = *pB++;
+            inB4 = *pB++;
+
+            sum3 += inA1 * inB1 + inA2 * inB2;
+            sum4 += inA1 * inB3 + inA2 * inB4;
+
+            inB1 = *pB++;
+            inB3 = *pB++;
+            inB2 = *pB++;
+            inB4 = *pB++;
+
+            sum += inA3 * inB1 + inA4 * inB2;
+            sum2 += inA3 * inB3 + inA4 * inB4;
+
+            inB1 = *pB++;
+            inB3 = *pB++;
+            inB2 = *pB++;
+            inB4 = *pB++;
+
+            sum3 += inA3 * inB1 + inA4 * inB2;
+            sum4 += inA3 * inB3 + inA4 * inB4;
+
+            colCnt--;
+        }
+        colCnt = size & 0x3;
+        while (colCnt)
+        {
+            q7_t      inA = *pA++;
+            q7_t      inB = *pB++;
+            sum += inA * inB;
+            inB = *pB++;
+            sum2 += inA * inB;
+            inB = *pB++;
+            sum3 += inA * inB;
+            inB = *pB++;
+            sum4 += inA * inB;
+
+            colCnt--;
+        }
+        *pO++ = (q7_t) NDS_ISA_SATS((sum >> out_rshift), 8);
+        *pO++ = (q7_t) NDS_ISA_SATS((sum2 >> out_rshift), 8);
+        *pO++ = (q7_t) NDS_ISA_SATS((sum3 >> out_rshift), 8);
+        *pO++ = (q7_t) NDS_ISA_SATS((sum4 >> out_rshift), 8);
+
+        rowCnt--;
+    }
+
+    rowCnt = wt_row_num & 0x3;
+
+    while (rowCnt)
+    {
+        int ip_out = ((q31_t)(*pBias++) << bias_lshift) + NN_ROUND(out_rshift);
+        int j;
+
+        pA = in_vec;
+        for (j = 0; j < size; j++)
+        {
+            q7_t      inA = *pA++;
+            q7_t      inB = *pB++;
+            ip_out += inA * inB;
+        }
+        *pO++ = (q7_t) NDS_ISA_SATS((ip_out >> out_rshift), 8);
+
+        rowCnt--;
+    }
+
+#endif                          /* ENA_DSP_ISA */
+
+    return 0;
+}

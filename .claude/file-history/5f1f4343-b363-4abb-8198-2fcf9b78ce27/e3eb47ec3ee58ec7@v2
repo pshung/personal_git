@@ -1,0 +1,79 @@
+---
+type: operator
+function: riscv_nn_conv_1x1_HWC_s8_s8_s8_asym_bias_fast_any
+source: Source/ConvolutionFunctions/riscv_nn_conv_1x1_HWC_s8_s8_s8_asym_bias_fast_any.c
+tags: [conv_1x1, s8, asym, bias, fast, any, rvv, vd4dots, runtime-dispatch]
+current_speedup: 2.60x
+baseline_cycles: 1116941
+current_cycles: 428860
+---
+
+# conv_1x1_HWC_s8_s8_s8_asym_bias_fast_any
+
+## What This Function Does
+
+Pointwise (1x1) convolution: projects each pixel independently through a weight matrix. No spatial sliding window. Equivalent to GEMM:
+
+```
+Output[M][N] = Input[M][K] x Weight[N][K]^T + bias[N]
+```
+
+Where M = H*W pixels, N = out_ch, K = in_ch.
+
+Test case: M=224 (14x16), N=32, K=512.
+
+## Active Code Path
+
+`#ifdef ENA_VEC_ISA && !defined(ENA_VEC_ELEN64)` was the tiling path. After fix:
+
+Runtime dispatch (commit 0a65e6c7) selects between:
+- **Small N** (N <= VLMAX_e8_m4/4): `nn_mat_mult_nt_t_s8_v2` -- vectorize K=512
+- **Large N** (N > threshold): `nn_mat_mul_kernel_tiling_asym_s8_s8_s8` -- vectorize N
+
+## Optimization History
+
+| Date | Commit | Approach | Cycles | Speedup | Notes |
+|---|---|---|---|---|---|
+| pre-2026-03-24 | baseline | ENA_TILING: `nn_mat_mul_kernel_tiling_transpose_q7` -> vectorize N=32 | 1,116,941 | 1.00x | VL=32/256=12.5% |
+| 2026-03-24 | dc9f3d62 | Direct GEMM: `nn_mat_mult_nt_t_s8_v2` -- vectorize K=512 | 428,860 | 2.60x | VL=128/128=100% |
+| 2026-03-25 | 0a65e6c7 | Runtime dispatch: threshold = VLMAX_e8_m4/4 | 428,860 | 2.60x | Fixes large-N regression |
+
+## Why 2.60x (Not 4-5x Like Other Conv Functions)
+
+Unlike conv_HWC functions, this function already had a reasonable starting point in some senses. The speedup is limited by:
+
+1. **VREDSUM overhead:** After vectorizing K=512, each output channel requires a VREDSUM to collapse the partial sums. For N=32 output channels: 32 VREDSUM calls per pixel group. This cannot be eliminated.
+
+2. **IPC penalty:** VD4DOTS at VL=128 has lower IPC (0.50) than VQMACC at VL=32 (0.72). The pipeline is longer per instruction.
+
+Despite these costs, the 3.74x instruction count reduction (807,631 -> 215,681) drives the 2.60x cycle reduction.
+
+See [[ipc-vs-throughput]] for the detailed analysis.
+
+## The Large-N Regression
+
+Initial commit `dc9f3d62` (no dispatch) regressed on test 9 (N=2050):
+- VD4DOTS: 2050/4 = ~513 VREDSUM calls per pixel group -- massive overhead
+- Tiling GEMM at N=2050: VL=512 at VLEN=1024 (25% util but large N amortizes)
+- Tiling wins for large N
+
+Commit `0a65e6c7` added VLMAX-based dispatch to fix this. No VLEN-specific magic constants.
+
+## Current State (2026-03-25)
+
+The main algorithmic opportunity is exhausted. Current profile:
+- Cycles: 428,860 (small N=32 test case)
+- Instructions: 215,681
+- IPC: 0.50
+
+Next potential optimization (uarch level): VREDSUM scheduling. The 16 VREDSUM calls after the K-loop serialize; interleaving them or restructuring to reduce serial reduction chains could help marginally.
+
+## Key Techniques Applied
+
+- [[vectorize-k-vs-n]] -- root cause and fix
+- [[runtime-dispatch]] -- VLMAX-based threshold for large-N portability
+- [[ipc-vs-throughput]] -- why 2.60x despite lower IPC
+
+## Reference
+
+Full analysis in `docs/conv1x1_asym_optimization_report.md`.

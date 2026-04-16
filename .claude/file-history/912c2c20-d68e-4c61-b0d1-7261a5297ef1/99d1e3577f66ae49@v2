@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""
+run_experiment.py: Drive the full gen -> build -> test -> report pipeline.
+
+Usage:
+    # Single config:
+    python run_experiment.py tools/libm_gen/configs/d9_estrin2.toml
+
+    # Sweep (directory of configs):
+    python run_experiment.py tools/libm_gen/configs/sweep/
+
+    # Skip bench (FPGA not available):
+    python run_experiment.py --no-bench tools/libm_gen/configs/d9_estrin2.toml
+
+Run from: libm/machine/riscv/
+"""
+
+import sys
+import os
+import re
+import csv
+import json
+import subprocess
+import argparse
+from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        sys.exit("Python >= 3.11 required (for tomllib), or install 'tomli'.")
+
+SCRIPT_DIR = Path(__file__).parent
+GEN_SINF   = SCRIPT_DIR / "gen_sinf.py"
+GEN_ROOT   = Path("gen")
+
+# Tool paths (same as Makefile defaults)
+TOOLCHAIN_32 = Path("/local/nick/SW_Release/build-ast542/build-toolchain/linux/nds32le-elf-mculib-v5")
+SIZE_32      = TOOLCHAIN_32 / "bin" / "riscv32-elf-size"
+
+
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
+
+def _run(cmd, **kwargs):
+    """Run command, print it, return CompletedProcess."""
+    print(f"  $ {' '.join(str(c) for c in cmd)}")
+    return subprocess.run(cmd, **kwargs)
+
+
+def _die(msg):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Generation step
+# ---------------------------------------------------------------------------
+
+def generate(cfg_path: Path):
+    """Call gen_sinf.py to produce gen/<name>/ artifacts."""
+    result = _run([sys.executable, str(GEN_SINF), str(cfg_path)],
+                  capture_output=False)
+    if result.returncode != 0:
+        _die(f"gen_sinf.py failed for {cfg_path}")
+
+
+# ---------------------------------------------------------------------------
+# Make steps
+# ---------------------------------------------------------------------------
+
+def run_make_test(name: str) -> dict:
+    """
+    Run 'make GEN=<name> test-sinf' and parse the accuracy output.
+    Returns dict with keys: pass (bool), diff_lines (int).
+    """
+    result = _run(
+        ["make", f"GEN={name}", "test-sinf"],
+        capture_output=True, text=True
+    )
+    output = result.stdout + result.stderr
+    print(output)
+
+    # Parse outcome line: "  sinf           PASS" or "  sinf           FAIL (N diffs)"
+    m = re.search(r"sinf\s+(PASS|FAIL)\s*(?:\((\d+) diffs\))?", output)
+    if m:
+        passed = m.group(1) == "PASS"
+        diffs  = int(m.group(2)) if m.group(2) else 0
+        return {"pass": passed, "diff_lines": diffs}
+
+    return {"pass": result.returncode == 0, "diff_lines": -1}
+
+
+def run_make_bench(name: str) -> dict:
+    """
+    Run 'make GEN=<name> bench-sinf' (FPGA via GDB) and parse cycle counts.
+    Returns dict: ref_cycles, opt_cycles, speedup.
+    """
+    result = _run(
+        ["make", f"GEN={name}", "bench-sinf"],
+        capture_output=True, text=True
+    )
+    output = result.stdout + result.stderr
+    print(output)
+
+    # Parse table line: "  sinf           12345    6789  1.82x   ..."
+    m = re.search(r"sinf\s+(\d+)\s+(\d+)\s+([\d.]+)x", output)
+    if m:
+        return {
+            "ref_cycles": int(m.group(1)),
+            "opt_cycles": int(m.group(2)),
+            "speedup":    float(m.group(3)),
+        }
+    return {"ref_cycles": 0, "opt_cycles": 0, "speedup": 0.0}
+
+
+# ---------------------------------------------------------------------------
+# Size measurement
+# ---------------------------------------------------------------------------
+
+def measure_size(name: str) -> dict:
+    """
+    Build gen/<name>/ objects (if not already built via make test) and
+    measure .text size via riscv32-elf-size.
+    """
+    gen_dir = GEN_ROOT / name
+    arch_flags = ["-march=rv32imc_zicsr", "-mabi=ilp32"]
+    as_path = TOOLCHAIN_32 / "bin" / "riscv32-elf-gcc"
+
+    text_total = 0
+    for src in ["sf_sin.s", "andes_fpsincof.s", "andes_fpcoscof.s", "andes_fpreduct.s"]:
+        src_path = gen_dir / src
+        if not src_path.exists():
+            continue
+        obj_path = gen_dir / src.replace(".s", ".o")
+        _run([str(as_path)] + arch_flags + ["-c", "-o", str(obj_path), str(src_path)],
+             capture_output=True)
+        if obj_path.exists() and SIZE_32.exists():
+            r = subprocess.run(
+                [str(SIZE_32), "-A", str(obj_path)],
+                capture_output=True, text=True
+            )
+            m = re.search(r"\.text\s+(\d+)", r.stdout)
+            if m:
+                text_total += int(m.group(1))
+
+    return {"text_bytes": text_total}
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+def load_report(name: str) -> dict:
+    path = GEN_ROOT / name / "report.json"
+    if path.exists():
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+
+def save_report(name: str, data: dict):
+    path = GEN_ROOT / name / "report.json"
+    # Merge with existing report
+    existing = load_report(name)
+    existing.update(data)
+    with open(path, "w") as f:
+        json.dump(existing, f, indent=2)
+    print(f"  Report: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Single-config experiment
+# ---------------------------------------------------------------------------
+
+def run_one(cfg_path: Path, no_bench: bool) -> dict:
+    with open(cfg_path, "rb") as f:
+        cfg = tomllib.load(f)
+    name = cfg["name"]
+
+    print(f"\n{'='*60}")
+    print(f"  Experiment: {name}")
+    print(f"  Config: {cfg_path}")
+    print(f"{'='*60}")
+
+    # Step 1: Generate
+    print("\n[1/4] Generating assembly...")
+    generate(cfg_path)
+
+    # Step 2: Test accuracy
+    print("\n[2/4] Running accuracy test (make test-sinf)...")
+    test_result = run_make_test(name)
+
+    # Step 3: Measure size
+    print("\n[3/4] Measuring code size...")
+    size_result = measure_size(name)
+
+    # Step 4: Bench (optional)
+    bench_result = {}
+    bench_enabled = cfg.get("bench", {}).get("enabled", False)
+    if bench_enabled and not no_bench:
+        print("\n[4/4] Running benchmark (make bench-sinf)...")
+        bench_result = run_make_bench(name)
+    else:
+        print("\n[4/4] Bench skipped (--no-bench or bench.enabled=false)")
+
+    # Load polynomial bounds from coeffs.json
+    coeffs_path = GEN_ROOT / name / "coeffs.json"
+    poly_bound = None
+    if coeffs_path.exists():
+        with open(coeffs_path) as f:
+            coeffs_data = json.load(f)
+        # supnorm is stored as string by Sollya
+        poly_bound = coeffs_data.get("polynomial_ulp_bound")
+
+    # Assemble report
+    report = {
+        "config": str(cfg_path),
+        "function": cfg.get("function"),
+        "evaluation": cfg.get("kernel", {}).get("evaluation"),
+        "sin_degree": cfg.get("kernel", {}).get("sin_degree"),
+        "cos_degree": cfg.get("kernel", {}).get("cos_degree"),
+        "polynomial_ulp_bound": poly_bound,
+        "test_pass": test_result.get("pass"),
+        "diff_lines": test_result.get("diff_lines"),
+        **size_result,
+        **bench_result,
+    }
+    save_report(name, report)
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Sweep
+# ---------------------------------------------------------------------------
+
+def run_sweep(sweep_dir: Path, no_bench: bool):
+    configs = sorted(sweep_dir.glob("*.toml"))
+    if not configs:
+        _die(f"No .toml files found in {sweep_dir}")
+
+    reports = []
+    for cfg_path in configs:
+        try:
+            r = run_one(cfg_path, no_bench)
+            reports.append(r)
+        except SystemExit:
+            print(f"WARNING: {cfg_path} failed, skipping")
+            continue
+
+    # Write sweep CSV
+    if not reports:
+        print("No successful experiments.")
+        return
+
+    csv_path = GEN_ROOT / "sweep.csv"
+    fields = ["config", "function", "evaluation", "sin_degree", "cos_degree",
+              "polynomial_ulp_bound", "test_pass", "diff_lines",
+              "text_bytes", "ref_cycles", "opt_cycles", "speedup"]
+
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(reports)
+
+    print(f"\nSweep CSV: {csv_path}")
+    print("\nResults summary:")
+    print(f"  {'name':<25} {'pass':>5} {'diffs':>7} {'bytes':>7} {'opt_cyc':>8} {'speedup':>8}")
+    print(f"  {'-'*25} {'-'*5} {'-'*7} {'-'*7} {'-'*8} {'-'*8}")
+    for r in reports:
+        name = Path(r.get("config", "")).stem
+        print(f"  {name:<25} {str(r.get('test_pass','?')):>5} "
+              f"{str(r.get('diff_lines','-')):>7} "
+              f"{str(r.get('text_bytes','-')):>7} "
+              f"{str(r.get('opt_cycles','-')):>8} "
+              f"{str(r.get('speedup','-')):>8}")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run sinf code-gen experiment(s): generate, test, bench, report"
+    )
+    parser.add_argument("config",
+        help="Path to a single .toml config or a directory of .toml configs (sweep mode)")
+    parser.add_argument("--no-bench", action="store_true",
+        help="Skip FPGA benchmarking (useful when FPGA is not available)")
+    args = parser.parse_args()
+
+    target = Path(args.config)
+    if not target.exists():
+        _die(f"Not found: {target}")
+
+    if target.is_dir():
+        run_sweep(target, args.no_bench)
+    else:
+        run_one(target, args.no_bench)
+
+
+if __name__ == "__main__":
+    main()

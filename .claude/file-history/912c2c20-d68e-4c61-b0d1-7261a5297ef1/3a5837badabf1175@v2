@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""
+gen_sinf.py: Generate sinf/cosf assembly from a TOML config.
+
+Usage:
+    python gen_sinf.py <config.toml>
+    python gen_sinf.py <config.toml> --dry-run
+
+Output: gen/<config.name>/ (relative to CWD, which should be libm/machine/riscv/).
+
+Q-format background
+-------------------
+After __gf_fpreduct, the reduced argument is returned as:
+  x10 = mantissa in Q0.32 (value = x10 / 2^32, in [0.5, 1.0))
+  x11 = biased exponent (normalization shifts applied)
+  x12 = quadrant (0-3)
+
+The sin kernel computes x13 = mulhu(x14, x14) >> 2*(126 - exponent),
+which gives x13 = actual_arg^2 * 2^32 (Q0.32 representation of x^2).
+
+The Horner polynomial then evaluates sin(x)/x in Q1.31:
+  result = c[n] - x13*(c[n-1] - x13*(... - x13*c[0])) / 2^32 at each step
+       = 2^31 * (sin(x)/x)
+
+Coefficients in Q1.31 for the standard Taylor polynomials:
+  sin(x)/x: 1, 1/6, 1/120, 1/5040, 1/362880 ...
+  cos(x):   1, 1/2, 1/24,  1/720,  1/40320  ...
+
+Sollya computes minimax (better than Taylor), scaled to Q1.31 integers.
+"""
+
+import sys
+import os
+import json
+import subprocess
+import shutil
+import tempfile
+import textwrap
+from pathlib import Path
+
+# Python 3.11+ has tomllib in stdlib; fall back to tomli third-party package.
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        sys.exit("Python >= 3.11 required (for tomllib), or install 'tomli' package.")
+
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR = Path(__file__).parent
+TEMPLATE_DIR = SCRIPT_DIR / "templates"
+# Generator output goes to gen/<name>/ relative to CWD.
+GEN_ROOT = Path("gen")
+
+
+# ---------------------------------------------------------------------------
+# Config loading and validation
+# ---------------------------------------------------------------------------
+
+REQUIRED_TOP = {"function", "name", "target", "kernel", "reduction", "accuracy"}
+VALID_FUNCTIONS = {"sinf", "cosf", "tanf"}
+VALID_EVALUATION = {"horner", "estrin2", "estrin4"}
+VALID_STRATEGIES = {"bit_serial", "cody_waite_2", "cody_waite_3", "payne_hanek"}
+
+def load_config(path: Path) -> dict:
+    with open(path, "rb") as f:
+        cfg = tomllib.load(f)
+    _validate(cfg, path)
+    return cfg
+
+
+def _validate(cfg: dict, path: Path):
+    missing = REQUIRED_TOP - set(cfg)
+    if missing:
+        _die(f"Missing required top-level keys in {path}: {missing}")
+
+    fn = cfg.get("function", "")
+    if fn not in VALID_FUNCTIONS:
+        _die(f"function must be one of {VALID_FUNCTIONS}, got '{fn}'")
+
+    ev = cfg.get("kernel", {}).get("evaluation", "horner")
+    if ev not in VALID_EVALUATION:
+        _die(f"kernel.evaluation must be one of {VALID_EVALUATION}, got '{ev}'")
+
+    st = cfg.get("reduction", {}).get("strategy", "bit_serial")
+    if st not in VALID_STRATEGIES:
+        _die(f"reduction.strategy must be one of {VALID_STRATEGIES}, got '{st}'")
+
+    if st == "bit_serial" and cfg.get("reduction", {}).get("huge_arg_policy") == "reduce":
+        _die("reduction.huge_arg_policy='reduce' requires strategy='payne_hanek', not 'bit_serial'")
+
+
+def _die(msg: str):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Sollya-based coefficient computation
+# ---------------------------------------------------------------------------
+
+def compute_coeffs_sollya(cfg: dict) -> dict:
+    """
+    Run Sollya to compute minimax polynomial coefficients.
+    Returns dict with 'sin' and 'cos' lists of float coefficients,
+    ordered outermost to innermost (constant term first).
+    """
+    kernel = cfg["kernel"]
+    sin_deg = kernel["sin_degree"]   # must be odd (7, 9, 11, ...)
+    cos_deg = kernel["cos_degree"]   # must be even (8, 10, 12, ...)
+
+    # Number of terms: degree/2 + 1 for each (polynomial in x^2)
+    n_sin = (sin_deg - 1) // 2 + 1   # e.g. degree-7 -> 4 terms
+    n_cos = cos_deg // 2 + 1         # e.g. degree-8 -> 5 terms
+
+    script = _build_sollya_script(n_sin, n_cos)
+    result = _run_sollya(script)
+    sin_coeffs, cos_coeffs = _parse_sollya_output(result, n_sin, n_cos)
+    return {"sin": sin_coeffs, "cos": cos_coeffs}
+
+
+def _build_sollya_script(n_sin: int, n_cos: int) -> str:
+    """
+    Build the Sollya script for computing minimax polynomial coefficients.
+
+    The polynomial variable is u = x^2 (actual argument squared).
+    Domain: u in [0, (pi/4)^2].
+
+    sin(x)/x expressed as polynomial in u: g_sin(u) = sin(sqrt(u))/sqrt(u)
+    cos(x) expressed as polynomial in u:   g_cos(u) = cos(sqrt(u))
+
+    Coefficients are output from degree-0 (constant) to degree-n,
+    i.e., outermost to innermost Horner order.
+    """
+    sin_degs = list(range(n_sin))  # [0, 1, ..., n_sin-1]
+    cos_degs = list(range(n_cos))  # [0, 1, ..., n_cos-1]
+
+    sin_deg_str = "[|" + ",".join(str(d) for d in sin_degs) + "|]"
+    cos_deg_str = "[|" + ",".join(str(d) for d in cos_degs) + "|]"
+
+    # Use D (double) precision for coefficient output - DD causes NaN in supnorm
+    sin_fmt = "[|" + ",".join(["D"] * n_sin) + "|]"
+    cos_fmt = "[|" + ",".join(["D"] * n_cos) + "|]"
+
+    # Small positive lower bound avoids removable singularity at x=0 in supnorm
+    d_lo = "1b-100"
+
+    lines = [
+        "prec = 256!;",
+        "display = decimal;",
+        f"d = [{d_lo}, (Pi/4)^2];",
+        "",
+        "/* Sin polynomial: sin(sqrt(u))/sqrt(u) on [eps, (pi/4)^2] */",
+        "g_sin = sin(sqrt(x))/sqrt(x);",
+        f"p_sin = fpminimax(g_sin, {sin_deg_str}, {sin_fmt}, d, relative);",
+        "/* supnorm is informational only -- skip to avoid blocking on hard cases */",
+        "",
+        "/* Cos polynomial: cos(sqrt(u)) on [eps, (pi/4)^2] */",
+        "g_cos = cos(sqrt(x));",
+        f"p_cos = fpminimax(g_cos, {cos_deg_str}, {cos_fmt}, d, relative);",
+        "",
+        "print(\"SIN_COEFFS_BEGIN\");",
+    ]
+    for k in range(n_sin):
+        lines.append(f"print(\"SIN_COEFF\", {k}, coeff(p_sin, {k}));")
+    lines.append("print(\"SIN_COEFFS_END\");")
+    lines.append("")
+    lines.append("print(\"COS_COEFFS_BEGIN\");")
+    for k in range(n_cos):
+        lines.append(f"print(\"COS_COEFF\", {k}, coeff(p_cos, {k}));")
+    lines.append("print(\"COS_COEFFS_END\");")
+    return "\n".join(lines)
+
+
+def _run_sollya(script: str) -> str:
+    """Invoke sollya, return stdout."""
+    if not shutil.which("sollya"):
+        _die("'sollya' not found on PATH. Install Sollya or add it to PATH.")
+    with tempfile.NamedTemporaryFile(suffix=".sollya", mode="w", delete=False) as f:
+        f.write(script)
+        tmp = f.name
+    try:
+        result = subprocess.run(
+            ["sollya", "--warnonstderr", tmp],
+            capture_output=True, text=True, timeout=120
+        )
+        # Sollya exits with 3 on warnings; only die on hard failure (no output)
+        if result.returncode not in (0, 3):
+            print("Sollya stderr:", result.stderr, file=sys.stderr)
+            _die(f"Sollya exited with code {result.returncode}")
+        if result.stderr:
+            print("Sollya warnings:", result.stderr[:500], file=sys.stderr)
+        return result.stdout
+    finally:
+        os.unlink(tmp)
+
+
+def _parse_sollya_output(output: str, n_sin: int, n_cos: int) -> tuple:
+    """Parse Sollya output, returning (sin_coeffs, cos_coeffs) as lists of floats."""
+    sin_coeffs = [None] * n_sin
+    cos_coeffs = [None] * n_cos
+
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("SIN_COEFF "):
+            # Format: "SIN_COEFF 2 -1.6666666...e-01"
+            parts = line.split(None, 2)   # split on whitespace, max 3 parts
+            k = int(parts[1])
+            sin_coeffs[k] = float(parts[2])
+        elif line.startswith("COS_COEFF "):
+            parts = line.split(None, 2)
+            k = int(parts[1])
+            cos_coeffs[k] = float(parts[2])
+
+    if None in sin_coeffs:
+        _die(f"Failed to parse all sin coefficients from Sollya output. Got: {sin_coeffs}")
+    if None in cos_coeffs:
+        _die(f"Failed to parse all cos coefficients from Sollya output. Got: {cos_coeffs}")
+
+    return sin_coeffs, cos_coeffs
+
+
+# ---------------------------------------------------------------------------
+# Q1.31 conversion and table building
+# ---------------------------------------------------------------------------
+
+def float_to_q131(c: float) -> int:
+    """Convert floating-point coefficient to Q1.31 unsigned integer."""
+    return round(abs(c) * (2 ** 31))
+
+
+def build_sin_table(coeffs_float: list, unroll: bool) -> list:
+    """
+    Build sin coefficient table in Q1.31 integers, ordered innermost to outermost.
+
+    coeffs_float: [c0, c1, ..., cn] from Sollya, outer-to-inner (c0 is constant term).
+    Returns table [q31(cn), ..., q31(c1), sentinel(c0)] for looped Horner,
+    or         [q31(cn), ..., q31(c1), q31(c0)] for unrolled.
+
+    Sentinel: the outermost coeff (c0 ≈ 1.0) will be >= 2^31 from Sollya minimax,
+    so it naturally acts as the loop-terminating sentinel (MSB set).
+    """
+    # Reverse: highest degree (innermost) first, constant term last
+    table = [float_to_q131(c) for c in reversed(coeffs_float)]
+    if not unroll:
+        # Ensure sentinel bit is set on last entry (it should be naturally for c0 >= 1.0)
+        if table[-1] < (1 << 31):
+            # Force sentinel bit: add 2^31. This might happen for cosf where c0 < 1.
+            table[-1] |= (1 << 31)
+    return table
+
+
+def build_cos_table(coeffs_float: list, unroll: bool) -> list:
+    """
+    Same as build_sin_table but for cos. Same layout convention.
+    cos(x) = 1 - x^2/2 + ... so c0 = 1.0, sentinel applies similarly.
+    """
+    return build_sin_table(coeffs_float, unroll)
+
+
+# ---------------------------------------------------------------------------
+# Assembly template rendering
+# ---------------------------------------------------------------------------
+
+def _read_template(name: str) -> str:
+    path = TEMPLATE_DIR / name
+    if not path.exists():
+        _die(f"Template not found: {path}")
+    return path.read_text()
+
+
+def render_coeff_table(name: str, symbol: str, table: list) -> str:
+    """Render a .s coefficient table file."""
+    size_bytes = len(table) * 4
+    longs = "\n".join(f"\t.long\t{v}" for v in table)
+    tmpl = _read_template("andes_fpsincof.s.tmpl")
+    return tmpl.replace("${SYMBOL}", symbol) \
+               .replace("${SIZE}", str(size_bytes)) \
+               .replace("${COEFFICIENTS}", longs)
+
+
+def render_fpreduct(cfg: dict) -> str:
+    """Render andes_fpreduct.s from template, selecting strategy variant."""
+    strategy = cfg["reduction"]["strategy"]
+    huge_policy = cfg["reduction"].get("huge_arg_policy", "return_nan")
+
+    # Render the huge_arg code block based on policy
+    if huge_policy == "return_nan":
+        huge_code = (
+            "\tli\tx12, -1                 # quadrant sentinel -> qNaN\n"
+            "\tli\tx11, 4290772992         # 0xFF800000\n"
+            "\ttail\t.LAret"
+        )
+    elif huge_policy == "reduce":
+        # Payne-Hanek required for reduce; bit_serial validated to reject this combo
+        huge_code = (
+            "\t# Payne-Hanek not yet implemented; fall through to return_nan\n"
+            "\tli\tx12, -1\n"
+            "\tli\tx11, 4290772992\n"
+            "\ttail\t.LAret"
+        )
+    else:
+        huge_code = (
+            "\tli\tx12, -1\n"
+            "\tli\tx11, 4290772992\n"
+            "\ttail\t.LAret"
+        )
+
+    tmpl = _read_template("andes_fpreduct.s.tmpl")
+    return tmpl.replace("${STRATEGY}", strategy) \
+               .replace("${HUGE_ARG_POLICY}", huge_policy) \
+               .replace("${HUGE_ARG_CODE}", huge_code)
+
+
+def render_sf_sin(cfg: dict, sin_table: list, cos_table: list) -> str:
+    """Render sf_sin.s from template, selecting kernel variant."""
+    kernel = cfg["kernel"]
+    evaluation = kernel.get("evaluation", "horner")
+    unroll = kernel.get("unroll", False)
+
+    if evaluation == "horner":
+        return _render_sf_sin_horner(cfg, sin_table, cos_table, unroll)
+    elif evaluation == "estrin2":
+        return _render_sf_sin_estrin2(cfg, sin_table, cos_table)
+    elif evaluation == "estrin4":
+        return _render_sf_sin_estrin4(cfg, sin_table, cos_table)
+    else:
+        _die(f"Unknown evaluation scheme: {evaluation}")
+
+
+def _render_sf_sin_horner(cfg, sin_table, cos_table, unroll: bool) -> str:
+    """Horner evaluation: looped (with sentinel) or unrolled."""
+    tmpl = _read_template("sf_sin.s.tmpl")
+
+    if unroll:
+        sin_body = _horner_unrolled_body("sin", sin_table)
+        cos_body = _horner_unrolled_body("cos", cos_table)
+    else:
+        sin_body = _horner_looped_body("sin")
+        cos_body = _horner_looped_body("cos")
+
+    return tmpl.replace("${SIN_KERNEL_BODY}", sin_body) \
+               .replace("${COS_KERNEL_BODY}", cos_body) \
+               .replace("${EVALUATION}", "horner") \
+               .replace("${NAME}", cfg["name"])
+
+
+def _horner_looped_body(kind: str) -> str:
+    """Generate the looped Horner kernel body (matches GoFast style)."""
+    if kind == "sin":
+        return textwrap.dedent("""\
+            \tla\tx18, __gf_fpsincof
+            \tlw\tx11, 0(x18)
+            \taddi\tx18, x18, 4
+            .Lb7:
+            \tmulhu\tx11, x13, x11
+            \tlw\tx12, 0(x18)
+            \taddi\tx18, x18, 4
+            \tsub\tx11, x12, x11
+            \tbgez\tx12, .Lb7""")
+    else:
+        return textwrap.dedent("""\
+            \tla\tx18, __gf_fpcoscof
+            \tlw\tx14, 0(x18)
+            \taddi\tx18, x18, 4
+            .Lb9:
+            \tmulhu\tx14, x13, x14
+            \tlw\tx12, 0(x18)
+            \taddi\tx18, x18, 4
+            \tsub\tx14, x12, x14
+            \tbgez\tx12, .Lb9""")
+
+
+def _horner_unrolled_body(kind: str, table: list) -> str:
+    """Generate fully unrolled Horner kernel body."""
+    lines = []
+    # table is [innermost (highest degree), ..., outermost (constant)]
+    # First entry loaded directly, then each step: mulhu + li + sub
+    if kind == "sin":
+        acc_reg = "x11"
+        cof_reg = "x12"
+        r2_reg = "x13"
+    else:
+        acc_reg = "x14"
+        cof_reg = "x12"
+        r2_reg = "x13"
+
+    # Load innermost coefficient
+    lines.append(f"\tli\t{acc_reg}, {table[0]}")
+
+    # Iterate over the rest
+    for c in table[1:]:
+        lines.append(f"\tmulhu\t{acc_reg}, {r2_reg}, {acc_reg}")
+        lines.append(f"\tli\t{cof_reg}, {c}")
+        lines.append(f"\tsub\t{acc_reg}, {cof_reg}, {acc_reg}")
+
+    return "\n".join(lines)
+
+
+def _render_sf_sin_estrin2(cfg, sin_table, cos_table) -> str:
+    """Estrin-2 evaluation: pairs of Horner steps computed in parallel."""
+    tmpl = _read_template("sf_sin.s.tmpl")
+    sin_body = _estrin2_body("sin", sin_table)
+    cos_body = _estrin2_body("cos", cos_table)
+    return tmpl.replace("${SIN_KERNEL_BODY}", sin_body) \
+               .replace("${COS_KERNEL_BODY}", cos_body) \
+               .replace("${EVALUATION}", "estrin2") \
+               .replace("${NAME}", cfg["name"])
+
+
+def _estrin2_body(kind: str, table: list) -> str:
+    """
+    Estrin-2 evaluation for polynomial of n terms.
+
+    table: [c_inner (highest degree), ..., c_outer (constant term)]
+    Polynomial: p(r) = c_outer - r*(... - r*c_inner)
+              = sum_{k=0}^{n-1} (-1)^k * c_outer_k * r^k  (alternating signs)
+
+    Estrin-2 pairs consecutive terms:
+      pair_k = c[2k] - r*c[2k-1]  (computing two Horner levels at once)
+    Final combination uses r^2 to merge pairs.
+
+    For 4 terms (degree-7 sin): c[0]=inner(1/5040), c[3]=outer(1)
+      pair_lo = c[1] - r*c[0]   (outermost pair: c[3]-based, c[2]-based)
+      pair_hi = c[3] - r*c[2]
+      result  = pair_lo + r^2*pair_hi  ... adjusted for alternating signs
+
+    Registers:
+      x13 = r2 (x^2 in Q0.32)
+      x17 = r4 (x^4 in Q0.32)
+      x11 = sin accumulator, x14 = cos accumulator
+    """
+    n = len(table)
+
+    # table[0] = innermost (highest degree), table[n-1] = outermost (constant ~1.0)
+    # Polynomial (outer to inner): c[n-1] - r*(c[n-2] - r*(... - r*c[0]))
+    # In our list: table[i] = coefficient of degree (n-1-i) in the x^2 polynomial
+
+    lines = []
+
+    if kind == "sin":
+        acc = "x11"; tmp = "x12"; r2 = "x13"; r4 = "x17"; t2 = "x16"
+    else:
+        acc = "x14"; tmp = "x12"; r2 = "x13"; r4 = "x17"; t2 = "x16"
+
+    if n < 2:
+        # Degenerate: just return table[0]
+        lines.append(f"\tli\t{acc}, {table[0]}")
+        return "\n".join(lines)
+
+    # Compute r4 = mulhu(r2, r2)
+    lines.append(f"\tmulhu\t{r4}, {r2}, {r2}")
+    lines.append("")
+
+    # We have pairs (outermost perspective):
+    # The polynomial from outermost to innermost: c[n-1], c[n-2], c[n-3], c[n-4], ...
+    # Pair_HI = c[n-1] - r*c[n-2]
+    # Pair_LO = c[n-3] - r*c[n-4]
+    # result = Pair_HI + r^4*Pair_LO  [if exactly 4 terms]
+
+    # For n terms, group from outermost:
+    # Group pairs from the outermost end, leftover handled at innermost
+
+    # Reorder: outer_coeffs[0] = table[n-1] (constant, ~1.0), outer_coeffs[1] = table[n-2], etc.
+    outer = list(reversed(table))  # outer[0]=constant, outer[1]=next, ...
+
+    groups = []
+    i = 0
+    while i < len(outer):
+        if i + 1 < len(outer):
+            groups.append((outer[i], outer[i+1]))  # (c_even, c_odd)
+            i += 2
+        else:
+            groups.append((outer[i],))
+            i += 1
+
+    # Each group represents: group[0] - r*group[1] (if pair), or just group[0]
+    # The final combination: g[0] + r^2*(g[1] + r^2*(g[2] + ...))
+    # But we want a flat Estrin-2 (2 levels), not recursive.
+
+    # For simplicity, implement as 2-level Estrin:
+    # If n == 4: pair_hi = c[0] - r*c[1], pair_lo = c[2] - r*c[3]
+    #            result = pair_hi + r^4*pair_lo
+    # If n == 5: pair_hi = c[0] - r*c[1], pair_mid = c[2] - r*c[3], extra = c[4]
+    #            result = pair_hi + r^4*(pair_mid + r^4*extra)  [not flat estrin2, but close]
+    # If n > 5: fall back to multiple levels
+
+    if n == 4:
+        # degree-7: 4 coefficients
+        c0, c1, c2, c3 = outer[0], outer[1], outer[2], outer[3]
+        lines.append(f"\t# pair_hi = {c0} - r2*{c1}")
+        lines.append(f"\tli\t{acc}, {c1}")
+        lines.append(f"\tmulhu\t{acc}, {r2}, {acc}")
+        lines.append(f"\tli\t{tmp}, {c0}")
+        lines.append(f"\tsub\t{acc}, {tmp}, {acc}")
+        lines.append("")
+        lines.append(f"\t# pair_lo = {c2} - r2*{c3}")
+        lines.append(f"\tli\t{tmp}, {c3}")
+        lines.append(f"\tmulhu\t{tmp}, {r2}, {tmp}")
+        lines.append(f"\tli\t{t2}, {c2}")
+        lines.append(f"\tsub\t{tmp}, {t2}, {tmp}")
+        lines.append("")
+        lines.append(f"\t# result = pair_hi + mulhu(r4, pair_lo)")
+        lines.append(f"\tmulhu\t{tmp}, {r4}, {tmp}")
+        lines.append(f"\tadd\t{acc}, {acc}, {tmp}")
+
+    elif n == 5:
+        # degree-9: 5 coefficients
+        c0, c1, c2, c3, c4 = outer[0], outer[1], outer[2], outer[3], outer[4]
+        lines.append(f"\t# pair_hi = {c0} - r2*{c1}")
+        lines.append(f"\tli\t{acc}, {c1}")
+        lines.append(f"\tmulhu\t{acc}, {r2}, {acc}")
+        lines.append(f"\tli\t{tmp}, {c0}")
+        lines.append(f"\tsub\t{acc}, {tmp}, {acc}")
+        lines.append("")
+        lines.append(f"\t# pair_lo = {c2} - r2*{c3}")
+        lines.append(f"\tli\t{tmp}, {c3}")
+        lines.append(f"\tmulhu\t{tmp}, {r2}, {tmp}")
+        lines.append(f"\tli\t{t2}, {c2}")
+        lines.append(f"\tsub\t{tmp}, {t2}, {tmp}")
+        lines.append("")
+        lines.append(f"\t# pair_lo += mulhu(r4, {c4})")
+        lines.append(f"\tli\t{t2}, {c4}")
+        lines.append(f"\tmulhu\t{t2}, {r4}, {t2}")
+        lines.append(f"\tadd\t{tmp}, {tmp}, {t2}")
+        lines.append("")
+        lines.append(f"\t# result = pair_hi + mulhu(r4, pair_lo)")
+        lines.append(f"\tmulhu\t{tmp}, {r4}, {tmp}")
+        lines.append(f"\tadd\t{acc}, {acc}, {tmp}")
+
+    elif n == 6:
+        # degree-10 cos (6 coefficients): need extra scratch register
+        # For cos path: acc=x14, tmp=x12, r2=x13, r4=x17, t2=x16
+        # x11 is free in the cos kernel path (it held shift amt, now unused)
+        extra = "x11" if kind == "cos" else "x15"  # x15 = exponent; careful - use only if safe
+        # Actually x15 is needed after the kernel for packing. For kind="sin" n=6 unlikely,
+        # but fall back to unrolled Horner for sin with n=6.
+        if kind == "sin":
+            lines = ["# estrin2 n=6 not implemented for sin; using unrolled Horner"]
+            lines += _horner_unrolled_body(kind, table).splitlines()
+            return "\n".join(lines)
+
+        c0, c1, c2, c3, c4, c5 = outer[0], outer[1], outer[2], outer[3], outer[4], outer[5]
+        lines.append(f"\t# pair_hi = {c0} - r2*{c1}")
+        lines.append(f"\tli\t{acc}, {c1}")
+        lines.append(f"\tmulhu\t{acc}, {r2}, {acc}")
+        lines.append(f"\tli\t{tmp}, {c0}")
+        lines.append(f"\tsub\t{acc}, {tmp}, {acc}")
+        lines.append("")
+        lines.append(f"\t# pair_mid = {c2} - r2*{c3}")
+        lines.append(f"\tli\t{tmp}, {c3}")
+        lines.append(f"\tmulhu\t{tmp}, {r2}, {tmp}")
+        lines.append(f"\tli\t{t2}, {c2}")
+        lines.append(f"\tsub\t{tmp}, {t2}, {tmp}")
+        lines.append("")
+        lines.append(f"\t# pair_lo = {c4} - r2*{c5} (use {extra} as extra scratch)")
+        lines.append(f"\tli\t{t2}, {c5}")
+        lines.append(f"\tmulhu\t{t2}, {r2}, {t2}")
+        lines.append(f"\tli\t{extra}, {c4}")
+        lines.append(f"\tsub\t{t2}, {extra}, {t2}")
+        lines.append("")
+        lines.append(f"\t# r4 = mulhu(r2, r2)")
+        lines.append(f"\tmulhu\t{r4}, {r2}, {r2}")
+        lines.append("")
+        lines.append(f"\t# pair_mid += mulhu(r4, pair_lo)")
+        lines.append(f"\tmulhu\t{t2}, {r4}, {t2}")
+        lines.append(f"\tadd\t{tmp}, {tmp}, {t2}")
+        lines.append("")
+        lines.append(f"\t# result = pair_hi + mulhu(r4, pair_mid)")
+        lines.append(f"\tmulhu\t{tmp}, {r4}, {tmp}")
+        lines.append(f"\tadd\t{acc}, {acc}, {tmp}")
+
+    else:
+        # General case: fall back to unrolled Horner for unsupported sizes
+        lines = ["# WARNING: estrin2 with n=%d terms, falling back to unrolled Horner" % n]
+        lines += _horner_unrolled_body(kind, table).splitlines()
+
+    return "\n".join(lines)
+
+
+def _render_sf_sin_estrin4(cfg, sin_table, cos_table) -> str:
+    """Estrin-4 evaluation (4 terms computed in parallel)."""
+    # For degree-11 and above. Not yet implemented; fall back to estrin2.
+    print("WARNING: estrin4 not fully implemented, using estrin2", file=sys.stderr)
+    return _render_sf_sin_estrin2(cfg, sin_table, cos_table)
+
+
+# ---------------------------------------------------------------------------
+# Main output generation
+# ---------------------------------------------------------------------------
+
+def generate(cfg_path: Path, cfg: dict, dry_run: bool = False):
+    name = cfg["name"]
+    out_dir = GEN_ROOT / name
+    print(f"Generating: {name} -> {out_dir}/")
+
+    # Step 1: Get coefficients
+    if "coeffs_override" in cfg:
+        ov = cfg["coeffs_override"]
+        sin_table = ov["sin_q31"]
+        cos_table = ov["cos_q31"]
+        coeffs_json = {
+            "source": "override",
+            "sin_q31": sin_table,
+            "cos_q31": cos_table,
+        }
+        print("  Using hardcoded coefficients from config")
+    else:
+        print("  Running Sollya...")
+        coeffs = compute_coeffs_sollya(cfg)
+        kernel = cfg["kernel"]
+        unroll = kernel.get("unroll", False)
+        sin_table = build_sin_table(coeffs["sin"], unroll)
+        cos_table = build_cos_table(coeffs["cos"], unroll)
+        coeffs_json = {
+            "source": "sollya",
+            "sin_float": coeffs["sin"],
+            "cos_float": coeffs["cos"],
+            "sin_q31": sin_table,
+            "cos_q31": cos_table,
+        }
+        print(f"  sin_q31: {sin_table}")
+        print(f"  cos_q31: {cos_table}")
+
+    # Step 2: Render assembly
+    evaluation = cfg["kernel"].get("evaluation", "horner")
+    unroll = cfg["kernel"].get("unroll", False)
+
+    sin_sym = "__gf_fpsincof"
+    cos_sym = "__gf_fpcoscof"
+
+    fpsincof_s = render_coeff_table(name, sin_sym, sin_table)
+    fpcoscof_s = render_coeff_table(name, cos_sym, cos_table)
+    fpreduct_s = render_fpreduct(cfg)
+    sf_sin_s   = render_sf_sin(cfg, sin_table, cos_table)
+
+    # Step 3: Write files
+    files = {
+        "andes_fpsincof.s": fpsincof_s,
+        "andes_fpcoscof.s": fpcoscof_s,
+        "andes_fpreduct.s": fpreduct_s,
+        "sf_sin.s": sf_sin_s,
+        "coeffs.json": json.dumps(coeffs_json, indent=2),
+    }
+
+    if dry_run:
+        for fname, content in files.items():
+            print(f"\n--- {out_dir}/{fname} ---")
+            print(content[:500] + ("..." if len(content) > 500 else ""))
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for fname, content in files.items():
+        (out_dir / fname).write_text(content)
+        print(f"  Wrote {out_dir}/{fname}")
+
+    # Copy config for reproducibility
+    shutil.copy(cfg_path, out_dir / "config.toml")
+
+    # Update gen/index.json
+    _update_index(name, str(cfg_path))
+    print(f"Done. Output in {out_dir}/")
+
+
+def _update_index(name: str, cfg_path: str):
+    idx_path = GEN_ROOT / "index.json"
+    if idx_path.exists():
+        with open(idx_path) as f:
+            idx = json.load(f)
+    else:
+        idx = {}
+    idx[name] = {"config": cfg_path}
+    with open(idx_path, "w") as f:
+        json.dump(idx, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate sinf assembly from TOML config")
+    parser.add_argument("config", help="Path to .toml config file")
+    parser.add_argument("--dry-run", action="store_true", help="Print output without writing files")
+    args = parser.parse_args()
+
+    cfg_path = Path(args.config)
+    if not cfg_path.exists():
+        _die(f"Config not found: {cfg_path}")
+
+    cfg = load_config(cfg_path)
+    generate(cfg_path, cfg, dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    main()

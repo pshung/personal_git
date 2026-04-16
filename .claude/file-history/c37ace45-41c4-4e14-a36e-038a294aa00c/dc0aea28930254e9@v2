@@ -1,0 +1,180 @@
+"""Tests for ai_rank adapter layer."""
+import json
+import math
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import numpy as np
+import pytest
+
+from auto_iree.ai_rank.adapter import (
+    extract_feature_a, extract_feature_b, config_to_lowering,
+    load_tile_config, _get_body_op_name, _get_tiling_op_name,
+    _compute_total_elements,
+)
+from auto_iree.ai_rank.features import FEATURE_A_DIM, FEATURE_B_DIM
+
+
+TILE_CONFIG_PATH = Path(__file__).parent.parent / "files" / "tile_config.json"
+
+# Multi-op dispatch: fill + generic-1 (reduction/matmul) + generic-2 (epilogue)
+# Tiling variation lives in generic-2, NOT generic-1.
+MULTI_OP_TILE_CONFIG = {
+    "linalg.fill-0": {
+        "instruction_seq": "",
+        "default": "[[32, 24], [1, 8], [0, 0], [0, 0]]",
+        "iteration_space": "[3136, 24]",
+        "iteration_type": "['parallel', 'parallel']",
+        "rank / tilingLevels": "[2, 4]",
+        "Parallel dimensions": "[0, 1]",
+        "Reduction dimensions": "[]",
+    },
+    "linalg.generic-1": {
+        "instruction_seq": "arith.mulf-arith.addf-linalg.yield",
+        "default": "[[32, 24, 0], [1, 8, 0], [0, 0, 32], [0, 0, 0]]",
+        "iteration_space": "[3136, 24, 144]",
+        "iteration_type": "['parallel', 'parallel', 'reduction']",
+        "rank / tilingLevels": "[3, 4]",
+        "Parallel dimensions": "[0, 1]",
+        "Reduction dimensions": "[2]",
+    },
+    "linalg.generic-2": {
+        "instruction_seq": "arith.addf-arith.maximumf-linalg.yield",
+        "default": "[[32, 24], [1, 8], [0, 0], [0, 0]]",
+        "iteration_space": "[3136, 24]",
+        "iteration_type": "['parallel', 'parallel']",
+        "rank / tilingLevels": "[2, 4]",
+        "Parallel dimensions": "[0, 1]",
+        "Reduction dimensions": "[]",
+    },
+}
+
+
+@pytest.fixture
+def tile_config():
+    with open(TILE_CONFIG_PATH) as f:
+        return json.load(f)
+
+
+@pytest.fixture
+def mock_task(tile_config):
+    task = MagicMock()
+    task.default_tile_file = TILE_CONFIG_PATH
+    task.subgraph_name = "module_main_dispatch_0"
+    return task
+
+
+class TestGetBodyOpName:
+    def test_finds_matmul(self, tile_config):
+        name = _get_body_op_name(tile_config)
+        assert name == "linalg.matmul-1"
+
+    def test_with_only_fill(self):
+        tc = {"linalg.fill-0": {"iteration_space": "[10]"}}
+        # Falls back to first key
+        assert _get_body_op_name(tc) == "linalg.fill-0"
+
+
+class TestComputeTotalElements:
+    def test_matmul(self, tile_config):
+        total = _compute_total_elements(tile_config, "linalg.matmul-1")
+        assert total == 3136 * 128 * 64
+
+
+class TestExtractFeatureA:
+    def test_from_mock_task(self, mock_task):
+        fa = extract_feature_a(mock_task)
+        assert fa.shape == (FEATURE_A_DIM,)
+        assert fa.dtype == np.float32
+        # Should use linalg.matmul-1 as body op
+        assert fa[0] == 0.0  # OP_TYPE_MAP['linalg.matmul-1'] = 0
+        assert fa[1] == 3.0  # rank = 3
+        assert fa[2] == 2.0  # 2 parallel dims
+        assert fa[3] == 1.0  # 1 reduction dim
+        assert fa[4] == 6.0  # 6 tiling levels
+
+
+class TestConfigToLowering:
+    def test_extracts_correct_op(self):
+        config = MagicMock()
+        config.to_iree_format.return_value = {
+            'linalg.fill-0': [[0, 0], [0, 0], [0, 0], [0, 0]],
+            'linalg.matmul-1': [[64, 32, 16], [8, 4, 0], [0, 0, 8], [0, 0, 0], [0, 0, 4], [0, 0, 0]],
+        }
+        lc = config_to_lowering(config, 'linalg.matmul-1')
+        assert lc == [[64, 32, 16], [8, 4, 0], [0, 0, 8], [0, 0, 0], [0, 0, 4], [0, 0, 0]]
+
+    def test_fallback_to_first_op(self):
+        config = MagicMock()
+        config.to_iree_format.return_value = {
+            'linalg.matmul-1': [[64, 32, 16]],
+        }
+        lc = config_to_lowering(config, 'nonexistent-op')
+        assert lc == [[64, 32, 16]]
+
+
+class TestGetTilingOpName:
+    def test_single_op_returns_same_as_body(self):
+        tc = {"linalg.conv_2d_nhwc_hwcf-0": {"iteration_space": "[1, 56, 56, 48]"}}
+        assert _get_tiling_op_name(tc) == "linalg.conv_2d_nhwc_hwcf-0"
+        assert _get_body_op_name(tc) == _get_tiling_op_name(tc)
+
+    def test_named_op_with_fill_and_epilogue(self, tile_config):
+        # fill-0 + matmul-1 + generic-2: tiling op is generic-2 (last non-fill)
+        assert _get_tiling_op_name(tile_config) == "linalg.generic-2"
+
+    def test_multi_generic_dispatch(self):
+        # fill + generic-1 (reduction) + generic-2 (epilogue)
+        assert _get_tiling_op_name(MULTI_OP_TILE_CONFIG) == "linalg.generic-2"
+
+    def test_body_op_still_returns_computation_op(self):
+        # _get_body_op_name should still return the computation op (generic-1)
+        assert _get_body_op_name(MULTI_OP_TILE_CONFIG) == "linalg.generic-1"
+
+
+class TestExtractFeatureB:
+    def test_from_mock_config(self, tile_config):
+        config = MagicMock()
+        config.to_iree_format.return_value = {
+            'linalg.matmul-1': [[64, 32, 16], [8, 4, 0], [0, 0, 8], [0, 0, 0], [0, 0, 4], [0, 0, 0]],
+        }
+        fb = extract_feature_b(
+            config, 'linalg.matmul-1',
+            total_elements=3136 * 128 * 64,
+            tile_config=tile_config,
+        )
+        assert fb.shape == (FEATURE_B_DIM,)
+        assert fb.dtype == np.float32
+        # Check tile flat values
+        assert fb[0] == 64.0  # level 0, dim 0
+        assert fb[1] == 32.0  # level 0, dim 1
+        assert fb[2] == 16.0  # level 0, dim 2
+
+    def test_multi_op_configs_produce_different_features(self):
+        """Two configs with same generic-1 but different generic-2 must differ."""
+        # Config A: generic-2 has zeros (no tiling)
+        config_a = MagicMock()
+        config_a.to_iree_format.return_value = {
+            'linalg.fill-0': [[0, 0], [0, 0], [0, 0], [0, 0]],
+            'linalg.generic-1': [[0, 0, 0], [0, 0, 0], [0, 0, 1], [0, 0, 0]],
+            'linalg.generic-2': [[0, 0], [0, 0], [0, 0], [0, 0]],
+        }
+        # Config B: generic-2 has real tiling
+        config_b = MagicMock()
+        config_b.to_iree_format.return_value = {
+            'linalg.fill-0': [[0, 0], [0, 0], [0, 0], [0, 0]],
+            'linalg.generic-1': [[0, 0, 0], [0, 0, 0], [0, 0, 1], [0, 0, 0]],
+            'linalg.generic-2': [[64, 24], [8, 8], [0, 0], [0, 0]],
+        }
+
+        tiling_op = _get_tiling_op_name(MULTI_OP_TILE_CONFIG)
+        total = 3136 * 24  # generic-2's iteration space
+
+        fb_a = extract_feature_b(config_a, tiling_op, total, MULTI_OP_TILE_CONFIG)
+        fb_b = extract_feature_b(config_b, tiling_op, total, MULTI_OP_TILE_CONFIG)
+
+        assert not np.array_equal(fb_a, fb_b), \
+            "Feature B must differ when tiling varies in generic-2"
+        # Config B should have nonzero tile values
+        assert fb_b[0] == 64.0  # level 0, dim 0
+        assert fb_b[1] == 24.0  # level 0, dim 1

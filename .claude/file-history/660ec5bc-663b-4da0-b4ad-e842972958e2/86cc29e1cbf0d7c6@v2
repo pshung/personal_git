@@ -1,0 +1,94 @@
+"""Adapter layer: convert AutoIREE MLIRTask/ConfigEntity to ModelzooRanker features."""
+from __future__ import annotations
+
+import json
+import math
+from typing import TYPE_CHECKING
+
+import numpy as np
+
+from auto_iree.ai_rank.features import (
+    compute_feature_a, compute_feature_b, _parse_int_list,
+)
+
+if TYPE_CHECKING:
+    from auto_iree.task import MLIRTask
+    from auto_iree.space import ConfigEntity
+
+
+def load_tile_config(task: MLIRTask) -> dict:
+    """Load and return tile_config.json as a dict for the given task."""
+    with open(task.default_tile_file, "r") as f:
+        return json.load(f)
+
+
+def _get_body_op_name(tile_config: dict) -> str:
+    """Find the main body op name (not linalg.fill) in tile_config."""
+    for key in tile_config:
+        if key.startswith('linalg.') and key != 'linalg.fill-0' and key != 'linalg.yield':
+            return key
+    return next(iter(tile_config))
+
+
+def _compute_total_elements(tile_config: dict, op_name: str) -> int:
+    """Compute product of iteration space dims for the body op."""
+    body_op = tile_config.get(op_name)
+    if body_op is None:
+        return 1
+    iteration_space = _parse_int_list(body_op['iteration_space'])
+    total = 1
+    for d in iteration_space:
+        total *= d
+    return total
+
+
+def extract_feature_a(task: MLIRTask) -> np.ndarray:
+    """Extract 18-dim Feature A from an MLIRTask.
+
+    Reads tile_config.json from the task's benchmark dir and builds
+    the group dict expected by compute_feature_a.
+    """
+    tile_config = load_tile_config(task)
+    op_name = _get_body_op_name(tile_config)
+    body_op = tile_config[op_name]
+    iteration_space = _parse_int_list(body_op['iteration_space'])
+
+    group = {
+        'op_name': op_name,
+        'shape': iteration_space,
+        'configs': [{'lowering_config': [[0] * len(iteration_space)]}],
+        'tile_config': tile_config,
+    }
+    return compute_feature_a(group)
+
+
+def config_to_lowering(config: ConfigEntity, op_name: str) -> list[list[int]]:
+    """Convert ConfigEntity.to_iree_format() to lowering_config for a specific op.
+
+    Returns the lowering_config (list of lists) for op_name.
+    Falls back to the first op if op_name not found.
+    """
+    iree_format = config.to_iree_format()
+    if op_name in iree_format:
+        return iree_format[op_name]
+    return next(iter(iree_format.values()))
+
+
+def extract_feature_b(config: ConfigEntity, op_name: str,
+                      total_elements: int,
+                      tile_config: dict) -> np.ndarray:
+    """Extract 59-dim Feature B from a ConfigEntity.
+
+    Args:
+        config: AutoIREE ConfigEntity from the search space.
+        op_name: The body op name (e.g., 'linalg.matmul-1').
+        total_elements: Product of iteration space dims.
+        tile_config: Parsed tile_config.json dict.
+    """
+    lowering_config = config_to_lowering(config, op_name)
+    config_dict = {
+        'lowering_config': lowering_config,
+        'op_name': op_name,
+    }
+    return compute_feature_b(config_dict, total_elements=total_elements,
+                              tile_config=tile_config)

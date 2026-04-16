@@ -1,0 +1,74 @@
+---
+type: technique
+tags: [rvv, lmul, sew, avepool, accumulation, e16]
+applies_to: [avepool_HWC_s8]
+---
+
+# e16 Accumulation: Halving Accumulator Width to Double VL
+
+## Problem: e32 Accumulation Wastes Vector Length
+
+Average pooling accumulates int8 values into a wider type to avoid overflow. The default approach uses e32/M2:
+
+```
+vsetvli(vl, ch, e32, m2)    // max VL=64 at VLEN=1024
+// vqmacc or vadd to accumulate
+```
+
+This wastes 75% of the vector register space.
+
+## Fix: Use e16/M4 When Values Fit
+
+For average pooling with `count` kernel positions:
+
+- Each input value is in [-128, 127] (int8)
+- Maximum accumulated value: `count * 127`
+- int16 range: [-32768, 32767]
+- Safe for e16 when: `count * 127 <= 32767` → `count <= 258`
+
+For typical pooling windows (3x3=9, 5x5=25, even 16x16=256), int16 accumulation is safe.
+
+### e16/M4 Configuration
+
+```
+vsetvli(vl, ch, e16, m4)    // max VL=256 at VLEN=1024 (vs 64 for e32/M2)
+```
+
+4x more elements per instruction. Use `vwadd.vv` to widen int8 inputs to int16 accumulator:
+
+```c
+// Load int8 input chunk
+NDS_VEC_VLE8_V(NDS_VEC_V8, in_ptr, vl_e8);   // e8/M2
+
+// Widen-add: int8 → int16
+NDS_VEC_VWADD_WV(NDS_VEC_V0, NDS_VEC_V0, NDS_VEC_V8, vl_e16);  // M4 acc += M2 input
+```
+
+After accumulation: divide by count (scalar), narrow int16 → int8, clamp.
+
+## Results (AX45MPV VLEN=1024)
+
+Applied to `riscv_nn_avepool_HWC_s8` (commit 3cc063eb):
+
+| Metric | Before (e32/M2) | After (e16/M4) | Ratio |
+|---|---|---|---|
+| Cycles | 149,131 | 53,535 | 2.79x faster |
+| VL per instr | 64 | 256 | 4x |
+
+## Condition Check
+
+```c
+// Add a small-count guard if needed:
+if (ker_h * ker_w <= 256) {
+    // use e16/M4 path
+} else {
+    // fall back to e32/M2 (rare for typical pooling)
+}
+```
+
+In practice, libnn uses e16 unconditionally with a compile-time assertion or runtime guard.
+
+## Related
+
+- [[lmul-selection]] -- general LMUL/SEW selection principles
+- [[avepool-hwc-s8]] -- operator page with full history

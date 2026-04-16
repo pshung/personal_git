@@ -1,0 +1,139 @@
+#!/bin/bash
+set -e
+
+############################
+# Run libm benchmarks on the Andes RISC-V FPGA board.
+#
+# Steps:
+#   1. Build picolibc (unless --skip-build)
+#   2. Compile bench-math.c against the installed picolibc
+#   3. Load and run on FPGA via GDB
+#   4. Capture CSV output to results file
+#
+# Usage:
+#   ./run-bench-fpga.sh [options]
+#
+# Options:
+#   --skip-build             Skip picolibc build (use existing install)
+#   --toolchain-path PATH    Path to toolchain bin/ directory
+#   --toolchain-prefix PFX   Toolchain prefix (default: riscv64-elf)
+#   --build-dir DIR          Build directory (default: build-riscv)
+#   --install-dir DIR        Install directory (default: install-riscv)
+#   --output FILE            Output CSV file (default: results.csv)
+#   --gdb-target HOST:PORT   GDB remote target (default: sw-boards.andestech.com:1116)
+############################
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SOURCE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Defaults
+SKIP_BUILD=false
+TOOLCHAIN_PREFIX="riscv64-elf"
+BUILD_DIR="$SOURCE_DIR/build-riscv"
+INSTALL_DIR="$SOURCE_DIR/install-riscv"
+OUTPUT_FILE="results.csv"
+GDB_TARGET="sw-boards.andestech.com:1116"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --skip-build)
+            SKIP_BUILD=true
+            shift
+            ;;
+        --toolchain-path)
+            TOOLCHAIN_PATH="$2"
+            shift 2
+            ;;
+        --toolchain-prefix)
+            TOOLCHAIN_PREFIX="$2"
+            shift 2
+            ;;
+        --build-dir)
+            BUILD_DIR="$2"
+            shift 2
+            ;;
+        --install-dir)
+            INSTALL_DIR="$2"
+            shift 2
+            ;;
+        --output)
+            OUTPUT_FILE="$2"
+            shift 2
+            ;;
+        --gdb-target)
+            GDB_TARGET="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [ -n "$TOOLCHAIN_PATH" ]; then
+    export PATH="$TOOLCHAIN_PATH:$PATH"
+fi
+
+# Verify toolchain
+if ! command -v "${TOOLCHAIN_PREFIX}-gcc" &>/dev/null; then
+    echo "Error: ${TOOLCHAIN_PREFIX}-gcc not found in PATH" >&2
+    echo "Set --toolchain-path or TOOLCHAIN_PATH." >&2
+    exit 1
+fi
+
+# Step 1: Build picolibc
+if [ "$SKIP_BUILD" = false ]; then
+    echo "==> Building picolibc"
+    "$SOURCE_DIR/build_mculib3.sh" "$TOOLCHAIN_PREFIX" "$BUILD_DIR" "$INSTALL_DIR"
+fi
+
+# Step 2: Find picolibc.specs
+SPECS_FILE=$(find "$INSTALL_DIR" -name 'picolibc.specs' | head -1)
+if [ -z "$SPECS_FILE" ]; then
+    echo "Error: picolibc.specs not found under $INSTALL_DIR" >&2
+    exit 1
+fi
+echo "==> Using specs: $SPECS_FILE"
+
+# Step 3: Compile bench-math.c
+echo "==> Compiling bench-math.c"
+${TOOLCHAIN_PREFIX}-gcc -Os \
+    --specs="$SPECS_FILE" \
+    -T "$SCRIPT_DIR/ae350.ld" \
+    -o "$SOURCE_DIR/bench-math.elf" \
+    "$SCRIPT_DIR/bench-math.c" \
+    -lm -lc -lsemihost
+
+echo "==> Built bench-math.elf"
+
+# Step 4: Create a temporary GDB script with the configured target
+GDB_SCRIPT=$(mktemp /tmp/run-bench-XXXXXX.gdb)
+cat > "$GDB_SCRIPT" <<EOF
+target remote $GDB_TARGET
+source $SCRIPT_DIR/gdb_45.script
+break _exit
+continue
+detach
+quit
+EOF
+
+# Step 5: Run on FPGA via GDB, capture output
+echo "==> Running on FPGA ($GDB_TARGET)"
+${TOOLCHAIN_PREFIX}-gdb -batch -x "$GDB_SCRIPT" "$SOURCE_DIR/bench-math.elf" \
+    2>/dev/null | grep -E '^(function,|[a-z])' > "$OUTPUT_FILE" || true
+
+rm -f "$GDB_SCRIPT"
+
+if [ -s "$OUTPUT_FILE" ]; then
+    echo "==> Results saved to $OUTPUT_FILE"
+    echo ""
+    echo "Preview (first 5 lines):"
+    head -6 "$OUTPUT_FILE"
+    echo ""
+    NLINES=$(wc -l < "$OUTPUT_FILE")
+    echo "Total: $NLINES lines (including header)"
+else
+    echo "Warning: No output captured. Check FPGA connection and semihosting." >&2
+    exit 1
+fi

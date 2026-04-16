@@ -1,0 +1,187 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What This Directory Is
+
+RISC-V architecture-specific math library (`libm`) optimizations for picolibc. These replace generic C implementations from `libm/common/` and `libm/math/` with hand-tuned assembly or hardware-FPU-aware C code.
+
+See `README.md` in this directory for detailed function listings and build configuration matrix.
+
+## Build System
+
+This directory is built as part of the top-level picolibc Meson build. There is no standalone build. The `meson.build` here populates `srcs_libm_machine` which gets compiled into the libm static library.
+
+A separate `CMakeLists.txt` exists for CMake-based builds but only includes a minimal subset (C files, no assembly, no configuration branching).
+
+### Key build flags (set in top-level `meson.build`, consumed here)
+
+- `is_softfp` — software floating-point ABI (no hardware FPU)
+- `is_double_abi` — hardware double-precision FPU
+- `is_riscv64` — 64-bit RISC-V
+- `is_rvm` — M-extension (hardware multiply/divide)
+- `is_rv32e` — RV32E reduced 16-register ISA
+
+### Per-target library quirk
+
+For soft-float RV32 configs (both standard and RV32E), `sf_sincos.c` is compiled as a separate per-target `static_library` via the `foreach params : targets` loop, not added to `srcs_libm_machine`. This is because it needs per-multilib `c_args`. The resulting `lib_machine<target>` libraries are linked via `link_whole` elsewhere.
+
+### Internal call graph
+
+Assembly math functions call shared Andes helper routines (`andes_*.s`). Key dependency chains:
+- Trig functions → `__gf_dpreduct`/`__gf_fpreduct` (argument reduction) → `__gf_exmul`/`__gf_exadd` (extended precision) → polynomial evaluators (`__gf_p4`–`__gf_p8`)
+- `exp`/`log`/`pow` → `__gf_dpexexp`/`__gf_dpexlog` → extended precision helpers
+- All assembly shares coefficient tables: `__gf_dpsincon`, `__gf_dpcoscon`, `__gf_fpsincof`, `__gf_fpcoscof`, etc.
+
+
+## Standalone Test Builds (outside Meson)
+
+For quick accuracy/correctness testing of individual assembly routines, use the standalone `Makefile` in this directory. It compiles test C files and links them against the relevant assembly objects directly.
+
+### Toolchain
+
+Use the Andes `nds32le-elf-mculib-v5` toolchain for RV32 soft-float builds:
+
+```
+/local/nick/SW_Release/build-ast542/build-toolchain/linux/nds32le-elf-mculib-v5/bin/riscv32-elf-gcc
+```
+
+- GCC 14.2.0, bare-metal (`riscv32-elf`)
+- Ships with newlib (provides printf, math reference functions, etc.)
+- `-mvh` flag enables Andes virtual hosting (semihosting) for I/O via QEMU/GDB
+- Target flags: `-march=rv32im -mabi=ilp32` for soft-float M-extension builds
+
+### QEMU
+
+Use the Andes QEMU v5 build for running test ELFs:
+
+- RV32: `/local/nick/qemu_v5/build/qemu-system-riscv32`
+- RV64: `/local/nick/qemu_v5/build/qemu-system-riscv64`
+
+QEMU 9.2.0 (Andes fork, v9.2.0-401-g4581fc99a4). Run via the Makefile targets below -- do not invoke QEMU directly.
+
+### Makefile targets
+
+```sh
+make                        # build all opt and ref ELFs (default: XLEN=32)
+make XLEN=64                # build for RV64 toolchain
+make test-all               # build, run all funcs in QEMU, diff opt vs ref
+make test-sinf              # build and test a single function
+make size-all               # report .text size for every assembly function
+make size-sinf              # report .text size for one function
+make clean                  # remove all build artifacts
+make list                   # show all available per-function targets
+```
+
+For each function with assembly, the Makefile builds `test/<func>_opt.elf` (linked with Andes assembly + `libandes.a`) and `test/<func>_ref.elf` (linked with toolchain libm only), runs both through QEMU, and diffs the outputs. Functions without assembly (e.g. `acosh`, `hypot`) get a ref-only run.
+
+### Unconditionally compiled sources
+
+Regardless of build configuration, the following C files are always included: `s_copysign`, `s_finite`, `s_fma`, `s_isinf`, `s_isnan`, `s_llrint`, `s_llround`, and their `sf_` (float) counterparts plus `sf_fmax`, `sf_fmin`, `sf_lrint`, `sf_lround`.
+
+## Writing Benchmarks
+
+Each test file (`test/test_<func>.c`) serves double duty: accuracy testing (default) and
+FPGA cycle-count benchmarking (when compiled with `-DEN_PERF`). The Makefile builds the
+bench ELF from the same source file -- do NOT create a separate `test_<func>_bench.c`.
+
+### Structure rules
+
+Follow `test/test_sin.c` (double) or `test/test_sinf.c` (float) exactly.
+
+1. After the `#include` block, add the perf header guard:
+   ```c
+   #ifdef EN_PERF
+   #define PF_COUNTER
+   #include "nds_pfcounter.h"
+   #endif
+   ```
+
+2. Wrap the `emit()`, `emit_u()`, and all `test_*()` functions in `#ifndef EN_PERF ... #endif`.
+
+3. Add a `perf()` function inside `#ifdef EN_PERF ... #endif /* EN_PERF */` immediately after
+   the closing `#endif` of the accuracy section. Template:
+
+   **Double-precision** (`double`, `d2u`/`u2d`, `%016llx`):
+   ```c
+   #ifdef EN_PERF
+   static void perf(double x)
+   {
+       volatile double acc = 0.0;
+       startPFM;
+       for (int i = 0; i < 100; i++)
+           acc += <func>(x+i);
+       stopPFM;
+       readResult();
+       printf("perf %016llx: %016llx\n",
+              (unsigned long long)d2u(x),
+              (unsigned long long)d2u((double)acc));
+   }
+   #endif /* EN_PERF */
+   ```
+
+   **Single-precision** (`float`, `f2u`/`u2f`, `%08lx`):
+   ```c
+   #ifdef EN_PERF
+   static void perf(float x)
+   {
+       volatile float acc = 0.0f;
+       startPFM;
+       for (int i = 0; i < 100; i++)
+           acc += <func>f(x+i);
+       stopPFM;
+       readResult();
+       printf("perf %08lx: %08lx\n",
+              (unsigned long)f2u(x),
+              (unsigned long)f2u((float)acc));
+   }
+   #endif /* EN_PERF */
+   ```
+
+   For functions that do not accept an integer offset meaningfully (e.g. `fabs`, `sqrt`,
+   `ceil`, `floor`, `fpclassify`), use a fixed array of representative inputs and iterate
+   over them instead of `x+i`.
+
+4. Update `main()` to branch on `EN_PERF`:
+   ```c
+   int main(void)
+   {
+   #ifdef EN_PERF
+       perf(<representative_input>);
+   #else
+       test_special();
+       ...
+   #endif
+       return 0;
+   }
+   ```
+
+### Choosing the representative input for `perf()`
+
+Pick an input that exercises the primary hot-path polynomial kernel:
+- Trig (`sin`, `cos`, `tan`, `sinf`, `cosf`, `tanf`): use `1.0` / `1.0f` (quadrant 0, normal range).
+- `exp` / `expf`: use `1.0` / `1.0f`.
+- `log` / `logf`: use `2.0` / `2.0f`.
+- `pow` / `powf`: use `2.0` / `2.0f` (base), `0.5` (exponent) -- pass base; loop varies exponent via `+i`.
+- `sqrt` / `sqrtf`: use `2.0` / `2.0f`.
+- Inverse trig (`asin`, `acos`, `atan`): use `0.5` / `0.5f`.
+
+### Makefile bench targets
+
+```sh
+make bench-sin       # build bench ELFs and run opt vs ref on FPGA via GDB
+make bench-all       # bench every function in FUNCS_SINGLE + FUNCS_DOUBLE_OPT
+```
+
+Bench ELFs are named `test/test_<func>_bench_opt.elf` and `test/test_<func>_bench_ref.elf`.
+The Makefile rule compiles `test/test_<func>.c` with `-DEN_PERF` automatically -- no extra
+source file is needed.
+
+## Naming Conventions
+
+- `e_` — IEEE error-handling wrapper functions (e.g., `e_sqrt` wraps the core sqrt)
+- `s_` — double-precision standard functions
+- `sf_` — single-precision (float) standard functions
+- `k_` — kernel helpers (internal, e.g., `k_sin`, `k_cos`)
+- `er_` — reentrant variants (e.g., `er_lgamma`)
+- `andes_` — shared assembly building blocks (not standalone math functions)

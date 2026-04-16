@@ -1,0 +1,276 @@
+"""Compile MLIR and extract features from vectorized IR and assembly.
+
+Used by agentic skills to inspect how a tile config affects code generation.
+"""
+from __future__ import annotations
+
+import math
+import re
+import subprocess
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from auto_iree.context import singleton_context as ctx
+from auto_iree.iree_helper import (
+    _get_iree_compile_base_args,
+    _get_iree_compile_llvm_args,
+    _get_llvm_riscv_args,
+)
+from auto_iree.log import setup_logger
+
+if TYPE_CHECKING:
+    from auto_iree.space import ConfigEntity
+    from auto_iree.task import MLIRTask
+
+logger = setup_logger("compiler_inspect")
+
+
+@dataclass
+class MLIRFeatures:
+    vector_transfer_read_count: int = 0
+    vector_transfer_write_count: int = 0
+    vector_contract_count: int = 0
+    vector_fma_count: int = 0
+    scalar_arith_count: int = 0
+    vector_types: list[str] = field(default_factory=list)
+    inferred_lmul: int = 1
+    has_scalar_fallback: bool = False
+    raw_text: str = ""
+
+
+@dataclass
+class ASMFeatures:
+    vsetvli_count: int = 0
+    vsetvli_configs: list[str] = field(default_factory=list)
+    rvv_instruction_count: int = 0
+    scalar_instruction_count: int = 0
+    stack_spill_bytes: int = 0
+    has_spills: bool = False
+    code_size_bytes: int = 0
+    raw_text: str = ""
+
+
+def compile_to_vectorized_mlir(task: MLIRTask,
+                               config: ConfigEntity,
+                               work_dir: Path,
+                               timeout: int = 120) -> str:
+    """Compile with iree-compile and capture post-vectorization MLIR IR.
+
+    Returns the MLIR text after the iree-codegen-generic-vectorization pass.
+    """
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate transform library
+    task.instantiate(config, work_dir)
+
+    transform_dir = work_dir / "transform_library"
+    out_file = work_dir / "temp_vectorized.mlir"
+
+    cmd = [
+        str(ctx.get_iree_compiler()),
+        str(task.mlir_file),
+        "-o", str(out_file),
+        "--compile-to=executable-sources",
+        "--mlir-print-ir-after=iree-codegen-generic-vectorization",
+        "--mlir-disable-threading",
+    ]
+    cmd.extend(_get_iree_compile_base_args())
+    cmd.extend(_get_llvm_riscv_args(ctx.get_target()))
+    cmd.extend(_get_iree_compile_llvm_args(ctx.get_target()))
+
+    if transform_dir.is_dir():
+        cmd.append(
+            f"--iree-codegen-transform-dialect-library-dir={str(transform_dir)}"
+        )
+
+    logger.debug(' '.join(str(x) for x in cmd))
+    try:
+        res = subprocess.run(
+            cmd, timeout=timeout, capture_output=True, check=False
+        )
+        # Post-vectorization IR is printed to stderr
+        mlir_text = res.stderr.decode(errors='replace')
+        if not mlir_text:
+            mlir_text = res.stdout.decode(errors='replace')
+        return mlir_text
+    except subprocess.TimeoutExpired:
+        logger.warning("compile_to_vectorized_mlir timed out")
+        return ""
+
+
+def compile_to_assembly(task: MLIRTask,
+                        config: ConfigEntity,
+                        work_dir: Path,
+                        timeout: int = 120) -> str:
+    """Compile to object file and disassemble with objdump.
+
+    Returns the disassembly text.
+    """
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = work_dir / "temp"
+    temp_dir.mkdir(exist_ok=True)
+
+    # Generate transform library
+    task.instantiate(config, work_dir)
+
+    transform_dir = work_dir / "transform_library"
+    host_c_h = work_dir / "temp" / "host-c.h"
+
+    cmd = [
+        str(ctx.get_iree_compiler()),
+        str(task.mlir_file),
+        "-o", str(host_c_h),
+        "--output-format=vm-c",
+        "-compile-from=executable-sources",
+        "-iree-llvmcpu-link-embedded=false",
+        "-iree-llvmcpu-link-static",
+        f"--iree-llvmcpu-static-library-output-path={str(work_dir / 'temp' / 'kernel.o')}",
+    ]
+    cmd.extend(_get_iree_compile_base_args())
+    cmd.extend(_get_llvm_riscv_args(ctx.get_target()))
+
+    if transform_dir.is_dir():
+        cmd.append(
+            f"--iree-codegen-transform-dialect-library-dir={str(transform_dir)}"
+        )
+
+    logger.debug(' '.join(str(x) for x in cmd))
+    try:
+        subprocess.run(cmd, timeout=timeout, capture_output=True, check=True)
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+        logger.warning("compile_to_assembly compile step failed: %s", e)
+        return ""
+
+    kernel_o = work_dir / "temp" / "kernel.o"
+    if not kernel_o.is_file():
+        logger.warning("kernel.o not found after compilation")
+        return ""
+
+    # Disassemble with objdump
+    toolchain = ctx.get_build_config().riscv_toolchain
+    objdump = Path(toolchain) / "riscv64-unknown-elf-objdump"
+    if not objdump.is_file():
+        # Try alternative name
+        objdump = Path(toolchain) / "riscv64-elf-objdump"
+
+    cmd_objdump = [str(objdump), "-d", str(kernel_o)]
+    try:
+        res = subprocess.run(
+            cmd_objdump, timeout=30, capture_output=True, check=True
+        )
+        return res.stdout.decode(errors='replace')
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError,
+            FileNotFoundError) as e:
+        logger.warning("objdump failed: %s", e)
+        return ""
+
+
+def extract_mlir_features(mlir_text: str) -> MLIRFeatures:
+    """Extract features from post-vectorization MLIR text."""
+    features = MLIRFeatures(raw_text=mlir_text)
+
+    features.vector_transfer_read_count = len(
+        re.findall(r'vector\.transfer_read', mlir_text))
+    features.vector_transfer_write_count = len(
+        re.findall(r'vector\.transfer_write', mlir_text))
+    features.vector_contract_count = len(
+        re.findall(r'vector\.contract', mlir_text))
+    features.vector_fma_count = len(
+        re.findall(r'vector\.fma', mlir_text))
+
+    # Count scalar arith ops (arith.* not inside vector ops)
+    features.scalar_arith_count = len(
+        re.findall(r'arith\.\w+', mlir_text))
+
+    # Extract vector types like vector<32xf32>
+    vector_types = re.findall(r'vector<[\d]+x\w+>', mlir_text)
+    features.vector_types = sorted(set(vector_types))
+
+    # Infer LMUL from vector types
+    max_elements = 0
+    sew = 32
+    for vt in features.vector_types:
+        m = re.match(r'vector<(\d+)x[fi](\d+)>', vt)
+        if m:
+            num_elements = int(m.group(1))
+            sew = int(m.group(2))
+            max_elements = max(max_elements, num_elements)
+
+    if max_elements > 0 and sew > 0:
+        # VLMAX at LMUL=1 for default vlen=1024
+        vlmax_lmul1 = 1024 // sew  # default; caller should check
+        if vlmax_lmul1 > 0:
+            raw_lmul = math.ceil(max_elements / vlmax_lmul1)
+            for valid in [1, 2, 4, 8]:
+                if raw_lmul <= valid:
+                    features.inferred_lmul = valid
+                    break
+            else:
+                features.inferred_lmul = 8
+
+    # Detect scalar fallback: scalar arith without vector ops
+    has_vector_compute = (features.vector_contract_count > 0 or
+                          features.vector_fma_count > 0)
+    if not has_vector_compute and features.scalar_arith_count > 0:
+        features.has_scalar_fallback = True
+
+    return features
+
+
+def extract_asm_features(asm_text: str) -> ASMFeatures:
+    """Extract features from RISC-V disassembly text."""
+    features = ASMFeatures(raw_text=asm_text)
+
+    # Count vsetvli instructions and extract configs
+    vsetvli_matches = re.findall(
+        r'vsetvli\s+\w+,\s*\w+,\s*(e\d+,\s*m\d+[^#\n]*)', asm_text)
+    features.vsetvli_count = len(vsetvli_matches)
+    features.vsetvli_configs = [m.strip().rstrip(',') for m in vsetvli_matches]
+
+    # Also catch vsetivli
+    vsetivli_matches = re.findall(
+        r'vsetivli\s+\w+,\s*\d+,\s*(e\d+,\s*m\d+[^#\n]*)', asm_text)
+    features.vsetvli_count += len(vsetivli_matches)
+    features.vsetvli_configs.extend(
+        [m.strip().rstrip(',') for m in vsetivli_matches])
+
+    # Count RVV instructions (v-prefixed mnemonics)
+    rvv_insns = re.findall(r'\bv\w+\.\w+', asm_text)
+    features.rvv_instruction_count = len(rvv_insns)
+
+    # Count scalar instructions (non-v-prefixed, non-label lines)
+    all_insns = re.findall(r'^\s+\w+:\s+\w+\s+(\w+)', asm_text, re.MULTILINE)
+    scalar_count = sum(1 for insn in all_insns if not insn.startswith('v'))
+    features.scalar_instruction_count = scalar_count
+
+    # Detect stack spills: look for sp-relative stores
+    spill_matches = re.findall(r's[wd]\s+\w+,\s*(-?\d+)\(sp\)', asm_text)
+    if spill_matches:
+        features.has_spills = True
+        offsets = [abs(int(m)) for m in spill_matches]
+        features.stack_spill_bytes = max(offsets) if offsets else 0
+
+    # Estimate code size from address range
+    addresses = re.findall(r'^\s+([0-9a-f]+):', asm_text, re.MULTILINE)
+    if len(addresses) >= 2:
+        try:
+            first = int(addresses[0], 16)
+            last = int(addresses[-1], 16)
+            features.code_size_bytes = last - first + 4  # +4 for last insn
+        except ValueError:
+            pass
+
+    return features
+
+
+def inspect_config(task: MLIRTask,
+                   config: ConfigEntity,
+                   work_dir: Path,
+                   timeout: int = 120) -> tuple[MLIRFeatures, ASMFeatures]:
+    """Convenience: compile both MLIR and asm, extract features, return tuple."""
+    mlir_text = compile_to_vectorized_mlir(task, config, work_dir, timeout)
+    asm_text = compile_to_assembly(task, config, work_dir, timeout)
+    return extract_mlir_features(mlir_text), extract_asm_features(asm_text)

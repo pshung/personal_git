@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""
+optdb.py — Optimization Experience Database for libnn
+
+ChromaDB-backed vector store for storing and retrieving optimization lessons,
+pipeline analysis results, and performance engineering knowledge.
+
+Usage:
+    # Add a lesson
+    python3 optdb.py add --title "vd4dots GEMM vectorization axis" \
+        --category "vectorization" --tags "vd4dots,gemm,conv" \
+        --text "Vectorize along reduction dimension instead of output channels..."
+
+    # Search for relevant lessons
+    python3 optdb.py search "how to optimize convolution with small output channels"
+
+    # List all entries
+    python3 optdb.py list
+
+    # Show a specific entry by ID
+    python3 optdb.py show <id>
+
+    # Import lessons from a YAML file
+    python3 optdb.py import lessons.yaml
+
+Requires: pip install chromadb (use .venv)
+"""
+
+import argparse
+import json
+import os
+import sys
+import textwrap
+from datetime import datetime
+
+import chromadb
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".optdb")
+
+def get_collection():
+    client = chromadb.PersistentClient(path=DB_PATH)
+    return client.get_or_create_collection(
+        name="optimization_lessons",
+        metadata={"description": "libnn RVV optimization experience database"}
+    )
+
+def cmd_add(args):
+    coll = get_collection()
+    doc_id = f"lesson_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{len(coll.get()['ids'])}"
+
+    metadata = {
+        "title": args.title,
+        "category": args.category,
+        "tags": args.tags or "",
+        "date": datetime.now().isoformat(),
+        "function": args.function or "",
+        "speedup": args.speedup or "",
+        "fpga_cycles": args.fpga_cycles or "",
+    }
+
+    coll.add(
+        ids=[doc_id],
+        documents=[args.text],
+        metadatas=[metadata],
+    )
+    print(f"Added: {doc_id}")
+    print(f"  Title: {args.title}")
+    print(f"  Category: {args.category}")
+    print(f"  Tags: {args.tags}")
+
+def cmd_search(args):
+    coll = get_collection()
+    results = coll.query(
+        query_texts=[args.query],
+        n_results=args.n,
+        include=["documents", "metadatas", "distances"],
+    )
+
+    if not results["ids"][0]:
+        print("No results found.")
+        return
+
+    print(f"=== Search: \"{args.query}\" ({len(results['ids'][0])} results) ===\n")
+    for i, (doc_id, doc, meta, dist) in enumerate(zip(
+        results["ids"][0], results["documents"][0],
+        results["metadatas"][0], results["distances"][0]
+    )):
+        relevance = max(0, 1 - dist)  # approximate relevance score
+        print(f"[{i+1}] {meta.get('title', 'untitled')}  (relevance: {relevance:.2f})")
+        print(f"    ID: {doc_id}")
+        print(f"    Category: {meta.get('category', '-')}  Tags: {meta.get('tags', '-')}")
+        if meta.get('function'):
+            print(f"    Function: {meta['function']}")
+        if meta.get('speedup'):
+            print(f"    Speedup: {meta['speedup']}")
+        if meta.get('fpga_cycles'):
+            print(f"    FPGA cycles: {meta['fpga_cycles']}")
+        # Show first 3 lines of document
+        lines = doc.strip().split('\n')
+        preview = '\n    '.join(lines[:4])
+        if len(lines) > 4:
+            preview += "\n    ..."
+        print(f"    ---\n    {preview}")
+        print()
+
+def cmd_list(args):
+    coll = get_collection()
+    data = coll.get(include=["metadatas"])
+    if not data["ids"]:
+        print("Database is empty.")
+        return
+
+    print(f"=== {len(data['ids'])} entries ===\n")
+    for doc_id, meta in zip(data["ids"], data["metadatas"]):
+        tags = meta.get('tags', '')
+        func = meta.get('function', '')
+        speedup = meta.get('speedup', '')
+        line = f"  {doc_id}: {meta.get('title', 'untitled')}"
+        if func:
+            line += f"  [{func}]"
+        if speedup:
+            line += f"  ({speedup})"
+        if tags:
+            line += f"  #{tags}"
+        print(line)
+
+def cmd_show(args):
+    coll = get_collection()
+    result = coll.get(ids=[args.id], include=["documents", "metadatas"])
+    if not result["ids"]:
+        print(f"Not found: {args.id}")
+        return
+    meta = result["metadatas"][0]
+    doc = result["documents"][0]
+    print(f"ID: {args.id}")
+    for k, v in meta.items():
+        if v:
+            print(f"{k}: {v}")
+    print(f"\n{doc}")
+
+def cmd_import(args):
+    """Import lessons from a YAML file."""
+    import yaml
+    with open(args.file) as f:
+        lessons = yaml.safe_load(f)
+
+    coll = get_collection()
+    count = 0
+    for lesson in lessons:
+        doc_id = f"lesson_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{count}"
+        metadata = {
+            "title": lesson.get("title", "untitled"),
+            "category": lesson.get("category", "general"),
+            "tags": lesson.get("tags", ""),
+            "date": lesson.get("date", datetime.now().isoformat()),
+            "function": lesson.get("function", ""),
+            "speedup": lesson.get("speedup", ""),
+            "fpga_cycles": lesson.get("fpga_cycles", ""),
+        }
+        coll.add(
+            ids=[doc_id],
+            documents=[lesson["text"]],
+            metadatas=[metadata],
+        )
+        count += 1
+        print(f"  Added: {metadata['title']}")
+    print(f"\nImported {count} lessons.")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="libnn Optimization Experience Database",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # add
+    p_add = sub.add_parser("add", help="Add a lesson")
+    p_add.add_argument("--title", required=True)
+    p_add.add_argument("--category", required=True,
+                       help="vectorization, pipeline, memory, algorithm, toolchain, measurement")
+    p_add.add_argument("--tags", default="")
+    p_add.add_argument("--text", required=True, help="Full lesson text")
+    p_add.add_argument("--function", default="", help="Target function name")
+    p_add.add_argument("--speedup", default="", help="Measured speedup (e.g. '2.49x')")
+    p_add.add_argument("--fpga-cycles", default="", help="FPGA cycle count")
+
+    # search
+    p_search = sub.add_parser("search", help="Search lessons")
+    p_search.add_argument("query", help="Natural language search query")
+    p_search.add_argument("-n", type=int, default=5, help="Number of results")
+
+    # list
+    sub.add_parser("list", help="List all entries")
+
+    # show
+    p_show = sub.add_parser("show", help="Show entry details")
+    p_show.add_argument("id", help="Entry ID")
+
+    # import
+    p_import = sub.add_parser("import", help="Import from YAML file")
+    p_import.add_argument("file", help="YAML file path")
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        return
+
+    {"add": cmd_add, "search": cmd_search, "list": cmd_list,
+     "show": cmd_show, "import": cmd_import}[args.command](args)
+
+if __name__ == "__main__":
+    main()

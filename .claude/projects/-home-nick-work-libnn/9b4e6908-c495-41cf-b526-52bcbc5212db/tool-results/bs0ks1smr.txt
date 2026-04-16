@@ -1,0 +1,300 @@
+  {
+    "id": "4f167833",
+    "document": "Function: riscv_nn_maxpool_HWC_s8\nSummary: Unrolled k_x by 2 to interleave vle8/vmax \u2014 REGRESSED\nApproach: Unrolled inner k_x loop by 2, loading into V8 and V16, then vmaxing both against V0. Goal was to interleave loads and computation to hide load-to-use latency.\nCycles before: 25657\nCycles after: 26489\nSpeedup: 0.97x (3.2% regression)\nPipeline insight: vsim too slow to complete; regression suggests extra pointer arithmetic and register pressure outweigh any load-interleaving benefit. The AX45MPV VLSU may already pipeline sequential vle8/vmax well at M8 e8.\nLesson: For maxpool with M8 e8 loads at VLEN=1024, unrolling the k_x loop by 2 does NOT help. The extra address computation overhead outweighs any load-to-use latency hiding. The original tight loop (vle8 + vmax per iteration) is already efficient for this pattern.\nOutcome: regressed\nTags: maxpool, unroll, load-interleave, regression",
+    "metadata": {
+      "cycles_before": "25657",
+      "tags": "maxpool,unroll,load-interleave,regression",
+      "cycles_after": "26489",
+      "speedup": "0.97x (3.2% regression)",
+      "function": "riscv_nn_maxpool_HWC_s8",
+      "outcome": "regressed",
+      "date": "2026-03-21"
+    }
+  },
+  {
+    "id": "77473db5",
+    "document": "Function: riscv_nn_maxpool_HWC_s8\nSummary: Replaced inner loop multiply-based addressing with precomputed pointer + stride addition\nApproach: Precomputed row_ptr base address before k_y loop and used col_ptr += in_tensor_ch for k_x advancement, eliminating the multiply (k_x + k_y * in_tensor_dim) * in_tensor_ch in the inner loop.\nCycles before: 25657\nCycles after: 25342\nSpeedup: 1.012x (1.2% improvement, essentially neutral)\nPipeline insight: Instruction count dropped 22.5% (10529 to 8164) but cycles barely changed (25657 to 25342). IPC dropped from 0.40 to 0.32. Function is clearly memory-bound by vector load latency at M8 e8 VLEN=1024 (128-byte loads).\nLesson: maxpool_HWC_s8 with in_tensor_ch=2048 and 3x3 kernel is memory-bound. Reducing scalar instruction count by 22% only saves 1.2% cycles. The bottleneck is VLSU throughput for 128-byte vle8 loads from strided addresses (stride=2048 bytes between k_x positions). Further optimization requires reducing total memory traffic, not instruction overhead.\nOutcome: neutral\nTags: maxpool, pointer-arithmetic, memory-bound, address-optimization",
+    "metadata": {
+      "cycles_after": "25342",
+      "date": "2026-03-21",
+      "outcome": "neutral",
+      "speedup": "1.012x (1.2% improvement, essentially neutral)",
+      "tags": "maxpool,pointer-arithmetic,memory-bound,address-optimization",
+      "cycles_before": "25657",
+      "function": "riscv_nn_maxpool_HWC_s8"
+    }
+  },
+  {
+    "id": "fb9cda57",
+    "document": "Function: riscv_nn_maxpool_HWC_s8\nSummary: M4 2-pixel parallel \u2014 neutral, memory-bound at M8 already\nApproach: Dropped LMUL from M8 to M4, processed 2 output pixels in parallel (separate accumulators v0/v4, separate load registers v8/v12). Goal: double memory-level parallelism. Result: IPC improved 0.32\u21920.57 but instruction count doubled (8192\u219214584). Net cycles: 25805 vs 25667 baseline (slight regression). The A/B pixel kernel loops are sequential so no true load interleaving occurs.\nCycles before: 25667\nCycles after: 25805\nSpeedup: 0.99x (neutral/slight regression)\nPipeline insight: vsim kernel extract at VLEN=512: M8 inner loop has 86-cycle period per vle8+vmax pair. vle8 VLSU latency is 27 cycles (issue\u2192VW8). vmax chains immediately after vle8 VW completes. With M8 the pipeline is fully serialized \u2014 only 1 vle8 and 1 vmax in flight at a time. Function is memory-bound on FPGA (ch=2048 >> L1 cache).\nLesson: maxpool_HWC_s8 is memory-bound \u2014 the hot loop is just vle8+vmax at M8 with no computation to hide behind. Reducing LMUL to M4 for 2-pixel parallelism doubles inst count without reducing cycles because the compiler emits sequential A/B loops (no interleaving). True improvement would require changing memory access patterns (e.g., blocking across output rows to reuse cache lines).\nOutcome: neutral\nTags: maxpool, memory-bound, LMUL, M8, M4, 2-pixel-parallel",
+    "metadata": {
+      "outcome": "neutral",
+      "cycles_after": "25805",
+      "speedup": "0.99x (neutral/slight regression)",
+      "cycles_before": "25667",
+      "tags": "maxpool,memory-bound,LMUL,M8,M4,2-pixel-parallel",
+      "function": "riscv_nn_maxpool_HWC_s8",
+      "date": "2026-03-23"
+    }
+  },
+  {
+    "id": "1b35bf81",
+    "document": "Function: riscv_nn_conv_HWC_s8_s8_s8_sym_bias_fast\nSummary: Replaced ENA_TILING GEMM (vectorize col2=32, 12.5% VL util) with im2col + 4x2 GEMM using vd4dots (vectorize K=1152, ~100% VL util)\nApproach: The ENA_TILING path used nn_mat_mul_kernel_tiling_q7 which vectorized across output channels (col2=32). At VLEN=1024/M2, only 32 of 256 possible elements were used per vector op (12.5% utilization). Replaced with the im2col + nn_mat_mul_kernel_q7_bias_2sft path which uses 4x2 tiled GEMM with vd4dots vectorizing across the reduction dimension K=1152, achieving full VL utilization. Also eliminated the weight transpose step.\nCycles before: 2292500\nCycles after: 551979\nSpeedup: 4.15x\nPipeline insight: vsim timed out. Assembly analysis: inner loop 6 vle8 + 8 vd4dots (M2), ratio 1.33. Speedup from vectorizing K=1152 instead of col2=32.\nLesson: When out_tensor_ch is small relative to VLEN, the tiling GEMM that vectorizes across output channels wastes VL capacity. Switch to GEMM that vectorizes across the reduction dimension K instead. The existing nn_mat_mul_kernel_q7_bias_2sft already implements this correctly. Also: ENA_TILING is defined in internal_nn_math.h, not build.sh \u2014 always verify active code path from linked binary objdump.\nOutcome: improved\nTags: conv_HWC, sym_bias_fast, GEMM, tiling, vector-utilization, vd4dots, ENA_TILING",
+    "metadata": {
+      "tags": "conv_HWC,sym_bias_fast,GEMM,tiling,vector-utilization,vd4dots,ENA_TILING",
+      "date": "2026-03-23",
+      "outcome": "improved",
+      "cycles_after": "551979",
+      "cycles_before": "2292500",
+      "function": "riscv_nn_conv_HWC_s8_s8_s8_sym_bias_fast",
+      "speedup": "4.15x"
+    }
+  },
+  {
+    "id": "2afa80a1",
+    "document": "Function: riscv_nn_conv_HWC_s8_s8_s8_sym_bias_fast\nSummary: Switched im2col from 2-pixel to 4-pixel batching with _unroll4 GEMM (4x4/M1) \u2014 4.3% improvement over round 1\nApproach: Changed buffer threshold from 2*K to 4*K and switched GEMM from nn_mat_mul_kernel_q7_bias_2sft (4x2/M2) to _unroll4 (4x4/M1). Halves weight reloads, improves compute-to-load ratio from 1.33 to 2.0. Trade-off: M1 gives VL=128 instead of M2 VL=256, doubling inner loop iterations. Net effect: instruction count increased 13% but IPC improved 0.59->0.70, reducing cycles by 4.3%.\nCycles before: 551979\nCycles after: 529123\nSpeedup: 1.043x (4.33x total from baseline 2292500)\nPipeline insight: IPC improved 0.59->0.70, suggesting better instruction-level parallelism from 4x4 tiling. But instruction count increased 13% due to M1 vs M2. Net gain modest.\nLesson: For conv with small out_ch and large K, switching from 4x2/M2 to 4x4/M1 gives modest 4% gain. The higher compute-to-load ratio (2.0 vs 1.33) helps IPC but the doubled inner iterations partially offset. Diminishing returns at this point.\nOutcome: improved\nTags: conv_HWC, sym_bias_fast, GEMM, unroll4, 4x4-tiling, M1-vs-M2",
+    "metadata": {
+      "outcome": "improved",
+      "speedup": "1.043x (4.33x total from baseline 2292500)",
+      "function": "riscv_nn_conv_HWC_s8_s8_s8_sym_bias_fast",
+      "tags": "conv_HWC,sym_bias_fast,GEMM,unroll4,4x4-tiling,M1-vs-M2",
+      "date": "2026-03-23",
+      "cycles_before": "551979",
+      "cycles_after": "529123"
+    }
+  },
+  {
+    "id": "243fb837",
+    "document": "Function: riscv_nn_conv_HWC_s8_s8_s8_sym_fast\nSummary: Replaced ENA_TILING GEMM (vectorize col2=32, 12.5% VL util) with im2col + 4x4 vd4dots GEMM (vectorize K=1152, ~100% VL util)\nApproach: Same optimization as sym_bias_fast: removed weight transpose + tiling GEMM, replaced with 4-pixel im2col + nn_mat_mul_kernel_q7_2sft_unroll4. K=1152 (128ch*3*3ker) vectorized at VLEN=1024/M1 gives ~4.5 inner loop iterations per output channel group.\nCycles before: 2276133\nCycles after: 522521\nSpeedup: 4.36x\nPipeline insight: Inner loop: 8 vle8 + 16 vd4dots (4x4 tiling, compute-to-load 2.0). Post: 16 vredsum + 12 vslideup + quantization. IPC 0.69, 362K instructions.\nLesson: The ENA_TILING GEMM pattern is consistently ~4x slower than im2col + vd4dots GEMM for these conv functions. The fix is mechanical: replace tiling path with im2col + _2sft/_bias_2sft unroll4 GEMM. Works for both bias and no-bias variants.\nOutcome: improved\nTags: conv, gemm, vd4dots, tiling, VL-utilization, sym_fast",
+    "metadata": {
+      "outcome": "improved",
+      "function": "riscv_nn_conv_HWC_s8_s8_s8_sym_fast",
+      "date": "2026-03-23",
+      "tags": "conv,gemm,vd4dots,tiling,VL-utilization,sym_fast",
+      "cycles_before": "2276133",
+      "speedup": "4.36x",
+      "cycles_after": "522521"
+    }
+  },
+  {
+    "id": "2369f56c",
+    "document": "Function: conv_HWC (general pattern)\nSummary: ENA_TILING GEMM is consistently ~4x slower than im2col + vd4dots GEMM for conv_HWC functions \u2014 mechanical fix pattern\nApproach: All conv_HWC_s8 variants using the ENA_TILING path (nn_mat_mul_kernel_tiling_*) vectorize across output channels (col2, typically 32). At VLEN=1024, this wastes 87.5% of vector length. The fix: replace with im2col + nn_mat_mul_kernel_q7_*_2sft_unroll4 which vectorizes across the reduction dimension K (in_ch * ker_h * ker_w). Use _bias_2sft_unroll4 for bias variants, _2sft_unroll4 for no-bias. Buffer 4 pixels of im2col before calling the GEMM. Handle leftovers with 2-pixel (_2sft) and 1-pixel (scalar) fallbacks. Remove weight transpose (nn_mat_mul_kernel_tiling_transpose_q7) and intermediate q32 buffer. Proven on: sym_bias_fast (4.33x), sym_fast (4.36x), asym_bias_any (already done).\nCycles before: ~2.3M (typical for 22x22x128->20x20x32, ker=3x3)\nCycles after: ~520K\nSpeedup: ~4.3x consistently\nPipeline insight: Optimized inner loop: 8 vle8 + 16 vd4dots (4x4 tiling), compute-to-load ratio 2.0. IPC ~0.69-0.70. At this point diminishing returns \u2014 Round 2 attempts on sym_bias_fast only yielded 4.3% additional.\nLesson: Any conv_HWC function still using ENA_TILING path with nn_mat_mul_kernel_tiling_* is a guaranteed ~4x win. The fix is mechanical: swap GEMM kernel, adjust buffer sizing, remove weight transpose. Check linked binary objdump for tiling_* calls to identify targets. Remaining candidates: sym_bias_fast_any, sym_fast_any, RGB variants, sft_bias.\nOutcome: improved\nTags: conv, gemm, vd4dots, tiling, VL-utilization, pattern, mechanical-fix",
+    "metadata": {
+      "function": "conv_HWC (general pattern)",
+      "cycles_before": "~2.3M (typical for 22x22x128->20x20x32, ker=3x3)",
+      "tags": "conv,gemm,vd4dots,tiling,VL-utilization,pattern,mechanical-fix",
+      "date": "2026-03-23",
+      "cycles_after": "~520K",
+      "speedup": "~4.3x consistently",
+      "outcome": "improved"
+    }
+  },
+  {
+    "id": "6ef161b2",
+    "document": "Function: riscv_nn_conv_HWC_u8_u8_s8_sym_bias_fast\nSummary: Replaced ENA_TILING GEMM with im2col + 4x4 vd4dotsu GEMM for u8 variant \u2014 3.91x speedup\nApproach: Same mechanical pattern as s8 variants: removed weight transpose + tiling GEMM (nn_mat_mul_kernel_tiling_bias_u8_u8_s8, vectorizes col2=32, 12.5% VL util at VLEN=1024), replaced with 4-pixel im2col + nn_mat_mul_kernel_u8_bias_2sft_unroll4 (4x4 vd4dotsu, vectorizes K=1152). u8-specific: vd4dotsu for signed*unsigned dot product, vnclipu for [0,255] clipping, NDS_ISA_SAT for scalar fallback.\nCycles before: 2297409\nCycles after: 586975\nSpeedup: 3.91x\nPipeline insight: Inner loop: 8 vle8 + 16 vd4dotsu (M1), compute-to-load 2.0. Same structure as s8 kernel. IPC 0.67.\nLesson: The ENA_TILING to vd4dots/vd4dotsu GEMM pattern extends mechanically to u8 variants. Use nn_mat_mul_kernel_u8_bias_2sft_unroll4 (vd4dotsu) for signed weights * unsigned inputs. vnclipu for unsigned output clipping. All conv_HWC u8 variants with ENA_TILING should follow the same pattern.\nOutcome: improved\nTags: conv_HWC, u8, ENA_TILING, vd4dotsu, GEMM, mechanical_fix",
+    "metadata": {
+      "cycles_after": "586975",
+      "function": "riscv_nn_conv_HWC_u8_u8_s8_sym_bias_fast",
+      "outcome": "improved",
+      "tags": "conv_HWC,u8,ENA_TILING,vd4dotsu,GEMM,mechanical_fix",
+      "cycles_before": "2297409",
+      "date": "2026-03-23",
+      "speedup": "3.91x"
+    }
+  },
+  {
+    "id": "31ed3665",
+    "document": "Function: riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any\nSummary: Upgraded GEMM from 4x2/M2 (v4) to 4x4/M1 (unroll4) for out_ch<=64 path \u2014 2.6% improvement\nApproach: Added nn_mat_mult_kernel_s8_offset_unroll4 with 4-channel x 4-pixel tiling using LMUL=M1. 16 M1 accumulators, 8 loads + 16 vd4dots per inner loop iteration. Compute-to-load ratio 2.0 (vs 1.33 for v4). Modified conv function to buffer 4 im2col pixels instead of 2.\nCycles before: 1769923\nCycles after: 1724015\nSpeedup: 1.03x\nPipeline insight: Inner loop: 8 vle8 + 16 vd4dots (M1). K=576 at VL=128 gives ~4.5 loop iters. With out_ch=16, only 4 channel groups. Reduction epilogue (16 vredsum + 12 vslideup + requantize) is significant overhead for small out_ch.\nLesson: 4x4/M1 upgrade gives modest 2.6% gain on asym_bias_any because: (1) v4 kernel was already good, (2) small out_ch=16 means few channel groups so reduction overhead dominates, (3) the asym contri_buf precomputation is a fixed cost. Larger out_ch would benefit more.\nOutcome: improved\nTags: conv, asym, GEMM, 4x4-tiling, vd4dots, M1",
+    "metadata": {
+      "tags": "conv,asym,GEMM,4x4-tiling,vd4dots,M1",
+      "cycles_after": "1724015",
+      "cycles_before": "1769923",
+      "date": "2026-03-23",
+      "speedup": "1.03x",
+      "function": "riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any",
+      "outcome": "improved"
+    }
+  },
+  {
+    "id": "10c78711",
+    "document": "Function: riscv_nn_conv_HWC_u8_s8_s8_sym_bias_fast\nSummary: Replaced ENA_TILING GEMM with im2col + 4x4 vd4dotsu GEMM (nn_mat_mul_kernel_u8_q7_bias_2sft_unroll4) \u2014 4.00x speedup\nApproach: Same pattern as s8_s8_s8 and u8_u8_s8 variants. Replaced weight transpose + tiling GEMM (vectorize col2=32, 12.5% VL util) with 4-pixel im2col + nn_mat_mul_kernel_u8_q7_bias_2sft_unroll4 (4x4 vd4dotsu, vectorize K). No new kernel needed \u2014 reused existing unroll4.\nCycles before: 2292583\nCycles after: 573699\nSpeedup: 4.00x\nPipeline insight: Assembly: 8 vle8 + 16 vd4dotsu per inner loop iter (M1). Same structure as u8_u8_s8 kernel at parity.\nLesson: u8_s8_s8 variant mechanically follows the same tiling GEMM \u2192 im2col + unroll4 pattern. nn_mat_mul_kernel_u8_q7_bias_2sft_unroll4 already existed \u2014 just needed to wire it up. Expect same ~4x for all remaining sym_bias_fast and sym_fast type variants.\nOutcome: improved\nTags: conv, sym, GEMM, 4x4-tiling, vd4dotsu, u8_s8",
+    "metadata": {
+      "tags": "conv,sym,GEMM,4x4-tiling,vd4dotsu,u8_s8",
+      "function": "riscv_nn_conv_HWC_u8_s8_s8_sym_bias_fast",
+      "date": "2026-03-23",
+      "speedup": "4.00x",
+      "outcome": "improved",
+      "cycles_before": "2292583",
+      "cycles_after": "573699"
+    }
+  },
+  {
+    "id": "71723dc2",
+    "document": "Function: riscv_nn_conv_HWC_u8_s16_s8_sym_bias_fast\nSummary: Replaced ENA_TILING GEMM with im2col + 4x4 vd4dotsu GEMM (nn_mat_mul_kernel_u8_q15_bias_2sft_unroll4) \u2014 4.26x speedup\nApproach: Same mechanical pattern. Replaced weight transpose + tiling GEMM with 4-pixel im2col + nn_mat_mul_kernel_u8_q15_bias_2sft_unroll4. Reused existing kernel.\nCycles before: 2289281\nCycles after: 536923\nSpeedup: 4.26x\nPipeline insight: Same structure as other sym_bias_fast variants \u2014 at parity.\nLesson: u8_s16_s8 variant follows same pattern. All sym_bias_fast variants are mechanical.\nOutcome: improved\nTags: conv, sym, GEMM, 4x4-tiling, vd4dotsu, u8_s16",
+    "metadata": {
+      "cycles_before": "2289281",
+      "date": "2026-03-23",
+      "function": "riscv_nn_conv_HWC_u8_s16_s8_sym_bias_fast",
+      "tags": "conv,sym,GEMM,4x4-tiling,vd4dotsu,u8_s16",
+      "speedup": "4.26x",
+      "cycles_after": "536923",
+      "outcome": "improved"
+    }
+  },
+  {
+    "id": "d27c0808",
+    "document": "Function: riscv_nn_conv_HWC_s8_s16_s8_sym_bias_fast\nSummary: Replaced ENA_TILING GEMM with im2col + 4x4 vd4dots GEMM \u2014 4.63x speedup\nApproach: Same pattern. nn_mat_mul_kernel_q7_q15_bias_2sft_unroll4 (signed*signed vd4dots).\nCycles before: 2289205\nCycles after: 493896\nSpeedup: 4.63x\nPipeline insight: Same structure as other variants \u2014 at parity.\nLesson: s8_s16 variant also mechanical. Best speedup of the batch \u2014 likely due to less overhead from q15 output path.\nOutcome: improved\nTags: conv, sym, GEMM, 4x4-tiling, vd4dots, s8_s16",
+    "metadata": {
+      "cycles_after": "493896",
+      "cycles_before": "2289205",
+      "speedup": "4.63x",
+      "date": "2026-03-23",
+      "function": "riscv_nn_conv_HWC_s8_s16_s8_sym_bias_fast",
+      "outcome": "improved",
+      "tags": "conv,sym,GEMM,4x4-tiling,vd4dots,s8_s16"
+    }
+  },
+  {
+    "id": "4962865a",
+    "document": "Function: riscv_nn_conv_HWC_s8_s8_s8_sym_bias_any\nSummary: Replaced ENA_TILING GEMM with im2col + runtime dispatch (unroll4 for col%4==0, 2-pixel for general) \u2014 4.37x speedup\nApproach: Same tiling\u2192im2col pattern but with runtime col_size%4 check since _any variant has no in_tensor_ch constraint. When divisible by 4, uses nn_mat_mul_kernel_q7_bias_2sft_unroll4 (4-pixel); otherwise nn_mat_mul_kernel_q7_bias_2sft (2-pixel). 5-region spatial partitioning. Perf test has ch=128 so unroll4 path is taken.\nCycles before: 2080991\nCycles after: 475951\nSpeedup: 4.37x\nPipeline insight: Same as _fast variants \u2014 tiling GEMM vectorizes col2=32 (12.5% VL util), unroll4 vectorizes K=1152 (~100% VL util)\nLesson: The _any (no channel constraint) variants can still use unroll4 with a runtime check. Cost is one branch per function call, negligible vs the 4x gain.\nOutcome: improved\nTags: tiling-to-im2col, unroll4, runtime-dispatch, sym-bias-any",
+    "metadata": {
+      "tags": "tiling-to-im2col,unroll4,runtime-dispatch,sym-bias-any",
+      "cycles_before": "2080991",
+      "date": "2026-03-23",
+      "function": "riscv_nn_conv_HWC_s8_s8_s8_sym_bias_any",
+      "outcome": "improved",
+      "cycles_after": "475951",
+      "speedup": "4.37x"
+    }
+  },
+  {
+    "id": "7ce6a65b",
+    "document": "Function: riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any_dilated\nSummary: Runtime dispatch: groups==1 uses unroll4 (4-pixel batching) instead of v3 (2-pixel) \u2014 1.05x speedup\nApproach: When groups==1, batch 4 im2col columns and call nn_mat_mult_kernel_s8_offset_unroll4 instead of 2-column nn_mat_mult_kernel_s8_offset_v3. Required updating get_buffer_size to allocate 4 columns. Marginal improvement because perf test has out_tensor_ch=16 (only 4 channel groups per GEMM call).\nCycles before: 1822840\nCycles after: 1734821\nSpeedup: 1.05x\nPipeline insight: With out_tensor_ch=16 and rhs_cols=576, reduction (vredsum) dominates. GEMM kernel upgrade provides marginal benefit. Larger out_tensor_ch would benefit more.\nLesson: Asymmetric dilated conv with small out_tensor_ch (16) is reduction-dominated. GEMM kernel optimization has diminishing returns below ~32 output channels. Dilation support adds im2col overhead that further limits GEMM-side gains.\nOutcome: improved\nTags: asym, dilated, unroll4, runtime-dispatch, marginal",
+    "metadata": {
+      "cycles_before": "1822840",
+      "speedup": "1.05x",
+      "date": "2026-03-23",
+      "function": "riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any_dilated",
+      "outcome": "improved",
+      "cycles_after": "1734821",
+      "tags": "asym,dilated,unroll4,runtime-dispatch,marginal"
+    }
+  },
+  {
+    "id": "8bb77f9f",
+    "document": "Function: riscv_nn_conv_HWC_s8_s8_s8_RGB_sym_bias_fast\nSummary: Attempted im2col + nn_mat_mul_kernel_q7_bias_2sft (2-pixel batching) to replace tiling GEMM \u2014 regressed 1.55x\nApproach: Replaced ENA_TILING block with im2col + nn_mat_mul_kernel_q7_bias_2sft. 2-pixel batching. K=3*5*5=75.\nCycles before: 820793\nCycles after: 1269843\nSpeedup: 0.65x (regression)\nPipeline insight: K=75 too small for vd4dots at VLEN=1024: only 7.4% VL util for dot product (19/256 at e32/M8). Tiling GEMM vectorizes col2=256 output pixels at e16/M8 giving much better VL utilization.\nLesson: im2col + vd4dots GEMM does NOT work for RGB (ch_im_in=3) with small kernels because K=3*ker^2 is tiny. The tiling GEMM is better here because it vectorizes across output pixels not K. Also: nn_mat_mul_kernel_q7_bias_2sft_unroll4 silently truncates when col_size%4!=0.\nOutcome: regressed\nTags: RGB, im2col, small-K, tiling-GEMM, vd4dots-truncation",
+    "metadata": {
+      "outcome": "regressed",
+      "cycles_after": "1269843",
+      "speedup": "0.65x (regression)",
+      "date": "2026-03-24",
+      "cycles_before": "820793",
+      "tags": "RGB,im2col,small-K,tiling-GEMM,vd4dots-truncation",
+      "function": "riscv_nn_conv_HWC_s8_s8_s8_RGB_sym_bias_fast"
+    }
+  },
+  {
+    "id": "12e35082",
+    "document": "Function: conv_HWC_s8_s8_s8_RGB_sym_bias_fast\nSummary: Direct conv with vqmacc.vx over output channels, 2-pixel batching, fused requantize \u2014 2.04x speedup\nApproach: Replaced tiling GEMM (weight transpose + nn_mat_mul_kernel_tiling_q7 + separate bias/requant pass) with direct convolution. Keeps weight transpose but eliminates im2col and q32 intermediate buffer. For each 2-pixel pair: load bias into e32/M8 accumulators, iterate K=75 positions (vle8 transposed weight + 2x vqmacc.vx), fuse bias+requantize (vsra+vmul+vnclip+vnclip+store). Vectorizes across out_tensor_ch=64.\nCycles before: 820793\nCycles after: 401483\nSpeedup: 2.04x\nPipeline insight: Hot loop has 150 padding branches per pixel pair plus 75 redundant vsetvli. Interior pixels dominate but pay full branch cost. Compiler unrolled ch=3 loop well. Next opportunity: split interior vs edge pixel paths.\nLesson: For RGB conv (ch_im_in=3, small K=75): direct conv with vqmacc.vx vectorizing across output channels beats both tiling GEMM and im2col+vd4dots. Weight transpose is cheap and amortized. Key win: eliminating q32 intermediate buffer and separate bias pass. Bottleneck shifts to padding branch overhead.\nOutcome: improved\nTags: RGB, direct-conv, vqmacc, fused-requantize, small-K, branch-overhead",
+    "metadata": {
+      "outcome": "improved",
+      "tags": "RGB,direct-conv,vqmacc,fused-requantize,small-K,branch-overhead",
+      "cycles_before": "820793",
+      "function": "conv_HWC_s8_s8_s8_RGB_sym_bias_fast",
+      "cycles_after": "401483",
+      "date": "2026-03-24",
+      "speedup": "2.04x"
+    }
+  },
+  {
+    "id": "df178202",
+    "document": "Function: conv_HWC_s8_s8_s8_RGB_sym_bias_fast\nSummary: Pad==0 branchless fast path + hoisted vsetvli \u2014 1.09x on top of 2.04x = 2.23x total\nApproach: Two changes: (1) Added if(pad==0) fast path that eliminates all boundary-check branches for interior pixels. With pad=0, all 28x28 output pixels are interior. (2) Hoisted vsetvli e8/M2 outside the kernel loop \u2014 set once after bias load, not 75 times per pixel pair.\nCycles before: 401483\nCycles after: 367823\nSpeedup: 1.09x (2.23x overall from 820793)\nPipeline insight: IPC dropped 1.32->0.75: scalar overhead eliminated, now dominated by vector latency. 48% fewer instructions but only 8.4% fewer cycles. vqmacc at e8/M2 with VL=64 uses only 25% of VLEN=1024 capacity. Bottleneck is vector instruction pipeline, not scalar.\nLesson: Branch elimination for pad=0 is a low-risk win but mostly reduces instruction count, not cycles. When vector instructions dominate, IPC drops and instruction reduction gives diminishing cycle returns. Next optimization should target vector utilization or compute-to-load ratio.\nOutcome: improved\nTags: branch-elimination, pad0-fast-path, vsetvli-hoist, IPC-analysis",
+    "metadata": {
+      "date": "2026-03-24",
+      "function": "conv_HWC_s8_s8_s8_RGB_sym_bias_fast",
+      "outcome": "improved",
+      "cycles_after": "367823",
+      "speedup": "1.09x (2.23x overall from 820793)",
+      "cycles_before": "401483",
+      "tags": "branch-elimination,pad0-fast-path,vsetvli-hoist,IPC-analysis"
+    }
+  },
+  {
+    "id": "29e52104",
+    "document": "Function: conv_HWC_s8_s8_s8_RGB_sym_bias_fast\nSummary: 4-pixel batching with M4 accumulators + M1 weight loads \u2014 1.20x on top of 2.23x = 2.67x total\nApproach: Changed from 2-pixel batching (M8 acc, M2 wt) to 4-pixel batching (M4 acc at v0/v4/v8/v12, M1 wt at v16). out_tensor_ch=64 fits in M4 at e32 (VLMAX=128). Compute-to-load ratio doubled from 2:1 to 4:1. Each weight load now feeds 4 vqmacc instead of 2.\nCycles before: 367823\nCycles after: 307751\nSpeedup: 1.20x (2.67x overall from 820793)\nPipeline insight: IPC=0.73, similar to round 3 (0.75). Instructions dropped 18% (275K->225K) from halved weight loads. Vector latency dominates. Remaining inner loop: 1 vle8 + 4 lb + 4 vqmacc per ch, x75 kernel positions x196 pixel quads.\nLesson: For small out_tensor_ch (64) fitting in smaller LMUL, reducing LMUL from M8 to M4 and increasing pixel batching from 2 to 4 is a clean win. The 4:1 compute-to-load ratio better amortizes weight vector loads. Matches the pattern seen in conv_HWC asym_bias_any (4x unroll + smaller LMUL). Further gains would need micro-arch level optimizations.\nOutcome: improved\nTags: 4-pixel-batching, M4-accumulator, compute-to-load-ratio, LMUL-reduction",
+    "metadata": {
+      "function": "conv_HWC_s8_s8_s8_RGB_sym_bias_fast",
+      "outcome": "improved",
+      "cycles_before": "367823",
+      "tags": "4-pixel-batching,M4-accumulator,compute-to-load-ratio,LMUL-reduction",
+      "cycles_after": "307751",
+      "date": "2026-03-24",
+      "speedup": "1.20x (2.67x overall from 820793)"
+    }
+  },
+  {
+    "id": "78371ff0",
+    "document": "Function: riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any\nSummary: Split im2col into top/mid/bottom regions with bulk row copies for pad=0 center \u2014 1.57x speedup\nApproach: Replaced single im2col loop with 5-region split (top/mid-left/mid-center/mid-right/bottom). Mid-center uses nn_dup_s8(in_tensor_ch * ker_dim_x) bulk row copy instead of per-position nn_dup_s8(in_tensor_ch). For pad=0 test case (32x30x64, 3x3, out_ch=16), all pixels fall in mid-center. Reduces 9 copies of 64B to 3 copies of 192B per pixel. Also fixed boundary clamping bug where bound_x_end could exceed out_tensor_dim_x.\nCycles before: 1724125\nCycles after: 1101509\nSpeedup: 1.57x\nPipeline insight: GEMM kernel unchanged: 4x4 tile, M1 vd4dots, 5 inner iterations, 16 vredsum + 12 vslideup epilogue per channel group. 420 calls total, weights reloaded fresh each call. Next: batch more pixels to amortize weight loads.\nLesson: Bulk row copy for non-padded im2col region is simple and effective. Key: clamp boundary computation to output dimensions to avoid OOB. The im2col copy overhead was ~36% of total cycles for this test case.\nOutcome: improved\nTags: im2col, bulk-copy, region-split, conv-HWC, asym",
+    "metadata": {
+      "cycles_after": "1101509",
+      "cycles_before": "1724125",
+      "function": "riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any",
+      "speedup": "1.57x",
+      "outcome": "improved",
+      "date": "2026-03-24",
+      "tags": "im2col,bulk-copy,region-split,conv-HWC,asym"
+    }
+  },
+  {
+    "id": "d7f18ece",
+    "document": "Function: riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any\nSummary: 8-pixel double-pump batching (im2col 8 pixels, call unroll4 twice) \u2014 neutral (0.4%)\nApproach: Changed im2col buffer from 4 to 8 columns. When 8 columns ready, call unroll4 kernel twice for pixels 0-3 then 4-7. Hypothesis: weight data (9KB per call) stays in L1 for second call. Reality: weights were already in L1 with 4-pixel batching. Added drain_ptr logic for 1..7 pixel leftover handling.\nCycles before: 1101509\nCycles after: 1096809\nSpeedup: 1.004x (neutral)\nPipeline insight: Weight data already in L1 cache even with 4-pixel batching. 8-pixel batching adds no cache benefit. IPC unchanged at 0.59.\nLesson: For K=576, out_ch=16, the weight working set (9KB) fits in L1 regardless of pixel batch size. L1 cache reuse from double-pump is not impactful when the working set is already small enough.\nOutcome: neutral\nTags: double-pump, pixel-batching, cache-locality, conv-HWC, asym",
+    "metadata": {
+      "cycles_before": "1101509",
+      "outcome": "neutral",
+      "date": "2026-03-24",
+      "function": "riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any",
+      "tags": "double-pump,pixel-batching,cache-locality,conv-HWC,asym",
+      "speedup": "1.004x (neutral)",
+      "cycles_after": "1096809"
+    }
+  },
+  {
+    "id": "35d97a4e",
+    "document": "Function: riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any_dilated\nSummary: Add pad=0 fast path skipping boundary checks, precomputed dilation strides \u2014 1.24x speedup\nApproach: For groups==1 with pad_x==0 && pad_y==0 (all kernel positions in-bounds), replaced the inner im2col loops that had 4 boundary checks per kernel position with a streamlined loop using precomputed dilation row/col strides and direct pointer arithmetic. Eliminated nn_set_val_s8 padding path entirely. Source addresses computed by pointer increment (ker_col += dil_col_stride) instead of multiplication each iteration.\nCycles before: 1734900\nCycles after: 1396358\nSpeedup: 1.24x\nPipeline insight: 7.8% fewer instructions but 19.5% fewer cycles \u2014 IPC improved from 0.53 to 0.60. Eliminated boundary check branches improved pipeline utilization significantly beyond raw instruction savings, suggesting branch prediction overhead and speculative execution waste were major contributors. The streamlined im2col inner loop (vle8+vse8+pointer add) is highly predictable.\nLesson: For dilated conv with pad=0, boundary checks are always false but cause significant pipeline overhead. Eliminating them improved IPC by 13% (0.53\u21920.60). Precomputed strides replaced per-iteration multiplications. The cycle savings (19.5%) far exceeded instruction savings (7.8%), confirming that branch-heavy im2col code has poor pipeline utilization on AX45MPV.\nOutcome: improved\nTags: im2col, boundary-check, branch-elimination, dilated-conv, pad-zero, ipc",
+    "metadata": {
+      "tags": "im2col,boundary-check,branch-elimination,dilated-conv,pad-zero,ipc",
+      "function": "riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any_dilated",
+      "cycles_before": "1734900",
+      "date": "2026-03-24",
+      "cycles_after": "1396358",
+      "outcome": "improved",
+      "speedup": "1.24x"
+    }
+  },
+  {
+    "id": "5903d267",
+    "document": "Function: riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any_dilated\nSummary: Inline NDS_VEC VLE8/VSE8 for im2col copies: 16% fewer instructions but IPC dropped 0.60\u21920.51, net 0.5% improvement \u2014 reverted\nApproach: Replaced nn_dup_s8() calls in pad=0 fast path with direct NDS_VEC_VLE8_V/NDS_VEC_VSE8_V macros, hoisting vsetvli outside loops. Required restoring vsetvli after each GEMM call (GEMM clobbers VL state). Reduced instructions from 843K to 709K but IPC dropped from 0.60 to 0.51.\nCycles before: 1396358\nCycles after: 1389095\nSpeedup: 1.005x (essentially neutral)\nPipeline insight: NDS_VEC_* inline asm macros use asm volatile with clobber lists that prevent compiler from reordering vector ops with surrounding scalar code. The nn_dup_s8 C function gives the compiler more scheduling freedom. 16% instruction reduction wiped out by 15% IPC regression. The compiler-generated nn_dup_s8 code interleaves scalar loop control with vector ops better than the opaque inline asm blocks.\nLesson: NDS_VEC_* inline asm macros can HURT IPC by blocking compiler instruction scheduling. For small copies (ker_ch <= VL), nn_dup_s8 inlines well and the compiler generates better-scheduled code. Only use NDS_VEC_* macros when the compiler cannot generate the needed vector instructions (e.g., vd4dots, vredsum). For simple vle8/vse8 patterns, let the compiler handle it via nn_dup_s8.\nOutcome: neutral\nTags: inline-asm, ipc-regression, compiler-scheduling, im2col, NDS_VEC_macros",
+    "metadata": {
+      "outcome": "neutral",
+      "cycles_before": "1396358",
+      "function": "riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any_dilated",
+      "speedup": "1.005x (essentially neutral)",
+      "tags": "inline-asm,ipc-regression,compiler-scheduling,im2col,NDS_VEC_macros",
+      "date": "2026-03-24",
+      "cycles_after": "1389095"
+    }
+  },
+  {
+    "id": "f9ca38ac",
+    "document": "Function: riscv_nn_conv_1x1_HWC_s8_s8_s8_asym_bias_fast_any\nSummary: Switched from ENA_TILING GEMM to nn_mat_mult_nt_t_s8_v2 direct GEMM - 2.60x speedup\nApproach: Added !defined(ENA_VEC_ELEN64) to ENA_TILING ifdef, allowing nn_mat_mult_nt_t_s8_v2 path. Eliminates weight transpose, vectorizes K=512 at 100% VL vs col2=32 at 12.5%.\nCycles before: 1116941\nCycles after: 428860\nSpeedup: 2.60x\nPipeline insight: IPC 0.72->0.50 but instrs 3.74x fewer (807k->216k). Hot loop: 8 VLE8 + 16 VD4DOTS at LMUL=M1, 4 K-loop iters.\nLesson: Same tiling_removal pattern as sym variants. ENA_TILING GEMM wastes 87.5% VL. For asym 1x1 conv, existing ENA_VEC_ELEN64 path was already correct.\nOutcome: improved\nTags: conv_1x1, asym, tiling_removal, ifdef_reorder",
+    "metadata": {
+      "outcome": "improved",
+      "date": "2026-03-24",
+      "cycles_after": "428860",
+      "tags": "conv_1x1,asym,tiling_removal,ifdef_reorder",
+      "speedup": "2.60x",
+      "cycles_before": "1116941",
+      "function": "riscv_nn_conv_1x1_HWC_s8_s8_s8_asym_bias_fast_any"
+    }
+  }
+]

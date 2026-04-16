@@ -1,0 +1,85 @@
+---
+type: technique
+tags: [rvv, im2col, conv_HWC, memory, bulk-copy]
+applies_to: [conv_HWC_s8_asym_bias_any, conv_HWC_s8_asym_bias_any_dilated]
+---
+
+# im2col Strategies for conv_HWC
+
+## What im2col Does
+
+Transforms a 3D convolution into GEMM by materializing each kernel window as a row in a buffer. For a 3x3 conv with 64 input channels: each row is `ker_h * ker_w * in_ch = 9 * 64 = 576` bytes. Buffering 4 rows lets the unroll4 GEMM kernel process 4 pixels per call.
+
+## Strategy 1: 5-Region Split for Efficient Center-Region Copy
+
+Default im2col iterates element-by-element, calling `nn_set_val_s8` for padding and `nn_dup_s8(in_tensor_ch)` per kernel position. For a 3x3 kernel: 9 copies of 64 bytes per pixel.
+
+For the center region (non-boundary pixels with no padding), replace with bulk row copies:
+
+```c
+// Instead of 9 separate copies of in_tensor_ch bytes:
+nn_dup_s8(in_tensor_ch * ker_dim_x, src_row, dst_row);  // copy ker_dim_x columns at once
+```
+
+This reduces 9x64B copies to 3x192B copies (one per kernel row) for a 3x3 kernel.
+
+### 5-Region Split Structure
+
+Split the output pixels into regions based on boundary proximity:
+1. **Top** -- y_start rows where k_y=0 positions are out of bounds
+2. **Mid-left** -- pixels near left edge (k_x=0 pads)
+3. **Mid-center** -- interior pixels: no padding, all kernel positions in-bounds -> bulk copy
+4. **Mid-right** -- pixels near right edge
+5. **Bottom** -- y_end rows where k_y=last positions are out of bounds
+
+For typical workloads (large input, small padding), mid-center dominates (>90% of pixels).
+
+**Applied in:** `riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any` (commit 92703a32)
+**Result:** 1.57x speedup from im2col alone
+
+## Strategy 2: pad=0 Fast Path for Dilated Convolutions
+
+When `pad_x == 0 && pad_y == 0`, all kernel positions are guaranteed in-bounds. Eliminate boundary checks entirely:
+
+```c
+if (groups == 1 && pad_x == 0 && pad_y == 0) {
+    // Fast path: no boundary checks
+    // Use precomputed dilation strides:
+    //   dil_row_stride = dil_y * in_tensor_dim_x * in_tensor_ch
+    //   dil_col_stride = dil_x * in_tensor_ch
+    // Advance by pointer arithmetic: ptr += dil_col_stride
+    // instead of: ptr = base + (k_x * dil_x + k_y * dil_y * in_tensor_dim_x) * in_tensor_ch
+}
+```
+
+**Applied in:** `riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any_dilated` (commit c05de8ad)
+**Result:** 1.24x speedup for the dilated function
+
+## Strategy 3: Pixel Batching (4-pixel im2col before GEMM call)
+
+Buffer 4 complete im2col rows (columns of the GEMM matrix) before calling the unroll4 GEMM kernel. This ensures the weight data loaded in one GEMM call stays in L1 for reuse across pixels.
+
+```
+[im2col buffer: 4 rows x K bytes]
+   ↓
+nn_mat_mul_kernel_q7_bias_2sft_unroll4(weight, im2col_buf, ...)
+   ↓
+[4 output pixels written]
+```
+
+**8-pixel double-pump** (call unroll4 twice per 8-pixel batch) is NOT faster -- weights already fit in L1 with 4-pixel batching. See optdb lesson `d7f18ece`.
+
+## Key Implementation Detail: Buffer Size
+
+When switching from 2-pixel to 4-pixel batching, `get_buffer_size` must allocate 4 columns:
+
+```c
+// For unroll4 (4-pixel batch):
+buf_size = 4 * ker_h * ker_w * in_tensor_ch;
+```
+
+## Related
+
+- [[tiling-gemm-to-vd4dots]] -- the GEMM kernel to pair with im2col
+- [[conv-hwc-s8-asym-bias-any]] -- operator page where bulk copy was applied
+- [[conv-hwc-asym-bias-any-dilated]] -- operator page where pad=0 fast path was applied

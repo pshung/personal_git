@@ -1,0 +1,1356 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+# pylint: disable=too-few-public-methods,invalid-name,unused-argument,arguments-differ
+# pylint: disable=consider-using-enumerate,too-many-lines
+"""
+Template configuration space.
+
+Each template function can be parameterized by a ConfigSpace.
+The space is declared when we invoke the template function with ConfigSpace.
+During evaluation, we pass in a ConfigEntity, which contains a specific
+entity in the space. This entity contains deterministic parameters.
+"""
+from __future__ import absolute_import as _abs
+
+from collections import OrderedDict
+from copy import deepcopy
+import functools
+import math
+import numpy as np
+from typing import Callable, TypeAlias
+
+from auto_iree.log import setup_logger
+
+logger = setup_logger("space")
+
+
+class TransformSpace(object):
+    """Base class for transform space
+    TransformSpace is the node in the computation graph of axes
+
+    .. note::
+
+        We can regard our schedule code as a combination of transformation of axes.
+        Starting from raw axes in the definition of MLIR operation, we can transform
+        these axes by some operators.
+        Each operator has some tunable parameters.
+        Then the tuning process is just to find good parameters of these op.
+
+    So all the combinations of the parameters of these op form our search space.
+
+    Naming convention:
+    We call the set of all possible values as XXXSpace. (XXX can be Tile ...)
+    We call a specific entity in a space as XXXEntity.
+    """
+
+    def __init__(self):
+        self.ins = []
+        self.num_output = 0
+        self.entities = []
+
+    def __len__(self):
+        return len(self.entities)
+
+    def __getitem__(self, index):
+        """Get an entity of the space by index
+
+        Parameters
+        ----------
+        index: int
+
+        Returns
+        -------
+        transform entity
+        """
+        return self.entities[index]
+
+    @staticmethod
+    def get_num_output() -> int:
+        """get number of output axes after this transform
+
+        Returns
+        -------
+        n: int
+            number of output axes
+        """
+        return 0
+
+
+def get_factors(n):
+    """return all factors of an integer
+
+    Parameters
+    ----------
+    n: int
+        integer to factorize
+
+    Returns
+    -------
+    factors: list
+        List of all factors
+    """
+    if n == 0:
+        return [0]
+    step = 2 if n % 2 else 1
+    ret = list(
+        set(
+            functools.reduce(
+                list.__add__,
+                ([i, n // i] for i in range(1, int(math.sqrt(n)) + 1, step) if n % i == 0),
+            )
+        )
+    )
+    ret.sort()
+    return ret
+
+
+def get_pow2s(n):
+    """return all power-of-two numbers that are less or equal than the integer
+
+    Parameters
+    ----------
+    n: int
+        integer for reference
+
+    Returns
+    -------
+    factors: list
+        List of all power-of-two numbers
+    """
+    if n == 0:
+        return [0]
+    return [2**x for x in range(math.floor(math.log2(n)) + 1)]
+
+PARALLEL = "parallel"
+REDUCTION = "reduction"
+
+class Axis(TransformSpace):
+    '''
+    An axis represents loop, iteration, mlir scf.for
+
+    no: No of axis of opname
+
+    trip_count: iteration trip count
+
+    type: parallel or reduce
+    '''
+    def __init__(self,
+                 opid: int,
+                 no: int,
+                 trip_count: int,
+                 type: str):
+        super().__init__()
+        self.opid = opid
+        self.no = no
+        self.trip_count = trip_count
+        self.type = type
+        if opid < 0:
+            raise ValueError
+        if no < 0:
+            raise ValueError
+        if trip_count < 1:
+            raise ValueError
+        if type != PARALLEL and type != REDUCTION:
+            raise ValueError
+    
+    def __eq__(self, value: object) -> bool:
+        assert isinstance(value, Axis) 
+        return self.opid == value.opid and \
+               self.no == value.no and \
+               self.trip_count == value.trip_count and \
+               self.type == value.type
+    
+    def __hash__(self) -> int:
+        text = self.__repr__()
+        return text.__hash__()
+
+    @staticmethod
+    def get_num_output() -> int:
+        return 1
+    
+    def __repr__(self) -> str:
+        return (f"Axis(opid={self.opid}, no={self.no}, "
+                f"trip_count={self.trip_count}, type={self.type})")
+    
+    @property
+    def record_format(self):
+        return f"{self.opid}, {self.no}, {self.trip_count}, {self.type}"
+
+    @staticmethod
+    def get_axes(opid: int, trip_counts: list[int], types: list[str]):
+        assert len(trip_counts) == len(types)
+        axes = []
+        count = 0
+        for trip_count, type in zip(trip_counts, types):
+            axes.append(Axis(opid, count, trip_count, type))
+            count += 1
+        return axes
+
+
+class OpInfo():
+    def __init__(self,
+                 no: int,
+                 opname: str,
+                 iteration_space: list[int],
+                 iteration_type: list[str],
+                 tile_levels: tuple[int, int]) -> None:
+        assert len(iteration_space) == len(iteration_type)
+        self.no = no
+        self.opname = opname
+        self.iteration_space = iteration_space
+        self.iteration_type = iteration_type
+        self.tile_levels = tile_levels
+        self.axes: list[Axis] = Axis.get_axes(no, iteration_space, iteration_type)
+    
+    def serialize(self):
+        return tuple(self.__dict__.values())
+    
+    @staticmethod
+    def deserialize(args: tuple):
+        assert len(args) == 5
+        return OpInfo(args[0], args[1], args[2], args[3], args[4])
+
+
+class TileSpace(TransformSpace):
+    """
+    Combinations of IREE tiling sizes of a axis
+    """
+    def __init__(self,
+                 trip_count: int,
+                 isParallel: bool,
+                 policy: str,
+                 tiling_level: int,
+                 max_tile_size: int,
+                 candidates: list[list[int]] | None = None,
+                 zero_vec_common = False,
+                 zero_vec_inner = False,
+                 fil = lambda x : True):
+        """
+        trip_count :
+            Loop size
+        isParallel :
+            Is a parallel axis
+        policy :
+            method to generate size number
+        tiling_level :
+            Number of tiles
+        max_tile_size :
+            Extra limit of tile size
+        candidates :
+            Fixed tile size, only available if policy is 'candidate'
+        zero_vec_common, zero_vec_inner :
+            In IREE, a parallel axis can not have non-zero size in VectorCommonTile and VectorInnerTile 
+            at the same time, these args can limit which tile level should be zero.
+        """
+        super().__init__()
+        self.policy = policy
+        self.entities: list[TileEntity] = []
+        self.product = trip_count
+        self.num_output = tiling_level
+        self.isParallel = isParallel
+        self.zero_vec_common = zero_vec_common
+        self.zero_vec_inner = zero_vec_inner
+
+        if policy == "candidate":
+            assert isinstance(candidates, list)
+            for candidate in candidates:
+                assert len(candidate) == self.num_output
+                self.entities.append(TileEntity(candidate))
+        else:
+            if policy == "factors":
+                factors = [0] + [x for x in get_factors(self.product) if x <= max_tile_size]
+            elif policy == "zero_plus_power2":
+                factors = [0] + [x for x in get_pow2s(self.product) if x <= max_tile_size]
+            else:
+                raise RuntimeError("Invalid policy: %s" % policy)
+
+            self.factors = factors
+            self._generate_space(0, [0] * self.num_output)         
+
+        self.entities = list(filter(fil, self.entities))   
+
+    def _generate_space(self, now, tmp_stack: list[int]):
+        """Generate space by DFS"""
+        if now == self.num_output:
+            if self.isParallel:
+                if now == 2 and self.zero_vec_common and tmp_stack[0] != 0:
+                    return
+                if now >= 3:
+                    if self.zero_vec_common and tmp_stack[1] != 0:
+                        return
+                    if self.zero_vec_inner and tmp_stack[0] != 0:
+                        return
+                    # vector related level can have at most one non-zero
+                    if tmp_stack[0] != 0 and tmp_stack[1] != 0:
+                        return
+                
+            prod = tmp_stack[0]
+            tile_sizes = [prod]
+            for i in range(1, now):
+                n = tmp_stack[i]
+                if n != 0:
+                    prod = prod * n if prod != 0 else n
+                    tile_sizes.append(prod)
+                else:
+                    tile_sizes.append(0)                
+            
+            if prod > self.product: # invalid
+                return
+
+            tile_sizes.reverse() # outer to inner
+            self.entities.append(TileEntity(tile_sizes))
+        else:
+            for factor in self.factors:
+                tmp_stack[now] = factor
+                self._generate_space(now + 1, tmp_stack)
+
+
+
+class TileEntity(object):
+    def __init__(self, sizes: list[int]) -> None:
+        self.sizes = sizes
+    
+    def __str__(self) -> str:
+        return ",".join([str(x) for x in self.sizes])
+    
+SpaceKey: TypeAlias = tuple[Axis, str]
+
+
+class ConfigSpace(object):
+    """
+    The collection of all MLIR operations and their transform spaces
+    """
+
+    def __init__(self):
+        self.space_map: OrderedDict[SpaceKey, TileSpace] = OrderedDict()  # name -> space
+        self._ops: OrderedDict[str, OpInfo] = OrderedDict()
+
+        self._length: int | None = None
+        self._range_length: int | None = None
+        self._dims: list[int] | None = None
+        self._cross_filters = []
+        self._canonicalized = False
+    
+    def add_op(self, opinfo: OpInfo):
+        """
+        Op must be added with order. space_map sorting is base on Op order
+        """
+        opname = opinfo.opname
+        iteration_space = opinfo.iteration_space
+        iteration_type = opinfo.iteration_type
+        tile_levels = opinfo.tile_levels
+        axes = opinfo.axes
+        
+        assert opname not in self._ops
+        logger.debug("Add Op %d: name=%s num_axis=%d", len(self._ops), opname, len(axes))
+        logger.debug("loop_size=%s", str(iteration_space))
+        logger.debug("loop_type=%s", str(iteration_type))
+        logger.debug("tile level=%d, %d", tile_levels[0], tile_levels[1])
+        self._ops[opname] = opinfo
+        self._canonicalized = False
+    
+    def get_op_axes(self, opanme: str) -> list[Axis]:
+        return self._ops[opanme].axes
+
+    def define_tile(self,
+                    axis: Axis,
+                    policy: str,
+                    num_splits: int,
+                    candidates: list[list[int]] | None = None,
+                    max_tile_size = 1 << 31,
+                    fil: Callable = lambda x : True):
+        if axis.trip_count == 0:
+            logger.debug("Skip definong TileSpace with axis trip count 0, assume it's a fake axis")
+            return
+        key: SpaceKey = (axis, "ts")
+        if key in self.space_map:
+            logger.error(f"tile space already exist for axis: {str(axis)}")
+            return
+
+        policies = policy.split(",")
+        zero_vector_common = policies.count("zero_vector_common") > 0
+        # since all root op are zero_vec_inner and only non-root may have zero_vector_common
+        # zero_vec_inner is on by default
+        zero_vec_inner = not zero_vector_common
+
+        max_tile_size = min(max_tile_size, axis.trip_count)
+        space: TransformSpace = TileSpace(
+            axis.trip_count, axis.type == PARALLEL, policies[0], num_splits, max_tile_size, candidates,
+            zero_vector_common, zero_vec_inner, fil)
+        logger.debug("Define TileSpace: axis=%s, policy=%s, tile_levels=%d, size=%d",
+                     str(axis), policy, num_splits, len(space))
+        self.space_map[key] = space
+        self._canonicalized = False
+
+    def canonicalize(self):
+        """
+        Sort space map accroding to [opid, axis_id, space_type]
+        """
+        if self._canonicalized:
+            return
+
+        def key_func(element: tuple[SpaceKey, TileSpace]):
+            axis = element[0][0]
+            opid = axis.opid
+            axis_id = axis.no
+            space_type = 0 # currently only TileSpace
+            return [opid, axis_id, space_type]
+        
+        logger.debug("Space before sort: %s", str(self.space_map.keys()))
+        self.space_map = OrderedDict(sorted(self.space_map.items(), key=key_func))
+        logger.debug("Space after sort: %s", str(self.space_map.keys()))
+        self._canonicalized = True
+
+    def is_knob_valid(self, knob: list[int]):
+        self.canonicalize()
+        if len(knob) != len(self.dims):
+            return False
+        entities: OrderedDict[SpaceKey, TileEntity] = OrderedDict()
+        for idx, (key, space) in zip(knob, self.space_map.items()):
+            if idx >= len(space):
+                return False
+            entities[key] = space[idx]
+            
+        for fil in self._cross_filters:
+            if not fil(entities):
+                return False
+
+        return True
+
+    def is_index_valid(self, index):
+        """Checks if the index satisfies the multi_filter condition,
+        if no multi_filter is set, return true
+
+        Parameters
+        ----------
+        index: int
+            index from the range of the space
+
+        Returns
+        -------
+        valid: bool
+            whether the index meets all the constraints
+        """
+        assert 0 <= index < self.range_length
+        self.canonicalize()
+        if len(self._cross_filters) == 0:
+            return True
+        
+        knob = self.point2knob(index)
+        return self.is_knob_valid(knob)
+
+    def multi_filter(self, filter):  # pylint: disable=redefined-builtin
+        """
+        Add multi_filer
+
+        multi_filer format:
+
+        def fil(arg: OrderedDict[SpaceKey, TileEntity]) -> Bool
+        """
+        self._cross_filters.append(filter)
+
+    @property
+    def range_length(self):
+        """Length of the index range in the space (product of all combinations)"""
+        self.canonicalize()
+        if self._range_length is None:
+            if len(self.space_map) > 0:
+                self._range_length = int(
+                    np.prod([len(x) for x in self.space_map.values()]))
+            else:
+                self._range_length = 0
+        return self._range_length
+
+    @property
+    def dims(self):
+        """Dimensions in the space"""
+        self.canonicalize()
+        if self._dims is None:
+            self._dims = [len(x) for x in self.space_map.values()]
+        return self._dims
+
+    def clear_cache(self):
+        """Clears the cache of index validity"""
+        self._dims = None
+        self._length = None
+        self._range_length = None
+
+    def point2knob(self, point):
+        """Convert point form (single integer) to knob (vector of index)
+
+        Parameters
+        ----------
+        point: int
+            point to convert
+
+        Returns
+        -------
+        knob: list
+            knob representation of the point
+        """
+        self.canonicalize()
+        knob = []
+        for dim in self.dims:
+            knob.append(point % dim)
+            point //= dim
+        
+        return knob
+
+    def knob2point(self, knob) -> int:
+        """Convert knob form (vector of index) to point form (single integer)
+
+        Parameters
+        ----------
+        knob: list
+            knob to convert
+
+        Returns
+        -------
+        point: int
+            point of the knob representation
+        """
+        self.canonicalize()
+        point = 0
+        for j, k in enumerate(knob):
+            point += int(np.prod(self.dims[:j])) * k
+        
+        return point
+
+    def __len__(self):
+        if self._length is None:
+            self._length = int(np.prod([len(x) for x in self.space_map.values()]))
+        return self._length
+
+    def get(self, index):
+        """Get a config entity with detailed parameters from this space
+
+        Parameters
+        ----------
+        index: int
+            index in the space
+        """
+        self.canonicalize()
+        ubound = self.range_length
+        if index < 0 or index >= ubound:
+            raise IndexError(f"Index out of range: size {ubound}, got index {index}")
+        if not self.is_index_valid(index):
+            raise IndexError(
+                f"Index does not correspond to the multi-filter condition, got index {index}. "
+                f"Use is_index_valid to pre-check"
+            )
+        entities = OrderedDict()
+        t = index
+        for key, space in self.space_map.items():
+            entities[key] = space[t % len(space)]
+            t //= len(space)
+        ret = ConfigEntity(index, self._ops, entities)
+        return ret
+    
+    def _multi_fil_vector_size(self, entities: OrderedDict[SpaceKey, TileEntity]) -> bool:
+        """
+        A loose vector size limit filter that can reduce large vector size but not all invalid case.
+        """
+        def check_op_vec(opinfo: OpInfo,
+                         global_p_vec_sizes: list[int],
+                         update_global=False) -> tuple[bool, list[int]]:
+            axes = opinfo.axes
+            p_level, _ = opinfo.tile_levels
+            p_vec_sizes = []
+            r_vec_sizes = []
+            for axis in axes:
+                key: SpaceKey = (axis, "ts")
+                sizes = entities[key].sizes
+                if axis.type == PARALLEL:
+                    if p_level >= 3:
+                        p_vec_sizes.append(sizes[-1] + sizes[-2]) # assume one of two size must be zero
+                    elif p_level == 2:
+                        p_vec_sizes.append(sizes[-1])
+                    else:
+                        raise
+                elif axis.type == REDUCTION:
+                    r_vec_sizes.append(sizes[-1]) # VectorReductionTiles
+                else:
+                    raise
+            
+            all_zero = len(p_vec_sizes) == p_vec_sizes.count(0)
+            if not all_zero and update_global:
+                global_p_vec_sizes = p_vec_sizes
+            else:
+                p_vec_sizes = global_p_vec_sizes
+            
+            SEW = 8
+            VLEN = 512
+            limit = 8 * VLEN / SEW
+
+            def prod(xs: list[int]) -> int:
+                prod = 1
+                for x in xs:
+                    prod *= x if x > 0 else 1
+                return prod
+
+            if len(r_vec_sizes) == 0:
+                vs = prod(p_vec_sizes)
+                logger.debug("Inferred vector size %d, limit %d", vs, limit)
+                if vs > limit:
+                    return False, global_p_vec_sizes
+            else:
+                for i in range(1, len(p_vec_sizes)):
+                    left = prod(p_vec_sizes[:i] + r_vec_sizes)
+                    right = prod(p_vec_sizes[i:] + r_vec_sizes)
+                    logger.debug("Inferred vector size %d, limit %d", left, limit)
+                    logger.debug("Inferred vector size %d, limit %d", right, limit)
+                    if left > limit or right > limit:
+                        return False, global_p_vec_sizes
+            return True, global_p_vec_sizes
+
+        
+        opinfos = [x for x in self._ops.values()]
+        lastop = opinfos[-1]
+        global_p_vec_sizes = [0] * lastop.iteration_type.count(PARALLEL)
+        valid, global_p_vec_sizes = check_op_vec(lastop, global_p_vec_sizes, True)
+        if not valid:
+            return False
+        if len(opinfos) > 1:
+            startop = opinfos[0]
+            valid, global_p_vec_sizes = check_op_vec(startop, global_p_vec_sizes, True)
+            if not valid:
+                return False
+            if len(opinfos) > 2:
+                for opinfo in opinfos[1:-1]:
+                    valid, _ = check_op_vec(opinfo, global_p_vec_sizes)
+                    if not valid:
+                        return False        
+
+        return True
+
+
+class MultiConfigSpace(object):
+    """
+    Combine of ConfigSpaces with same dimension, provide interfaces using
+    outer index and outer knob.
+    
+    Outer index will be convert to inner index to access inner ConfigSpace.
+    Outer knob entend inner knob with index of all ConfigSpaces at front.
+    e.g. knob [0, ...] can be convert from index belongs to first ConfigSpace
+    """
+    def __init__(self, cfgs: list[ConfigSpace]) -> None:
+        dims = len(cfgs[0].dims)
+        for cfg in cfgs:
+            assert dims == len(cfg.dims), f"{dims} {len(cfg.dims)}"
+            cfg.canonicalize()
+
+        self._cfgs = cfgs
+        self._space_sizes = [x.range_length for x in self._cfgs]
+        if len(self) != 0:
+            self._weight = [float(x) / len(self) for x in self._space_sizes]
+        else:
+            self._weight = [0.0] * len(self._cfgs)
+    
+    def __len__(self):
+        return int(np.sum(self._space_sizes))
+
+    def point2knob(self, point: int):
+        assert 0 <= point < len(self)
+        _point = point
+        knob: list[int] = []
+        group_count = 0
+        for space_size, cfg in zip(self._space_sizes, self._cfgs):
+            if point >= space_size:
+                group_count += 1
+                point -= space_size
+                continue
+            else:
+                knob.append(group_count)
+                knob.extend(cfg.point2knob(point))
+                break
+        
+        logger.debug("point2knob: %d to %s", _point, str(knob))
+        return knob
+    
+    def knob2point(self, knob: list[int]):
+        assert knob[0] < len(self._cfgs)
+        cfg = self._cfgs[knob[0]]
+        assert len(knob) == len(cfg.dims) + 1
+        for index, ubound in zip(knob[1:], cfg.dims):
+            if index >= ubound:
+                raise IndexError
+
+        point = cfg.knob2point(knob[1:])
+        point += sum(self._space_sizes[:knob[0]])
+        logger.debug("knob2point: %s to %d", str(knob), point)
+        return point
+    
+    def is_knob_valid(self, knob: list[int]):
+        if len(knob) < 2:
+            return False
+        if knob[0] < 0 or knob[0] >= len(self._cfgs):
+            return False
+        cfg = self._cfgs[knob[0]]
+        return cfg.is_knob_valid(knob[1:])
+
+    def is_index_valid(self, index: int):
+        ubound = len(self)
+        if index < 0 or index >= ubound:
+            return False
+        
+        knob = self.point2knob(index)
+        return self.is_knob_valid(knob)
+    
+    def get(self, index: int):
+        ubound = len(self)
+        if index < 0 or index >= ubound:
+            raise IndexError(f"Index out of range: size {ubound}, got index {index}")
+
+        knob = self.point2knob(index)
+        assert self.is_knob_valid(knob), f"{index}, {str(knob)}"
+        cfg = self._cfgs[knob[0]]
+        inner_idx = cfg.knob2point(knob[1:])
+        ce = cfg.get(inner_idx)
+        # recreate ConfigEntity with MutiConfigSpace index instead of ConfigSpace index
+        return ConfigEntity(index, ce.ops, ce.entity_map)
+
+
+class GAMCS(MultiConfigSpace):
+    """
+    Inherit MultiConfigSpace
+    provide GA operation
+    """
+    def __init__(self, arg) -> None:
+        if isinstance(arg, MultiConfigSpace):
+            self.__dict__.update(arg.__dict__)
+        elif isinstance(arg, list):
+            super().__init__(arg)
+        else:
+            raise
+
+    def crossover_1p(self, g1: list[int], g2: list[int], point: int | None = None):
+        """
+        one-point crossover
+
+        return two genes(can be invalid)
+        """        
+        # auto-select point by GAMCS
+        if point is None:
+            point = np.random.randint(len(g1) - 1) + 1
+        if point < 1 or point >= len(g1):
+            raise IndexError
+        
+        ng1 = g1[:point] + g2[point:]
+        ng2 = g2[:point] + g1[point:]
+        return ng1, ng2
+    
+    def mutation(self, gene: list[int], mutation_prob: float):
+        ret = gene[:]
+        # mutation among cfg, base on their combination number
+        if np.random.random() < mutation_prob:
+            randv = np.random.random()
+            for i in range(len(self._weight)):
+                weight = self._weight[i]
+                if randv >= weight:
+                    randv -= weight
+                    continue
+                else:
+                    ret[0] = i
+
+        dim_sizes = self._cfgs[ret[0]].dims
+        for i in range(1, len(ret)):
+            if np.random.random() < mutation_prob:
+                ret[i] = np.random.randint(dim_sizes[i - 1])
+            else:
+                # mutate to another cfg may cause unmutate gene to exceed upbound
+                ret[i] = ret[i] % dim_sizes[i-1] 
+        
+        return ret
+
+
+class ConfigEntity(object):
+    """A configuration with detailed parameters
+
+    Parameters
+    ----------
+    index: int
+        index of this config in space
+    ops: OrderedDict[str, OpInfo]
+        operations of this entity based on
+    entity_map: OrderedDict[SpaceKey, TileEntity]
+        map name to transform entity
+    """
+
+    def __init__(self,
+                 index: int,
+                 ops: OrderedDict[str, OpInfo],
+                 entity_map: OrderedDict[SpaceKey, TileEntity]) -> None:
+        self.index = index
+        self.ops = ops
+        self.entity_map = entity_map
+    
+    def __str__(self) -> str:
+        return str(self.to_json_dict())
+
+    def to_json_dict(self):
+        """convert to a json serializable dictionary
+
+        Return
+        ------
+        json_dict: dict
+            a json serializable dictionary
+        """
+        json_dict = {}
+        json_dict["index"] = self.index
+        
+        op_data = []
+        for info in self.ops.values():
+            args = info.serialize()
+            op_data.append((args[1], args[2], args[3], args[4]))
+        json_dict["ops"] = op_data
+
+        f = []
+        for key, te in self.entity_map.items():
+            f.append((key[0].opid, key[0].no, key[1], [te.sizes]))
+        json_dict["configs"] = f
+        return json_dict
+
+    @staticmethod
+    def from_json_dict(json_dict):
+        """Build a ConfigEntity from json serializable dictionary
+
+        Parameters
+        ----------
+        json_dict: dict
+            Json serializable dictionary. This should be the return value
+            of :any:`to_json_dict`.
+
+        Returns
+        -------
+        config: ConfigEntity
+            The corresponding config object
+
+        """
+        index: int = json_dict["index"]
+        ops: list[tuple[str, list[int], list[str], tuple[int]]] = json_dict["ops"]
+        configs: list[tuple[int, int, str, list]] = json_dict["configs"]
+        
+        ops_dict: OrderedDict[str, OpInfo] = OrderedDict()
+        for op in ops:
+            no = len(ops_dict)
+            args = (no, op[0], op[1], op[2], op[3])
+            ops_dict[op[0]] = OpInfo.deserialize(args)
+        
+        entity_map = OrderedDict()
+        for config in configs:
+            opid, axis_no, space_type, entity = config
+            assert space_type == "ts"
+            te_args: list[list[int]] = entity
+            trip_count = ops[opid][1][axis_no]
+            iteration_type = ops[opid][2][axis_no]
+            key: SpaceKey = (Axis(opid, axis_no, trip_count, iteration_type), space_type)
+            entity_map[key] = TileEntity(te_args[0])
+
+        return ConfigEntity(index, ops_dict, entity_map)
+
+    def to_iree_format(self):
+        """
+        In IREE tile config format, zero contained tile level is exist even if iteration type not exist.
+        e.g. op has no reduction iteration but tile level is 4,
+             the tile config will be [[64], [32], [0], [8]], for [0] is reduction tile
+        To generate this format, op will add to ConfigSpace with a fake axis (trip_count 0)
+        """
+        iree_lowering_configs: dict[str, list[list[int]]] = {}
+        for i, (name, info) in enumerate(self.ops.items()):
+            rank = len(info.iteration_space)
+            p_tile_level, r_tile_level = info.tile_levels
+            all_tile_level = p_tile_level + r_tile_level
+            logger.debug("iree tiling level %d, %d", p_tile_level, r_tile_level)
+            # create tiling config list and fill with zero
+            iree_lowering_configs[name] = [[0] * rank for _ in range(all_tile_level)]
+
+            related_entities = [x for x in self.entity_map.items() if x[0][0].opid == i]
+            for (axis, space_type), entity in related_entities:
+                if space_type == "ts":
+                    assert isinstance(entity, TileEntity)
+                    no = axis.no
+                    if all_tile_level == 6:
+                        if axis.type == PARALLEL:
+                            iree_lowering_configs[name][0][no] = entity.sizes[0]
+                            iree_lowering_configs[name][1][no] = entity.sizes[1]
+                            iree_lowering_configs[name][3][no] = entity.sizes[2]
+                            iree_lowering_configs[name][5][no] = entity.sizes[3]
+                        elif axis.type == REDUCTION:
+                            iree_lowering_configs[name][2][no] = entity.sizes[0]
+                            iree_lowering_configs[name][4][no] = entity.sizes[1]      
+                        else:
+                            raise
+                    elif all_tile_level == 4:
+                        if axis.type == PARALLEL:
+                            iree_lowering_configs[name][0][no] = entity.sizes[0]
+                            iree_lowering_configs[name][1][no] = entity.sizes[1]
+                            iree_lowering_configs[name][3][no] = entity.sizes[2]
+                        elif axis.type == REDUCTION:
+                            iree_lowering_configs[name][2][no] = entity.sizes[0]
+                        else:
+                            raise
+                    elif all_tile_level == 2:
+                        if axis.type == PARALLEL:
+                            iree_lowering_configs[name][0][no] = entity.sizes[0]
+                            iree_lowering_configs[name][1][no] = entity.sizes[1]
+                        else:
+                            raise
+                    elif all_tile_level == 3:
+                        if axis.type == PARALLEL:
+                            iree_lowering_configs[name][0][no] = entity.sizes[0]
+                            iree_lowering_configs[name][1][no] = entity.sizes[1]
+                        elif axis.type == REDUCTION:
+                            iree_lowering_configs[name][2][no] = entity.sizes[0]
+                        else:
+                            raise
+                    elif all_tile_level == 1:
+                        if axis.type == PARALLEL:
+                            iree_lowering_configs[name][0][no] = entity.sizes[0]
+                        else:
+                            raise
+                    else:
+                        raise
+
+        return iree_lowering_configs
+
+
+# third-party/iree-src/compiler/src/iree/compiler/Codegen/LLVMCPU/Passes.cpp:L263
+special_op_list_24_35 = [ # N, OC, OH, OW, KH, KW
+    "linalg.pooling_nchw_max",
+    "linalg.pooling_nchw_sum"
+]
+special_op_list_36_25 = [ # N, OC, OH, OW, (IC), KH, KW
+    "linalg.conv_2d_nchw_fchw"
+]
+special_op_list_14_25 = [ # N, OH, OW, OC, KH, KW, (IC)
+    "linalg.depthwise_conv_2d_nhwc_hwc",
+    "linalg.pooling_nhwc_sum",
+    "linalg.pooling_nhwc_max",
+    "linalg.pooling_nhwc_max_unsigned",
+    "linalg.pooling_nhwc_min",
+    "linalg.pooling_nhwc_min_unsigned",
+    "linalg.conv_2d_nhwc_hwcf"
+]
+
+
+def _getRootOp(opinfos: list[OpInfo]):
+    rootOp = None
+    for opinfo in reversed(opinfos):
+        opname = opinfo.opname.split('-')[0]
+        dialect = opname.split('.')[0]
+        if dialect == "linalg":
+            if opinfo.iteration_type.count(REDUCTION) == 0:
+                continue
+            rootOp = opinfo
+            break
+
+        if opname != "tensor.pad" and opname != "tensor.pack" and opname != "tensor.unpack":
+            rootOp = opinfo
+    
+    if rootOp is None:
+        for opinfo in reversed(opinfos):
+            dialect = opinfo.opname.split('.')[0]
+            if dialect == "linalg":
+                rootOp = opinfo
+                break
+    
+    if rootOp is None:
+        for opinfo in reversed(opinfos):
+            opname = opinfo.opname.split('-')[0]
+            if opname == "tensor.pad" or opname == "tensor.pack" or opname == "tensor.unpack":
+                rootOp = opinfo
+                break
+    
+    return rootOp
+
+
+def _get_vectorinnerparallel_start_axis(opinfos: list[OpInfo]) -> int:
+    """
+    axis before result of this function should have zero in VectorInnerParallelTile
+    axis equal and after should have zero in VectorCommonParallel
+    """
+    maxLoopNums = max([len(x.iteration_type) for x in opinfos])
+    for idx in range(maxLoopNums):
+        for opinfo in opinfos:
+            if idx >= len(opinfo.iteration_type):
+                continue
+            if opinfo.iteration_type[idx] == "reduction":
+                return idx
+    return maxLoopNums
+
+
+def _createConfigSpace_CPUDoubleTilingExpert(opinfos: list[OpInfo], policy: str):
+    # DistrbutionTiles (level 0) always use last op config
+
+    # iree-src/compiler/src/iree/compiler/Codegen/LLVMCPU/LLVMCPULowerExecutableTarget.cpp:L121
+    rootOp = _getRootOp(opinfos)
+    if rootOp is None:
+        return None
+    root_total_level = rootOp.tile_levels[0] + rootOp.tile_levels[1]
+    if root_total_level not in [4, 6]:
+        return None
+    
+    start_inner = _get_vectorinnerparallel_start_axis(opinfos)
+
+    cfg = ConfigSpace()
+    cfg.multi_filter(cfg._multi_fil_vector_size)
+    for opinfo in opinfos:
+        cfg.add_op(opinfo)
+        axes = cfg.get_op_axes(opinfo.opname)
+        p_level, r_level = opinfo.tile_levels
+        isRoot = opinfo == rootOp
+        beforeRoot = opinfos.index(opinfo) < opinfos.index(rootOp)
+
+        for axis in axes:
+            if axis.type == PARALLEL:
+                # LLVMCPUTileAndFuse search tile levels start from root op, then other ops.
+                if isRoot:
+                    # vec inner tile is used only in root op
+                    if axis.no >= start_inner:
+                        cfg.define_tile(axis, policy + ",zero_vector_common", p_level)
+                    else:
+                        cfg.define_tile(axis, policy, p_level)
+                else:
+                    # provide no level
+                    cfg.define_tile(axis, "candidate", p_level, candidates=[[0]*p_level])
+            elif axis.type == REDUCTION:
+                if root_total_level == 6: # root op has CacheReductionTiles and VectorReductionTiles
+                    if beforeRoot: # only affect producer of root op
+                        def fil_before_root(entity: TileEntity):
+                            for i, s, in enumerate(entity.sizes):
+                                # levels provided by root op limited to zero
+                                if i == 0 and s != 0:
+                                    return False
+                            return True
+
+                        cfg.define_tile(axis, policy, r_level, fil=fil_before_root)
+                    else:
+                        cfg.define_tile(axis, policy, r_level)
+                else: # only VectorReductionTiles, no fuse
+                    cfg.define_tile(axis, policy, r_level)
+            else:
+                raise
+
+    return MultiConfigSpace([cfg])
+
+def _createConfigSpace_CPUConvTileAndDecomposeExpert(opinfos: list[OpInfo], policy: str):
+    # DistrbutionTiles (level 0) always use last op config
+    cfg = ConfigSpace()
+    cfg.multi_filter(cfg._multi_fil_vector_size)
+    for opinfo in opinfos:
+        # root of this passpipeline has lv4
+        # non-root op musr be lv4
+        if opinfo.tile_levels != (3, 1): 
+            return None
+        cfg.add_op(opinfo)
+    
+    rootOp = _getRootOp(opinfos)
+    if rootOp is None:
+        return None
+    opname = rootOp.opname.split("-")[0]
+    if opname in special_op_list_14_25:
+        conditons = [1, 4, 2, 5]
+        normals = [0, 3]
+    elif opname in special_op_list_24_35:
+        conditons = [2, 4, 3, 5]
+        normals = [0, 1]
+    elif opname in special_op_list_36_25:
+        conditons = [3, 6, 2, 5]
+        normals = [0, 1]
+    else:
+        return None
+    
+    start_inner = _get_vectorinnerparallel_start_axis(opinfos)
+
+    p_level, r_level = (3, 1)
+    root_is_last = rootOp == opinfos[-1]
+
+    if root_is_last:
+        if len(opinfos) > 1:
+            for opinfo in opinfos[0:-1]:
+                for axis in cfg.get_op_axes(opinfo.opname):
+                    if axis.type == PARALLEL:
+                        # all 3 level provide by root op
+                        cfg.define_tile(axis, "candidate", p_level, candidates=[[0] * p_level])
+                    elif axis.type == REDUCTION:
+                        # all 1 level provide by root op
+                        cfg.define_tile(axis, "candidate", r_level, candidates=[[0] * r_level])
+                    else:
+                        raise
+    else:
+        root_idx = opinfos.index(rootOp)
+        for i, opinfo in enumerate(opinfos[:-1]): # last op determined with root op
+            if opinfo == rootOp: # skip multi-space Op for now
+                continue
+            beforeRoot = i < root_idx
+            for axis in cfg.get_op_axes(opinfo.opname):
+                if axis.type == PARALLEL:
+                    # all 3 level provide by last op
+                    cfg.define_tile(axis, "candidate", p_level, candidates=[[0] * p_level])
+                elif axis.type == REDUCTION:
+                    if beforeRoot:
+                        # all 1 level provide by root op
+                        cfg.define_tile(axis, "candidate", r_level, candidates=[[0] * r_level])
+                    else:
+                        cfg.define_tile(axis, policy, r_level)
+                else:
+                    raise
+    
+    # root and last op
+    # rule of conv op reqiure comparsion of both p_level and r_level
+    # if root is not last, then last provide p_level and root provide r_level
+    def fil_last_is_one(entity: TileEntity):
+        for s in reversed(entity.sizes):
+            if s == 1:
+                return True
+            elif s == 0:
+                continue
+            else:
+                return False                
+        return False
+    
+    def fil_last_not_one(entity: TileEntity):
+        for s in reversed(entity.sizes):
+            if s == 1:
+                return False
+            elif s == 0:
+                continue
+            else:
+                return True
+        return False
+    
+    def fil_Any(entity: TileEntity):
+        return True
+
+    # form 4 non-overlapped spaces
+    # Space1 [T, T, Any, Any]
+    # Space2 [T, F, T, T]
+    # Space3 [F, T, T, T]
+    # Space4 [F, F, T, T]
+    # thus, [T, T, T, T] will only appear in Space1
+    def dup_with_last_and_root(cfg: ConfigSpace, last: OpInfo, root: OpInfo, fils: list[Callable]):
+        dup_cfg = deepcopy(cfg)
+        for i, axis in enumerate(dup_cfg.get_op_axes(root.opname)):
+            if axis.type == PARALLEL:
+                dup_cfg.define_tile(axis, "candidate", p_level, candidates=[[0] * p_level])
+            elif axis.type == REDUCTION:
+                if i == conditons[1]:
+                    dup_cfg.define_tile(axis, policy, r_level, fil=fils[1])
+                elif i == conditons[3]:
+                    dup_cfg.define_tile(axis, policy, r_level, fil=fils[3])
+                else:
+                    raise
+            else:
+                raise
+        
+        p_count = 0 # TODO: if parallel is always outter than reduction, we don't need this
+        for i, axis in enumerate(dup_cfg.get_op_axes(last.opname)):
+            if axis.type == PARALLEL:
+                if axis.no < start_inner:
+                    extra_policy = ""
+                else:
+                    extra_policy = ",zero_vector_common"
+                
+                if p_count == conditons[0]:
+                    dup_cfg.define_tile(axis, policy + extra_policy, p_level, fil=fils[0])
+                elif p_count == conditons[2]:
+                    dup_cfg.define_tile(axis, policy + extra_policy, p_level, fil=fils[2])
+                else:
+                    dup_cfg.define_tile(axis, policy + extra_policy, p_level)
+                p_count += 1
+
+            elif axis.type == REDUCTION:
+                dup_cfg.define_tile(axis, policy, r_level)
+            else:
+                raise
+        return dup_cfg
+
+    def dup_with_root(cfg: ConfigSpace, root: OpInfo, fils: list[Callable]):
+        dup_cfg = deepcopy(cfg)
+        p_count = 0 # TODO: if parallel is always outter than reduction, we don't need this
+        for i, axis in enumerate(dup_cfg.get_op_axes(root.opname)):
+            if axis.type == PARALLEL:
+                if p_count == conditons[0]:
+                    dup_cfg.define_tile(axis, policy, p_level, fil=fils[0])
+                elif p_count == conditons[2]:
+                    dup_cfg.define_tile(axis, policy, p_level, fil=fils[2])
+                else:
+                    dup_cfg.define_tile(axis, policy, p_level)
+                p_count += 1
+            elif axis.type == REDUCTION:
+                if i == conditons[1]:
+                    dup_cfg.define_tile(axis, policy, r_level, fil=fils[1])
+                elif i == conditons[3]:
+                    dup_cfg.define_tile(axis, policy, r_level, fil=fils[3])
+                else:
+                    dup_cfg.define_tile(axis, policy, r_level)
+            else:
+                raise
+        return dup_cfg
+
+
+    fil_TTAA = [fil_last_is_one, fil_last_is_one, fil_Any, fil_Any]
+    fil_TFTT = [fil_last_is_one, fil_last_not_one, fil_last_is_one, fil_last_is_one]
+    fil_FTTT = [fil_last_not_one, fil_last_is_one, fil_last_is_one, fil_last_is_one]
+    fil_FFTT = [fil_last_not_one, fil_last_not_one, fil_last_is_one, fil_last_is_one]
+    if not root_is_last:
+        lastOp = opinfos[-1]
+        cfg_TTAA = dup_with_last_and_root(cfg, lastOp, rootOp, fil_TTAA)
+        cfg_TFTT = dup_with_last_and_root(cfg, lastOp, rootOp, fil_TFTT)
+        cfg_FTTT = dup_with_last_and_root(cfg, lastOp, rootOp, fil_FTTT)
+        cfg_FFTT = dup_with_last_and_root(cfg, lastOp, rootOp, fil_FFTT)
+    else:
+        cfg_TTAA = dup_with_root(cfg, rootOp, fil_TTAA)
+        cfg_TFTT = dup_with_root(cfg, rootOp, fil_TFTT)
+        cfg_FTTT = dup_with_root(cfg, rootOp, fil_FTTT)
+        cfg_FFTT = dup_with_root(cfg, rootOp, fil_FFTT)
+        
+    return MultiConfigSpace([cfg_TTAA, cfg_TFTT, cfg_FTTT, cfg_FFTT])
+
+def _createConfigSpace_CPUBufferOpsTileAndVectorize(opinfos: list[OpInfo], policy: str): 
+    # DistrbutionTiles (level 0) always use last op config
+    # VectorCommonParallelTiles(VCPT) use op its own config
+
+    # iree-src/compiler/src/iree/compiler/Codegen/LLVMCPU/LLVMCPULowerExecutableTarget.cpp:L121
+    rootOp = _getRootOp(opinfos)
+    if rootOp is None:
+        return None
+    root_total_level = rootOp.tile_levels[0] + rootOp.tile_levels[1]
+    # iree-src/compiler/src/iree/compiler/Codegen/LLVMCPU/Passes.cpp:354
+    # not exist case that CPUBufferOpsTileAndVectorize root has other levels
+    if root_total_level != 4 or rootOp.tile_levels[0] != 3: 
+        return None
+    
+    # since CPUBufferOpsTileAndVectorize only allow 4 levels op, below level is fixed
+    # parallel tile config = [Distribution, VectorCommonParallel, VectorInnerParallel]
+    # reduction tile config = [VectorReduction]
+    Distribution = 0
+    VectorCommonParallel = 1
+    VectorReduction = 0
+    VectorInnerParallel = 2
+
+    start_inner = _get_vectorinnerparallel_start_axis(opinfos)
+    
+    # iree-src/compiler/src/iree/compiler/Codegen/LLVMCPU/LLVMCPUTile.cpp:L59
+    # Note. since all opinfo has tiling config, retrieve config from fist op as fallback is NOT needed
+
+    cfg = ConfigSpace()
+    cfg.multi_filter(cfg._multi_fil_vector_size)
+    for opinfo in opinfos:
+        cfg.add_op(opinfo)
+        axes = cfg.get_op_axes(opinfo.opname)
+        p_level, r_level = opinfo.tile_levels
+        if p_level != 3 or r_level != 1: # root is lv4 and others are always lv4
+            return None
+
+        isRoot = opinfo == rootOp
+
+        def fil_rootop(entity: TileEntity):
+            assert len(entity.sizes) == 3
+            # unused level limited to zero
+            if entity.sizes[VectorInnerParallel] != 0:
+                return False
+            return True
+
+        def fil_otherop(entity: TileEntity):
+            assert len(entity.sizes) == 3
+            # not provide
+            if entity.sizes[Distribution] != 0 or entity.sizes[VectorCommonParallel] != 0:
+                return False
+            # unused level limited to zero
+            if entity.sizes[VectorInnerParallel] != 0:
+                return False
+            return True
+
+        try:
+            for axis in axes:
+                if axis.type == PARALLEL:
+                    if isRoot:
+                        # root op has all its tile levels used
+                        if axis.no >= start_inner:
+                            cfg.define_tile(axis, policy + ",zero_vector_common", p_level, fil=fil_rootop)
+                        else:
+                            cfg.define_tile(axis, policy, p_level, fil=fil_rootop)
+                    else:
+                        cfg.define_tile(axis, policy, p_level, fil=fil_otherop)
+                elif axis.type == REDUCTION:
+                    # no tiling perform on reduction axis
+                    cfg.define_tile(axis, "candidate", r_level, candidates=[[0]*r_level])
+                else:
+                    raise 
+        except:
+            return None
+
+    return MultiConfigSpace([cfg])
+
+
+_iree_passpipeline = [
+    "CPUDefault",
+    "CPUDoubleTilingExpert",
+    "CPUConvTileAndDecomposeExpert",
+    "CPUBufferOpsTileAndVectorize",
+    "CPUDataTiling",
+    "CPULinalgExtTileAndVectorize"
+]
+
+
+def createConfigSpace(opinfos: list[OpInfo], policy: str, passpipeline: str, reduce_space = True):
+    logger.debug(f"IREE tiling strategy search space reduction: {'On' if reduce_space else 'Off'}")
+    if reduce_space:    
+        if passpipeline not in _iree_passpipeline:
+            logger.warning(f"Unknown passpipeline: {passpipeline} , return to fallback")
+            passpipeline = "unknown"
+        
+        if passpipeline == "CPUBufferOpsTileAndVectorize":
+            mcfg = _createConfigSpace_CPUBufferOpsTileAndVectorize(opinfos, policy)
+            if mcfg is not None:
+                return mcfg
+            logger.warning("Create search sapce for CPUBufferOpsTileAndVectorize Failed, return to fallback")
+        
+        if passpipeline == "CPUDoubleTilingExpert":
+            mcfg = _createConfigSpace_CPUDoubleTilingExpert(opinfos, policy)
+            if mcfg is not None:
+                return mcfg
+            logger.warning("Create search sapce for CPUDoubleTilingExpert Failed, return to fallback")
+
+        if passpipeline == "CPUConvTileAndDecomposeExpert":
+            mcfg = _createConfigSpace_CPUConvTileAndDecomposeExpert(opinfos, policy)
+            if mcfg is not None:
+                return mcfg
+            logger.warning("Create search sapce for CPUConvTileAndDecomposeExpert Failed, return to fallback")
+        
+        # TODO: add CPUDefault
+        # TODO: add CPUDataTiling
+        # TODO: add CPULinalgExtTileAndVectorize
+
+
+    # Fallback cfg
+    logger.warning("Use fallback search sapce")
+    cfg = ConfigSpace()
+    for opinfo in opinfos:
+        cfg.add_op(opinfo)
+        p_level, r_level = opinfo.tile_levels
+        for axis in cfg.get_op_axes(opinfo.opname):
+            if axis.type == PARALLEL:
+                cfg.define_tile(axis, policy, p_level)
+            elif axis.type == REDUCTION:
+                cfg.define_tile(axis, policy, r_level)
+            else:
+                raise
+    
+    return MultiConfigSpace([cfg])
+

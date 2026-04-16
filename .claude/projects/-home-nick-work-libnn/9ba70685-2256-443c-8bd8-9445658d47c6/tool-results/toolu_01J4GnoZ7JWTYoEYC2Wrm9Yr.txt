@@ -1,0 +1,1184 @@
+     1→/******************************************************************************
+     2→ * Copyright (C) 2010-2025 Arm Limited or its affiliates. All rights reserved.*
+     3→ * Copyright (C) 2018-2025 Andes Technology Corporation. All rights reserved. *
+     4→ *                                                                            *
+     5→ * SPDX-License-Identifier: Apache-2.0                                        *
+     6→ *                                                                            *
+     7→ * Licensed under the Apache License, Version 2.0 (the License); you may      *
+     8→ * not use this file except in compliance with the License.                   *
+     9→ * You may obtain a copy of the License at                                    *
+    10→ *                                                                            *
+    11→ * www.apache.org/licenses/LICENSE-2.0                                        *
+    12→ *                                                                            *
+    13→ * Unless required by applicable law or agreed to in writing, software        *
+    14→ * distributed under the License is distributed on an AS IS BASIS, WITHOUT    *
+    15→ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.           *
+    16→ * See the License for the specific language governing permissions and        *
+    17→ * limitations under the License.                                             *
+    18→ ******************************************************************************/
+    19→
+    20→/** @file*/
+    21→
+    22→#include "internal_nn_math.h"
+    23→#include "riscv_nn_support.h"
+    24→
+    25→//// Convolution Functions
+    26→int32_t riscv_nn_conv_HWC_s8_s8_s8_RGB_sym_bias_fast(const q7_t * in_tensor,
+    27→                                            const uint16_t in_tensor_dim,
+    28→                                            const q7_t * ker_weight,
+    29→                                            const uint16_t out_tensor_ch,
+    30→                                            const uint16_t ker_dim,
+    31→                                            const uint16_t pad,
+    32→                                            const uint16_t stride,
+    33→                                            const q31_t * bias,
+    34→                                            const uint16_t pre_rshift,
+    35→                                            const uint16_t out_scale,
+    36→                                            const uint16_t post_rshift,
+    37→                                            q7_t * out_tensor,
+    38→                                            const uint16_t out_tensor_dim,
+    39→                                            q15_t * in_tmp_buf,
+    40→                                            q15_t * wt_tmp_buf)
+    41→{
+    42→#ifdef ENA_EMPTY_FUN
+    43→    //empty body
+    44→#elif defined(ENA_VEC_ISA) && defined(ENA_VEC_INTRINSIC)
+    45→    long   i_out_y, i_out_x, i_ker_y, i_ker_x;
+    46→
+    47→    /*
+    48→     *  Here we use in_tmp_buf as q15_t internally as computation are done with q15_t level
+    49→     *  im2col are done to output in q15_t format from q7_t input
+    50→     */
+    51→    q7_t *pBuffer = (q7_t *)in_tmp_buf;
+    52→    q7_t *pOut = out_tensor;
+    53→
+    54→    long buf_len = (3 * ker_dim * ker_dim);
+    55→    long vl;
+    56→
+    57→    // This part implements the im2col function
+    58→    for (i_out_y = 0; i_out_y < out_tensor_dim; i_out_y++)
+    59→    {
+    60→        for (i_out_x = 0; i_out_x < out_tensor_dim; i_out_x++)
+    61→        {
+    62→            // init in_tmp_buf
+    63→            long len = buf_len;
+    64→            q7_t *pBuffer2 = pBuffer;
+    65→            vl = __riscv_vsetvl_e8m8(len);
+    66→            vint8m8_t vZero = __riscv_vand(__riscv_vundefined_i8m8(), 0x0, vl);     //const zero for redsum
+    67→            while(len > 0)
+    68→            {
+    69→                __riscv_vse8(pBuffer2, vZero, vl);
+    70→                len -= vl;
+    71→                pBuffer2 += vl;
+    72→                vl = __riscv_vsetvl_e8m8(len);
+    73→            }
+    74→
+    75→            // if (i_ker_y < 0)
+    76→            for (i_ker_y = i_out_y * stride - pad; i_ker_y < 0; i_ker_y++)
+    77→            {
+    78→                pBuffer += ker_dim * 3;
+    79→            }
+    80→
+    81→            long bound_y = ((i_out_y * stride - pad + ker_dim) < in_tensor_dim)? (i_out_y * stride - pad + ker_dim) : in_tensor_dim;
+    82→            for (; i_ker_y < bound_y; i_ker_y++)
+    83→            {
+    84→                // if (i_ker_x < 0)
+    85→                for (i_ker_x = i_out_x * stride - pad; i_ker_x < 0; i_ker_x++)
+    86→                {
+    87→                    pBuffer += 3;
+    88→                }
+    89→
+    90→                long bound_x = (i_out_x * stride - pad + ker_dim < in_tensor_dim)? (i_out_x * stride - pad + ker_dim) : in_tensor_dim;
+    91→                const q7_t *pPixel = in_tensor + (i_ker_y * in_tensor_dim + i_ker_x) * 3;
+    92→                long loop = (bound_x - i_ker_x)*3;
+    93→                i_ker_x = bound_x;
+    94→                while(loop > 0)
+    95→                {
+    96→                    vl = __riscv_vsetvl_e8m8(loop);
+    97→                    vint8m8_t vpPixel = __riscv_vle8_v_i8m8(pPixel, vl);
+    98→                    __riscv_vse8(pBuffer, vpPixel, vl);
+    99→                    pPixel += vl;
+   100→                    pBuffer += vl;
+   101→                    loop -= vl;
+   102→                }
+   103→
+   104→                // if (i_ker_x >= in_tensor_dim)
+   105→                for ( ; i_ker_x < i_out_x * stride - pad + ker_dim; i_ker_x++)
+   106→                {
+   107→                    pBuffer += 3;
+   108→                }
+   109→            }
+   110→
+   111→            // if (i_ker_y >= in_tensor_dim)
+   112→            for (; i_ker_y < i_out_y * stride - pad + ker_dim; i_ker_y++)
+   113→            {
+   114→                pBuffer += ker_dim * 3;
+   115→            }
+   116→
+   117→            if (pBuffer == (q7_t *)in_tmp_buf + 2 * (3 * ker_dim * ker_dim))
+   118→            {
+   119→                pOut = nn_mat_mul_kernel_q7_bias_2sft((q7_t *)ker_weight, (q7_t *)in_tmp_buf, out_tensor_ch, 3 * ker_dim * ker_dim, pre_rshift, out_scale, post_rshift, bias, pOut);
+   120→                pBuffer = (q7_t *)in_tmp_buf;
+   121→            }
+   122→        }
+   123→    }
+   124→
+   125→#if (NDS_VEC_RVV_VERSION >= 100) && defined(ENA_NDS_V5_VEC_DOT_PROD)
+   126→    if (pBuffer != (q7_t *)in_tmp_buf)
+   127→    {
+   128→        unsigned vl;
+   129→        const q7_t *p_wt = ker_weight;
+   130→        int       i;
+   131→        uint16_t  colCnt = 3 * ker_dim * ker_dim;
+   132→        // long vlenb = NDS_VEC_CSR_GET_VLENB();
+   133→
+   134→#if (__clang__)
+   135→        register const long zero asm ("x0") = 0;
+   136→#else
+   137→        register const long zero asm ("x0");
+   138→#endif
+   139→
+   140→        vl = __riscv_vsetvl_e32m1(1);
+   141→        vint32m1_t vZero = __riscv_vand(__riscv_vundefined_i32m1(), zero, vl);     //const zero for redsum
+   142→
+   143→        for (i = 0; i < out_tensor_ch; i++)
+   144→        {
+   145→            q7_t      *p_in = (q7_t*)in_tmp_buf;
+   146→            uint16_t colCnt2 = colCnt;
+   147→
+   148→            //clear v0~v7
+   149→            vl = __riscv_vsetvl_e32m8(colCnt);
+   150→            vint32m8_t vAccumulator = __riscv_vand(__riscv_vundefined_i32m8(), zero, vl);
+   151→
+   152→            // while (colCnt2 >= (vlenb * NDS_VEC_VTYPE_LMUL_ID_M8))
+   153→            // {
+   154→            //     NDS_VEC_VSETVLI(vl, colCnt2, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M8);
+   155→            //     //load src1
+   156→            //     NDS_VEC_VLB_V(NDS_VEC_V8, p_wt);
+   157→            //     //load src2
+   158→            //     NDS_VEC_VLB_V(NDS_VEC_V16, p_in);
+   159→            //     //bump pointers and update loop counter
+   160→            //     colCnt2 -= vl;
+   161→            //     p_wt += vl;
+   162→            //     p_in += vl;
+   163→            //     //set the proper avl/SEW/LMUL values for vd4dot
+   164→            //     vl >>= 2;
+   165→            //     NDS_VEC_VSETVLI(vl, vl, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M8);
+   166→            //     //acc += src1 * src2
+   167→            //     NDS_VEC_VD4DOTS_VV(NDS_VEC_V0, NDS_VEC_V8, NDS_VEC_V16);
+   168→            // }
+   169→
+   170→            //extra process for the case of elements to be dot producted is not a mutiple of 4
+   171→            while(colCnt2 > 0)
+   172→            {
+   173→                //clean one of the dot product source
+   174→                vl = __riscv_vsetvlmax_e8m8();
+   175→                vint8m8_t vP_wt_i8m8 = __riscv_vand(__riscv_vundefined_i8m8(), zero, vl);
+   176→
+   177→                vl = __riscv_vsetvl_e8m8(colCnt2);
+   178→                //load src1
+   179→                vP_wt_i8m8 = __riscv_vle8_v_i8m8_tu(vP_wt_i8m8, p_wt, vl);
+   180→                //load src2
+   181→                vint8m8_t vP_in_i8m8 = __riscv_vle8_v_i8m8(p_in, vl);
+   182→                //bump pointers and update loop counter
+   183→                colCnt2 -= vl;
+   184→                p_wt += vl;
+   185→                p_in += vl;
+   186→                //set the proper avl/SEW/LMUL values for vd4dot
+   187→                //remember to deal with the avl of vd4dot is not a multiple of 4 case
+   188→                vl = __riscv_vsetvl_e32m8(vl);
+   189→                //acc += src1 * src2
+   190→                vAccumulator = __riscv_vd4dots_vv_i32m8(vAccumulator, vP_wt_i8m8, vP_in_i8m8, vl);
+   191→            }
+   192→
+   193→            vl = __riscv_vsetvl_e32m8(colCnt);  //note the avl here
+   194→            vint32m1_t vSum_i32 = __riscv_vredsum(vAccumulator, vZero, vl);
+   195→
+   196→            //add bias back
+   197→            vl = __riscv_vsetvl_e32m1(1);
+   198→            vint32m1_t vBias_i32 = __riscv_vle32_v_i32m1(bias, vl);
+   199→            vSum_i32 = __riscv_vadd(vSum_i32, vBias_i32, vl);
+   200→
+   201→            //2-stage shift
+   202→            vSum_i32 = __riscv_vsra(vSum_i32, pre_rshift, vl);
+   203→            vSum_i32 = __riscv_vmul(vSum_i32, out_scale, vl);
+   204→            vSum_i32 = __riscv_vadd(vSum_i32, NN_ROUND(post_rshift), vl);
+   205→
+   206→            //scale down, clip and store the results
+   207→            vl = __riscv_vsetvl_e16mf2(1);
+   208→            vint16mf2_t vSum_i16 = __riscv_vnsra(vSum_i32, post_rshift, vl);
+   209→            vl = __riscv_vsetvl_e8mf4(1);
+   210→            vint8mf4_t vSum_i8 = __riscv_vnclip(vSum_i16, zero, __RISCV_VXRM_RNU, vl);
+   211→            __riscv_vse8(pOut, vSum_i8, vl);
+   212→            bias += vl;
+   213→            pOut += vl;
+   214→        }
+   215→    }
+   216→#elif (NDS_VEC_RVV_VERSION >= 100) && defined(ENA_VEC_ISA_ZVQMAC)
+   217→    /* left-over because odd number of output pixels */
+   218→    if (pBuffer != (q7_t *)in_tmp_buf)
+   219→    {
+   220→        const q7_t *pA = ker_weight;
+   221→        long i;
+   222→        /* basically each time it process 4 entries */
+   223→        long colCnt = (3 * ker_dim * ker_dim);
+   224→
+   225→        //set SEW for 1st time VMV_S_X
+   226→        //LMUL=8 is just for clear v8~v15 (vmv ignores LMUL)
+   227→        vl = __riscv_vsetvl_e32m8(colCnt);
+   228→
+   229→        for (i = 0; i < out_tensor_ch; i++)
+   230→        {
+   231→            q31_t sum = bias[i];
+   232→            q7_t *pB = (q7_t*)in_tmp_buf;
+   233→            long colCnt2 = colCnt;
+   234→
+   235→            //init
+   236→            vint32m1_t vBias = __riscv_vmv_s_x_i32m1(sum, vl);
+   237→            //clear v8~v15 (acc)
+   238→            vint32m8_t vAcc = __riscv_vundefined_i32m8();
+   239→            vAcc = __riscv_vand_tu(vAcc, vAcc, 0, vl);
+   240→
+   241→            while(colCnt2 > 0)
+   242→            {
+   243→                vl = __riscv_vsetvl_e8m2(colCnt2);
+   244→                vint8m2_t vPa_i8 = __riscv_vundefined_i8m2();
+   245→                vint8m2_t vPb_i8 = __riscv_vundefined_i8m2();
+   246→                vPa_i8 = __riscv_vle8_tu(vPa_i8, pA, vl);
+   247→                vPb_i8 = __riscv_vle8_tu(vPb_i8, pB, vl);
+   248→                vAcc = __riscv_vqmacc_vv_i32m8_tu(vAcc, vPa_i8, vPb_i8, vl);
+   249→                //bump pointers and update loop counter
+   250→                colCnt2 -= vl;
+   251→                pA += vl;
+   252→                pB += vl;
+   253→            }
+   254→
+   255→            vl = __riscv_vsetvl_e32m8(colCnt);    //note the avl here
+   256→            vint32m1_t vAcc_sum = __riscv_vredsum(vAcc, vBias, vl);
+   257→            //move vr results to gpr
+   258→            sum = __riscv_vmv_x(vAcc_sum);
+   259→
+   260→            sum  = (sum  >> pre_rshift) * out_scale + NN_ROUND(post_rshift);
+   261→            *pOut++ = NDS_ISA_SATS((sum >> post_rshift), 8);
+   262→        }
+   263→    }
+   264→#endif
+   265→#elif defined(ENA_VEC_ISA)
+   266→#ifdef ENA_TILING
+   267→#if (NDS_VEC_RVV_VERSION >= 1000)
+   268→    /*
+   269→     * Direct convolution with fused bias + requantize.
+   270→     * Vectorizes across out_tensor_ch: vqmacc.vx accumulates one input scalar
+   271→     * against the full transposed weight row (all output channels).
+   272→     * Processes 4 output pixels at a time, sharing weight loads.
+   273→     * Eliminates im2col buffer and q32 intermediate buffer.
+   274→     *
+   275→     * Register plan:
+   276→     *   v0-v3   (M4 e32): Accumulator pixel 1
+   277→     *   v4-v7   (M4 e32): Accumulator pixel 2
+   278→     *   v8-v11  (M4 e32): Accumulator pixel 3
+   279→     *   v12-v15 (M4 e32): Accumulator pixel 4
+   280→     *   v16     (M1 e8):  Weight vector load
+   281→     */
+   282→    const int in_tensor_ch = 3;
+   283→    long i_ker_y, i_ker_x, ch;
+   284→
+   285→    const long align_byte = 64;
+   286→    q7_t *pOut = out_tensor;
+   287→    long vl;
+   288→
+   289→    /* Allocate transposed weight buffer from in_tmp_buf */
+   290→    q7_t *src2 = (q7_t *)in_tmp_buf;
+   291→    src2 = (q7_t*)nn_align((unsigned long)src2, align_byte);
+   292→
+   293→    /* Transpose weights once: from [out_ch x K] to [K x out_ch] */
+   294→    const long row = out_tensor_ch;
+   295→    const long col = ker_dim * ker_dim * in_tensor_ch;
+   296→    nn_mat_mul_kernel_tiling_transpose_q7(ker_weight, src2, row, col);
+   297→
+   298→    /* Total output pixels */
+   299→    long total_pixels = (long)out_tensor_dim * out_tensor_dim;
+   300→    long pixel_idx = 0;
+   301→
+   302→    /* Process 4 output pixels at a time */
+   303→    for (; pixel_idx + 3 < total_pixels; pixel_idx += 4)
+   304→    {
+   305→        long out_y1 = pixel_idx / out_tensor_dim;
+   306→        long out_x1 = pixel_idx % out_tensor_dim;
+   307→        long out_y2 = (pixel_idx + 1) / out_tensor_dim;
+   308→        long out_x2 = (pixel_idx + 1) % out_tensor_dim;
+   309→        long out_y3 = (pixel_idx + 2) / out_tensor_dim;
+   310→        long out_x3 = (pixel_idx + 2) % out_tensor_dim;
+   311→        long out_y4 = (pixel_idx + 3) / out_tensor_dim;
+   312→        long out_x4 = (pixel_idx + 3) % out_tensor_dim;
+   313→
+   314→        /* Load bias into 4 M4 accumulators at e32/M4 */
+   315→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M4);
+   316→        NDS_VEC_VLE32_V(NDS_VEC_V0, bias);
+   317→        NDS_VEC_VLE32_V(NDS_VEC_V4, bias);
+   318→        NDS_VEC_VLE32_V(NDS_VEC_V8, bias);
+   319→        NDS_VEC_VLE32_V(NDS_VEC_V12, bias);
+   320→
+   321→        /* Set e8/M1 once for all vqmacc accumulation (e8*e8->e32, M1 input, M4 acc) */
+   322→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M1);
+   323→
+   324→        /* Accumulate over all K positions */
+   325→        if (pad == 0)
+   326→        {
+   327→            /* Fast path: no padding means all pixels are interior — skip boundary checks */
+   328→            for (i_ker_y = 0; i_ker_y < ker_dim; i_ker_y++)
+   329→            {
+   330→                long in_row1 = out_y1 * stride + i_ker_y;
+   331→                long in_row2 = out_y2 * stride + i_ker_y;
+   332→                long in_row3 = out_y3 * stride + i_ker_y;
+   333→                long in_row4 = out_y4 * stride + i_ker_y;
+   334→
+   335→                for (i_ker_x = 0; i_ker_x < ker_dim; i_ker_x++)
+   336→                {
+   337→                    long in_col1 = out_x1 * stride + i_ker_x;
+   338→                    long in_col2 = out_x2 * stride + i_ker_x;
+   339→                    long in_col3 = out_x3 * stride + i_ker_x;
+   340→                    long in_col4 = out_x4 * stride + i_ker_x;
+   341→                    long k_base = (i_ker_y * ker_dim + i_ker_x) * in_tensor_ch;
+   342→
+   343→                    for (ch = 0; ch < in_tensor_ch; ch++)
+   344→                    {
+   345→                        long k_pos = k_base + ch;
+   346→
+   347→                        /* Load transposed weight row into v16 at e8/M1 */
+   348→                        NDS_VEC_VLB_V(NDS_VEC_V16, src2 + k_pos * out_tensor_ch);
+   349→
+   350→                        /* Get input scalars — no boundary checks needed */
+   351→                        q7_t a1 = in_tensor[(in_row1 * in_tensor_dim + in_col1) * in_tensor_ch + ch];
+   352→                        q7_t a2 = in_tensor[(in_row2 * in_tensor_dim + in_col2) * in_tensor_ch + ch];
+   353→                        q7_t a3 = in_tensor[(in_row3 * in_tensor_dim + in_col3) * in_tensor_ch + ch];
+   354→                        q7_t a4 = in_tensor[(in_row4 * in_tensor_dim + in_col4) * in_tensor_ch + ch];
+   355→
+   356→                        /* vqmacc.vx: acc[e32/M4] += scalar * wt[e8/M1] */
+   357→                        NDS_VEC_VQMACC_VX(NDS_VEC_V0, a1, NDS_VEC_V16);
+   358→                        NDS_VEC_VQMACC_VX(NDS_VEC_V4, a2, NDS_VEC_V16);
+   359→                        NDS_VEC_VQMACC_VX(NDS_VEC_V8, a3, NDS_VEC_V16);
+   360→                        NDS_VEC_VQMACC_VX(NDS_VEC_V12, a4, NDS_VEC_V16);
+   361→                    }
+   362→                }
+   363→            }
+   364→        }
+   365→        else
+   366→        {
+   367→            /* General path: check boundaries for padding */
+   368→            for (i_ker_y = 0; i_ker_y < ker_dim; i_ker_y++)
+   369→            {
+   370→                long in_row1 = out_y1 * stride - pad + i_ker_y;
+   371→                long in_row2 = out_y2 * stride - pad + i_ker_y;
+   372→                long in_row3 = out_y3 * stride - pad + i_ker_y;
+   373→                long in_row4 = out_y4 * stride - pad + i_ker_y;
+   374→
+   375→                for (i_ker_x = 0; i_ker_x < ker_dim; i_ker_x++)
+   376→                {
+   377→                    long in_col1 = out_x1 * stride - pad + i_ker_x;
+   378→                    long in_col2 = out_x2 * stride - pad + i_ker_x;
+   379→                    long in_col3 = out_x3 * stride - pad + i_ker_x;
+   380→                    long in_col4 = out_x4 * stride - pad + i_ker_x;
+   381→                    long k_base = (i_ker_y * ker_dim + i_ker_x) * in_tensor_ch;
+   382→
+   383→                    for (ch = 0; ch < in_tensor_ch; ch++)
+   384→                    {
+   385→                        long k_pos = k_base + ch;
+   386→
+   387→                        /* Load transposed weight row into v16 at e8/M1 */
+   388→                        NDS_VEC_VLB_V(NDS_VEC_V16, src2 + k_pos * out_tensor_ch);
+   389→
+   390→                        /* Get input scalars with boundary checks */
+   391→                        q7_t a1 = 0, a2 = 0, a3 = 0, a4 = 0;
+   392→                        if (in_row1 >= 0 && in_row1 < in_tensor_dim &&
+   393→                            in_col1 >= 0 && in_col1 < in_tensor_dim)
+   394→                            a1 = in_tensor[(in_row1 * in_tensor_dim + in_col1) * in_tensor_ch + ch];
+   395→                        if (in_row2 >= 0 && in_row2 < in_tensor_dim &&
+   396→                            in_col2 >= 0 && in_col2 < in_tensor_dim)
+   397→                            a2 = in_tensor[(in_row2 * in_tensor_dim + in_col2) * in_tensor_ch + ch];
+   398→                        if (in_row3 >= 0 && in_row3 < in_tensor_dim &&
+   399→                            in_col3 >= 0 && in_col3 < in_tensor_dim)
+   400→                            a3 = in_tensor[(in_row3 * in_tensor_dim + in_col3) * in_tensor_ch + ch];
+   401→                        if (in_row4 >= 0 && in_row4 < in_tensor_dim &&
+   402→                            in_col4 >= 0 && in_col4 < in_tensor_dim)
+   403→                            a4 = in_tensor[(in_row4 * in_tensor_dim + in_col4) * in_tensor_ch + ch];
+   404→
+   405→                        /* vqmacc.vx: acc[e32/M4] += scalar * wt[e8/M1] */
+   406→                        NDS_VEC_VQMACC_VX(NDS_VEC_V0, a1, NDS_VEC_V16);
+   407→                        NDS_VEC_VQMACC_VX(NDS_VEC_V4, a2, NDS_VEC_V16);
+   408→                        NDS_VEC_VQMACC_VX(NDS_VEC_V8, a3, NDS_VEC_V16);
+   409→                        NDS_VEC_VQMACC_VX(NDS_VEC_V12, a4, NDS_VEC_V16);
+   410→                    }
+   411→                }
+   412→            }
+   413→        }
+   414→
+   415→        /* Requantize pixel 1: shift, scale, narrow, clip, store */
+   416→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M4);
+   417→        NDS_VEC_VSRA_VX(NDS_VEC_V0, NDS_VEC_V0, pre_rshift);
+   418→        NDS_VEC_VMUL_VX(NDS_VEC_V0, NDS_VEC_V0, out_scale);
+   419→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E16, NDS_VEC_VTYPE_LMUL_M2);
+   420→        NDS_VEC_VNCLIP_WX(NDS_VEC_V0, NDS_VEC_V0, post_rshift);
+   421→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M1);
+   422→        NDS_VEC_VNCLIP_WX(NDS_VEC_V0, NDS_VEC_V0, 0);
+   423→        NDS_VEC_VSB_V(NDS_VEC_V0, pOut);
+   424→        pOut += out_tensor_ch;
+   425→
+   426→        /* Requantize pixel 2 */
+   427→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M4);
+   428→        NDS_VEC_VSRA_VX(NDS_VEC_V4, NDS_VEC_V4, pre_rshift);
+   429→        NDS_VEC_VMUL_VX(NDS_VEC_V4, NDS_VEC_V4, out_scale);
+   430→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E16, NDS_VEC_VTYPE_LMUL_M2);
+   431→        NDS_VEC_VNCLIP_WX(NDS_VEC_V4, NDS_VEC_V4, post_rshift);
+   432→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M1);
+   433→        NDS_VEC_VNCLIP_WX(NDS_VEC_V4, NDS_VEC_V4, 0);
+   434→        NDS_VEC_VSB_V(NDS_VEC_V4, pOut);
+   435→        pOut += out_tensor_ch;
+   436→
+   437→        /* Requantize pixel 3 */
+   438→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M4);
+   439→        NDS_VEC_VSRA_VX(NDS_VEC_V8, NDS_VEC_V8, pre_rshift);
+   440→        NDS_VEC_VMUL_VX(NDS_VEC_V8, NDS_VEC_V8, out_scale);
+   441→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E16, NDS_VEC_VTYPE_LMUL_M2);
+   442→        NDS_VEC_VNCLIP_WX(NDS_VEC_V8, NDS_VEC_V8, post_rshift);
+   443→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M1);
+   444→        NDS_VEC_VNCLIP_WX(NDS_VEC_V8, NDS_VEC_V8, 0);
+   445→        NDS_VEC_VSB_V(NDS_VEC_V8, pOut);
+   446→        pOut += out_tensor_ch;
+   447→
+   448→        /* Requantize pixel 4 */
+   449→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M4);
+   450→        NDS_VEC_VSRA_VX(NDS_VEC_V12, NDS_VEC_V12, pre_rshift);
+   451→        NDS_VEC_VMUL_VX(NDS_VEC_V12, NDS_VEC_V12, out_scale);
+   452→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E16, NDS_VEC_VTYPE_LMUL_M2);
+   453→        NDS_VEC_VNCLIP_WX(NDS_VEC_V12, NDS_VEC_V12, post_rshift);
+   454→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M1);
+   455→        NDS_VEC_VNCLIP_WX(NDS_VEC_V12, NDS_VEC_V12, 0);
+   456→        NDS_VEC_VSB_V(NDS_VEC_V12, pOut);
+   457→        pOut += out_tensor_ch;
+   458→    }
+   459→
+   460→    /* Handle remaining 0-3 pixels one at a time */
+   461→    for (; pixel_idx < total_pixels; pixel_idx++)
+   462→    {
+   463→        long out_y1 = pixel_idx / out_tensor_dim;
+   464→        long out_x1 = pixel_idx % out_tensor_dim;
+   465→
+   466→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M4);
+   467→        NDS_VEC_VLE32_V(NDS_VEC_V0, bias);
+   468→
+   469→        /* Set e8/M1 once for all vqmacc accumulation */
+   470→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M1);
+   471→
+   472→        if (pad == 0)
+   473→        {
+   474→            /* Fast path: no padding — skip boundary checks */
+   475→            for (i_ker_y = 0; i_ker_y < ker_dim; i_ker_y++)
+   476→            {
+   477→                long in_row1 = out_y1 * stride + i_ker_y;
+   478→                for (i_ker_x = 0; i_ker_x < ker_dim; i_ker_x++)
+   479→                {
+   480→                    long in_col1 = out_x1 * stride + i_ker_x;
+   481→                    long k_base = (i_ker_y * ker_dim + i_ker_x) * in_tensor_ch;
+   482→                    for (ch = 0; ch < in_tensor_ch; ch++)
+   483→                    {
+   484→                        long k_pos = k_base + ch;
+   485→                        NDS_VEC_VLB_V(NDS_VEC_V16, src2 + k_pos * out_tensor_ch);
+   486→                        q7_t a1 = in_tensor[(in_row1 * in_tensor_dim + in_col1) * in_tensor_ch + ch];
+   487→                        NDS_VEC_VQMACC_VX(NDS_VEC_V0, a1, NDS_VEC_V16);
+   488→                    }
+   489→                }
+   490→            }
+   491→        }
+   492→        else
+   493→        {
+   494→            /* General path: check boundaries for padding */
+   495→            for (i_ker_y = 0; i_ker_y < ker_dim; i_ker_y++)
+   496→            {
+   497→                long in_row1 = out_y1 * stride - pad + i_ker_y;
+   498→                for (i_ker_x = 0; i_ker_x < ker_dim; i_ker_x++)
+   499→                {
+   500→                    long in_col1 = out_x1 * stride - pad + i_ker_x;
+   501→                    long k_base = (i_ker_y * ker_dim + i_ker_x) * in_tensor_ch;
+   502→                    for (ch = 0; ch < in_tensor_ch; ch++)
+   503→                    {
+   504→                        long k_pos = k_base + ch;
+   505→                        NDS_VEC_VLB_V(NDS_VEC_V16, src2 + k_pos * out_tensor_ch);
+   506→                        q7_t a1 = 0;
+   507→                        if (in_row1 >= 0 && in_row1 < in_tensor_dim &&
+   508→                            in_col1 >= 0 && in_col1 < in_tensor_dim)
+   509→                            a1 = in_tensor[(in_row1 * in_tensor_dim + in_col1) * in_tensor_ch + ch];
+   510→                        NDS_VEC_VQMACC_VX(NDS_VEC_V0, a1, NDS_VEC_V16);
+   511→                    }
+   512→                }
+   513→            }
+   514→        }
+   515→
+   516→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M4);
+   517→        NDS_VEC_VSRA_VX(NDS_VEC_V0, NDS_VEC_V0, pre_rshift);
+   518→        NDS_VEC_VMUL_VX(NDS_VEC_V0, NDS_VEC_V0, out_scale);
+   519→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E16, NDS_VEC_VTYPE_LMUL_M2);
+   520→        NDS_VEC_VNCLIP_WX(NDS_VEC_V0, NDS_VEC_V0, post_rshift);
+   521→        NDS_VEC_VSETVLI(vl, out_tensor_ch, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M1);
+   522→        NDS_VEC_VNCLIP_WX(NDS_VEC_V0, NDS_VEC_V0, 0);
+   523→        NDS_VEC_VSB_V(NDS_VEC_V0, pOut);
+   524→        pOut += out_tensor_ch;
+   525→    }
+   526→#else /* NDS_VEC_RVV_VERSION < 1000: fallback to tiling GEMM */
+   527→    //cache is 512KB, type is q7
+   528→    uint32_t tiling_size = 256;
+   529→    //num of columnar
+   530→    int col_counter = 0;
+   531→    const int in_tensor_ch = 3;
+   532→    int16_t    i_out_y, i_out_x, i_ker_y, i_ker_x;
+   533→    unsigned long addr_in_tmp_buf;
+   534→
+   535→    /*
+   536→     *  Here we use in_tmp_buf as q15_t internally as computation are done with q15_t level
+   537→     *  im2col are done to output in q15_t format from q7_t input
+   538→     */
+   539→    const long align_byte = 64;
+   540→    q7_t *pBuffer = (q7_t*)in_tmp_buf;
+   541→    q7_t *pOut = out_tensor;
+   542→    q31_t *dst_q31;
+   543→#ifdef DCACHE_SIZE
+   544→    int i;
+   545→    int tiling_size_arr[] = { 1,8,16,32,64,128,256,512,1024,2048 };
+   546→    int max_tile_size_in_cache = sqrt(((DCACHE_SIZE) << 10) / 6); //sqrt(((DCACHE_SIZE) << 10) / 3 / sizeof(float16_t))
+   547→    for (i = 1; i < sizeof(tiling_size_arr) / sizeof(tiling_size_arr[0]); i++)
+   548→    {
+   549→        if (tiling_size_arr[i] > max_tile_size_in_cache)
+   550→        {
+   551→            tiling_size = tiling_size_arr[i - 1];
+   552→            break;
+   553→        }
+   554→    }
+   555→#endif
+   556→#ifdef ENA_8MHVM
+   557→    char *hvm_base = (char *)0x90000000;
+   558→    q7_t *src2 = (q7_t *)hvm_base;
+   559→    addr_in_tmp_buf = (unsigned long)src2 + sizeof(*ker_weight) * in_tensor_ch * ker_dim * ker_dim * out_tensor_ch;
+   560→#else
+   561→    q7_t *src2 = (q7_t *)in_tmp_buf
+   562→                         + sizeof(*in_tensor) * tiling_size * in_tensor_ch * ker_dim * ker_dim; //matrix_A's memory space
+   563→    src2 = (q7_t*)nn_align((unsigned long)src2, align_byte);  // align the starting addresss
+   564→    addr_in_tmp_buf = (unsigned long)src2;
+   565→    addr_in_tmp_buf += sizeof(*ker_weight) * out_tensor_ch * in_tensor_ch * ker_dim * ker_dim;
+   566→#endif
+   567→    addr_in_tmp_buf = nn_align(addr_in_tmp_buf, align_byte);
+   568→    dst_q31 = (q31_t *)addr_in_tmp_buf;
+   569→
+   570→    /* initial the output */
+   571→    nn_set_zero_s16((q15_t *)dst_q31, (tiling_size * out_tensor_ch * 2));
+   572→
+   573→    // transpose the kernel_weight for matrix multiplication
+   574→    const long row = out_tensor_ch;
+   575→    const long col = ker_dim * ker_dim * in_tensor_ch;
+   576→    nn_mat_mul_kernel_tiling_transpose_q7(ker_weight, src2, row, col);
+   577→
+   578→    /* This part implements the im256col function */
+   579→    for (i_out_y = 0; i_out_y < out_tensor_dim; i_out_y++)
+   580→    {
+   581→        for (i_out_x = 0; i_out_x < out_tensor_dim; i_out_x++)
+   582→        {
+   583→            for (i_ker_y = i_out_y * stride - pad; i_ker_y < i_out_y * stride - pad + ker_dim; i_ker_y++)
+   584→            {
+   585→                for (i_ker_x = i_out_x * stride - pad; i_ker_x < i_out_x * stride - pad + ker_dim; i_ker_x++)
+   586→                {
+   587→                    if (i_ker_y < 0 || i_ker_y >= in_tensor_dim || i_ker_x < 0 || i_ker_x >= in_tensor_dim)
+   588→                    {
+   589→                        /* Filling 0 for out-of-bound paddings */
+   590→                        nn_set_zero_s8(pBuffer, sizeof(q7_t)*in_tensor_ch);
+   591→                    }
+   592→                    else
+   593→                    {
+   594→                        /* Copying the pixel data to column */
+   595→                        nn_dup_s8((q7_t *)in_tensor + (i_ker_y * in_tensor_dim + i_ker_x) * in_tensor_ch, pBuffer, in_tensor_ch);
+   596→                    }
+   597→                    pBuffer += in_tensor_ch;
+   598→                }
+   599→            }
+   600→            col_counter++;
+   601→
+   602→            /* Computation is filed for [tiling_size] columns */
+   603→            if (col_counter == tiling_size)
+   604→            {
+   605→                pOut = nn_mat_mul_kernel_tiling_q7((q7_t *)in_tmp_buf,
+   606→                                                   src2,
+   607→                                                   dst_q31,
+   608→                                                   pOut,
+   609→                                                   col_counter,
+   610→                                                   in_tensor_ch * ker_dim * ker_dim,
+   611→                                                   out_tensor_ch,
+   612→                                                   pre_rshift,
+   613→                                                   out_scale,
+   614→                                                   post_rshift,
+   615→                                                   bias,
+   616→                                                   tiling_size);
+   617→                /* reset */
+   618→                col_counter = 0;
+   619→                pBuffer = (q7_t *)in_tmp_buf;
+   620→            }
+   621→        }
+   622→    }
+   623→
+   624→    /* check if there is left-over for compute */
+   625→    pOut = nn_mat_mul_kernel_tiling_q7((q7_t*)in_tmp_buf,
+   626→                                       src2,
+   627→                                       dst_q31,
+   628→                                       pOut,
+   629→                                       col_counter,
+   630→                                       in_tensor_ch * ker_dim * ker_dim,
+   631→                                       out_tensor_ch,
+   632→                                       pre_rshift,
+   633→                                       out_scale,
+   634→                                       post_rshift,
+   635→                                       bias,
+   636→                                       tiling_size);
+   637→#endif /* NDS_VEC_RVV_VERSION >= 1000 */
+   638→#else
+   639→    long   i_out_y, i_out_x, i_ker_y, i_ker_x;
+   640→
+   641→    /*
+   642→     *  Here we use in_tmp_buf as q15_t internally as computation are done with q15_t level
+   643→     *  im2col are done to output in q15_t format from q7_t input
+   644→     */
+   645→    q7_t *pBuffer = (q7_t *)in_tmp_buf;
+   646→    q7_t *pOut = out_tensor;
+   647→
+   648→    long buf_len = (3 * ker_dim * ker_dim);
+   649→    long vl;
+   650→
+   651→    // This part implements the im2col function
+   652→    for (i_out_y = 0; i_out_y < out_tensor_dim; i_out_y++)
+   653→    {
+   654→        for (i_out_x = 0; i_out_x < out_tensor_dim; i_out_x++)
+   655→        {
+   656→            // init in_tmp_buf
+   657→            long len = buf_len;
+   658→            q7_t *pBuffer2 = pBuffer;
+   659→            NDS_VEC_VSETVLI(vl, len, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M8);
+   660→            NDS_VEC_VAND_VI(NDS_VEC_V24, NDS_VEC_V24, 0);   //zero
+   661→            while(len > 0)
+   662→            {
+   663→                NDS_VEC_VSB_V(NDS_VEC_V24, pBuffer2);
+   664→                len -= vl;
+   665→                pBuffer2 += vl;
+   666→                NDS_VEC_VSETVLI(vl, len, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M8);
+   667→            }
+   668→
+   669→            // if (i_ker_y < 0)
+   670→            for (i_ker_y = i_out_y * stride - pad; i_ker_y < 0; i_ker_y++)
+   671→            {
+   672→                pBuffer += ker_dim * 3;
+   673→            }
+   674→
+   675→            long bound_y = ((i_out_y * stride - pad + ker_dim) < in_tensor_dim)? (i_out_y * stride - pad + ker_dim) : in_tensor_dim;
+   676→            for (; i_ker_y < bound_y; i_ker_y++)
+   677→            {
+   678→                // if (i_ker_x < 0)
+   679→                for (i_ker_x = i_out_x * stride - pad; i_ker_x < 0; i_ker_x++)
+   680→                {
+   681→                    pBuffer += 3;
+   682→                }
+   683→
+   684→                long bound_x = (i_out_x * stride - pad + ker_dim < in_tensor_dim)? (i_out_x * stride - pad + ker_dim) : in_tensor_dim;
+   685→                const q7_t *pPixel = in_tensor + (i_ker_y * in_tensor_dim + i_ker_x) * 3;
+   686→                long loop = (bound_x - i_ker_x)*3;
+   687→                i_ker_x = bound_x;
+   688→                while(loop > 0)
+   689→                {
+   690→                    NDS_VEC_VSETVLI(vl, loop, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M8);
+   691→                    NDS_VEC_VLB_V(NDS_VEC_V0, pPixel);
+   692→                    NDS_VEC_VSB_V(NDS_VEC_V0, pBuffer);
+   693→                    pPixel += vl;
+   694→                    pBuffer += vl;
+   695→                    loop -= vl;
+   696→                }
+   697→
+   698→                // if (i_ker_x >= in_tensor_dim)
+   699→                for ( ; i_ker_x < i_out_x * stride - pad + ker_dim; i_ker_x++)
+   700→                {
+   701→                    pBuffer += 3;
+   702→                }
+   703→            }
+   704→
+   705→            // if (i_ker_y >= in_tensor_dim)
+   706→            for (; i_ker_y < i_out_y * stride - pad + ker_dim; i_ker_y++)
+   707→            {
+   708→                pBuffer += ker_dim * 3;
+   709→            }
+   710→
+   711→            if (pBuffer == (q7_t *)in_tmp_buf + 2 * (3 * ker_dim * ker_dim))
+   712→            {
+   713→                pOut = nn_mat_mul_kernel_q7_bias_2sft((q7_t *)ker_weight, (q7_t *)in_tmp_buf, out_tensor_ch, 3 * ker_dim * ker_dim, pre_rshift, out_scale, post_rshift, bias, pOut);
+   714→                pBuffer = (q7_t *)in_tmp_buf;
+   715→            }
+   716→        }
+   717→    }
+   718→
+   719→#if (NDS_VEC_RVV_VERSION >= 100) && defined(ENA_NDS_V5_VEC_DOT_PROD)
+   720→    if (pBuffer != (q7_t *)in_tmp_buf)
+   721→    {
+   722→        unsigned vl;
+   723→        const q7_t *p_wt = ker_weight;
+   724→        int       i;
+   725→        uint16_t  colCnt = 3 * ker_dim * ker_dim;
+   726→        // long vlenb = NDS_VEC_CSR_GET_VLENB();
+   727→
+   728→#if (__clang__)
+   729→        register const long zero asm ("x0") = 0;
+   730→#else
+   731→        register const long zero asm ("x0");
+   732→#endif
+   733→
+   734→        NDS_VEC_VSETVLI(vl, 1, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M1);
+   735→        NDS_VEC_VAND_VI(NDS_VEC_V31, NDS_VEC_V31, 0x0);     //const zero for redsum
+   736→
+   737→        for (i = 0; i < out_tensor_ch; i++)
+   738→        {
+   739→            q7_t      *p_in = (q7_t*)in_tmp_buf;
+   740→            uint16_t colCnt2 = colCnt;
+   741→
+   742→            //clear v0~v7
+   743→            NDS_VEC_VSETVLI(vl, colCnt, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M8);
+   744→            NDS_VEC_VAND_VI(NDS_VEC_V0, NDS_VEC_V0, 0x0);
+   745→
+   746→            // while (colCnt2 >= (vlenb * NDS_VEC_VTYPE_LMUL_ID_M8))
+   747→            // {
+   748→            //     NDS_VEC_VSETVLI(vl, colCnt2, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M8);
+   749→            //     //load src1
+   750→            //     NDS_VEC_VLB_V(NDS_VEC_V8, p_wt);
+   751→            //     //load src2
+   752→            //     NDS_VEC_VLB_V(NDS_VEC_V16, p_in);
+   753→            //     //bump pointers and update loop counter
+   754→            //     colCnt2 -= vl;
+   755→            //     p_wt += vl;
+   756→            //     p_in += vl;
+   757→            //     //set the proper avl/SEW/LMUL values for vd4dot
+   758→            //     vl >>= 2;
+   759→            //     NDS_VEC_VSETVLI(vl, vl, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M8);
+   760→            //     //acc += src1 * src2
+   761→            //     NDS_VEC_VD4DOTS_VV(NDS_VEC_V0, NDS_VEC_V8, NDS_VEC_V16);
+   762→            // }
+   763→
+   764→            //extra process for the case of elements to be dot producted is not a mutiple of 4
+   765→            while(colCnt2 > 0)
+   766→            {
+   767→                //clean one of the dot product source
+   768→                NDS_VEC_VSETVLI(vl, zero, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M8);
+   769→                NDS_VEC_VAND_VI(NDS_VEC_V8, NDS_VEC_V8, 0);
+   770→
+   771→                NDS_VEC_VSETVLI(vl, colCnt2, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M8);
+   772→                //load src1
+   773→                NDS_VEC_VLB_V(NDS_VEC_V8, p_wt);
+   774→                //load src2
+   775→                NDS_VEC_VLB_V(NDS_VEC_V16, p_in);
+   776→                //bump pointers and update loop counter
+   777→                colCnt2 -= vl;
+   778→                p_wt += vl;
+   779→                p_in += vl;
+   780→                //set the proper avl/SEW/LMUL values for vd4dot
+   781→                //remember to deal with the elements to be dot producted is not a multiple of 4 case
+   782→                NDS_VEC_VSETVLI(vl, vl, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M8);
+   783→                //acc += src1 * src2
+   784→                NDS_VEC_VD4DOTS_VV(NDS_VEC_V0, NDS_VEC_V8, NDS_VEC_V16);
+   785→            }
+   786→
+   787→            NDS_VEC_VSETVLI(vl, colCnt, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M8);  //note the avl here
+   788→            NDS_VEC_VREDSUM_VS(NDS_VEC_V8, NDS_VEC_V0, NDS_VEC_V31);
+   789→
+   790→            //add bias back
+   791→            NDS_VEC_VSETVLI(vl, 1, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M1);
+   792→            NDS_VEC_VLW_V(NDS_VEC_V9, bias);
+   793→            NDS_VEC_VADD_VV(NDS_VEC_V8, NDS_VEC_V8, NDS_VEC_V9);
+   794→
+   795→            //2-stage shift
+   796→            NDS_VEC_VSRA_VX(NDS_VEC_V8, NDS_VEC_V8, pre_rshift);
+   797→            NDS_VEC_VMUL_VX(NDS_VEC_V8, NDS_VEC_V8, out_scale);
+   798→            NDS_VEC_VADD_VX(NDS_VEC_V8, NDS_VEC_V8, NN_ROUND(post_rshift));
+   799→
+   800→            //scale down, clip and store the results
+   801→            NDS_VEC_VSETVLI(vl, 1, NDS_VEC_VTYPE_SEW_E16, NDS_VEC_VTYPE_LMUL_M1);
+   802→            NDS_VEC_VNSRA_WX(NDS_VEC_V8, NDS_VEC_V8, post_rshift);
+   803→            NDS_VEC_VSETVLI(vl, 1, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M1);
+   804→            NDS_VEC_VNCLIP_WI(NDS_VEC_V8, NDS_VEC_V8, 0);
+   805→            NDS_VEC_VSB_V(NDS_VEC_V8, pOut);
+   806→            bias += vl;
+   807→            pOut += vl;
+   808→        }
+   809→    }
+   810→#elif (NDS_VEC_RVV_VERSION >= 100) && defined(ENA_VEC_ISA_ZVQMAC)
+   811→    /* left-over because odd number of output pixels */
+   812→    if (pBuffer != (q7_t *)in_tmp_buf)
+   813→    {
+   814→        const q7_t *pA = ker_weight;
+   815→        long i;
+   816→        /* basically each time it process 4 entries */
+   817→        long colCnt = (3 * ker_dim * ker_dim);
+   818→
+   819→        //set SEW for 1st time VMV_S_X
+   820→        //LMUL=8 is just for clear v8~v15 (vmv ignores LMUL)
+   821→        NDS_VEC_VSETVLI(vl, colCnt, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M8);
+   822→
+   823→        for (i = 0; i < out_tensor_ch; i++)
+   824→        {
+   825→            q31_t sum = bias[i];
+   826→            q7_t *pB = (q7_t*)in_tmp_buf;
+   827→            long colCnt2 = colCnt;
+   828→
+   829→            //init
+   830→            NDS_VEC_VMV_S_X(NDS_VEC_V0, sum);
+   831→            //clear v8~v15 (acc)
+   832→            NDS_VEC_VAND_VI(NDS_VEC_V8, NDS_VEC_V8, 0x0);
+   833→
+   834→            while(colCnt2 > 0)
+   835→            {
+   836→                NDS_VEC_VSETVLI(vl, colCnt2, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M2);
+   837→                NDS_VEC_VLB_V(NDS_VEC_V2, pA);
+   838→                NDS_VEC_VLB_V(NDS_VEC_V4, pB);
+   839→                NDS_VEC_VQMACC_VV(NDS_VEC_V8, NDS_VEC_V2, NDS_VEC_V4);
+   840→                //bump pointers and update loop counter
+   841→                colCnt2 -= vl;
+   842→                pA += vl;
+   843→                pB += vl;
+   844→            }
+   845→
+   846→            NDS_VEC_VSETVLI(vl, colCnt, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M8);
+   847→            NDS_VEC_VREDSUM_VS(NDS_VEC_V1, NDS_VEC_V8, NDS_VEC_V0);
+   848→            //move vr results to gpr
+   849→            NDS_VEC_VMV_X_S(sum, NDS_VEC_V1);
+   850→
+   851→            sum  = (sum  >> pre_rshift) * out_scale + NN_ROUND(post_rshift);
+   852→            *pOut++ = NDS_ISA_SATS((sum >> post_rshift), 8);
+   853→        }
+   854→    }
+   855→#elif (NDS_VEC_RVV_VERSION == 80)
+   856→    /* left-over because odd number of output pixels */
+   857→    if (pBuffer != (q7_t *)in_tmp_buf)
+   858→    {
+   859→        const q7_t *pA = ker_weight;
+   860→        int i;
+   861→        /* basically each time it process 4 entries */
+   862→        uint16_t colCnt = (3 * ker_dim * ker_dim);
+   863→
+   864→        //set SEW for 1st time VMV_S_X
+   865→        //LMUL=2 is just for clear v2~v3 (vmv ignores LMUL)
+   866→        NDS_VEC_VSETVLI_E32_M2(vl, colCnt);
+   867→
+   868→        for (i = 0; i < out_tensor_ch; i++)
+   869→        {
+   870→            q31_t sum = bias[i];
+   871→            q7_t *pB = (q7_t*)in_tmp_buf;
+   872→            uint16_t colCnt2 = colCnt;
+   873→
+   874→            //init
+   875→            NDS_VEC_VMV_S_X(NDS_VEC_V4, sum);
+   876→            //clear v2~v3 (acc)
+   877→            NDS_VEC_VAND_VI(NDS_VEC_V2, NDS_VEC_V2, 0x0);
+   878→
+   879→            while(colCnt2 > 0)
+   880→            {
+   881→                NDS_VEC_VSETVLI_E16(vl, colCnt2);
+   882→                NDS_VEC_VLB_V(NDS_VEC_V0, pA);
+   883→                NDS_VEC_VLB_V(NDS_VEC_V1, pB);
+   884→                NDS_VEC_VWMACC_VV(NDS_VEC_V2, NDS_VEC_V1, NDS_VEC_V0);
+   885→                //bump pointers and update loop counter
+   886→                colCnt2 -= vl;
+   887→                pA += vl;
+   888→                pB += vl;
+   889→            }
+   890→
+   891→            NDS_VEC_VSETVLI_E32_M2(vl, colCnt);
+   892→            NDS_VEC_VREDSUM_VS(NDS_VEC_V4, NDS_VEC_V2, NDS_VEC_V4);
+   893→            //move vr results to gpr
+   894→            NDS_VEC_VMV_X_S(sum, NDS_VEC_V4);
+   895→
+   896→            sum  = (sum  >> pre_rshift) * out_scale + NN_ROUND(post_rshift);
+   897→            *pOut++ = (q7_t) NDS_ISA_SATS((sum >> post_rshift), 8);
+   898→        }
+   899→    }
+   900→#endif
+   901→#endif
+   902→#elif defined(ENA_DSP_ISA_V5)
+   903→    int16_t   i_out_y, i_out_x, i_ker_y, i_ker_x;
+   904→
+   905→    /*
+   906→     *  Here we use in_tmp_buf as q15_t internally as computation are done with q15_t level
+   907→     *  im2col are done to output in q15_t format from q7_t input
+   908→     */
+   909→    q7_t *wt_tmp = (q7_t*)ker_weight;
+   910→
+   911→    q7_t    *pBuffer = (q7_t *)in_tmp_buf;
+   912→    q7_t     *pOut = out_tensor;
+   913→
+   914→    uint32_t i;
+   915→    q7_t    *pBufferB = (q7_t *)wt_tmp_buf;
+   916→
+   917→    uint16_t totalsize = 3 * ker_dim * ker_dim;
+   918→    for (i = 0; i < out_tensor_ch; i++)
+   919→    {
+   920→        uint32_t j;
+   921→        for (j = 0; j < totalsize; j++)
+   922→        {
+   923→            *pBufferB++ = *wt_tmp++;
+   924→        }
+   925→        *pBufferB++ = 0;
+   926→    }
+   927→
+   928→    // This part implements the im2col function
+   929→    for (i_out_y = 0; i_out_y < out_tensor_dim; i_out_y++)
+   930→    {
+   931→        for (i_out_x = 0; i_out_x < out_tensor_dim; i_out_x++)
+   932→        {
+   933→            for (i_ker_y = i_out_y * stride - pad; i_ker_y < i_out_y * stride - pad + ker_dim; i_ker_y++)
+   934→            {
+   935→                for (i_ker_x = i_out_x * stride - pad; i_ker_x < i_out_x * stride - pad + ker_dim; i_ker_x++)
+   936→                {
+   937→                    if (i_ker_y < 0 || i_ker_y >= in_tensor_dim || i_ker_x < 0 || i_ker_x >= in_tensor_dim)
+   938→                    {
+   939→                        *pBuffer++ = 0;
+   940→                        *pBuffer++ = 0;
+   941→                        *pBuffer++ = 0;
+   942→                    }
+   943→                    else
+   944→                    {
+   945→                        const q7_t *pPixel = in_tensor + (i_ker_y * in_tensor_dim + i_ker_x) * 3;
+   946→                        *pBuffer++ = *pPixel++;
+   947→                        *pBuffer++ = *pPixel++;
+   948→                        *pBuffer++ = *pPixel++;
+   949→                    }
+   950→                }
+   951→            }
+   952→            *pBuffer++ = 0;
+   953→
+   954→            if (pBuffer == (q7_t *)in_tmp_buf + 2 * (3 * ker_dim * ker_dim + 1))
+   955→            {
+   956→                pOut = nn_mat_mul_kernel_q7_bias_2sft((q7_t *)wt_tmp_buf, (q7_t *)in_tmp_buf, out_tensor_ch, 3 * ker_dim * ker_dim + 1, pre_rshift, out_scale, post_rshift, bias, pOut);
+   957→                pBuffer = (q7_t *)in_tmp_buf;
+   958→            }
+   959→        }
+   960→    }
+   961→
+   962→    /* left-over because odd number of output pixels */
+   963→#ifdef ENA_DSP_ISA_64
+   964→    if (pBuffer != (q7_t *)in_tmp_buf)
+   965→    {
+   966→        const q7_t *pA = ker_weight;
+   967→        int i;
+   968→
+   969→        for (i = 0; i < out_tensor_ch; i++)
+   970→        {
+   971→            long sum = 0;
+   972→            q7_t *pB = (q7_t*)in_tmp_buf;
+   973→
+   974→            /* basically each time it process 8 entries */
+   975→            uint16_t  colCnt = 3 * ker_dim * ker_dim >> 3;
+   976→
+   977→            while (colCnt)
+   978→            {
+   979→                long inA1, inB1;
+   980→                inA1 = *__SIMD64(pA)++;
+   981→                inB1 = *__SIMD64(pB)++;
+   982→                sum = NDS_DSP_SMAQA(sum, inA1, inB1);
+   983→                colCnt--;
+   984→            }
+   985→            //sum up the high and low part results (SIMD results)
+   986→            sum = (q31_t)(sum >> 32) + (q31_t)sum;
+   987→
+   988→            colCnt = 3 * ker_dim * ker_dim & 0x7;
+   989→            while (colCnt)
+   990→            {
+   991→                q7_t inA1 = *pA++;
+   992→                q7_t inB1 = *pB++;
+   993→                sum += inA1 * inB1;
+   994→                colCnt--;
+   995→            }
+   996→
+   997→            //add bias back
+   998→            sum += *bias++;
+   999→
+  1000→            sum  = (sum  >> pre_rshift) * out_scale + NN_ROUND(post_rshift);
+  1001→            *pOut++ = NDS_DSP_SATS((sum >> post_rshift), 8);
+  1002→        }
+  1003→    }
+  1004→#else
+  1005→    if (pBuffer != (q7_t *)in_tmp_buf)
+  1006→    {
+  1007→        const q7_t *pA = ker_weight;
+  1008→        int i;
+  1009→
+  1010→        for (i = 0; i < out_tensor_ch; i++)
+  1011→        {
+  1012→            long sum = *bias++;
+  1013→            q7_t *pB = (q7_t*)in_tmp_buf;
+  1014→
+  1015→            uint16_t  colCnt = 3 * ker_dim * ker_dim >> 2;
+  1016→            while (colCnt)
+  1017→            {
+  1018→                long inA1, inB1;
+  1019→                inA1 = *__SIMD32(pA)++;
+  1020→                inB1 = *__SIMD32(pB)++;
+  1021→                sum = NDS_DSP_SMAQA(sum, inA1, inB1);
+  1022→                colCnt--;
+  1023→            }
+  1024→
+  1025→            colCnt = 3 * ker_dim * ker_dim & 0x3;
+  1026→            while (colCnt)
+  1027→            {
+  1028→                q7_t inA1 = *pA++;
+  1029→                q7_t inB1 = *pB++;
+  1030→                sum += inA1 * inB1;
+  1031→                colCnt--;
+  1032→            }
+  1033→
+  1034→            sum  = (sum  >> pre_rshift) * out_scale + NN_ROUND(post_rshift);
+  1035→            *pOut++ = NDS_DSP_SATS((sum >> post_rshift), 8);
+  1036→        }
+  1037→    }
+  1038→#endif
+  1039→#elif defined(ENA_DSP_ISA)
+  1040→    int16_t   i_out_y, i_out_x, i_ker_y, i_ker_x;
+  1041→
+  1042→    /*
+  1043→     *  Here we use in_tmp_buf as q15_t internally as computation are done with q15_t level
+  1044→     *  im2col are done to output in q15_t format from q7_t input
+  1045→     */
+  1046→    q7_t *wt_tmp = (q7_t*)ker_weight;
+  1047→    q15_t *pBuffer = in_tmp_buf;
+  1048→    q7_t *pOut = out_tensor;
+  1049→
+  1050→    uint32_t i;
+  1051→    uint16_t size;
+  1052→    uint16_t size2 = (3 * ker_dim * ker_dim) >> 2;
+  1053→    q31_t tmp;
+  1054→    q31_t *pwt2 = (q31_t *)wt_tmp_buf;
+  1055→    for (i = 0; i < out_tensor_ch; i++)
+  1056→    {
+  1057→        size = size2;
+  1058→        while (size != 0)
+  1059→        {
+  1060→            tmp = *__SIMD32(wt_tmp)++;;
+  1061→            *pwt2++ = NDS_DSP_SUNPKD810(tmp);
+  1062→            *pwt2++ = NDS_DSP_SUNPKD810(tmp >> 16);
+  1063→            size--;
+  1064→        }
+  1065→        q7_t tmp1 = *wt_tmp++;
+  1066→        q7_t tmp2 = *wt_tmp++;
+  1067→        *pwt2++ = NDS_DSP_PKBB16(tmp2, tmp1);
+  1068→        tmp1 = *wt_tmp++;
+  1069→        *pwt2++ = (u16_t)tmp1;
+  1070→    }
+  1071→
+  1072→    // This part implements the im2col function
+  1073→    for (i_out_y = 0; i_out_y < out_tensor_dim; i_out_y++)
+  1074→    {
+  1075→        for (i_out_x = 0; i_out_x < out_tensor_dim; i_out_x++)
+  1076→        {
+  1077→            for (i_ker_y = i_out_y * stride - pad; i_ker_y < i_out_y * stride - pad + ker_dim; i_ker_y++)
+  1078→            {
+  1079→                for (i_ker_x = i_out_x * stride - pad; i_ker_x < i_out_x * stride - pad + ker_dim; i_ker_x++)
+  1080→                {
+  1081→                    if (i_ker_y < 0 || i_ker_y >= in_tensor_dim || i_ker_x < 0 || i_ker_x >= in_tensor_dim)
+  1082→                    {
+  1083→                        *pBuffer++ = 0;
+  1084→                        *pBuffer++ = 0;
+  1085→                        *pBuffer++ = 0;
+  1086→                    }
+  1087→                    else
+  1088→                    {
+  1089→                        const q7_t *pPixel = in_tensor + (i_ker_y * in_tensor_dim + i_ker_x) * 3;
+  1090→                        *pBuffer++ = *pPixel++;
+  1091→                        *pBuffer++ = *pPixel++;
+  1092→                        *pBuffer++ = *pPixel++;
+  1093→                    }
+  1094→                }
+  1095→            }
+  1096→            *pBuffer++ = 0;
+  1097→
+  1098→            if (pBuffer == in_tmp_buf + 2 * (3 * ker_dim * ker_dim + 1))
+  1099→            {
+  1100→                pOut = nn_mat_mul_kernel_q15_q15_q7_bias_2sft(wt_tmp_buf, in_tmp_buf, out_tensor_ch, 3 * ker_dim * ker_dim + 1, pre_rshift, out_scale, post_rshift, bias, pOut);
+  1101→                pBuffer = in_tmp_buf;
+  1102→            }
+  1103→        }
+  1104→    }
+  1105→
+  1106→    if (pBuffer != in_tmp_buf)
+  1107→    {
+  1108→        const q7_t *pA = ker_weight;
+  1109→        int i;
+  1110→
+  1111→        for (i = 0; i < out_tensor_ch; i++)
+  1112→        {
+  1113→            q31_t   sum = bias[i];
+  1114→            q15_t   *pB = in_tmp_buf;
+  1115→
+  1116→            /* basically each time it process 4 entries */
+  1117→            uint16_t  colCnt = 3 * ker_dim * ker_dim >> 2;
+  1118→
+  1119→            while (colCnt)
+  1120→            {
+  1121→                q31_t     inA1, inA2;
+  1122→                q31_t     inB1, inB2;
+  1123→
+  1124→                pA = (q7_t *) read_and_pad((void *)pA, &inA1, &inA2);
+  1125→                inB1 = *__SIMD32(pB)++;
+  1126→                sum = NDS_DSP_KMADA(sum, inA1, inB1);
+  1127→                inB2 = *__SIMD32(pB)++;
+  1128→                sum = NDS_DSP_KMADA(sum, inA2, inB2);
+  1129→
+  1130→                colCnt--;
+  1131→            }
+  1132→            colCnt = 3 * ker_dim * ker_dim & 0x3;
+  1133→            while (colCnt)
+  1134→            {
+  1135→                q7_t      inA1 = *pA++;
+  1136→                q15_t     inB1 = *pB++;
+  1137→                sum += inA1 * inB1;
+  1138→                colCnt--;
+  1139→            }
+  1140→
+  1141→            sum = (sum >> pre_rshift) * out_scale + NN_ROUND(post_rshift);
+  1142→            *pOut++ = NDS_DSP_SATS((sum >> post_rshift), 8);
+  1143→        }
+  1144→    }
+  1145→#else
+  1146→    uint16_t  i, j, k, l, m, n;
+  1147→    int       conv_out;
+  1148→    long in_row, in_col;
+  1149→
+  1150→    for (i = 0; i < out_tensor_ch; i++)
+  1151→    {
+  1152→        for (j = 0; j < out_tensor_dim; j++)
+  1153→        {
+  1154→            for (k = 0; k < out_tensor_dim; k++)
+  1155→            {
+  1156→                conv_out = bias[i];
+  1157→                for (m = 0; m < ker_dim; m++)
+  1158→                {
+  1159→                    for (n = 0; n < ker_dim; n++)
+  1160→                    {
+  1161→                        /* if-for implementation */
+  1162→                        in_row = stride * j + m - pad;
+  1163→                        in_col = stride * k + n - pad;
+  1164→                        if (in_row >= 0 && in_col >= 0 && in_row < in_tensor_dim && in_col < in_tensor_dim)
+  1165→                        {
+  1166→                            for (l = 0; l < 3; l++)
+  1167→                            {
+  1168→                                conv_out +=
+  1169→                                    in_tensor[(in_row * in_tensor_dim + in_col) * 3 + l]
+  1170→                                    * ker_weight[i * 3 * ker_dim * ker_dim + (m * ker_dim + n) * 3 + l];
+  1171→                            }
+  1172→                        }
+  1173→                    }
+  1174→                }
+  1175→                conv_out = (conv_out >> pre_rshift) * out_scale + NN_ROUND(post_rshift);
+  1176→                out_tensor[i + (j * out_tensor_dim + k) * out_tensor_ch] = NDS_ISA_SATS((conv_out >> post_rshift), 8);
+  1177→            }
+  1178→        }
+  1179→    }
+  1180→#endif
+  1181→
+  1182→    return 0;
+  1183→}
+  1184→

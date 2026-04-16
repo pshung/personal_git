@@ -1,0 +1,74 @@
+---
+type: operator
+function: riscv_nn_conv_HWC_s8_s8_s8_sft_bias_fast
+source: Source/ConvolutionFunctions/riscv_nn_conv_HWC_s8_s8_s8_sft_bias_fast.c
+tags: [conv, s8, sft, bias, rvv, vd4dots, im2col, cifar10]
+current_speedup: 1.09x (conv2), 1.05x (conv3)
+baseline_cycles_conv2: 246845
+current_cycles_conv2: 226245
+baseline_cycles_conv3: 87923
+current_cycles_conv3: 83633
+context: cifar10 conv2 (16x16, 32->16ch, K=800) and conv3 (8x8, 16->32ch, K=400)
+---
+
+# conv_HWC_s8_s8_s8_sft_bias_fast
+
+## What This Function Does
+
+General HWC convolution with sft (shift-based) quantization. Uses im2col + GEMM. Requires `in_tensor_ch % 4 == 0` and `out_tensor_ch % 2 == 0`.
+
+For cifar10:
+- conv2: K = 32 * 5 * 5 = 800, N = 16, out_dim = 16
+- conv3: K = 16 * 5 * 5 = 400, N = 32, out_dim = 8
+
+## Active Code Path (AX45MPV)
+
+`#if defined(ENA_VEC_ISA) || defined(ENA_DSP_ISA_V5)` block. Uses `nn_mat_mul_kernel_q7_unroll4` (4-pixel batch, vd4dots GEMM vectorizing K).
+
+The BATCH_PIXELS define selects the kernel:
+- `ENA_NDS_V5_VEC_DOT_PROD` defined: BATCH_PIXELS=4, calls `nn_mat_mul_kernel_q7_unroll4`
+- otherwise: BATCH_PIXELS=2, calls `nn_mat_mul_kernel_q7`
+
+## Optimization History
+
+| Date | Approach | Conv2 Cycles | Conv3 Cycles | Notes |
+|---|---|---|---|---|
+| baseline | 2-pixel batch, nn_mat_mul_kernel_q7 | 246,845 | 87,923 | cifar10 FPGA |
+| 2026-04-13 | 4-pixel batch, nn_mat_mul_kernel_q7_unroll4 | 226,245 | 83,633 | FPGA cifar10 board 1115 |
+
+## Why 4-Pixel Batch
+
+`nn_mat_mul_kernel_q7_unroll4` processes 4 input pixels simultaneously using vd4dots. With K=800 at VLEN=1024 (e8/M1 VL=128), it gets 100% vector utilization on K. The 4-pixel batch amortizes GEMM call overhead and im2col write cost across 4 outputs.
+
+The function handles `out_tensor_ch % 2 != 0` tails correctly via its internal tail handler.
+
+## Buffer Constraint
+
+With BATCH_PIXELS=4, im2col buffer needs: `4 * K` bytes.
+- conv2: 4 * 800 = 3200 bytes = col_buffer exactly (tight fit, OK)
+- conv3: 4 * 400 = 1600 bytes < 3200 (fits)
+
+The API-specified `in_tmp_buf[2 * K q15_t]` = `4 * K` bytes -- exactly covers the 4-pixel q7_t batch.
+
+## Leftover Handler Fix
+
+With BATCH_PIXELS=4, up to 3 pixels can remain unprocessed. The leftover handler was extended with an outer pixel loop:
+```c
+int n_left = (pBuffer - (q7_t*)in_tmp_buf) / colCnt;
+const q7_t *bias_base = bias;
+for (int p = 0; p < n_left; p++) {
+    bias = bias_base;  // reset bias for each pixel
+    // ... vd4dots reduction for pixel p
+}
+```
+
+Without this fix, pixels 1-3 of the leftover are silently dropped.
+
+## Further Opportunity
+
+Both conv2 and conv3 show IPC ~0.70-0.74, which is below the dual-issue ceiling. The K-vectorization (100% VL for K=800) is already optimal. Micro-arch profiling (pipeline stalls) is the next avenue if more headroom is needed.
+
+## Key Techniques
+
+- [[tiling-gemm-to-vd4dots]] -- vd4dots with K vectorization at 100% VL for K=800
+- `nn_mat_mul_kernel_q7_unroll4` is the 4-pixel NDS_VEC_* path active under `ENA_NDS_V5_VEC_DOT_PROD` without `ENA_VEC_INTRINSIC`

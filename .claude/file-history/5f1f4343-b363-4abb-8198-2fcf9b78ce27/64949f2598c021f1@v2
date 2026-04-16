@@ -1,0 +1,92 @@
+---
+type: operator
+function: riscv_nn_maxpool_HWC_s8
+source: Source/PoolingFunctions/riscv_nn_maxpool_HWC_s8.c
+tags: [maxpool, s8, rvv, memory-bound]
+current_speedup: 1.0x
+baseline_cycles: 25667
+current_cycles: 25667
+---
+
+# maxpool_HWC_s8
+
+## Function Signature
+
+```c
+riscv_nn_status riscv_nn_maxpool_HWC_s8(
+    const int8_t *in_tensor,
+    const uint16_t in_tensor_dim,
+    const uint16_t in_tensor_ch,
+    const uint16_t filt_dim,
+    const uint16_t padding,
+    const uint16_t stride,
+    const uint16_t out_tensor_dim,
+    int8_t *in_tmp_buf,
+    int8_t *out_tensor
+);
+```
+
+## What This Function Does
+
+Max pooling: for each output pixel and channel, return the maximum value in the kernel window. Inner loop structure:
+
+```
+for each output pixel:
+    init accumulator (vle8, load first kernel position)
+    for k_y in 0..filt_dim:
+        for k_x in 0..filt_dim:
+            vle8 load in_tensor_ch channels
+            vmax with accumulator
+    vse8 store result
+```
+
+Two instructions per kernel position: load + vmax. LMUL=M8, VL=1024 at VLEN=1024.
+
+## Active Code Path
+
+`#ifdef ENA_VEC_ISA` block. M8 vle8 + vmax loop.
+
+## Optimization History (All Attempts)
+
+| Date | Attempt | Approach | Cycles | Delta | IPC | Outcome |
+|---|---|---|---|---|---|---|
+| 2026-03-21 | baseline | M8 vle8 + vmax, pointer *= for addressing | 25,667 | -- | 0.32 | baseline |
+| 2026-03-21 | round 1 | Unroll k_x by 2: interleave vle8 V8+V16, two vmax | 26,365 | +2.7% | 0.31 | REGRESSED |
+| 2026-03-21 | round 2 | Precomputed pointer + stride arithmetic | 25,361 | -1.2% | ~0.33 | neutral |
+| 2026-03-23 | round 3 | M4 2-pixel parallel (v0+v4 accumulators) | 25,805 | +0.5% | 0.57 | neutral/slight regress |
+
+Final state: No improvement possible. Memory-bound.
+
+## Diagnosis: Memory-Bound at Hardware Limit
+
+**Confirmed memory-bound behavior:**
+
+1. IPC=0.32 baseline -- very low for a loop with 2 vector instructions/iteration
+2. Unrolling (round 1) kept cycles identical despite doubling loads
+3. M4 2-pixel parallel (round 3): IPC doubled from 0.32 to 0.57 -- the CPU can execute more instructions per cycle when VW chains are shorter -- **but cycles stayed the same**. The bottleneck is VLSU bandwidth, not instruction throughput.
+
+**Why IPC doubled but cycles didn't change (round 3):**
+- M4 processes half as many channels per instruction -> shorter VW chain -> instruction completes faster -> higher IPC
+- But VLSU still reads the same number of bytes from memory
+- Two sequential M4 pixels = same bytes = same bandwidth = same time
+
+The function is limited by memory bandwidth at ~25,000 cycles for this test input (32x30x64 tensor, 3x3 pool).
+
+## Why No More Optimization
+
+All algorithmic levers have been tried:
+- Different LMUL: neutral (same bandwidth)
+- Loop unrolling: regressed (slight overhead)
+- Pointer arithmetic: marginal (1.2% from scalar overhead reduction)
+
+The only path to improvement would be:
+- Smaller working set (data fits in L1 cache) -- unlikely for real networks
+- VLSU prefetching (marginal, hardware already prefetches some)
+- Layout change (channels in different arrangement) -- breaks API contract
+
+**Decision:** Do not re-attempt maxpool_HWC_s8 optimization without new hardware capabilities or a fundamentally different input data size.
+
+## Key References
+
+- [[memory-bound-diagnosis]] -- how to diagnose and confirm this state
+- [[anti-lmul-reduction-memory-bound]] -- why LMUL/parallelism changes don't help

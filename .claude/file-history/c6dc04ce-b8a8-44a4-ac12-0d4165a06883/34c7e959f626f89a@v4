@@ -1,0 +1,256 @@
+#!/bin/bash
+set -e
+
+############################
+# Build mculib 3.x (picolibc-based)
+#
+# Usage:
+#   ./build_mculib3.sh [options] <toolchain-prefix> [build-dir] [install-dir]
+#
+# Options:
+#   --libm-only              Rebuild only libm (skip configure, build libm targets only)
+#   --test                   Enable tests and run them via QEMU after build
+#   --qemu-path PATH         Path to QEMU binary (default: /local/nick/qemu_andes/build/qemu-system-riscv64)
+#   --toolchain-path PATH    Path to toolchain bin/ directory
+#
+# Examples:
+#   # Full build with default toolchain
+#   ./build_mculib3.sh riscv64-elf $PWD/build-riscv64 $PWD/install-riscv64
+#
+#   # Full build with specified toolchain
+#   ./build_mculib3.sh --toolchain-path /path/to/toolchain/bin riscv64-elf
+#
+#   # Rebuild libm only
+#   ./build_mculib3.sh --libm-only --toolchain-path /path/to/bin riscv64-elf $PWD/build-riscv
+#
+#   # Build and run tests via QEMU
+#   ./build_mculib3.sh --test riscv64-elf $PWD/build-riscv64 $PWD/install-riscv64
+#
+# TOOLCHAIN_PATH can also be set as an environment variable.
+############################
+# Default paths (edit these to match your environment)
+TOOLCHAIN_PATH="${TOOLCHAIN_PATH:-/local/nick/SW_Release_cp/ast530/nds64le-elf-newlib-v5d/bin}"
+############################
+
+LIBM_ONLY=false
+RUN_TESTS=false
+QEMU_PATH="${QEMU_PATH:-/local/nick/qemu_andes/build/qemu-system-riscv64}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --libm-only)
+            LIBM_ONLY=true
+            shift
+            ;;
+        --test)
+            RUN_TESTS=true
+            shift
+            ;;
+        --qemu-path)
+            QEMU_PATH="$2"
+            shift 2
+            ;;
+        --toolchain-path)
+            TOOLCHAIN_PATH="$2"
+            shift 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+SOURCE_DIR="$(pwd)"
+TOOLCHAIN_PREFIX="$1"
+BUILD_DIR="${2:-$(pwd)/build}"
+INSTALL_DIR="${3:-$(pwd)/install}"
+
+if [ -z "$TOOLCHAIN_PREFIX" ]; then
+    echo "Usage: $0 [options] <toolchain-prefix> [build-dir] [install-dir]"
+    echo ""
+    echo "  <toolchain-prefix>           e.g. riscv64-elf or riscv32-elf"
+    echo ""
+    echo "Options:"
+    echo "  --libm-only                  Rebuild only libm (skip configure)"
+    echo "  --test                       Enable tests and run them via QEMU after build"
+    echo "  --qemu-path PATH             Path to QEMU binary (default: \$QEMU_PATH or Andes QEMU)"
+    echo "  --toolchain-path PATH        Path to toolchain bin/ directory"
+    echo ""
+    echo "TOOLCHAIN_PATH can also be set as an env var."
+    exit 1
+fi
+
+SOURCE_DIR=$(realpath "$SOURCE_DIR")
+
+
+# Put QEMU directory on PATH so run-riscv can find it
+if [ "$RUN_TESTS" = true ]; then
+    QEMU_DIR="$(dirname "$QEMU_PATH")"
+    export PATH="$QEMU_DIR:$PATH"
+    if [ ! -x "$QEMU_PATH" ]; then
+        echo "Error: QEMU not found at $QEMU_PATH"
+        echo "Set --qemu-path or QEMU_PATH to point to qemu-system-riscv64."
+        exit 1
+    fi
+    echo "==> QEMU:      $QEMU_PATH ($("$QEMU_PATH" --version | head -1))"
+fi
+
+export PATH="$TOOLCHAIN_PATH:$PATH"
+
+# Verify toolchain exists
+if ! command -v "${TOOLCHAIN_PREFIX}-gcc" &>/dev/null; then
+    echo "Error: ${TOOLCHAIN_PREFIX}-gcc not found in PATH"
+    echo "Set TOOLCHAIN_PATH to the directory containing the toolchain binaries."
+    exit 1
+fi
+
+# Detect cpu_family / cpu from prefix
+case "$TOOLCHAIN_PREFIX" in
+    riscv64*)
+        CPU_FAMILY="riscv64"
+        CPU="riscv"
+        ;;
+    riscv32*)
+        CPU_FAMILY="riscv32"
+        CPU="riscv32"
+        ;;
+    *)
+        echo "Error: unsupported toolchain prefix '$TOOLCHAIN_PREFIX'"
+        exit 1
+        ;;
+esac
+
+echo "==> Source:    $SOURCE_DIR"
+echo "==> Toolchain: ${TOOLCHAIN_PREFIX}-gcc ($(which ${TOOLCHAIN_PREFIX}-gcc))"
+echo "==> Build dir: $BUILD_DIR"
+echo "==> Install:   $INSTALL_DIR"
+
+# --libm-only: rebuild libm targets and reinstall
+if [ "$LIBM_ONLY" = true ]; then
+    if [ ! -f "$BUILD_DIR/build.ninja" ]; then
+        echo "Error: $BUILD_DIR/build.ninja not found. Run a full build first."
+        exit 1
+    fi
+    cd "$BUILD_DIR"
+
+    # Clean libm objects
+    echo ""
+    echo "==> Cleaning libm objects"
+    find libm/ -name '*.o' -delete 2>/dev/null || true
+    find libm/ -name '*.a' -delete 2>/dev/null || true
+
+    # Rebuild all libm targets
+    echo "==> Rebuilding libm"
+    LIBM_TARGETS=$(ninja -t targets all | grep -E '^libm/.*\.a:' | cut -d: -f1)
+    ninja $LIBM_TARGETS
+
+    # Reinstall
+    echo "==> Reinstalling"
+    ninja install
+
+    echo ""
+    echo "==> Done! libm rebuilt and installed to: $INSTALL_DIR"
+    exit 0
+fi
+
+# Step 1: Generate meson cross-compilation config
+CROSS_FILE="$SOURCE_DIR/scripts/cross-ndsv5-unknown-elf.txt"
+echo ""
+echo "==> [1/5] Generating cross file: $CROSS_FILE"
+cat > "$CROSS_FILE" <<EOF
+[binaries]
+c = '${TOOLCHAIN_PREFIX}-gcc'
+ar = '${TOOLCHAIN_PREFIX}-ar'
+as = '${TOOLCHAIN_PREFIX}-as'
+strip = '${TOOLCHAIN_PREFIX}-strip'
+nm = '${TOOLCHAIN_PREFIX}-nm'
+exe_wrapper = ['sh', '-c', 'test -z "\$MESON_SOURCE_ROOT" || "\$MESON_SOURCE_ROOT"/scripts/run-riscv "\$@"', 'run-riscv']
+
+[host_machine]
+system = 'unknown'
+cpu_family = '${CPU_FAMILY}'
+cpu = '${CPU}'
+endian = 'little'
+
+[properties]
+needs_exe_wrapper = true
+skip_sanity_check = true
+has_link_defsym = true
+libgcc = '-lgcc'
+default_flash_addr = '0x80000000'
+default_flash_size = '0x00800000'
+default_ram_addr   = '0x80800000'
+default_ram_size   = '0x00800000'
+# Alias _xxx -> xxx so Andes machine stubs resolve against picolibc semihost
+additional_libs = ['-Wl,--defsym=_write=write', '-Wl,--defsym=_sbrk=sbrk', '-Wl,--defsym=_read=read', '-Wl,--defsym=_close=close', '-Wl,--defsym=_open=open', '-Wl,--defsym=_lseek=lseek', '-Wl,--defsym=_fstat=fstat', '-Wl,--defsym=_isatty=isatty', '-Wl,--defsym=_times=times', '-Wl,--defsym=_unlink=unlink', '-Wl,--defsym=_kill=kill', '-Wl,--defsym=_getpid=getpid', '-Wl,--defsym=_gettimeofday=gettimeofday']
+
+[built-in options]
+c_args = ['-nostdlib', '-fno-common', '-msave-restore', '-mvh']
+EOF
+
+# Step 2: Configure with meson
+echo ""
+echo "==> [2/5] Configuring (meson)"
+mkdir -p "$BUILD_DIR"
+cd "$BUILD_DIR"
+
+TESTS_OPTION="-Dtests=false"
+MULTILIB_OPTION="-Dmultilib=true"
+if [ "$RUN_TESTS" = true ]; then
+    TESTS_OPTION="-Dtests=true"
+    MULTILIB_OPTION="-Dmultilib=false"
+fi
+
+"$SOURCE_DIR/scripts/do-ndsv5-configure" \
+    -Dprefix="$INSTALL_DIR" \
+    -Doptimization=s \
+    $MULTILIB_OPTION \
+    $TESTS_OPTION \
+    -Dpicolib=false \
+    -Dthread-local-storage=false \
+    -Dio-c99-formats=false
+
+# Step 3: Patch build.ninja for RVV support
+if [ -f "$SOURCE_DIR/scripts/rvv.py" ]; then
+    echo ""
+    echo "==> [3/5] Patching build.ninja for RVV"
+    python3 "$SOURCE_DIR/scripts/rvv.py" "${TOOLCHAIN_PREFIX}-"
+else
+    echo ""
+    echo "==> [3/5] Skipping RVV patch (rvv.py not found)"
+fi
+
+# Step 4: Build
+echo ""
+echo "==> [4/5] Building (ninja)"
+if [ "$RUN_TESTS" = true ]; then
+    # Use -k 0 to build as many test targets as possible despite link errors
+    ninja -k 0 || true
+else
+    ninja
+fi
+
+# Step 5: Run tests (if --test)
+if [ "$RUN_TESTS" = true ]; then
+    echo ""
+    echo "==> [5/6] Running tests via QEMU"
+    # Allow non-zero exit from meson test (UNEXPECTEDPASS returns non-zero)
+    meson test -t 20 -v || TEST_RC=$?
+    echo ""
+    if [ "${TEST_RC:-0}" -ne 0 ]; then
+        echo "==> Tests completed (meson test exited with code ${TEST_RC}; check for UNEXPECTEDPASS or failures above)"
+    else
+        echo "==> Tests completed (all passed)"
+    fi
+fi
+
+# Step 6: Install
+STEP_INSTALL="5/5"
+if [ "$RUN_TESTS" = true ]; then
+    STEP_INSTALL="6/6"
+fi
+echo ""
+echo "==> [$STEP_INSTALL] Installing to: $INSTALL_DIR"
+ninja install
+
+echo ""
+echo "==> Done! mculib installed to: $INSTALL_DIR"

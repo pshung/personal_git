@@ -1,0 +1,59 @@
+---
+type: operator
+tags: [fc, rvv, s16, gru]
+applies_to: [fc_mat_vec_s16_s16_s8_sft_bias_fast]
+status: algorithm-level exhausted
+---
+
+# riscv_nn_fc_mat_vec_s16_s16_s8_sft_bias_fast
+
+s16 input, s8 weight, s16 output FC matrix-vector kernel. Used by GRU (input reset/update/hidden gates).
+
+## Current algorithm (active path, ENA_VEC_ISA + RVV>=1.0, no ENA_VEC_INTRINSIC)
+
+- Input pre-reordered to 4x via `nn_dup_s16_x4_reordered_v2` (vrgather).
+- 4-row outer unroll on weights (pre-converted by `riscv_nn_fc_mat_vec_s8_wt_converter`).
+- Inner loop: VLH + VLB + VSEXT_VF2 + VWMACC_VV at SEW=E16/LMUL=M4 -> widened E32/M8.
+- Epilogue per 4-row group: 4 masked VREDSUM + 3 VSLIDEUP + VSRA/VMAX/VMIN + VNSRA + VSH.
+
+## Weight layout constraint
+
+Weights passed to this function MUST be pre-converted via `riscv_nn_fc_mat_vec_s8_wt_converter`. Format is 4-row interleaved in 8-byte blocks: `[r0c0 r1c0 r0c1 r1c1 r2c0 r3c0 r2c1 r3c1 ...]` for each col pair, repeated across the matrix. Tail rows (wt_row_num % 4) fall back to raw row-major via memcpy. Both the unit test and the GRU example (`UPDATE_GATE_WEIGHT_X4`) use this converted layout.
+
+## GRU performance (AX45MPV VLEN=1024, 2026-04-14)
+
+- Shape: size=64, wt_row_num=32. 3 calls per GRU iteration.
+- Per-call: ~1,940 cycles, 670 inst, IPC=0.35.
+- ~76% of GRU total cycles.
+
+## Unit test performance
+
+- Shape: size=1024, wt_row_num=128.
+- 15,105 cycles, 7,558 inst, IPC=0.50.
+
+## Failed idea: N-vectorize dispatch for small-K/small-N
+
+Attempted on 2026-04-14. Plan: for `size<=128 && wt_row_num<=128`, skip input reorder and K-axis reduction; do K iterations of `VLSB_V` (strided weight column load, stride=size) + `VSEXT_VF2` + `VWMACC_VX` with scalar input broadcast.
+
+Result: FAIL on sub-tests size=11/7 and size=69/11. Root cause: the strided-load assumed raw `[row][col]` weight layout, but weights are pre-converted to 4-row interleaved. A strided load with stride=size fetches garbage from the interleaved buffer.
+
+To make N-vectorize work would require either:
+- A new weight-converter variant that emits raw row-major for the small-shape path (adds an API breaking change), or
+- Re-materializing a raw `[row][col]` block from the interleaved layout at function entry (extra pass, probably kills the savings).
+
+Neither approach survives the ROI bar for a function that is already ~76% of GRU and bounded below by epilogue reduction chain.
+
+## Related
+
+- [[vectorize-k-vs-n]] - the N-vectorize idea applies when K is small, BUT requires amenable weight layout.
+- [[runtime-dispatch]] - dispatch idea itself is sound; layout constraint blocked it here.
+- Weight converter: `Source/FullyConnectedFunctions/riscv_nn_fc_mat_vec_s8_wt_converter.c`.
+
+## Remaining opportunity
+
+Micro-arch level only (IPC=0.35-0.50 suggests pipeline stalls). Candidates:
+- VMV_S_X + MSK_VREDSUM dependency chain in epilogue.
+- Scalar bias load + shift + VMV_S_X serialization between inner and epilogue.
+- VSETVLI changes between SEW=E32/M8 and SEW=E16/M4 and E16/M2.
+
+Algorithm-level is exhausted within the current API contract.

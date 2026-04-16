@@ -1,0 +1,358 @@
+/******************************************************************************
+ * Copyright (C) 2010-2025 Arm Limited or its affiliates. All rights reserved.*
+ * Copyright (C) 2018-2025 Andes Technology Corporation. All rights reserved. *
+ *                                                                            *
+ * SPDX-License-Identifier: Apache-2.0                                        *
+ *                                                                            *
+ * Licensed under the Apache License, Version 2.0 (the License); you may      *
+ * not use this file except in compliance with the License.                   *
+ * You may obtain a copy of the License at                                    *
+ *                                                                            *
+ * www.apache.org/licenses/LICENSE-2.0                                        *
+ *                                                                            *
+ * Unless required by applicable law or agreed to in writing, software        *
+ * distributed under the License is distributed on an AS IS BASIS, WITHOUT    *
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.           *
+ * See the License for the specific language governing permissions and        *
+ * limitations under the License.                                             *
+ ******************************************************************************/
+
+/** @file*/
+
+#include "internal_nn_math.h"
+#include "riscv_nn_support.h"
+
+//// Pooling Functions
+
+void riscv_nn_avepool_HWC_s8(q7_t * in_tensor,
+                             const uint16_t in_tensor_batch,
+                             const uint16_t in_tensor_dim,
+                             const uint16_t in_tensor_ch,
+                             const uint16_t ker_dim,
+                             const uint16_t pad,
+                             const uint16_t stride,
+                             const uint16_t out_tensor_dim,
+                             q7_t * in_tmp_buf,
+                             q7_t * out_tensor)
+{
+#ifdef ENA_EMPTY_FUN
+    //empty body
+#elif defined(ENA_VEC_ISA) && (NDS_VEC_RVV_VERSION >= 100) && defined(ENA_VEC_INTRINSIC) && 0
+    // the v-ext algorithm is modifed, please remember to update the intrinsic version v-ext algorithm
+
+    long out_x, out_y, k_x, k_y, in_x, in_y;
+
+    for (out_y = 0, in_y = -pad; out_y < out_tensor_dim; out_y++, in_y += stride)
+    {
+        long ker_y_start = MAX(0, in_y);
+        long ker_y_end   = MIN(in_tensor_dim, in_y + ker_dim);
+        for (out_x = 0, in_x = -pad; out_x < out_tensor_dim; out_x++, in_x += stride)
+        {
+            long count = 0;
+            long ker_x_start = MAX(0, in_x);
+            long ker_x_end   = MIN(in_tensor_dim, in_x + ker_dim);
+            long cur_ch = 0, vl = 0;
+
+            //calculate the numbers of kernel nodes in the range of input tensor
+            for(k_y = ker_y_start; k_y < ker_y_end; k_y++)
+            {
+                for(k_x = ker_x_start; k_x < ker_x_end; k_x++)
+                {
+                    count++;
+                }
+            }
+
+            long in_tensor_ch2 = in_tensor_ch;
+            while(in_tensor_ch2 > 0)
+            {
+                // reset the accumulators
+                vl = __riscv_vsetvl_e16m8(in_tensor_ch2);
+                vint16m8_t vAcc_i16 = __riscv_vundefined_i16m8();
+                vAcc_i16 = __riscv_vand(vAcc_i16, 0, vl);
+                vl = __riscv_vsetvl_e8m4(in_tensor_ch2);
+
+                for(k_y = ker_y_start; k_y < ker_y_end; k_y++)
+                {
+                    for(k_x = ker_x_start; k_x < ker_x_end; k_x++)
+                    {
+                        q7_t *in_ptr = in_tensor + (in_tensor_ch * (k_x + k_y * in_tensor_dim)) + cur_ch;
+                        vint8m4_t vIn_ptr_i8 = __riscv_vle8_v_i8m4(in_ptr, vl);
+                        vAcc_i16 = __riscv_vwadd_wv(vAcc_i16, vIn_ptr_i8, vl);
+                    }
+                }
+
+                vl = __riscv_vsetvl_e16m8(in_tensor_ch2);
+                vAcc_i16 = __riscv_vdiv(vAcc_i16, count, vl);
+                vl = __riscv_vsetvl_e8m4(in_tensor_ch2);
+                vint8m4_t vResult_i8 = __riscv_vnsra(vAcc_i16, 0, vl);
+                __riscv_vse8(out_tensor, vResult_i8, vl);
+                out_tensor += vl;
+                cur_ch += vl;
+                in_tensor_ch2 -= vl;
+            }
+        }
+    }
+#elif defined(ENA_VEC_ISA) && (NDS_VEC_RVV_VERSION >= 100) && defined(ENA_VEC_ISA_ZVQMAC)
+    long cur_batch, out_x, out_y, k_x, k_y, in_x, in_y;
+    const long input_len = in_tensor_dim * in_tensor_dim * in_tensor_ch;
+
+    for (cur_batch = 0; cur_batch < in_tensor_batch; cur_batch++)
+    {
+        for (out_y = 0, in_y = -pad; out_y < out_tensor_dim; out_y++, in_y += stride)
+        {
+            long ker_y_start = MAX(0, in_y);
+            long ker_y_end   = MIN(in_tensor_dim, in_y + ker_dim);
+            for (out_x = 0, in_x = -pad; out_x < out_tensor_dim; out_x++, in_x += stride)
+            {
+                long ker_x_start = MAX(0, in_x);
+                long ker_x_end   = MIN(in_tensor_dim, in_x + ker_dim);
+                long cur_ch = 0, vl = 0;
+
+                if ((ker_y_end > ker_y_start) &&
+                    (ker_x_end > ker_x_start))
+                {
+                    long count = (ker_y_end - ker_y_start) * (ker_x_end - ker_x_start);
+                    long in_tensor_ch2 = in_tensor_ch;
+                    while(in_tensor_ch2 > 0)
+                    {
+                        // reset the accumulators
+                        NDS_VEC_VSETVLI(vl, in_tensor_ch2, NDS_VEC_VTYPE_SEW_E16, NDS_VEC_VTYPE_LMUL_M8);
+                        NDS_VEC_VAND_VI(NDS_VEC_V0, NDS_VEC_V0, 0);
+                        NDS_VEC_VSETVLI(vl, in_tensor_ch2, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M4);
+
+                        for(k_y = ker_y_start; k_y < ker_y_end; k_y++)
+                        {
+                            for(k_x = ker_x_start; k_x < ker_x_end; k_x++)
+                            {
+                                q7_t *in_ptr = in_tensor + (in_tensor_ch * (k_x + k_y * in_tensor_dim)) + cur_ch;
+                                NDS_VEC_VLE8_V(NDS_VEC_V8, in_ptr);
+                                NDS_VEC_VWADD_WV(NDS_VEC_V0, NDS_VEC_V0, NDS_VEC_V8);
+                            }
+                        }
+
+                        NDS_VEC_VSETVLI(vl, in_tensor_ch2, NDS_VEC_VTYPE_SEW_E16, NDS_VEC_VTYPE_LMUL_M8);
+                        NDS_VEC_VDIV_VX(NDS_VEC_V0, NDS_VEC_V0, count);
+                        NDS_VEC_VSETVLI(vl, vl, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M4);
+                        NDS_VEC_VNSRA_WI(NDS_VEC_V0, NDS_VEC_V0, 0);
+                        NDS_VEC_VSE8_V(NDS_VEC_V0, out_tensor);
+                        out_tensor += vl;
+                        cur_ch += vl;
+                        in_tensor_ch2 -= vl;
+                    }
+                }
+                else
+                {
+                    // for those outputs in boundary as there is no overlapping
+                    // between ifm and kernel
+                    nn_set_zero_s8(out_tensor, in_tensor_ch);
+                    out_tensor += in_tensor_ch;
+                }
+            }
+        }
+        in_tensor += input_len;
+    }
+#elif defined(ENA_DSP_ISA_64)
+    const long input_len = in_tensor_dim * in_tensor_dim * in_tensor_ch;
+    const long_t cst_one_q15x4 = 0x0001000100010001;
+
+    for (long cur_batch = 0; cur_batch < in_tensor_batch; cur_batch++)
+    {
+        for (long out_y = 0, in_y = -pad; out_y < out_tensor_dim; out_y++, in_y += stride)
+        {
+            long ker_y_start = MAX(0, in_y);
+            long ker_y_end   = MIN(in_tensor_dim, in_y + ker_dim);
+            for (long out_x = 0, in_x = -pad; out_x < out_tensor_dim; out_x++, in_x += stride)
+            {
+                long ker_x_start = MAX(0, in_x);
+                long ker_x_end   = MIN(in_tensor_dim, in_x + ker_dim);
+                uint32_t cur_ch;
+
+                if ((ker_y_end > ker_y_start) &&
+                    (ker_x_end > ker_x_start))
+                {
+                    long count = (ker_y_end - ker_y_start) * (ker_x_end - ker_x_start);
+                    for (cur_ch = 0; (cur_ch + SIMD_NUM_Q7) <= in_tensor_ch; cur_ch += SIMD_NUM_Q7)
+                    {
+                        suni_t sum_q31x2_0;
+                        suni_t sum_q31x2_1;
+                        suni_t sum_q31x2_2;
+                        suni_t sum_q31x2_3;
+                        sum_q31x2_0.l0 = 0;
+                        sum_q31x2_1.l0 = 0;
+                        sum_q31x2_2.l0 = 0;
+                        sum_q31x2_3.l0 = 0;
+
+                        for (long k_y = ker_y_start; k_y < ker_y_end; k_y++)
+                        {
+                            for (long k_x = ker_x_start; k_x < ker_x_end; k_x++)
+                            {
+                                q7_t *pIn = in_tensor + (in_tensor_ch * (k_x + k_y * in_tensor_dim)) + cur_ch;
+                                suni_t in_q7x8 = simd_load_8(pIn, 0);
+                                long in_q15x4_0 = NDS_DSP_SUNPKD810(in_q7x8.l0);
+                                long in_q15x4_1 = NDS_DSP_SUNPKD832(in_q7x8.l0);
+                                sum_q31x2_0.l0 = NDS_DSP_KMABB(sum_q31x2_0.l0, in_q15x4_0, cst_one_q15x4);
+                                sum_q31x2_1.l0 = NDS_DSP_KMATT(sum_q31x2_1.l0, in_q15x4_0, cst_one_q15x4);
+                                sum_q31x2_2.l0 = NDS_DSP_KMABB(sum_q31x2_2.l0, in_q15x4_1, cst_one_q15x4);
+                                sum_q31x2_3.l0 = NDS_DSP_KMATT(sum_q31x2_3.l0, in_q15x4_1, cst_one_q15x4);
+                            }
+                        }
+
+                        suni_t out_q7x8;
+                        out_q7x8.b8.b0 = sum_q31x2_0.b32.w0 / count;
+                        out_q7x8.b8.b1 = sum_q31x2_1.b32.w0 / count;
+                        out_q7x8.b8.b2 = sum_q31x2_2.b32.w0 / count;
+                        out_q7x8.b8.b3 = sum_q31x2_3.b32.w0 / count;
+                        out_q7x8.b8.b4 = sum_q31x2_0.b32.w1 / count;
+                        out_q7x8.b8.b5 = sum_q31x2_1.b32.w1 / count;
+                        out_q7x8.b8.b6 = sum_q31x2_2.b32.w1 / count;
+                        out_q7x8.b8.b7 = sum_q31x2_3.b32.w1 / count;
+                        simd_save_8((s8_t*)out_tensor, out_q7x8.l0);
+                        out_tensor += SIMD_NUM_Q7;
+                    }
+
+                    // rest channels
+                    for (; cur_ch < in_tensor_ch; cur_ch++)
+                    {
+                        int sum = 0;
+                        for (long k_y = ker_y_start; k_y < ker_y_end; k_y++)
+                        {
+                            for (long k_x = ker_x_start; k_x < ker_x_end; k_x++)
+                            {
+                                q7_t *pIn = in_tensor + (in_tensor_ch * (k_x + k_y * in_tensor_dim)) + cur_ch;
+                                sum += *pIn;
+                            }
+                        }
+
+                        *out_tensor++ = sum / count;
+                    }
+                }
+                else
+                {
+                    // for those outputs in boundary as there is no overlapping
+                    // between ifm and kernel
+                    nn_set_zero_s8(out_tensor, in_tensor_ch);
+                    out_tensor += in_tensor_ch;
+                }
+            }
+        }
+        in_tensor += input_len;
+    }
+#elif defined(ENA_DSP_ISA)
+    const long input_len = in_tensor_dim * in_tensor_dim * in_tensor_ch;
+
+    for (long cur_batch = 0; cur_batch < in_tensor_batch; cur_batch++)
+    {
+        for (long out_y = 0, in_y = -pad; out_y < out_tensor_dim; out_y++, in_y += stride)
+        {
+            long ker_y_start = MAX(0, in_y);
+            long ker_y_end   = MIN(in_tensor_dim, in_y + ker_dim);
+            for (long out_x = 0, in_x = -pad; out_x < out_tensor_dim; out_x++, in_x += stride)
+            {
+                long ker_x_start = MAX(0, in_x);
+                long ker_x_end   = MIN(in_tensor_dim, in_x + ker_dim);
+                uint32_t cur_ch;
+
+                if ((ker_y_end > ker_y_start) &&
+                    (ker_x_end > ker_x_start))
+                {
+                    long count = (ker_y_end - ker_y_start) * (ker_x_end - ker_x_start);
+                    for (cur_ch = 0; (cur_ch + SIMD_NUM_Q7) <= in_tensor_ch; cur_ch += SIMD_NUM_Q7)
+                    {
+                        long_t sum_q31_0 = 0;
+                        long_t sum_q31_1 = 0;
+                        long_t sum_q31_2 = 0;
+                        long_t sum_q31_3 = 0;
+
+                        for (long k_y = ker_y_start; k_y < ker_y_end; k_y++)
+                        {
+                            for (long k_x = ker_x_start; k_x < ker_x_end; k_x++)
+                            {
+                                q7_t *pIn = in_tensor + (in_tensor_ch * (k_x + k_y * in_tensor_dim)) + cur_ch;
+                                suni_t in_q7x4 = simd_load_8(pIn, 0);
+                                sum_q31_0 += in_q7x4.b8.b0;
+                                sum_q31_1 += in_q7x4.b8.b1;
+                                sum_q31_2 += in_q7x4.b8.b2;
+                                sum_q31_3 += in_q7x4.b8.b3;
+                            }
+                        }
+
+                        suni_t out_q7x4;
+                        out_q7x4.b8.b0 = sum_q31_0 / count;
+                        out_q7x4.b8.b1 = sum_q31_1 / count;
+                        out_q7x4.b8.b2 = sum_q31_2 / count;
+                        out_q7x4.b8.b3 = sum_q31_3 / count;
+                        simd_save_8((s8_t*)out_tensor, out_q7x4.l0);
+                        out_tensor += SIMD_NUM_Q7;
+                    }
+
+                    // rest channels
+                    for (; cur_ch < in_tensor_ch; cur_ch++)
+                    {
+                        int sum = 0;
+                        for (long k_y = ker_y_start; k_y < ker_y_end; k_y++)
+                        {
+                            for (long k_x = ker_x_start; k_x < ker_x_end; k_x++)
+                            {
+                                q7_t *pIn = in_tensor + (in_tensor_ch * (k_x + k_y * in_tensor_dim)) + cur_ch;
+                                sum += *pIn;
+                            }
+                        }
+
+                        *out_tensor++ = sum / count;
+                    }
+                }
+                else
+                {
+                    // for those outputs in boundary as there is no overlapping
+                    // between ifm and kernel
+                    nn_set_zero_s8(out_tensor, in_tensor_ch);
+                    out_tensor += in_tensor_ch;
+                }
+            }
+        }
+        in_tensor += input_len;
+    }
+#else
+    int16_t   i_batch, i_ch_in, i_x, i_y;
+    int16_t   k_x, k_y;
+    const int32_t input_len = in_tensor_dim * in_tensor_dim * in_tensor_ch;
+    const int32_t output_len = out_tensor_dim * out_tensor_dim * in_tensor_ch;
+
+    for (i_batch = 0; i_batch < in_tensor_batch; i_batch++)
+    {
+        for (i_ch_in = 0; i_ch_in < in_tensor_ch; i_ch_in++)
+        {
+            for (i_y = 0; i_y < out_tensor_dim; i_y++)
+            {
+                for (i_x = 0; i_x < out_tensor_dim; i_x++)
+                {
+                    int       sum = 0;
+                    int       count = 0;
+                    for (k_y = i_y * stride - pad; k_y < i_y * stride - pad + ker_dim; k_y++)
+                    {
+                        for (k_x = i_x * stride - pad; k_x < i_x * stride - pad + ker_dim; k_x++)
+                        {
+                            if (k_y >= 0 && k_x >= 0 && k_y < in_tensor_dim && k_x < in_tensor_dim)
+                            {
+                                sum += in_tensor[i_ch_in + in_tensor_ch * (k_x + k_y * in_tensor_dim)];
+                                count++;
+                            }
+                        }
+                    }
+
+                    if (count == 0)
+                    {
+                        out_tensor[i_ch_in + in_tensor_ch * (i_x + i_y * out_tensor_dim)] = 0;
+                    }
+                    else
+                    {
+                        out_tensor[i_ch_in + in_tensor_ch * (i_x + i_y * out_tensor_dim)] = sum / count;
+                    }
+                }
+            }
+        }
+        in_tensor += input_len;
+        out_tensor += output_len;
+    }
+#endif
+}

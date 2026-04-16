@@ -1,0 +1,84 @@
+# Tiling Principles: depthwise_conv
+
+## Hardware Context
+- VLEN=1024 bits, f32 → VLMAX=32 elements at LMUL=1
+- L2 cache: 8MB
+- Valid LMUL: 1, 2, 4, 8
+
+## Op Signature
+- `linalg.depthwise_conv_2d_nhwc_hwc`
+- Iteration: [N, OH, OW, C, KH, KW] with [parallel×4, reduction×2]
+- rank/tilingLevels: [6, 4]
+- Key difference from conv2d: no IC/OC split — single C dimension
+
+## Tile Size Format
+```
+[[L0_N, L0_OH, L0_OW, L0_C, L0_KH, L0_KW],  # Distribution
+ [L1_N, L1_OH, L1_OW, L1_C, L1_KH, L1_KW],  # Vector parallel
+ [L2_N, L2_OH, L2_OW, L2_C, L2_KH, L2_KW],  # Reduction (always 0)
+ [L3_N, L3_OH, L3_OW, L3_C, L3_KH, L3_KW]]  # Vector inner (always 0)
+```
+
+## Core Principles
+
+### 1. Channel dimension (C) — vectorize this
+- L0_C: Often 0 (untiled, 42/95) or large multiples of 32 (64, 128, 256)
+  - Most common: 0(42), 64(16), 32(11), 16(8), 256(7), 128(4)
+- L1_C: 64 is most common (29/95), then 0(27), 128(11)
+- When C < 32: leave at 0
+- When C ≥ 64: L0_C = 0 or C; L1_C = 64 or 128
+- **Rule: C tiles should be multiples of 32 or 0; L1_C=64 is the sweet spot**
+
+### 2. Spatial dimensions (OH, OW)
+- L0_OH: Small values (1-16), median=2
+- L0_OW: Often 0(26), small (2-8)
+- L1_OH: Almost always 1 (74/95)
+- L1_OW: 1(43), 0(23), 2(15)
+- **Rule: L0 spatial small (1-8); L1 spatial = 1**
+
+### 3. Reduction dimensions (KH, KW)
+- L0_KH: Almost always 1 (89/95)
+- L0_KW: Split between 1(44) and 0(41)
+- **Rule: KH=1; KW=0 or 1**
+
+### 4. L2 and L3 always zero (95/95 cases)
+
+## Decision Template
+Given iteration_space=[N, OH, OW, C, KH, KW]:
+
+- **L0 (Distribution):**
+  - N: 0 if N=1, else 1
+  - OH: power of 2 in [1, 8]
+  - OW: 0 or power of 2 in [2, 32]
+  - C: 0 if C ≤ 32; else largest power of 2 ≤ C that is ≥ 64
+  - KH: 1
+  - KW: 0 or 1
+
+- **L1 (Vector parallel):**
+  - N: 0 or 1
+  - OH: 1
+  - OW: 1
+  - C: 64 if C ≥ 64; else 0
+
+- **L2, L3:** All zeros
+
+## Examples from Zoo
+
+| Model | Shape [N,OH,OW,C,KH,KW] | Default | Speedup | Key Change |
+|-------|--------------------------|---------|---------|------------|
+| CartoonGAN | [1,512,512,3,3,3] | [0,64,64,3,...] | 5.87x | Small C, spatial restructured |
+| PoseNet | [1,129,65,128,3,3] | [0,43,13,64,...] | 3.18x | C=128 fully vectorized |
+| PoseNet | [1,33,17,1024,3,3] | [0,33,17,64,...] | 3.13x | C=1024, L1_C=64 |
+| MobileNet_v1_int8 | [1,56,56,128,3,3] | [0,8,56,64,...] | 2.87x | C=128→full |
+| MobileNet_v3_int8 | [1,14,14,240,3,3] | [0,2,14,60,...] | 2.43x | Channel tiling removed |
+| DeepLab_int8 | [1,32,32,768,3,3] | [0,32,32,64,...] | 2.08x | C=256, L1=256 |
+
+### Key Observation
+- IREE defaults cap OC at 64 for depthwise too, but best configs often use full C
+- Depthwise conv is memory-bandwidth-bound (no IC dimension to create reuse)
+- Best speedups come from maximizing vector utilization on the C dimension
+
+## Confidence Criteria
+- **HIGH**: C ≥ 64, standard 3×3 kernel, spatial ≥ 14×14
+- **MEDIUM**: Large C (≥ 512), non-standard kernel sizes (5×5)
+- **LOW**: C < 32, very small spatial (< 7×7), C not power of 2

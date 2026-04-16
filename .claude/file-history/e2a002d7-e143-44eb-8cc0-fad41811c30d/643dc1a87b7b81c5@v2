@@ -1,0 +1,130 @@
+---
+description: "Predict optimal tile config for a subgraph using learned principles"
+allowed-tools: "Read,Glob,Grep,Bash,Agent"
+---
+
+# /optimize_subgraph — Predict Optimal Tile Configuration
+
+You are an expert RISC-V RVV compiler engineer predicting the optimal tile configuration for a dispatch subgraph.
+
+**Budget:** up to 10 compiles, up to 3 device runs. HIGH confidence = 0 compiles, 0 runs.
+
+## Arguments
+
+The user should provide a path to the subgraph's working directory or dispatch name.
+Example: `/optimize_subgraph models/mobilenet_v2/benchmarks/module_main_dispatch_5`
+
+## Step 1: Understand the dispatch
+
+1. Read the `tile_config.json` for this dispatch:
+   - Extract op names, iteration_space, iteration_type, instruction_seq
+   - Note the default tile sizes
+
+2. Read the benchmark MLIR file (`*_static_benchmark.mlir`):
+   - Identify data types (f32, i8, etc.)
+   - Note the full operation semantics
+
+3. Classify the dispatch:
+   - matmul, conv2d, depthwise_conv, pooling, generic (sub-type), fill
+
+## Step 2: Load principles
+
+1. Read the matching principle file from `knowledge/principles/{op_type}.md`
+2. If no principle file exists, note this and proceed with general RVV knowledge:
+   - VLEN=1024, f32 → VLMAX=32 at LMUL=1
+   - L2=8MB, available vregs = 32/LMUL
+   - Prefer LMUL=1 or LMUL=2 for most ops
+   - Innermost parallel tile should be multiple of VLMAX
+
+## Step 3: Cost model filtering
+
+Run the cost model to prune the search space:
+
+```python
+import sys
+sys.path.insert(0, ".")
+sys.path.insert(0, "python")
+from pathlib import Path
+from auto_iree.cost_model import HardwareParams, filter_configs, filter_config_entity
+from auto_iree.utils import TilingJSON
+
+hw = HardwareParams(vlen=1024, l2_cache_size=8388608, sew=32)
+tj = TilingJSON(Path("path/to/tile_config.json"))
+# ... load config space and filter
+```
+
+This gives ~5-10 survivor configs out of potentially thousands.
+
+## Step 4: Rank survivors using principles
+
+Apply the loaded principles to rank the surviving configs:
+
+1. Score each survivor based on:
+   - Vector utilization (higher is better)
+   - LMUL (prefer 1 or 2, accept 4 for large problems)
+   - Working set fit in L2
+   - Register pressure margin
+   - Match to known-good patterns from evidence files
+
+2. Assign confidence:
+   - **HIGH**: Op type has good principle coverage, best survivor clearly matches known patterns, iteration space is similar to studied cases
+   - **MEDIUM**: Op type has principles but iteration space is unusual, or top-2 survivors are close
+   - **LOW**: No principle file, novel op pattern, or cost model rejected most configs
+
+## Step 5: Act on confidence
+
+### HIGH confidence (0 compiles, 0 runs)
+- Output the recommended config immediately
+- Explain why this config is optimal based on principles
+
+### MEDIUM confidence (up to 5 compiles, 1 run)
+1. Compile top-3 configs using compiler_inspect:
+   ```python
+   from auto_iree.compiler_inspect import inspect_config
+   mlir_features, asm_features = inspect_config(task, config, work_dir)
+   ```
+2. Compare:
+   - Which has fewer vsetvli transitions?
+   - Which has no spills?
+   - Which uses the expected LMUL?
+3. Pick the best from features
+4. Optionally run 1 config on device to validate
+
+### LOW confidence (up to 10 compiles, 3 runs)
+1. Compile top-5 configs, inspect all
+2. Run top-2 on device
+3. Pick winner based on actual cycle counts
+4. Document findings for future principle updates
+
+## Output Format
+
+```
+## Recommendation
+
+**Dispatch:** {dispatch_name}
+**Op type:** {classification}
+**Confidence:** HIGH/MEDIUM/LOW
+
+**Recommended tile config:**
+{tile_sizes in IREE format}
+
+**Reasoning:**
+- [Why this config is optimal]
+- [Key hardware constraints satisfied]
+
+**Budget used:**
+- Compiles: N/10
+- Device runs: N/3
+
+**Comparison to default:**
+- Default tile: [...]
+- Predicted improvement: [if known from zoo data]
+```
+
+## Important Notes
+
+- Always check `knowledge/principles/` first — don't reinvent analysis
+- The cost model is a filter, not a predictor — it removes bad configs but doesn't rank good ones
+- When compiling, use temporary work directories to avoid polluting the model workspace
+- If the dispatch has multiple ops, focus on the dominant op (has reduction dims or largest iteration space)
+- Record any new insights that could improve principles for future use

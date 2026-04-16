@@ -1,0 +1,264 @@
+---
+name: optimize
+description: RVV optimization workflow for libnn functions on AX45MPV (VLEN=1024). Follows a 7-step finite state machine — select, analyze, implement, verify, measure, profile, learn. Use when optimizing existing RVV implementations for better FPGA cycle counts.
+argument-hint: [step|next|status|reset|function_name]
+disable-model-invocation: true
+allowed-tools: Read, Grep, Glob, Bash, Edit, Write, Agent
+---
+
+# libnn RVV Optimization Skill
+
+This skill drives a 7-step optimization workflow as a finite state machine.
+State is persisted in `.claude/opt-state.json`.
+
+## Current State
+
+!`cat /home/nick/work/libnn/.claude/opt-state.json 2>/dev/null || echo '{"step":"idle","function":"","history":[]}'`
+
+## Commands
+
+- `/optimize <function_name>` — Start a new optimization for the named function
+- `/optimize next` — Advance to the next step
+- `/optimize status` — Show current state and what to do next
+- `/optimize reset` — Reset state machine to idle
+- `/optimize <step_name>` — Jump to a specific step (select, analyze, implement, verify, measure, profile, learn)
+
+Arguments received: `$ARGUMENTS`
+
+## Finite State Machine
+
+```
+idle → select → analyze → implement → verify → measure → profile → learn → idle
+                  ↑                      |
+                  └──────────────────────┘  (if verify fails, go back to implement)
+```
+
+### State Transitions
+
+Follow these rules strictly based on the current state:
+
+---
+
+### State: `idle`
+
+**Entry:** No optimization in progress.
+
+**Action:** If a function name was provided as argument, transition to `select` with that function. If argument is "status", just show that no optimization is in progress. Otherwise, explain the workflow and ask what function to optimize.
+
+**Transition:** → `select`
+
+---
+
+### State: `select`
+
+**Entry:** A function has been named. Validate it exists and has RVV code.
+
+**Action:**
+1. Find the source file: `Grep` for the function name under `Source/`
+2. Confirm it has `#ifdef ENA_VEC_ISA` (i.e., existing RVV to improve)
+3. Find corresponding test(s) in `Examples/unit_func/`
+4. Query optdb for prior lessons on this function:
+   ```
+   .venv/bin/python3 scripts/optdb.py search "<function_name>"
+   ```
+5. Save state with function name, source path, test name
+
+**Transition:** → `analyze`
+**Failure:** If function not found or no RVV exists, stay in `select` and report error.
+
+---
+
+### State: `analyze`
+
+**Entry:** Function is selected and validated.
+
+**Action:**
+1. Read the full source file (both RVV and plain C paths)
+2. Check the disassembly in `libnn.objdump` for the function
+3. Query optdb for lessons on similar patterns:
+   ```
+   .venv/bin/python3 scripts/optdb.py search "<relevant pattern>"
+   ```
+4. Identify the bottleneck and form a hypothesis
+5. Present analysis to the user:
+   - Current RVV approach (LMUL, tiling, loop structure)
+   - Disassembly observations (register spills, instruction count, scheduling)
+   - Proposed optimization and why it should help
+6. **Wait for user approval before proceeding**
+
+**Transition:** → `implement` (after user approves the approach)
+
+---
+
+### State: `implement`
+
+**Entry:** User approved the optimization approach.
+
+**Action:**
+1. Implement the optimization in the RVV path inside `#ifdef ENA_VEC_ISA`
+2. Do NOT touch the plain C fallback
+3. Save a description of what was changed in state
+
+**Transition:** → `verify`
+
+---
+
+### State: `verify`
+
+**Entry:** Code has been modified.
+
+**Action:**
+1. Build libnn:
+   ```
+   /usr/bin/bash /home/nick/work/libnn/qemu-validate/build_libnn.sh
+   ```
+2. Run the specific test at VLEN=1024:
+   ```
+   /usr/bin/bash /home/nick/work/libnn/qemu-validate/run_qemu_test.sh <test_name> --strace --vlen 1024
+   ```
+3. If the test passes, run full regression:
+   ```
+   /usr/bin/bash /home/nick/work/libnn/qemu-validate/run_all_tests.sh 16 1024
+   ```
+   (16 is the number of parallel jobs, 1024 is VLEN)
+
+**Transition on PASS:** → `measure`
+**Transition on FAIL:** → `implement` (report the failure, fix and retry)
+
+---
+
+### State: `measure`
+
+**Entry:** QEMU verification passed.
+
+**Action:**
+1. Remind the user to run FPGA measurement:
+   ```bash
+   cd /home/nick/work/libnn/build_perf_ax45mpv
+   export PATH="/local/nick/SW_Release_cp/ast530/nds64le-elf-newlib-v5d/bin:/home/nick/work/libnn:$PATH"
+   export MYPC=sw-boards.andestech.com
+   export MYPORT=1116
+   rm -f /home/nick/work/libnn/project/ax45mpv/First_Reset_done
+   ../test.sh "" riscv64-elf-gcc \
+     /home/nick/work/libnn/project/ax45mpv/riscv64-sim-wrapper-on-board \
+     BOARD BS3 \
+     "-mtune=andes-45-series -mext-vector -DNDS_VEC_RVV_VERSION=1000 \
+      -DENA_RUN_TWICE -DENA_CACHEABLE_ENV_SETUP -lnn_v -mzfh \
+      -DENA_TEST_PERF -DENA_DUMP_PARAMETERS"
+   ```
+2. GDB uploads the binary to the FPGA board and runs it
+3. Cycle counts are printed via `PF_COUNTER` macros — find them in the log files under `build_perf_ax45mpv/<run_dir>/log/`
+4. **Ask the user for the before/after cycle counts**
+5. Save cycle counts in state
+
+**Transition:** → `profile`
+
+---
+
+### State: `profile`
+
+**Entry:** FPGA cycle counts are recorded.
+
+**Action:**
+1. Run vsim pipeline analysis to understand WHY performance changed:
+   - Quick function-level breakdown:
+     ```bash
+     /local/nick/vsim-workspace/vsim/build/sim_ax45mpv_premium <program.adx> --log-level 0 2>&1 \
+       | python3 /local/nick/vsim-workspace/vsim/tools/functrace.py <program.dump>
+     ```
+   - Detailed pipeline log:
+     ```bash
+     ln -sfn /local/nick/vsim-workspace/vsim/tools /tmp/vsim
+     PYTHONPATH=/tmp python3 /local/nick/vsim-workspace/vsim/tools/konata.py \
+       --cpu ax45mpv_premium \
+       --objdump-file <program.dump> \
+       --output kanata.log \
+       --experimental \
+       <program.adx>
+     ```
+2. Analyze the pipeline log for:
+   - VQ→VD gaps (VPU backpressure)
+   - VW stage count (LMUL overhead)
+   - Dual-issue utilization
+   - VLSU stalls (cache misses)
+   - Branch mispredictions (flushes)
+3. Present pipeline findings to the user
+4. Note: vsim is core-only (no memory subsystem), FPGA is ground truth
+
+**Transition:** → `learn`
+
+---
+
+### State: `learn`
+
+**Entry:** Profile analysis is complete.
+
+**Action:**
+1. Compose a lesson from the optimization round:
+   ```bash
+   echo '{
+     "function": "<function>",
+     "summary": "<what was tried>",
+     "approach": "<detailed change>",
+     "cycles_before": "<FPGA cycles>",
+     "cycles_after": "<FPGA cycles>",
+     "speedup": "<Nx or regression>",
+     "pipeline_insight": "<vsim findings>",
+     "lesson": "<key takeaway>",
+     "outcome": "improved|regressed|neutral",
+     "tags": ["<relevant>", "<tags>"],
+     "date": "YYYY-MM-DD"
+   }' | .venv/bin/python3 scripts/optdb.py add --json
+   ```
+2. Present the lesson summary to the user
+3. Ask: iterate on this function (→ analyze) or move to next function (→ idle)?
+
+**Transition:** → `idle` (done) or → `analyze` (iterate)
+
+---
+
+## State File Format
+
+The state file `.claude/opt-state.json` has this structure:
+
+```json
+{
+  "step": "idle|select|analyze|implement|verify|measure|profile|learn",
+  "function": "function_name",
+  "source_file": "Source/.../file.c",
+  "test_name": "test_name_for_qemu",
+  "hypothesis": "what we plan to change and why",
+  "changes": "description of what was implemented",
+  "cycles_before": "",
+  "cycles_after": "",
+  "speedup": "",
+  "pipeline_insight": "",
+  "history": ["list of past step transitions with timestamps"]
+}
+```
+
+**Always update the state file when transitioning.** Use this exact command pattern:
+
+```bash
+# Read current state, update, write back
+python3 -c "
+import json, sys
+from datetime import datetime
+state = json.load(open('/home/nick/work/libnn/.claude/opt-state.json'))
+state['step'] = '<new_step>'
+state['history'].append(f'{datetime.now().isoformat()} → <new_step>')
+# ... update other fields as needed ...
+json.dump(state, open('/home/nick/work/libnn/.claude/opt-state.json', 'w'), indent=2)
+print(json.dumps(state, indent=2))
+"
+```
+
+## Important Rules
+
+1. **One function at a time.** Complete or reset before starting another.
+2. **Never skip steps.** Follow the FSM transitions strictly.
+3. **Always wait for user input** at `analyze` (approval), `measure` (cycle counts), and `learn` (iterate decision).
+4. **FPGA is ground truth** for cycle counts. QEMU is correctness only.
+5. **vsim is core-only** — use for pipeline understanding, not absolute cycle counts.
+6. **Always record lessons** in optdb — wins AND losses compound knowledge.
+7. **Target VLEN=1024.** Do not optimize for other VLENs at the expense of 1024.

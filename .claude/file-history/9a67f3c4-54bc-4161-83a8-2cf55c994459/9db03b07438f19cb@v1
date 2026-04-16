@@ -1,0 +1,257 @@
+# Makefile for libm accuracy test — A/B comparison
+# Target: RV32IM or RV64IM soft-float (Andes optimized assembly)
+#
+# Usage:
+#   make size-all       - report .text size for each assembly function
+#   make size-sinf      - report .text size for a single function
+#   make test-all       — build, run opt vs ref in QEMU, diff outputs
+#   make test-sinf      — test a single function
+#   make bench-all      — build bench ELFs, run opt vs ref on FPGA via GDB
+#   make bench-sin      — bench a single function on FPGA via GDB
+#
+# FPGA board:
+#   make FPGA_REMOTE=<host:port> bench-sin   (default: sqa-boards.andestech.com:1113)
+#
+# Toolchain selection:
+#   make XLEN=32 ...    - use RV32 toolchain (default)
+#   make XLEN=64 ...    - use RV64 toolchain
+
+XLEN ?= 32
+
+ifeq ($(XLEN),64)
+  TOOLCHAIN  = /local/nick/SW_Release/build-ast542/build-toolchain/linux/nds64le-elf-mculib-v5
+  PREFIX     = $(TOOLCHAIN)/bin/riscv64-elf-
+  ARCH       = -march=rv64imc -mabi=lp64
+  QEMU       = /local/nick/qemu_v5/build/qemu-system-riscv64
+  QEMU_FLAGS = -cpu andes-ax25 -nographic -M andes_ae350 -semihosting -bios
+else
+  TOOLCHAIN  = /local/nick/SW_Release/build-ast542/build-toolchain/linux/nds32le-elf-mculib-v5
+  PREFIX     = $(TOOLCHAIN)/bin/riscv32-elf-
+  ARCH       = -march=rv32imc_zicsr -mabi=ilp32
+  QEMU       = /local/nick/qemu_v5/build/qemu-system-riscv32
+  QEMU_FLAGS = -cpu andes-n25 -nographic -M andes_ae350 -semihosting -bios
+endif
+
+CC  = $(PREFIX)gcc
+AS  = $(PREFIX)gcc
+LD  = $(PREFIX)gcc
+
+CFLAGS   = $(ARCH) -O2 -mvh -Wall
+ASFLAGS  = $(ARCH)
+LDFLAGS     = $(ARCH) -mvh -lm
+LDFLAGS_OPT = $(ARCH) -mvh -L. -landes
+
+SIZE = $(PREFIX)size
+NM   = $(PREFIX)nm
+AR   = $(PREFIX)ar
+GDB  = $(PREFIX)gdb
+
+FPGA_REMOTE    ?= sqa-boards.andestech.com:1113
+FPGA_GDB_FLAGS  = -batch-silent -ex "target remote $(FPGA_REMOTE)" -ex "reset-and-hold" -ex "lo" -ex "c"
+
+# Andes helper assembly (shared internals — not standalone math functions)
+ANDES_SRCS = $(wildcard andes_*.s)
+ANDES_OBJS = $(ANDES_SRCS:.s=.o)
+
+# Assembly sources — single-precision
+ASM_SRCS = sf_atan.s sf_ceil.s sf_cos.s sf_fabs.s sf_floor.s sf_frexp.s \
+           sf_ldexp.s sf_modf.s sf_sin.s sf_tan.s sf_tanh.s \
+           sf_acos.s sf_asin.s sf_cosh.s sf_exp.s sf_fmod.s sf_log.s \
+           sf_log10.s sf_pow.s sf_sinh.s sf_sqrt.s \
+           sf_fpclassify.s
+ASM_OBJS = $(ASM_SRCS:.s=.o)
+
+# Assembly sources — double-precision
+S_ASM_SRCS = s_sin.s s_cos.s s_tan.s s_atan.s s_asin.s s_acos.s s_fabs.s \
+             s_ceil.s s_floor.s s_exp.s s_sinh.s s_cosh.s s_tanh.s \
+             s_log.s s_log10.s s_sqrt.s s_fmod.s s_pow.s s_frexp.s \
+             s_ldexp.s s_modf.s s_fpclassify.s s_expm1.s s_log1p.s \
+             s_rint.s s_round.s s_trunc.s s_fmax.s s_fmin.s s_ilogb.s \
+             s_nextafter.s s_remquo.s
+S_ASM_OBJS = $(S_ASM_SRCS:.s=.o)
+
+# Note: sf_sincos.c and sf_scalbn.c need picolibc headers, excluded from
+# standalone size target. Measure those via full meson build.
+
+# Single-precision functions (must have test_<name>f.c and sf_<name>.s)
+FUNCS_SINGLE = sinf cosf tanf atanf asinf acosf fabsf ceilf floorf expf \
+               sinhf coshf tanhf logf log10f sqrtf fmodf powf frexpf ldexpf \
+               modff fpclassifyf
+
+# Double-precision functions with s_*.s assembly (opt vs ref comparison)
+FUNCS_DOUBLE_OPT = sin cos tan atan asin acos fabs ceil floor exp sinh cosh \
+                   tanh log log10 sqrt fmod pow frexp ldexp modf fpclassify \
+                   expm1 log1p rint round trunc fmax fmin ilogb nextafter remquo
+
+# Double-precision functions without assembly (run only)
+FUNCS_DOUBLE_NOOPT = acosh atanh erf erfc lgamma \
+                     hypot remainder lrint lround
+
+# All functions to test
+FUNCS = $(FUNCS_SINGLE) $(FUNCS_DOUBLE_OPT) $(FUNCS_DOUBLE_NOOPT)
+
+# Test output directory
+TESTDIR = test
+
+# Verbose build output (set V=1 to see brief build progress)
+V ?= 0
+ifeq ($(V),1)
+  Q =
+  MSG_AS  = @printf "  AS\t%s\n" $@;
+  MSG_CC  = @printf "  CC\t%s\n" $@;
+  MSG_LD  =
+  MSG_AR  = @printf "  AR\t%s\n" $@;
+else
+  Q = @
+  MSG_AS =
+  MSG_CC =
+  MSG_LD =
+  MSG_AR =
+endif
+
+libandes.a: $(ANDES_OBJS)
+	$(MSG_AR)$(Q)$(AR) rcs $@ $^
+
+# --- Pattern rules ---
+
+%.o: %.s
+	$(MSG_AS)$(Q)$(AS) $(ASFLAGS) -c -o $@ $<
+
+$(TESTDIR)/%.o: $(TESTDIR)/%.c
+	$(MSG_CC)$(Q)$(CC) $(CFLAGS) -c -o $@ $<
+
+$(TESTDIR)/%_bench.o: $(TESTDIR)/%.c
+	$(MSG_CC)$(Q)$(CC) $(CFLAGS) -DEN_PERF -c -o $@ $<
+
+# For single-precision functions: build opt (with asm) and ref (toolchain only) ELFs.
+# The asm object name: strip trailing 'f' from func name to get sf_<base>.o
+# e.g. sinf -> sf_sin.o, log10f -> sf_log10.o, fpclassifyf -> sf_fpclassify.o
+define FUNC_RULES_SINGLE
+$(TESTDIR)/test_$(1)_opt.elf: $(TESTDIR)/test_$(1).o sf_$(patsubst %f,%,$(1)).o libandes.a
+	$$(MSG_LD)$$(Q)$$(LD) -o $$@ $$(filter-out libandes.a,$$^) $$(LDFLAGS_OPT)
+
+$(TESTDIR)/test_$(1)_ref.elf: $(TESTDIR)/test_$(1).o
+	$$(MSG_LD)$$(Q)$$(LD) -o $$@ $$^ $$(LDFLAGS)
+
+test-$(1): $(TESTDIR)/test_$(1)_opt.elf $(TESTDIR)/test_$(1)_ref.elf
+	$$(Q)$$(QEMU) $$(QEMU_FLAGS) $(TESTDIR)/test_$(1)_ref.elf < /dev/null > $(TESTDIR)/test_$(1)_ref.txt
+	$$(Q)$$(QEMU) $$(QEMU_FLAGS) $(TESTDIR)/test_$(1)_opt.elf < /dev/null > $(TESTDIR)/test_$(1)_opt.txt
+	@if diff -q $(TESTDIR)/test_$(1)_ref.txt $(TESTDIR)/test_$(1)_opt.txt > /dev/null 2>&1; then \
+		printf "  %-14s PASS\n" $(1); \
+	else \
+		printf "  %-14s FAIL (%d diffs)\n" $(1) \
+			$$$$(diff $(TESTDIR)/test_$(1)_ref.txt $(TESTDIR)/test_$(1)_opt.txt | grep -c '^[<>]'); \
+	fi
+
+size-$(1): sf_$(patsubst %f,%,$(1)).o
+	@printf "  %-20s %d\n" $(1) `$$(SIZE) -A $$< | awk '/\.text/ {print $$$$2}'`
+endef
+
+# For double-precision functions with assembly: opt vs ref comparison
+define FUNC_RULES_DOUBLE_OPT
+$(TESTDIR)/test_$(1)_opt.elf: $(TESTDIR)/test_$(1).o s_$(1).o libandes.a
+	$$(MSG_LD)$$(Q)$$(LD) -o $$@ $$(filter-out libandes.a,$$^) $$(LDFLAGS_OPT)
+
+$(TESTDIR)/test_$(1)_ref.elf: $(TESTDIR)/test_$(1).o
+	$$(MSG_LD)$$(Q)$$(LD) -o $$@ $$^ $$(LDFLAGS)
+
+test-$(1): $(TESTDIR)/test_$(1)_opt.elf $(TESTDIR)/test_$(1)_ref.elf
+	$$(Q)$$(QEMU) $$(QEMU_FLAGS) $(TESTDIR)/test_$(1)_ref.elf < /dev/null > $(TESTDIR)/test_$(1)_ref.txt
+	$$(Q)$$(QEMU) $$(QEMU_FLAGS) $(TESTDIR)/test_$(1)_opt.elf < /dev/null > $(TESTDIR)/test_$(1)_opt.txt
+	@if diff -q $(TESTDIR)/test_$(1)_ref.txt $(TESTDIR)/test_$(1)_opt.txt > /dev/null 2>&1; then \
+		printf "  %-14s PASS\n" $(1); \
+	else \
+		printf "  %-14s FAIL (%d diffs)\n" $(1) \
+			$$$$(diff $(TESTDIR)/test_$(1)_ref.txt $(TESTDIR)/test_$(1)_opt.txt | grep -c '^[<>]'); \
+	fi
+
+size-$(1): s_$(1).o
+	@printf "  %-20s %d\n" $(1) `$$(SIZE) -A $$< | awk '/\.text/ {print $$$$2}'`
+endef
+
+# For double-precision functions without assembly: run only (no opt to compare)
+define FUNC_RULES_DOUBLE
+$(TESTDIR)/test_$(1)_ref.elf: $(TESTDIR)/test_$(1).o
+	$$(MSG_LD)$$(Q)$$(LD) -o $$@ $$^ $$(LDFLAGS)
+
+test-$(1): $(TESTDIR)/test_$(1)_ref.elf
+	$$(Q)$$(QEMU) $$(QEMU_FLAGS) $(TESTDIR)/test_$(1)_ref.elf < /dev/null > $(TESTDIR)/test_$(1)_ref.txt
+	@if [ -s $(TESTDIR)/test_$(1)_ref.txt ]; then \
+		printf "  %-14s PASS\n" $(1); \
+	else \
+		printf "  %-14s FAIL\n" $(1); \
+	fi
+endef
+
+$(foreach f,$(FUNCS_SINGLE),$(eval $(call FUNC_RULES_SINGLE,$(f))))
+$(foreach f,$(FUNCS_DOUBLE_OPT),$(eval $(call FUNC_RULES_DOUBLE_OPT,$(f))))
+$(foreach f,$(FUNCS_DOUBLE_NOOPT),$(eval $(call FUNC_RULES_DOUBLE,$(f))))
+
+# Bench rules: compile with -DEN_PERF, run on FPGA via GDB, display cycle counts
+define FUNC_RULES_BENCH_SINGLE
+$(TESTDIR)/test_$(1)_bench_opt.elf: $(TESTDIR)/test_$(1)_bench.o sf_$(patsubst %f,%,$(1)).o libandes.a
+	$$(MSG_LD)$$(Q)$$(LD) -o $$@ $$(filter-out libandes.a,$$^) $$(LDFLAGS_OPT)
+
+$(TESTDIR)/test_$(1)_bench_ref.elf: $(TESTDIR)/test_$(1)_bench.o
+	$$(MSG_LD)$$(Q)$$(LD) -o $$@ $$^ $$(LDFLAGS)
+
+bench-$(1): $(TESTDIR)/test_$(1)_bench_opt.elf $(TESTDIR)/test_$(1)_bench_ref.elf
+	@printf "  %-14s ref: " $(1)
+	$$(Q)$$(GDB) $(TESTDIR)/test_$(1)_bench_ref.elf $$(FPGA_GDB_FLAGS)
+	@printf "  %-14s opt: " $(1)
+	$$(Q)$$(GDB) $(TESTDIR)/test_$(1)_bench_opt.elf $$(FPGA_GDB_FLAGS)
+endef
+
+define FUNC_RULES_BENCH_DOUBLE_OPT
+$(TESTDIR)/test_$(1)_bench_opt.elf: $(TESTDIR)/test_$(1)_bench.o s_$(1).o libandes.a
+	$$(MSG_LD)$$(Q)$$(LD) -o $$@ $$(filter-out libandes.a,$$^) $$(LDFLAGS_OPT)
+
+$(TESTDIR)/test_$(1)_bench_ref.elf: $(TESTDIR)/test_$(1)_bench.o
+	$$(MSG_LD)$$(Q)$$(LD) -o $$@ $$^ $$(LDFLAGS)
+
+bench-$(1): $(TESTDIR)/test_$(1)_bench_opt.elf $(TESTDIR)/test_$(1)_bench_ref.elf
+	@printf "  %-14s ref: " $(1)
+	$$(Q)$$(GDB) $(TESTDIR)/test_$(1)_bench_ref.elf $$(FPGA_GDB_FLAGS)
+	@printf "  %-14s opt: " $(1)
+	$$(Q)$$(GDB) $(TESTDIR)/test_$(1)_bench_opt.elf $$(FPGA_GDB_FLAGS)
+endef
+
+$(foreach f,$(FUNCS_SINGLE),$(eval $(call FUNC_RULES_BENCH_SINGLE,$(f))))
+$(foreach f,$(FUNCS_DOUBLE_OPT),$(eval $(call FUNC_RULES_BENCH_DOUBLE_OPT,$(f))))
+
+# --- Top-level targets ---
+
+OPT_ELFS = $(foreach f,$(FUNCS_SINGLE),$(TESTDIR)/test_$(f)_opt.elf) \
+           $(foreach f,$(FUNCS_DOUBLE_OPT),$(TESTDIR)/test_$(f)_opt.elf)
+REF_ELFS = $(foreach f,$(FUNCS),$(TESTDIR)/test_$(f)_ref.elf)
+
+all: $(OPT_ELFS) $(REF_ELFS)
+
+test-all: $(foreach f,$(FUNCS),test-$(f))
+	@echo "Done."
+
+bench-all: $(foreach f,$(FUNCS_SINGLE),bench-$(f)) \
+           $(foreach f,$(FUNCS_DOUBLE_OPT),bench-$(f))
+	@echo "Done."
+
+size-all: $(ASM_OBJS) $(S_ASM_OBJS)
+	@echo "=== .text size (bytes) ==="
+	@$(foreach o,$(ASM_OBJS) $(S_ASM_OBJS), \
+		printf "  %-20s %d\n" $(basename $(o)) \
+			$$($(SIZE) -A $(o) | awk '/\.text/ {print $$2}');)
+	@echo "  --------------------"
+	@printf "  %-20s %d\n" "TOTAL" \
+		$$($(SIZE) -A $(ASM_OBJS) $(S_ASM_OBJS) | awk '/\.text/ {s+=$$2} END {print s}')
+
+list:
+	@echo "Targets: all size-all test-all clean list"
+	@echo "Per-function: $(foreach f,$(FUNCS),test-$(f))"
+
+clean:
+	rm -f $(ASM_OBJS) $(S_ASM_OBJS) $(ANDES_OBJS) libandes.a $(TESTDIR)/*.o $(TESTDIR)/*.elf $(TESTDIR)/*_ref.txt $(TESTDIR)/*_opt.txt $(TESTDIR)/*_bench.txt
+
+.PHONY: all size-all test-all bench-all clean list $(foreach f,$(FUNCS),test-$(f)) \
+        $(foreach f,$(FUNCS_SINGLE),size-$(f)) \
+        $(foreach f,$(FUNCS_DOUBLE_OPT),size-$(f)) \
+        $(foreach f,$(FUNCS_SINGLE),bench-$(f)) \
+        $(foreach f,$(FUNCS_DOUBLE_OPT),bench-$(f))

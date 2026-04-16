@@ -1,0 +1,666 @@
+/*
+ * Comprehensive accuracy test for single-precision sinf()
+ * Targets: RV32 soft-float with M extension (Andes optimized assembly)
+ *
+ * Tests sinf() against (float)sin((double)x) as the reference.
+ * Since double has 53 bits of mantissa vs float's 24, the double-precision
+ * result cast to float is correctly rounded for virtually all inputs.
+ */
+
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <float.h>
+
+/* ------------------------------------------------------------------ */
+/* Helpers                                                             */
+/* ------------------------------------------------------------------ */
+
+static inline uint32_t float_to_bits(float f)
+{
+    union { float f; uint32_t u; } u;
+    u.f = f;
+    return u.u;
+}
+
+static inline float bits_to_float(uint32_t u)
+{
+    union { float f; uint32_t u; } x;
+    x.u = u;
+    return x.f;
+}
+
+static inline int is_nan(float f)
+{
+    uint32_t b = float_to_bits(f);
+    return ((b & 0x7f800000u) == 0x7f800000u) && ((b & 0x007fffffu) != 0);
+}
+
+static inline int is_inf(float f)
+{
+    uint32_t b = float_to_bits(f);
+    return ((b & 0x7fffffffu) == 0x7f800000u);
+}
+
+/*
+ * Compute ULP distance between two floats.
+ * Returns -1 if either is NaN.
+ */
+static int32_t ulp_distance(float a, float b)
+{
+    if (is_nan(a) || is_nan(b))
+        return -1;
+
+    uint32_t ua = float_to_bits(a);
+    uint32_t ub = float_to_bits(b);
+
+    /* Convert to signed magnitude → two's complement for comparison */
+    int32_t ia = (int32_t)ua;
+    int32_t ib = (int32_t)ub;
+
+    if (ia < 0) ia = (int32_t)(0x80000000u - ua);
+    if (ib < 0) ib = (int32_t)(0x80000000u - ub);
+
+    int32_t diff = ia - ib;
+    return diff < 0 ? -diff : diff;
+}
+
+/* ------------------------------------------------------------------ */
+/* Test infrastructure                                                 */
+/* ------------------------------------------------------------------ */
+
+static int total_tests = 0;
+static int total_failures = 0;
+static int32_t max_ulp_seen = 0;
+
+static void check_sinf(float input, float expected, int32_t max_ulp, const char *label)
+{
+    float got = sinf(input);
+    total_tests++;
+
+    /* Both NaN → pass */
+    if (is_nan(expected) && is_nan(got))
+        return;
+
+    /* One NaN, other not → fail */
+    if (is_nan(expected) || is_nan(got)) {
+        printf("FAIL [%s]: sinf(%.8e) = %.8e [0x%08lx], expected %.8e [0x%08lx] (NaN mismatch)\n",
+               label, (double)input, (double)got, float_to_bits(got),
+               (double)expected, float_to_bits(expected));
+        total_failures++;
+        return;
+    }
+
+    int32_t ulp = ulp_distance(got, expected);
+
+    if (ulp > max_ulp_seen)
+        max_ulp_seen = ulp;
+
+    if (ulp > max_ulp) {
+        printf("FAIL [%s]: sinf(%.8e [0x%08lx]) = %.8e [0x%08lx], expected %.8e [0x%08lx] (ulp=%d, max=%d)\n",
+               label, (double)input, float_to_bits(input),
+               (double)got, float_to_bits(got),
+               (double)expected, float_to_bits(expected),
+               (int)ulp, (int)max_ulp);
+        total_failures++;
+    }
+}
+
+/*
+ * Use double-precision sin as reference for sinf.
+ * (float)sin((double)x) is correctly rounded for all but a handful of
+ * inputs, so 1 ULP tolerance handles those.
+ */
+static void check_sinf_ref(float input, int32_t max_ulp, const char *label)
+{
+    float expected = (float)sin((double)input);
+    check_sinf(input, expected, max_ulp, label);
+}
+
+/* ------------------------------------------------------------------ */
+/* 1. Exact / special value tests                                      */
+/* ------------------------------------------------------------------ */
+
+static void test_zeros(void)
+{
+    printf("--- Zeros ---\n");
+    /* sin(+0) = +0 */
+    check_sinf(0.0f, 0.0f, 0, "+0");
+    /* sin(-0) = -0 */
+    check_sinf(-0.0f, -0.0f, 0, "-0");
+
+    /* Verify sign bit of zero results */
+    float r_pos = sinf(0.0f);
+    float r_neg = sinf(-0.0f);
+    if (float_to_bits(r_pos) != 0x00000000u) {
+        printf("FAIL [+0 sign]: sinf(+0) sign bit wrong: 0x%08lx\n", float_to_bits(r_pos));
+        total_failures++;
+    }
+    total_tests++;
+    if (float_to_bits(r_neg) != 0x80000000u) {
+        printf("FAIL [-0 sign]: sinf(-0) sign bit wrong: 0x%08lx\n", float_to_bits(r_neg));
+        total_failures++;
+    }
+    total_tests++;
+}
+
+static void test_nan(void)
+{
+    printf("--- NaN ---\n");
+    /* sin(NaN) = NaN */
+    float qnan = bits_to_float(0x7fc00000u); /* quiet NaN */
+    float snan = bits_to_float(0x7f800001u); /* signaling NaN */
+    float neg_nan = bits_to_float(0xffc00000u);
+
+    check_sinf(qnan, qnan, 0, "qNaN");
+    check_sinf(snan, qnan, 0, "sNaN");  /* sNaN should become qNaN */
+    check_sinf(neg_nan, neg_nan, 0, "-NaN");
+}
+
+static void test_infinity(void)
+{
+    printf("--- Infinity ---\n");
+    /* sin(+Inf) = NaN */
+    float pinf = bits_to_float(0x7f800000u);
+    float ninf = bits_to_float(0xff800000u);
+    float expected_nan = bits_to_float(0x7fc00000u);
+
+    check_sinf(pinf, expected_nan, 0, "+Inf");
+    check_sinf(ninf, expected_nan, 0, "-Inf");
+}
+
+/* ------------------------------------------------------------------ */
+/* 2. Tiny values: sin(x) ≈ x                                         */
+/* ------------------------------------------------------------------ */
+
+static void test_tiny(void)
+{
+    printf("--- Tiny values (sin(x) ~ x) ---\n");
+
+    /* Smallest denormal */
+    check_sinf_ref(bits_to_float(0x00000001u), 1, "min_denorm");
+    check_sinf_ref(bits_to_float(0x80000001u), 1, "-min_denorm");
+
+    /* Mid-range denormals */
+    check_sinf_ref(bits_to_float(0x00400000u), 1, "mid_denorm");
+    check_sinf_ref(bits_to_float(0x80400000u), 1, "-mid_denorm");
+
+    /* Max denormal */
+    check_sinf_ref(bits_to_float(0x007fffffu), 1, "max_denorm");
+    check_sinf_ref(bits_to_float(0x807fffffu), 1, "-max_denorm");
+
+    /* Smallest normal */
+    check_sinf_ref(FLT_MIN, 1, "FLT_MIN");
+    check_sinf_ref(-FLT_MIN, 1, "-FLT_MIN");
+
+    /* Very small normals where sin(x) = x exactly in float */
+    check_sinf_ref(1.0e-20f, 1, "1e-20");
+    check_sinf_ref(-1.0e-20f, 1, "-1e-20");
+    check_sinf_ref(1.0e-10f, 1, "1e-10");
+    check_sinf_ref(-1.0e-10f, 1, "-1e-10");
+}
+
+/* ------------------------------------------------------------------ */
+/* 3. Known mathematical values                                        */
+/* ------------------------------------------------------------------ */
+
+static void test_known_values(void)
+{
+    printf("--- Known mathematical values ---\n");
+
+    /* pi/6, pi/4, pi/3, pi/2 and negatives */
+    /* Using (float) casts of double constants for best-representable input */
+    float pi_f = 3.14159265358979323846f;
+    float pi_2 = 1.57079632679489661923f;
+    float pi_3 = 1.04719755119659774615f;
+    float pi_4 = 0.78539816339744830962f;
+    float pi_6 = 0.52359877559829887308f;
+
+    check_sinf_ref(pi_6, 1, "pi/6");          /* ~ 0.5 */
+    check_sinf_ref(pi_4, 1, "pi/4");          /* ~ sqrt(2)/2 */
+    check_sinf_ref(pi_3, 1, "pi/3");          /* ~ sqrt(3)/2 */
+    check_sinf_ref(pi_2, 1, "pi/2");          /* ~ 1.0 */
+    check_sinf_ref(pi_f, 1, "pi");            /* ~ 0 (cancellation) */
+    check_sinf_ref(2.0f * pi_f, 1, "2*pi");   /* ~ 0 (cancellation) */
+
+    /* Negative inputs */
+    check_sinf_ref(-pi_6, 1, "-pi/6");
+    check_sinf_ref(-pi_4, 1, "-pi/4");
+    check_sinf_ref(-pi_2, 1, "-pi/2");
+    check_sinf_ref(-pi_f, 1, "-pi");
+
+    /* 3*pi/2: sin = -1 */
+    check_sinf_ref(3.0f * pi_2, 1, "3*pi/2");
+
+    /* Quadrant boundaries */
+    check_sinf_ref(pi_2 + 0.001f, 1, "pi/2+eps");
+    check_sinf_ref(pi_f + 0.001f, 1, "pi+eps");
+    check_sinf_ref(pi_f - 0.001f, 1, "pi-eps");
+}
+
+/* ------------------------------------------------------------------ */
+/* 4. Large argument reduction                                         */
+/* ------------------------------------------------------------------ */
+
+static void test_large_args(void)
+{
+    printf("--- Large arguments (argument reduction stress) ---\n");
+
+    /* Moderate multiples of pi */
+    float vals[] = {
+        10.0f, 100.0f, 1000.0f, 10000.0f, 100000.0f, 1000000.0f,
+        -10.0f, -100.0f, -1000.0f, -10000.0f,
+        /* Near-integer multiples of pi */
+        3.14159265f * 10.0f,
+        3.14159265f * 100.0f,
+        3.14159265f * 1000.0f,
+        /* Large values */
+        1.0e10f, 1.0e20f, 1.0e30f,
+        -1.0e10f, -1.0e20f, -1.0e30f,
+        /* FLT_MAX */
+        FLT_MAX, -FLT_MAX,
+    };
+
+    char buf[64];
+    int n = sizeof(vals) / sizeof(vals[0]);
+    for (int i = 0; i < n; i++) {
+        snprintf(buf, sizeof(buf), "large[%d]=%.4e", i, (double)vals[i]);
+        check_sinf_ref(vals[i], 2, buf);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* 5. Quadrant transition points                                       */
+/* ------------------------------------------------------------------ */
+
+static void test_quadrant_transitions(void)
+{
+    printf("--- Quadrant transition points ---\n");
+
+    /* Test values just around each quadrant boundary */
+    float pi_2 = 1.5707963267948966f;
+    float offsets[] = { -1e-3f, -1e-5f, -1e-7f, 0.0f, 1e-7f, 1e-5f, 1e-3f };
+    int noff = sizeof(offsets) / sizeof(offsets[0]);
+    char buf[64];
+
+    /* Boundaries at k*pi/2 for k = 1..8 */
+    for (int k = 1; k <= 8; k++) {
+        float boundary = (float)((double)k * (double)pi_2);
+        for (int j = 0; j < noff; j++) {
+            float x = boundary + offsets[j];
+            snprintf(buf, sizeof(buf), "quad k=%d off=%d", k, j);
+            check_sinf_ref(x, 1, buf);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* 6. Sign symmetry: sin(-x) = -sin(x)                                */
+/* ------------------------------------------------------------------ */
+
+static void test_symmetry(void)
+{
+    printf("--- Odd-function symmetry ---\n");
+
+    float vals[] = {
+        0.1f, 0.5f, 1.0f, 1.5f, 2.0f, 2.5f, 3.0f, 3.5f,
+        0.001f, 0.01f, 100.0f, 1e6f, 1e10f
+    };
+    char buf[64];
+    int n = sizeof(vals) / sizeof(vals[0]);
+
+    for (int i = 0; i < n; i++) {
+        float sp = sinf(vals[i]);
+        float sn = sinf(-vals[i]);
+        total_tests++;
+
+        /* Check that sin(-x) == -sin(x) exactly (bit-identical) */
+        uint32_t bp = float_to_bits(sp);
+        uint32_t bn = float_to_bits(sn);
+
+        if (bp != (bn ^ 0x80000000u)) {
+            snprintf(buf, sizeof(buf), "sym[%.4e]", (double)vals[i]);
+            printf("FAIL [%s]: sinf(x)=0x%08lx, sinf(-x)=0x%08lx (sign flip mismatch)\n",
+                   buf, bp, bn);
+            total_failures++;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* 7. Range bound: |sin(x)| <= 1                                       */
+/* ------------------------------------------------------------------ */
+
+static void test_range_bound(void)
+{
+    printf("--- Range bound |sin(x)| <= 1 ---\n");
+
+    /* Sweep a bunch of values and verify output is in [-1, 1] */
+    uint32_t step = 0x00100000u; /* ~1M steps across positive floats */
+    int violations = 0;
+    int checked = 0;
+
+    for (uint32_t bits = 0x00800000u; bits < 0x7f800000u; bits += step) {
+        float x = bits_to_float(bits);
+        float r = sinf(x);
+        checked++;
+
+        if (!is_nan(r) && (r > 1.0f || r < -1.0f)) {
+            if (violations < 10) {
+                printf("FAIL [range]: sinf(%.8e) = %.8e (out of [-1,1])\n",
+                       (double)x, (double)r);
+            }
+            violations++;
+        }
+    }
+
+    total_tests += checked;
+    total_failures += violations;
+    printf("  Checked %d values, %d range violations\n", checked, violations);
+}
+
+/* ------------------------------------------------------------------ */
+/* 8. Systematic ULP sweep across key intervals                        */
+/* ------------------------------------------------------------------ */
+
+static void test_ulp_sweep(void)
+{
+    printf("--- Systematic ULP sweep ---\n");
+
+    /*
+     * Sweep [0, 4*pi] in fine steps (covers 2 full periods).
+     * Also sweep some negative range.
+     */
+    int32_t local_max_ulp = 0;
+    int count = 0;
+    int fail_count = 0;
+    char buf[64];
+
+    /* [0, 4*pi] with 100k steps */
+    float lo = 0.0f;
+    float hi = 4.0f * 3.14159265358979323846f;
+    int nsteps = 100000;
+    float step = (hi - lo) / (float)nsteps;
+
+    for (int i = 0; i <= nsteps; i++) {
+        float x = lo + (float)i * step;
+        float got = sinf(x);
+        float ref = (float)sin((double)x);
+        int32_t ulp = ulp_distance(got, ref);
+
+        total_tests++;
+        count++;
+
+        if (ulp > local_max_ulp)
+            local_max_ulp = ulp;
+
+        if (ulp > 1) {
+            if (fail_count < 5) {
+                snprintf(buf, sizeof(buf), "sweep+[%d]", i);
+                printf("FAIL [%s]: sinf(%.8e) = %.8e, ref=%.8e, ulp=%d\n",
+                       buf, (double)x, (double)got, (double)ref, (int)ulp);
+            }
+            fail_count++;
+            total_failures++;
+        }
+    }
+
+    /* [-4*pi, 0] with 100k steps */
+    lo = -4.0f * 3.14159265358979323846f;
+    hi = 0.0f;
+    for (int i = 0; i <= nsteps; i++) {
+        float x = lo + (float)i * step;
+        float got = sinf(x);
+        float ref = (float)sin((double)x);
+        int32_t ulp = ulp_distance(got, ref);
+
+        total_tests++;
+        count++;
+
+        if (ulp > local_max_ulp)
+            local_max_ulp = ulp;
+
+        if (ulp > 1) {
+            if (fail_count < 10) {
+                snprintf(buf, sizeof(buf), "sweep-[%d]", i);
+                printf("FAIL [%s]: sinf(%.8e) = %.8e, ref=%.8e, ulp=%d\n",
+                       buf, (double)x, (double)got, (double)ref, (int)ulp);
+            }
+            fail_count++;
+            total_failures++;
+        }
+    }
+
+    if (local_max_ulp > max_ulp_seen)
+        max_ulp_seen = local_max_ulp;
+
+    printf("  Swept %d values, max ULP = %d, failures (>1 ULP) = %d\n",
+           count, (int)local_max_ulp, fail_count);
+}
+
+/* ------------------------------------------------------------------ */
+/* 9. Problematic float bit patterns (worst-case for argument reduction) */
+/* ------------------------------------------------------------------ */
+
+static void test_worst_case_reduction(void)
+{
+    printf("--- Worst-case argument reduction ---\n");
+
+    /*
+     * Values near exact multiples of pi/2 where cancellation is severe.
+     * These are known hard cases for sinf argument reduction.
+     */
+    float hard_cases[] = {
+        /* Near pi: sin(pi) ≈ 0, massive cancellation */
+        3.1415927f, /* closest float to pi */
+        3.1415925f, /* float below pi */
+        3.1415929f, /* float above pi */
+
+        /* Near 2*pi */
+        6.2831853f,
+        6.2831855f,
+
+        /* Near pi/2 where cos is used internally */
+        1.5707964f,
+        1.5707963f,
+
+        /* Specific bit patterns known to stress reduction */
+        bits_to_float(0x40490fdbu), /* pi as float */
+        bits_to_float(0x40c90fdbu), /* 2*pi as float */
+        bits_to_float(0x4096cbe4u), /* 3*pi/2 */
+
+        /* Powers of 2 near pi multiples */
+        4.0f,   /* slightly > pi */
+        8.0f,   /* slightly > 2*pi + small */
+        16.0f,
+        32.0f,
+        64.0f,
+        128.0f,
+        256.0f,
+    };
+    char buf[64];
+    int n = sizeof(hard_cases) / sizeof(hard_cases[0]);
+
+    for (int i = 0; i < n; i++) {
+        snprintf(buf, sizeof(buf), "hard[%d]=%.8e", i, (double)hard_cases[i]);
+        check_sinf_ref(hard_cases[i], 1, buf);
+        /* Also test negative */
+        snprintf(buf, sizeof(buf), "hard[%d]=-%.8e", i, (double)hard_cases[i]);
+        check_sinf_ref(-hard_cases[i], 1, buf);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* 10. Monotonicity checks                                             */
+/* ------------------------------------------------------------------ */
+
+static void test_monotonicity(void)
+{
+    printf("--- Monotonicity in [0, pi/2] ---\n");
+
+    /*
+     * sin is strictly increasing on [0, pi/2].
+     * Walk consecutive floats and verify non-decreasing.
+     */
+    float start = 0.0f;
+    float end = 1.5707963f; /* just under pi/2 */
+    uint32_t start_bits = float_to_bits(start);
+    uint32_t end_bits = float_to_bits(end);
+    int violations = 0;
+    int checked = 0;
+
+    /* Step by 256 ULPs to keep runtime reasonable */
+    uint32_t step = 256;
+    float prev = sinf(bits_to_float(start_bits));
+
+    for (uint32_t b = start_bits + step; b <= end_bits; b += step) {
+        float x = bits_to_float(b);
+        float cur = sinf(x);
+        checked++;
+
+        if (cur < prev) {
+            if (violations < 5) {
+                printf("FAIL [mono]: sinf(%.8e)=%.8e < sinf(prev)=%.8e\n",
+                       (double)x, (double)cur, (double)prev);
+            }
+            violations++;
+        }
+        prev = cur;
+    }
+
+    total_tests += checked;
+    total_failures += violations;
+    printf("  Checked %d consecutive pairs, %d monotonicity violations\n",
+           checked, violations);
+}
+
+/* ------------------------------------------------------------------ */
+/* 11. Continuity: adjacent floats should not produce wild jumps        */
+/* ------------------------------------------------------------------ */
+
+static void test_continuity(void)
+{
+    printf("--- Continuity (adjacent float inputs) ---\n");
+
+    /*
+     * For adjacent float inputs x and nextafter(x), the outputs should
+     * differ by at most a few ULP (bounded by the derivative |cos(x)| * 1 ULP(x)).
+     * We just flag cases where the output jumps by more than 4096 ULPs.
+     */
+    float test_points[] = {
+        0.1f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 3.14f, 4.5f, 6.0f, 10.0f
+    };
+    int n = sizeof(test_points) / sizeof(test_points[0]);
+    int violations = 0;
+    char buf[64];
+
+    for (int i = 0; i < n; i++) {
+        float x = test_points[i];
+        /* Check 100 consecutive floats around this point */
+        uint32_t base = float_to_bits(x);
+        float prev_r = sinf(bits_to_float(base));
+
+        for (uint32_t j = 1; j <= 100; j++) {
+            float cur_x = bits_to_float(base + j);
+            float cur_r = sinf(cur_x);
+            int32_t output_ulp = ulp_distance(prev_r, cur_r);
+            total_tests++;
+
+            if (output_ulp > 4096 && !is_nan(prev_r) && !is_nan(cur_r)) {
+                if (violations < 5) {
+                    snprintf(buf, sizeof(buf), "cont near %.4e +%d", (double)x, (int)j);
+                    printf("FAIL [%s]: output jump of %d ULP\n", buf, (int)output_ulp);
+                }
+                violations++;
+                total_failures++;
+            }
+            prev_r = cur_r;
+        }
+    }
+
+    printf("  Checked %d adjacent pairs, %d continuity violations\n",
+           n * 100, violations);
+}
+
+/* ------------------------------------------------------------------ */
+/* 12. Exhaustive sweep of small range [0, pi/4]                       */
+/* ------------------------------------------------------------------ */
+
+static void test_exhaustive_small(void)
+{
+    printf("--- Exhaustive [0, pi/4] every 16 ULP ---\n");
+
+    /*
+     * pi/4 ≈ 0.7854 → 0x3f490fdb
+     * Walk every 16th float in [0, pi/4] and check against double ref.
+     */
+    uint32_t end_bits = 0x3f490fdbu; /* pi/4 */
+    int32_t local_max_ulp = 0;
+    int count = 0;
+    int fail_count = 0;
+
+    for (uint32_t b = 0; b <= end_bits; b += 16) {
+        float x = bits_to_float(b);
+        float got = sinf(x);
+        float ref = (float)sin((double)x);
+        int32_t ulp = ulp_distance(got, ref);
+
+        total_tests++;
+        count++;
+
+        if (ulp > local_max_ulp)
+            local_max_ulp = ulp;
+
+        if (ulp > 1) {
+            if (fail_count < 5) {
+                printf("FAIL [exh]: sinf(%.8e [0x%08lx]) = 0x%08lx, ref=0x%08lx, ulp=%d\n",
+                       (double)x, b, float_to_bits(got), float_to_bits(ref), (int)ulp);
+            }
+            fail_count++;
+            total_failures++;
+        }
+    }
+
+    if (local_max_ulp > max_ulp_seen)
+        max_ulp_seen = local_max_ulp;
+
+    printf("  Checked %d values, max ULP = %d, failures = %d\n",
+           count, (int)local_max_ulp, fail_count);
+}
+
+/* ------------------------------------------------------------------ */
+/* Main                                                                */
+/* ------------------------------------------------------------------ */
+
+int main(void)
+{
+    printf("=== sinf() comprehensive accuracy test ===\n\n");
+
+    test_zeros();
+    test_nan();
+    test_infinity();
+    test_tiny();
+    test_known_values();
+    test_large_args();
+    test_quadrant_transitions();
+    test_symmetry();
+    test_range_bound();
+    test_ulp_sweep();
+    test_worst_case_reduction();
+    test_monotonicity();
+    test_continuity();
+    test_exhaustive_small();
+
+    printf("\n=== Summary ===\n");
+    printf("Total tests:    %d\n", total_tests);
+    printf("Total failures: %d\n", total_failures);
+    printf("Max ULP seen:   %d\n", (int)max_ulp_seen);
+
+    if (total_failures == 0)
+        printf("PASSED\n");
+    else
+        printf("FAILED\n");
+
+    return total_failures > 0 ? 1 : 0;
+}

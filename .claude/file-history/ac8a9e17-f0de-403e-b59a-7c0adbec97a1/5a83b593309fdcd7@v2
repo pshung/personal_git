@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+################################################################################
+# config/run.sh — Wrapper that reads an INI-style .cfg file and invokes
+#                 build.sh / test.sh with the correct positional arguments.
+#
+# This script does NOT modify build.sh or test.sh. It translates config values
+# into the positional arguments and environment variables those scripts expect.
+#
+# Usage:
+#   config/run.sh build  <config_file> [extra_cflags] [output_path]
+#   config/run.sh test   <config_file> <BS3|DAILY> [extra_flags] [linker]
+#
+# Config file format (INI-style):
+#   # comment
+#   [section]
+#   key = value        # inline comment
+#
+# Supported sections and keys:
+#   [cpu]
+#     name             — CPU name passed to build.sh $1 (e.g., nx27v, d25, x86)
+#
+#   [toolchain]
+#     prefix           — toolchain prefix (e.g., riscv64-elf-)
+#     compiler         — full compiler name or path (e.g., riscv64-elf-gcc)
+#     linker           — linker name (e.g., lld); optional
+#     extra_cflags     — extra flags appended to build.sh $2 / test.sh $6
+#
+#   [sim]
+#     wrapper          — simulator wrapper name/path (test.sh $3)
+#     target           — GDB, SID, BOARD, or QEMU (test.sh $4)
+#
+#   [qemu]
+#     binary           — QEMU binary path; exported as QEMU_SYS_RV64/RV32
+#     vec_cfg          — vector config (e.g., zve64d); exported as VEC_CFG
+#
+#   [board]
+#     ice_host         — ICEman host; exported as MYPC
+#     ice_port         — ICEman port; exported as MYPORT
+#
+# Example config (config/ax45mpv.cfg):
+#   [cpu]
+#   name = ax45mpv
+#
+#   [toolchain]
+#   compiler = riscv64-elf-gcc
+#   extra_cflags = -mext-vector -mtune=andes-45-series
+#
+#   [sim]
+#   wrapper = riscv-qemu-wrapper-v512_d512_b512
+#   target = QEMU
+#
+#   [qemu]
+#   binary = /opt/qemu/bin/qemu-system-riscv64
+#   vec_cfg = zve64d
+#
+# Example invocations:
+#   config/run.sh build config/ax45mpv.cfg
+#   config/run.sh build config/ax45mpv.cfg "-funroll-loops"
+#   config/run.sh test  config/ax45mpv.cfg BS3
+#   config/run.sh test  config/ax45mpv.cfg DAILY "" lld
+################################################################################
+
+set -euo pipefail
+
+SCRIPT_DIR=$(readlink -f "$(dirname "${BASH_SOURCE[0]}")")
+LIB_ROOT=$(readlink -f "${SCRIPT_DIR}/..")
+
+#--- INI parser ---
+# Reads the config file and exports CFG_<SECTION>_<KEY> variables.
+parse_cfg() {
+    local cfg_file="${1}"
+    local section=""
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        # trim whitespace
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+
+        # skip empty / comment lines
+        [[ -z "${line}" ]] && continue
+        [[ "${line}" == \#* ]] && continue
+
+        # section header
+        if [[ "${line}" =~ ^\[([a-zA-Z0-9_]+)\]$ ]]; then
+            section="${BASH_REMATCH[1]}"
+            continue
+        fi
+
+        # key = value
+        if [[ "${line}" =~ ^([a-zA-Z0-9_]+)[[:space:]]*=[[:space:]]*(.*) ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local val="${BASH_REMATCH[2]}"
+
+            # strip inline comments (# preceded by whitespace)
+            val="${val%%[[:space:]]#*}"
+            # strip trailing whitespace
+            val="${val%"${val##*[![:space:]]}"}"
+
+            local sec_upper key_upper
+            sec_upper=$(echo "${section}" | tr '[:lower:]' '[:upper:]')
+            key_upper=$(echo "${key}" | tr '[:lower:]' '[:upper:]')
+
+            export "CFG_${sec_upper}_${key_upper}=${val}"
+        fi
+    done < "${cfg_file}"
+}
+
+#--- helpers ---
+die() { echo "Error: $*" >&2; exit 1; }
+
+usage() {
+    echo "Usage:"
+    echo "  ${0} build <config_file> [extra_cflags] [output_path]"
+    echo "  ${0} test  <config_file> <BS3|DAILY> [extra_flags] [linker]"
+    exit 1
+}
+
+#--- main ---
+[[ $# -lt 2 ]] && usage
+
+MODE="${1}"
+CFG_FILE="${2}"
+shift 2
+
+# resolve config file path
+if [[ ! -f "${CFG_FILE}" ]]; then
+    if [[ -f "${LIB_ROOT}/${CFG_FILE}" ]]; then
+        CFG_FILE="${LIB_ROOT}/${CFG_FILE}"
+    else
+        die "Config file '${CFG_FILE}' not found."
+    fi
+fi
+
+parse_cfg "${CFG_FILE}"
+
+# export QEMU env vars if configured
+if [[ -n "${CFG_QEMU_BINARY:-}" ]]; then
+    export QEMU_SYS_RV64="${CFG_QEMU_BINARY}"
+    export QEMU_SYS_RV32="${CFG_QEMU_BINARY}"
+fi
+if [[ -n "${CFG_QEMU_VEC_CFG:-}" ]]; then
+    export VEC_CFG="${CFG_QEMU_VEC_CFG}"
+fi
+
+# export board env vars if configured
+if [[ -n "${CFG_BOARD_ICE_HOST:-}" ]]; then
+    export MYPC="${CFG_BOARD_ICE_HOST}"
+fi
+if [[ -n "${CFG_BOARD_ICE_PORT:-}" ]]; then
+    export MYPORT="${CFG_BOARD_ICE_PORT}"
+fi
+
+# read config values with defaults
+CPU_NAME="${CFG_CPU_NAME:-}"
+COMPILER="${CFG_TOOLCHAIN_COMPILER:-}"
+EXTRA_CFLAGS="${CFG_TOOLCHAIN_EXTRA_CFLAGS:-}"
+LINKER="${CFG_TOOLCHAIN_LINKER:-}"
+SIM_WRAPPER="${CFG_SIM_WRAPPER:-}"
+SIM_TARGET="${CFG_SIM_TARGET:-}"
+
+[[ -z "${CPU_NAME}" ]] && die "[cpu] name is required in config file."
+
+case "${MODE}" in
+    build)
+        # build.sh $1=CPU  $2=extra_cflags  $3=compiler  $4=output_path
+        ARG_EXTRA="${1:-}"
+        ARG_OUTPUT="${2:-}"
+
+        # merge extra_cflags: config + command-line
+        MERGED_EXTRA="${EXTRA_CFLAGS}"
+        if [[ -n "${ARG_EXTRA}" ]]; then
+            MERGED_EXTRA="${MERGED_EXTRA:+${MERGED_EXTRA} }${ARG_EXTRA}"
+        fi
+
+        echo ">> build.sh ${CPU_NAME} \"${MERGED_EXTRA}\" \"${COMPILER}\" \"${ARG_OUTPUT}\""
+        exec "${LIB_ROOT}/build.sh" "${CPU_NAME}" "${MERGED_EXTRA}" "${COMPILER}" "${ARG_OUTPUT}"
+        ;;
+
+    test)
+        # test.sh $1=""(dummy)  $2=compiler  $3=sim_wrapper  $4=target  $5=BS3/DAILY  $6=extra_flags  $7=linker
+        TEST_TYPE="${1:-}"
+        ARG_EXTRA="${2:-}"
+        ARG_LINKER="${3:-}"
+
+        [[ -z "${TEST_TYPE}" ]] && die "test mode requires BS3 or DAILY as third argument."
+
+        # merge extra_cflags: config + command-line
+        MERGED_EXTRA="${EXTRA_CFLAGS}"
+        if [[ -n "${ARG_EXTRA}" ]]; then
+            MERGED_EXTRA="${MERGED_EXTRA:+${MERGED_EXTRA} }${ARG_EXTRA}"
+        fi
+
+        # use command-line linker if provided, else config
+        FINAL_LINKER="${ARG_LINKER:-${LINKER}}"
+
+        echo ">> test.sh \"\" \"${COMPILER}\" \"${SIM_WRAPPER}\" \"${SIM_TARGET}\" \"${TEST_TYPE}\" \"${MERGED_EXTRA}\" \"${FINAL_LINKER}\""
+        exec "${LIB_ROOT}/test.sh" "" "${COMPILER}" "${SIM_WRAPPER}" "${SIM_TARGET}" "${TEST_TYPE}" "${MERGED_EXTRA}" "${FINAL_LINKER}"
+        ;;
+
+    *)
+        die "Unknown mode '${MODE}'. Use 'build' or 'test'."
+        ;;
+esac

@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""
+optdb.py — Optimization knowledge base for libnn RVV performance engineering.
+
+Records lessons learned from each optimization round (what was tried, cycle
+counts before/after, pipeline analysis insights, why it worked or didn't).
+Uses ChromaDB for semantic search so past lessons inform future optimizations.
+
+Usage:
+    .venv/bin/python3 scripts/optdb.py add       — interactively add a lesson
+    .venv/bin/python3 scripts/optdb.py add --json — add from JSON on stdin
+    .venv/bin/python3 scripts/optdb.py search "query"
+    .venv/bin/python3 scripts/optdb.py list
+    .venv/bin/python3 scripts/optdb.py show <id>
+    .venv/bin/python3 scripts/optdb.py delete <id>
+    .venv/bin/python3 scripts/optdb.py import <file.json>
+    .venv/bin/python3 scripts/optdb.py export [file.json]
+"""
+
+import argparse
+import json
+import sys
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+import chromadb
+
+DB_DIR = Path(__file__).resolve().parent.parent / ".optdb"
+COLLECTION = "optimization_lessons"
+
+
+def get_collection():
+    client = chromadb.PersistentClient(path=str(DB_DIR))
+    return client.get_or_create_collection(
+        name=COLLECTION,
+        metadata={"hnsw:space": "cosine"},
+    )
+
+
+def cmd_add(args):
+    if args.json:
+        data = json.load(sys.stdin)
+    else:
+        data = interactive_add()
+
+    required = ["function", "summary"]
+    for key in required:
+        if key not in data or not data[key]:
+            print(f"Error: '{key}' is required.", file=sys.stderr)
+            sys.exit(1)
+
+    lesson_id = data.get("id", str(uuid.uuid4())[:8])
+    timestamp = data.get("date", datetime.now().strftime("%Y-%m-%d"))
+
+    # Build the document text for embedding
+    doc_parts = [
+        f"Function: {data['function']}",
+        f"Summary: {data['summary']}",
+    ]
+    if data.get("approach"):
+        doc_parts.append(f"Approach: {data['approach']}")
+    if data.get("cycles_before"):
+        doc_parts.append(f"Cycles before: {data['cycles_before']}")
+    if data.get("cycles_after"):
+        doc_parts.append(f"Cycles after: {data['cycles_after']}")
+    if data.get("speedup"):
+        doc_parts.append(f"Speedup: {data['speedup']}")
+    if data.get("pipeline_insight"):
+        doc_parts.append(f"Pipeline insight: {data['pipeline_insight']}")
+    if data.get("lesson"):
+        doc_parts.append(f"Lesson: {data['lesson']}")
+    if data.get("outcome"):
+        doc_parts.append(f"Outcome: {data['outcome']}")
+    if data.get("tags"):
+        doc_parts.append(f"Tags: {', '.join(data['tags'])}")
+
+    document = "\n".join(doc_parts)
+
+    metadata = {
+        "function": data["function"],
+        "date": timestamp,
+        "outcome": data.get("outcome", "unknown"),
+    }
+    if data.get("cycles_before"):
+        metadata["cycles_before"] = str(data["cycles_before"])
+    if data.get("cycles_after"):
+        metadata["cycles_after"] = str(data["cycles_after"])
+    if data.get("speedup"):
+        metadata["speedup"] = str(data["speedup"])
+    if data.get("tags"):
+        metadata["tags"] = ",".join(data["tags"])
+
+    col = get_collection()
+    col.add(ids=[lesson_id], documents=[document], metadatas=[metadata])
+    print(f"Added lesson '{lesson_id}': {data['summary']}")
+
+
+def interactive_add():
+    data = {}
+    data["function"] = input("Function name: ").strip()
+    data["summary"] = input("One-line summary: ").strip()
+    data["approach"] = input("Approach (what you tried): ").strip()
+    data["cycles_before"] = input("Cycles before (or empty): ").strip()
+    data["cycles_after"] = input("Cycles after (or empty): ").strip()
+    data["speedup"] = input("Speedup (e.g. 2.5x, or empty): ").strip()
+    data["pipeline_insight"] = input("Pipeline insight (or empty): ").strip()
+    data["lesson"] = input("Key lesson learned: ").strip()
+    data["outcome"] = input("Outcome (improved/regressed/neutral): ").strip() or "unknown"
+    tags_str = input("Tags (comma-separated, or empty): ").strip()
+    data["tags"] = [t.strip() for t in tags_str.split(",") if t.strip()] if tags_str else []
+    return data
+
+
+def cmd_search(args):
+    col = get_collection()
+    results = col.query(
+        query_texts=[args.query],
+        n_results=args.n,
+    )
+    if not results["ids"][0]:
+        print("No lessons found.")
+        return
+
+    for i, (doc_id, doc, meta) in enumerate(
+        zip(results["ids"][0], results["documents"][0], results["metadatas"][0])
+    ):
+        dist = results["distances"][0][i] if results.get("distances") else None
+        print(f"--- [{doc_id}] (score: {1 - dist:.3f}) ---" if dist is not None else f"--- [{doc_id}] ---")
+        print(f"  Function: {meta.get('function', '?')}")
+        print(f"  Date: {meta.get('date', '?')}")
+        print(f"  Outcome: {meta.get('outcome', '?')}")
+        if meta.get("speedup"):
+            print(f"  Speedup: {meta['speedup']}")
+        # Print first 2 lines of doc as preview
+        lines = doc.strip().split("\n")
+        for line in lines[:3]:
+            print(f"  {line}")
+        print()
+
+
+def cmd_list(args):
+    col = get_collection()
+    all_data = col.get()
+    if not all_data["ids"]:
+        print("No lessons in database.")
+        return
+
+    for doc_id, meta in zip(all_data["ids"], all_data["metadatas"]):
+        outcome = meta.get("outcome", "?")
+        speedup = meta.get("speedup", "")
+        speedup_str = f" ({speedup})" if speedup else ""
+        print(f"  [{doc_id}] {meta.get('function', '?')} — {outcome}{speedup_str} ({meta.get('date', '?')})")
+
+
+def cmd_show(args):
+    col = get_collection()
+    result = col.get(ids=[args.id])
+    if not result["ids"]:
+        print(f"Lesson '{args.id}' not found.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"ID: {result['ids'][0]}")
+    print(f"Metadata: {json.dumps(result['metadatas'][0], indent=2)}")
+    print(f"\n{result['documents'][0]}")
+
+
+def cmd_delete(args):
+    col = get_collection()
+    col.delete(ids=[args.id])
+    print(f"Deleted lesson '{args.id}'.")
+
+
+def cmd_import(args):
+    with open(args.file) as f:
+        lessons = json.load(f)
+
+    if isinstance(lessons, dict):
+        lessons = [lessons]
+
+    col = get_collection()
+    for lesson in lessons:
+        lesson_id = lesson.get("id", str(uuid.uuid4())[:8])
+        doc_parts = []
+        for key in ["function", "summary", "approach", "cycles_before", "cycles_after",
+                     "speedup", "pipeline_insight", "lesson", "outcome"]:
+            if lesson.get(key):
+                doc_parts.append(f"{key.replace('_', ' ').title()}: {lesson[key]}")
+        if lesson.get("tags"):
+            doc_parts.append(f"Tags: {', '.join(lesson['tags'])}")
+
+        metadata = {
+            "function": lesson.get("function", "unknown"),
+            "date": lesson.get("date", datetime.now().strftime("%Y-%m-%d")),
+            "outcome": lesson.get("outcome", "unknown"),
+        }
+        for key in ["cycles_before", "cycles_after", "speedup"]:
+            if lesson.get(key):
+                metadata[key] = str(lesson[key])
+        if lesson.get("tags"):
+            metadata["tags"] = ",".join(lesson["tags"])
+
+        col.add(ids=[lesson_id], documents=["\n".join(doc_parts)], metadatas=[metadata])
+        print(f"Imported [{lesson_id}]: {lesson.get('summary', '?')}")
+
+
+def cmd_export(args):
+    col = get_collection()
+    all_data = col.get()
+    if not all_data["ids"]:
+        print("No lessons to export.", file=sys.stderr)
+        sys.exit(1)
+
+    lessons = []
+    for doc_id, doc, meta in zip(all_data["ids"], all_data["documents"], all_data["metadatas"]):
+        lessons.append({"id": doc_id, "document": doc, "metadata": meta})
+
+    output = json.dumps(lessons, indent=2)
+    if args.file:
+        with open(args.file, "w") as f:
+            f.write(output)
+        print(f"Exported {len(lessons)} lessons to {args.file}")
+    else:
+        print(output)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="libnn optimization knowledge base")
+    sub = parser.add_subparsers(dest="command")
+
+    p_add = sub.add_parser("add", help="Add a lesson")
+    p_add.add_argument("--json", action="store_true", help="Read lesson from JSON on stdin")
+
+    p_search = sub.add_parser("search", help="Search lessons")
+    p_search.add_argument("query", help="Search query")
+    p_search.add_argument("-n", type=int, default=5, help="Number of results")
+
+    sub.add_parser("list", help="List all lessons")
+
+    p_show = sub.add_parser("show", help="Show a lesson by ID")
+    p_show.add_argument("id", help="Lesson ID")
+
+    p_del = sub.add_parser("delete", help="Delete a lesson by ID")
+    p_del.add_argument("id", help="Lesson ID")
+
+    p_imp = sub.add_parser("import", help="Import lessons from JSON file")
+    p_imp.add_argument("file", help="JSON file path")
+
+    p_exp = sub.add_parser("export", help="Export all lessons to JSON")
+    p_exp.add_argument("file", nargs="?", help="Output file (stdout if omitted)")
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    {
+        "add": cmd_add,
+        "search": cmd_search,
+        "list": cmd_list,
+        "show": cmd_show,
+        "delete": cmd_delete,
+        "import": cmd_import,
+        "export": cmd_export,
+    }[args.command](args)
+
+
+if __name__ == "__main__":
+    main()

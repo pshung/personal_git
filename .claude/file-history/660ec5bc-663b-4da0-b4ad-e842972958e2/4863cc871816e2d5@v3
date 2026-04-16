@@ -1,0 +1,91 @@
+# AI-Tune Integration Plan
+
+## Goal
+Add `--ai-tune` path to AutoIREE that uses ModelzooRanker to predict top-5 tile configs per dispatch, measures only those 5 on FPGA, and picks the best one. No GA fallback.
+
+## Architecture
+
+```
+Per dispatch in --ai-tune:
+
+  MLIRTask
+    ├── .config_space (MultiConfigSpace)  ← AutoIREE's search space
+    ├── .subgraph_name                    ← dispatch identity
+    └── tile_config.json metadata         ← op metadata (iteration_space, dims, types)
+          │
+          ▼
+  ┌─────────────────────────────┐
+  │  Adapter Layer              │
+  │  (new: auto_iree/ai_rank/) │
+  │                             │
+  │  1. Extract op metadata     │
+  │     from MLIRTask + tile    │
+  │     config → Feature A [18] │
+  │                             │
+  │  2. Enumerate all configs   │
+  │     from MultiConfigSpace   │
+  │     → config.to_iree_format │
+  │     → lowering_config       │
+  │     → Feature B [S, 59]    │
+  │                             │
+  │  3. ModelzooRanker.forward  │
+  │     → scores [S]           │
+  │     → top-5 indices        │
+  └─────────────┬───────────────┘
+                │
+                ▼
+  Top-5 ConfigEntity objects
+                │
+                ▼
+  MLIRBuilder.build() + MLIRRunner.run()
+  → 5 MeasureResults (cycle counts)
+                │
+                ▼
+  Pick lowest-cycle config → save to history.log + record.json
+  → --build_transform_from_record → --export (existing pipeline)
+```
+
+## Tasks
+
+### Phase 1: Copy ModelzooRanker into AutoIREE
+- [x] 1.1 Copy model code: `model/ranker.py` into `python/auto_iree/ai_rank/model/`
+- [x] 1.2 Copy feature code: `data/features.py` into `python/auto_iree/ai_rank/features.py`
+- [x] 1.3 Copy trained weights: `model.pt` from `tmp/modelzoo_ranker_v3/` into `python/auto_iree/ai_rank/weights/`
+- [ ] 1.4 Add `torch` dependency to `pyproject.toml`
+- [x] 1.5 Verify: `from auto_iree.ai_rank.model.ranker import ModelzooRanker` imports cleanly
+
+### Phase 2: Adapter — Feature A extraction from MLIRTask
+- [x] 2.1 Write `auto_iree/ai_rank/adapter.py::extract_feature_a(task: MLIRTask)`
+- [x] 2.2 Test: given a known MLIRTask, feature_a matches expected 18-dim vector
+
+### Phase 3: Adapter — Feature B from ConfigEntity.to_iree_format()
+- [x] 3.1 Write `auto_iree/ai_rank/adapter.py::extract_feature_b(config, op_name, total_elements, tile_config)`
+- [x] 3.2 Test: given a known ConfigEntity, feature_b matches expected 59-dim vector
+
+### Phase 4: Ranking — enumerate space + batch inference
+- [x] 4.1 Write `auto_iree/ai_rank/ranker.py::AIRanker` with chunked batch inference
+- [x] 4.2 Handle large spaces: batch inference in chunks (10K per batch)
+- [x] 4.3 Test: AIRanker.rank() returns 5 ConfigEntity objects with valid indices
+
+### Phase 5: Wire into iree_tuner.py
+- [x] 5.1 Add CLI args: `--ai-tune`, `--ai-model`, `--ai-top-k`
+- [x] 5.2 Write `auto_iree/ai_tune.py` with `ai_tune_dispatch()` and `ai_tune_impl()`
+- [x] 5.3 Output is compatible with existing `--build_transform_from_record` and `--export`
+- [ ] 5.4 Test: end-to-end with dryrun mode (requires FPGA)
+
+### Phase 6: Train ModelzooRanker on dataset0314
+- [ ] 6.1 Prepare dataset0314 data in ModelzooRanker's expected format (raw.csv per split)
+- [ ] 6.2 Train model, evaluate top-5 error metric
+- [ ] 6.3 Replace bundled model.pt with dataset0314-trained weights
+
+### Phase 7: Integration test on real FPGA
+- [ ] 7.1 Run `--ai-tune` on a real model, compare top-5 error vs GA baseline
+- [ ] 7.2 Measure wall-clock speedup (5 measurements vs hundreds)
+
+## Key Design Decisions
+- **New pipeline path** (`--ai-tune`), does NOT touch existing GA code
+- **AutoIREE's search space** (MultiConfigSpace) generates configs, NOT ai_iree's search_space.py
+- **ModelzooRanker** (77-dim, residual MLP) from ai_iree, NOT TileRanker
+- **No GA fallback** — trust the model's top-5
+- **Enumerate all** configs in search space (no sampling)
+- **Record-compatible output** — reuses existing --build_transform_from_record → --export pipeline

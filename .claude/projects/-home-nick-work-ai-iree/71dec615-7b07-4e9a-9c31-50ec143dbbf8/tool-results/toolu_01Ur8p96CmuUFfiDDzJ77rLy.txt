@@ -1,0 +1,1624 @@
+     1→"""Tiling configuration search space generation."""
+     2→
+     3→import os
+     4→import json
+     5→import math
+     6→from typing import Dict, List, Tuple, Optional, Any
+     7→from itertools import product
+     8→
+     9→from . import config as _config
+    10→from .config import (
+    11→    DTYPE_BYTES,
+    12→    ACCUMULATOR_DTYPE,
+    13→    SIX_LEVEL_OPS,
+    14→)
+    15→
+    16→
+    17→class TilingStrategy:
+    18→    """Base class for tiling search space generation strategies."""
+    19→
+    20→    name: str = ""
+    21→
+    22→    def generate_configs(
+    23→        self,
+    24→        iterator_types: List[str],
+    25→        dim_sizes: List[int],
+    26→        output_dtype: str,
+    27→        max_configs: int,
+    28→        op_name: str,
+    29→        num_operands: int,
+    30→        input_dtype: str,
+    31→    ) -> List[List[List[int]]]:
+    32→        """Generate tiling configurations for one pattern."""
+    33→        raise NotImplementedError
+    34→
+    35→    def get_num_levels(self, op_name: str) -> int:
+    36→        """Return the number of tiling levels (4 or 6)."""
+    37→        raise NotImplementedError
+    38→
+    39→    def format_header(
+    40→        self,
+    41→        op_name: str,
+    42→        iterator_types: List[str],
+    43→        dim_sizes: List[int],
+    44→        input_dtype: str,
+    45→        num_levels: int,
+    46→    ) -> str:
+    47→        """Generate the # comment header block for a search space file."""
+    48→        raise NotImplementedError
+    49→
+    50→
+    51→
+    52→def get_lmul_vector_tiles(
+    53→    dim_size: int,
+    54→    input_dtype: str = 'f32',
+    55→) -> List[Tuple[int, int]]:
+    56→    """
+    57→    Get LMUL-based (V_inner, V_outer_max) tiers up to the ceiling tier.
+    58→
+    59→    Walks through LMUL tiers in ascending V_inner order, including all tiers
+    60→    up to and including the first tier where V_inner >= dim_size (the ceiling).
+    61→    If no tier reaches dim_size, all tiers are included.
+    62→
+    63→    Tier table selection:
+    64→    - f32 and non-widening types: LMUL_TIERS_F32 (LMUL1..LMUL8)
+    65→    - i8→i32 widening (input_dtype in i8/si8/ui8): LMUL_TIERS_I8_WIDENING
+    66→      v_inner = VLEN/8 × LMUL (MF4, MF2, LMUL1, LMUL2 — LMUL4/LMUL8 excluded)
+    67→
+    68→    If REQUIRE_V_INNER_DIVIDES_N=True, substitutes V_inner values that don't
+    69→    divide dim_size evenly with the largest divisor of dim_size that is ≤ V_inner.
+    70→
+    71→    Args:
+    72→        dim_size: Size of the inner-most parallel dimension.
+    73→        input_dtype: Input data type string (e.g., 'f32', 'i8').
+    74→
+    75→    Returns:
+    76→        List of (V_inner, V_outer_max) tuples.
+    77→    """
+    78→    # Select tier table based on widening: i8/si8/ui8 → i32 uses widening tiers
+    79→    is_widening = input_dtype in ('i8', 'si8', 'ui8')
+    80→    if is_widening and _config.LMUL_TIERS_I8_WIDENING:
+    81→        tiers = _config.LMUL_TIERS_I8_WIDENING
+    82→    else:
+    83→        tiers = _config.LMUL_TIERS_F32
+    84→
+    85→    result = []
+    86→    for vi, vo_max in tiers:
+    87→        # Apply divisibility substitution
+    88→        if _config.REQUIRE_V_INNER_DIVIDES_N and dim_size % vi != 0:
+    89→            # Find largest divisor of dim_size that is ≤ vi
+    90→            substitute_vi = None
+    91→            for d in range(min(vi, dim_size), 0, -1):
+    92→                if dim_size % d == 0:
+    93→                    substitute_vi = d
+    94→                    break
+    95→            if substitute_vi:
+    96→                result.append((substitute_vi, vo_max))
+    97→        else:
+    98→            result.append((vi, vo_max))
+    99→
+   100→        # Stop at ceiling tier (first tier where vi >= dim_size)
+   101→        if vi >= dim_size:
+   102→            break
+   103→    return result
+   104→
+   105→
+   106→def remap_probe_bounds_for_substitution(
+   107→    probe_bounds: Dict[int, int],
+   108→    dim_size: int
+   109→) -> tuple[Dict[int, int], Dict[int, int]]:
+   110→    """Remap probe bounds when v_inner values are substituted.
+   111→
+   112→    When get_lmul_vector_tiles substitutes v_inner values (e.g., 128→96),
+   113→    the probe bounds need to be updated to use the substituted keys.
+   114→
+   115→    Args:
+   116→        probe_bounds: Original bounds {v_inner: max_v_outer} from probing
+   117→        dim_size: Size of inner parallel dimension
+   118→
+   119→    Returns:
+   120→        Tuple of (remapped_bounds, substitution_map) where:
+   121→        - remapped_bounds: {substituted_v_inner: max_v_outer}
+   122→        - substitution_map: {substituted_v_inner: original_v_inner} for tracking
+   123→    """
+   124→    if not _config.REQUIRE_V_INNER_DIVIDES_N or not probe_bounds:
+   125→        return probe_bounds, {}
+   126→
+   127→    remapped = {}
+   128→    substitution_map = {}
+   129→    for vi, vo_max in probe_bounds.items():
+   130→        if dim_size % vi != 0:
+   131→            # Find substituted value (largest divisor ≤ vi)
+   132→            for d in range(min(vi, dim_size), 0, -1):
+   133→                if dim_size % d == 0:
+   134→                    remapped[d] = vo_max  # Use original bounds
+   135→                    substitution_map[d] = vi  # Track substitution
+   136→                    break
+   137→        else:
+   138→            remapped[vi] = vo_max
+   139→
+   140→    return remapped, substitution_map
+   141→
+   142→
+   143→def get_lmul_tier_capacity(v_inner: int) -> Tuple[int, str]:
+   144→    """Find the enclosing LMUL tier capacity for a given v_inner value.
+   145→
+   146→    Maps any v_inner (including substituted values) to the smallest LMUL tier
+   147→    whose capacity >= v_inner. This determines the actual hardware vector
+   148→    register capacity being used, regardless of how much of it v_inner fills.
+   149→
+   150→    Args:
+   151→        v_inner: The vector inner tile size from a tile configuration.
+   152→
+   153→    Returns:
+   154→        Tuple of (tier_capacity, lmul_label) where tier_capacity is the
+   155→        LMUL tier's V_inner and lmul_label is e.g. "LMUL1", "LMUL4".
+   156→    """
+   157→    for idx, (vi, _) in enumerate(_config.LMUL_TIERS_F32):
+   158→        if vi >= v_inner:
+   159→            return vi, f"LMUL{1 << idx}"
+   160→    # Beyond all tiers — use the largest
+   161→    last_vi, _ = _config.LMUL_TIERS_F32[-1]
+   162→    return last_vi, f"LMUL{1 << (len(_config.LMUL_TIERS_F32) - 1)}"
+   163→
+   164→
+   165→def check_vector_utilization(
+   166→    tile_config_path: str,
+   167→    threshold: float = 0.5,
+   168→) -> Dict[str, Any]:
+   169→    """Analyze vector utilization in a tile config search space file.
+   170→
+   171→    Extracts v_inner from generated configs and compares to the enclosing
+   172→    LMUL tier capacity. Flags configs where utilization
+   173→    (v_inner / tier_capacity) < threshold.
+   174→
+   175→    Args:
+   176→        tile_config_path: Path to a search space .json file.
+   177→        threshold: Utilization ratio below which to flag (default 0.5 = 50%).
+   178→
+   179→    Returns:
+   180→        Dict with:
+   181→            'file': basename of the file,
+   182→            'total_configs': count of non-baseline configs,
+   183→            'low_utilization': list of per-config dicts with v_inner,
+   184→                tier_capacity, lmul_label, utilization.
+   185→    """
+   186→    import ast
+   187→    import re
+   188→
+   189→    iterator_types = None
+   190→    num_levels = None
+   191→    dim_inner = None
+   192→    configs = []
+   193→
+   194→    with open(tile_config_path) as f:
+   195→        for line in f:
+   196→            line = line.strip()
+   197→            if line.startswith('# Iterator types:'):
+   198→                iterator_types = ast.literal_eval(line.split(':', 1)[1].strip())
+   199→            elif line.startswith('# Dim sizes:'):
+   200→                m = re.search(r'N\(inner\)=(\d+)', line)
+   201→                if m:
+   202→                    dim_inner = int(m.group(1))
+   203→            elif line.startswith('# Format:'):
+   204→                num_levels = 6 if 'L5' in line else 4
+   205→            elif line and not line.startswith('#'):
+   206→                # Strip optional index prefix (e.g., "42: [[...]]")
+   207→                if not line.startswith('['):
+   208→                    line = line.split(': ', 1)[-1]
+   209→                configs.append(json.loads(line))
+   210→
+   211→    basename = os.path.basename(tile_config_path)
+   212→    empty = {'file': basename, 'total_configs': 0, 'low_utilization': [],
+   213→             'dim_inner': dim_inner}
+   214→
+   215→    if not iterator_types or num_levels is None:
+   216→        return empty
+   217→
+   218→    parallel_dims = [i for i, t in enumerate(iterator_types) if t == 'parallel']
+   219→    if not parallel_dims:
+   220→        return empty
+   221→
+   222→    inner_parallel = parallel_dims[-1]
+   223→    vec_parallel_level = 3 if num_levels == 6 else 1
+   224→
+   225→    low_util = []
+   226→    total_non_baseline = 0
+   227→
+   228→    for idx, config in enumerate(configs):
+   229→        if len(config) <= vec_parallel_level:
+   230→            continue
+   231→        vec_parallel = config[vec_parallel_level]
+   232→        if inner_parallel >= len(vec_parallel):
+   233→            continue
+   234→
+   235→        v_inner = vec_parallel[inner_parallel]
+   236→        if v_inner == 0:
+   237→            continue
+   238→
+   239→        total_non_baseline += 1
+   240→        tier_capacity, lmul_label = get_lmul_tier_capacity(v_inner)
+   241→        utilization = v_inner / tier_capacity
+   242→
+   243→        if utilization < threshold:
+   244→            low_util.append({
+   245→                'config_idx': idx,
+   246→                'v_inner': v_inner,
+   247→                'tier_capacity': tier_capacity,
+   248→                'lmul_label': lmul_label,
+   249→                'utilization': utilization,
+   250→            })
+   251→
+   252→    return {
+   253→        'file': basename,
+   254→        'total_configs': total_non_baseline,
+   255→        'low_utilization': low_util,
+   256→        'dim_inner': dim_inner,
+   257→    }
+   258→
+   259→
+   260→def get_lmul_label(v_inner: int, input_dtype: str = 'f32') -> str:
+   261→    """Return a human-readable LMUL label for a V_inner value.
+   262→
+   263→    Uses the appropriate tier table based on input_dtype.
+   264→    i8 widening tiers: MF4, MF2, LMUL1, LMUL2.
+   265→    f32 tiers: LMUL1, LMUL2, LMUL4, LMUL8.
+   266→    Falls back to 'V=<v_inner>' for unknown values.
+   267→    """
+   268→    is_widening = input_dtype in ('i8', 'si8', 'ui8')
+   269→    if is_widening and _config.LMUL_TIERS_I8_WIDENING:
+   270→        _I8_LABELS = ['MF4', 'MF2', 'LMUL1', 'LMUL2']
+   271→        for idx, (vi, _) in enumerate(_config.LMUL_TIERS_I8_WIDENING):
+   272→            if vi == v_inner:
+   273→                return _I8_LABELS[idx] if idx < len(_I8_LABELS) else f"V={v_inner}"
+   274→    # f32 tiers (LMUL1..LMUL8)
+   275→    for idx, (vi, _) in enumerate(_config.LMUL_TIERS_F32):
+   276→        if vi == v_inner:
+   277→            return f"LMUL{1 << idx}"
+   278→    return f"V={v_inner}"
+   279→
+   280→
+   281→def compute_v_outer_candidates(max_v_outer: int, dim_M: int) -> List[int]:
+   282→    """Compute V_outer candidates with optional filtering.
+   283→
+   284→    Default: 2 candidates (max_v_outer + max divisor of M <= max_v_outer).
+   285→    Exhaustive (V_OUTER_EXHAUSTIVE=True): all values 1..effective_max.
+   286→
+   287→    Filtering options (applied after candidate generation):
+   288→    - REQUIRE_V_OUTER_DIVIDES_M: Only keep divisors of dim_M
+   289→    - Parity matching: odd dim_M keeps only odd v_outer, even dim_M keeps only even v_outer
+   290→    - V_OUTER_EXCLUDE: Remove explicitly excluded values
+   291→    - V_OUTER_MIN: Remove values below minimum
+   292→
+   293→    Args:
+   294→        max_v_outer: Maximum non-spilling V_outer from probe stage.
+   295→        dim_M: Size of the outer parallel dimension (M).
+   296→
+   297→    Returns:
+   298→        Sorted list of unique candidates after filtering.
+   299→    """
+   300→    effective_max = min(max_v_outer, dim_M)
+   301→
+   302→    # Generate base candidates
+   303→    if _config.V_OUTER_EXHAUSTIVE:
+   304→        candidates = set(range(1, effective_max + 1)) if effective_max >= 1 else set()
+   305→    else:
+   306→        candidates = set()
+   307→        candidates.add(effective_max)
+   308→        # Find max divisor of dim_M that fits within max_v_outer
+   309→        for d in range(effective_max, 0, -1):
+   310→            if dim_M % d == 0:
+   311→                candidates.add(d)
+   312→                break
+   313→
+   314→    # Apply filters
+   315→    if _config.REQUIRE_V_OUTER_DIVIDES_M:
+   316→        candidates = {v for v in candidates if dim_M % v == 0}
+   317→
+   318→    # Parity matching: odd dim_M → odd v_outer, even dim_M → even v_outer
+   319→    parity = dim_M % 2
+   320→    candidates = {v for v in candidates if v % 2 == parity}
+   321→
+   322→    if _config.V_OUTER_EXCLUDE:
+   323→        candidates = {v for v in candidates if v not in _config.V_OUTER_EXCLUDE}
+   324→
+   325→    if _config.V_OUTER_MIN > 1:
+   326→        candidates = {v for v in candidates if v >= _config.V_OUTER_MIN}
+   327→
+   328→    return sorted(candidates) if candidates else [0]
+   329→
+   330→
+   331→def _is_prime(n):
+   332→    """Return True if n is a prime number."""
+   333→    if n < 2:
+   334→        return False
+   335→    if n < 4:
+   336→        return True
+   337→    if n % 2 == 0 or n % 3 == 0:
+   338→        return False
+   339→    i = 5
+   340→    while i * i <= n:
+   341→        if n % i == 0 or n % (i + 2) == 0:
+   342→            return False
+   343→        i += 6
+   344→    return True
+   345→
+   346→
+   347→def generate_distribution_configs(
+   348→    v_inner: int,
+   349→    v_outer: int,
+   350→    dim_inner: int,
+   351→    dim_outer: int,
+   352→    output_element_bytes: int = 4,
+   353→    l2_targets: Optional[List[int]] = None,
+   354→) -> List[Tuple[int, int]]:
+   355→    """Generate (dist_outer, dist_inner) pairs: 1 per L2 target.
+   356→
+   357→    Strategy: maximize dist_inner (N dimension), reduce dist_outer (M) to fit
+   358→    L2 budget, avoid prime dist_outer.
+   359→
+   360→    All values snapped to V_inner grid and <= dim size.
+   361→    Deduplicated across L2 targets.
+   362→
+   363→    Args:
+   364→        v_inner: Vector inner tile size.
+   365→        v_outer: Vector outer tile size.
+   366→        dim_inner: Inner parallel dimension size.
+   367→        dim_outer: Outer parallel dimension size.
+   368→        output_element_bytes: Bytes per output element (default 4 for f32/i32).
+   369→        l2_targets: L2 utilization targets in bytes. Defaults to config.L2_TARGETS.
+   370→
+   371→    Returns:
+   372→        List of (dist_outer, dist_inner) pairs.
+   373→    """
+   374→    if l2_targets is None:
+   375→        l2_targets = _config.L2_TARGETS
+   376→
+   377→    if v_inner <= 0 or v_outer <= 0:
+   378→        return [(min(1, dim_outer), min(1, dim_inner))]
+   379→
+   380→    seen = set()
+   381→    pairs = []
+   382→
+   383→    for l2_budget in l2_targets:
+   384→        max_elements = l2_budget // output_element_bytes
+   385→
+   386→        # Maximize dist_inner (N dimension), snap to v_inner grid
+   387→        d_inner_mult = min(dim_inner, max_elements) // v_inner
+   388→        if d_inner_mult < 1:
+   389→            d_inner_mult = 1
+   390→        d_inner = min(v_inner * d_inner_mult, dim_inner)
+   391→
+   392→        # Reduce dist_outer (M dimension) to fit L2 budget
+   393→        remaining = max_elements // d_inner if d_inner > 0 else 1
+   394→        d_outer = min(remaining, dim_outer)
+   395→        # Avoid prime dist_outer: if prime and >2, decrement to nearest even
+   396→        if d_outer > 2 and _is_prime(d_outer):
+   397→            d_outer -= 1
+   398→
+   399→        key = (d_outer, d_inner)
+   400→        if key not in seen:
+   401→            seen.add(key)
+   402→            pairs.append(key)
+   403→
+   404→    if not pairs:
+   405→        return [(min(v_outer, dim_outer), min(v_inner, dim_inner))]
+   406→
+   407→    return pairs
+   408→
+   409→
+   410→def snap_to_grid(target: int, v_step: int) -> int:
+   411→    """
+   412→    Snap a target value to the nearest multiple of v_step.
+   413→
+   414→    Mult = max(1, round(target / v_step)), return v_step * Mult.
+   415→    """
+   416→    mult = max(1, round(target / v_step))
+   417→    return v_step * mult
+   418→
+   419→
+   420→def calculate_vector_size_bytes(
+   421→    tile_sizes: List[int],
+   422→    dim_sizes: List[int],
+   423→    dtype: str = 'f32',
+   424→    iterator_types: Optional[List[str]] = None
+   425→) -> int:
+   426→    """
+   427→    Calculate effective vector size in bytes for a vector-level tiling config.
+   428→
+   429→    At the vector level, tile_size=0 means "use full dimension" (not tiled),
+   430→    which uses the actual dimension size for the calculation.
+   431→
+   432→    For integer types (i8, i16) with reduction dimensions, uses accumulator
+   433→    type (i32) for size calculation since reductions accumulate to wider types.
+   434→    Element-wise ops (no reduction) use the original dtype.
+   435→
+   436→    Args:
+   437→        tile_sizes: Tile sizes for each dimension (0 means use full dim_size)
+   438→        dim_sizes: Actual dimension sizes
+   439→        dtype: Data type string (e.g., 'f32', 'i8')
+   440→        iterator_types: Optional list of iterator types ('parallel' or 'reduction')
+   441→
+   442→    Returns:
+   443→        Vector size in bytes
+   444→    """
+   445→    if len(tile_sizes) != len(dim_sizes):
+   446→        return 0
+   447→
+   448→    # Check if there are reduction dimensions (need accumulator type for integers)
+   449→    has_reduction = False
+   450→    if iterator_types:
+   451→        has_reduction = any(t == 'reduction' for t in iterator_types)
+   452→
+   453→    # Use accumulator type for small integers only when there are reductions
+   454→    if has_reduction:
+   455→        acc_dtype = ACCUMULATOR_DTYPE.get(dtype, dtype)
+   456→    else:
+   457→        acc_dtype = dtype
+   458→    element_bytes = DTYPE_BYTES.get(acc_dtype, 4)
+   459→
+   460→    num_elements = 1
+   461→    for tile, dim in zip(tile_sizes, dim_sizes):
+   462→        # tile=0 means use full dimension size
+   463→        effective_tile = tile if tile > 0 else dim
+   464→        num_elements *= effective_tile
+   465→
+   466→    return num_elements * element_bytes
+   467→
+   468→
+   469→def is_valid_vector_config(
+   470→    config: List[List[int]],
+   471→    dim_sizes: List[int],
+   472→    dtype: str = 'f32',
+   473→    max_vector_bytes: int = None,
+   474→    iterator_types: Optional[List[str]] = None
+   475→) -> bool:
+   476→    """
+   477→    Check if a tiling configuration produces valid vector sizes.
+   478→
+   479→    Validates that the vector-level tiles don't exceed IREE's maximum
+   480→    allowed vector size (65536 bytes by default).
+   481→
+   482→    Checks BOTH vector parallel and vector reduction levels:
+   483→    - 4-level: L1 (vector parallel) + L2 (vector reduction)
+   484→    - 6-level: L3 (vector outer) + L4 (vector reduction)
+   485→
+   486→    Args:
+   487→        config: List of tile size lists for each level
+   488→        dim_sizes: Actual dimension sizes
+   489→        dtype: Data type string
+   490→        max_vector_bytes: Maximum allowed vector size in bytes
+   491→        iterator_types: Optional list of iterator types ('parallel' or 'reduction')
+   492→
+   493→    Returns:
+   494→        True if configuration is valid, False otherwise
+   495→    """
+   496→    if max_vector_bytes is None:
+   497→        max_vector_bytes = _config.IREE_MAX_VECTOR_BYTES
+   498→    num_levels = len(config)
+   499→
+   500→    # Vector parallel level: L1 for 4-level, L3 for 6-level
+   501→    # Vector reduction level: L2 for 4-level, L4 for 6-level
+   502→    if num_levels == 4:
+   503→        vec_parallel_level, vec_reduction_level = 1, 2
+   504→    elif num_levels == 6:
+   505→        vec_parallel_level, vec_reduction_level = 3, 4
+   506→    else:
+   507→        return True
+   508→
+   509→    if vec_reduction_level >= num_levels:
+   510→        return True
+   511→
+   512→    vec_parallel = config[vec_parallel_level]
+   513→    vec_reduction = config[vec_reduction_level]
+   514→
+   515→    # Combine tiles: parallel dims from vec_parallel, reduction dims from vec_reduction
+   516→    # For each dim, one level has the tile value, the other has 0
+   517→    # Take the non-zero value (or 0 if both are 0, which means full dim)
+   518→    combined_tiles = []
+   519→    for p, r in zip(vec_parallel, vec_reduction):
+   520→        # Use whichever is non-zero; if both 0, stay 0 (will use full dim)
+   521→        combined_tiles.append(p if p > 0 else r)
+   522→
+   523→    vector_bytes = calculate_vector_size_bytes(combined_tiles, dim_sizes, dtype, iterator_types)
+   524→
+   525→    return vector_bytes < max_vector_bytes
+   526→
+   527→
+   528→def get_divisors(n: int, max_val: int = None) -> List[int]:
+   529→    """Get all divisors of n, optionally limited by max_val."""
+   530→    if n <= 0:
+   531→        return []
+   532→    divisors = set()
+   533→    for i in range(1, int(math.sqrt(n)) + 1):
+   534→        if n % i == 0:
+   535→            divisors.add(i)
+   536→            divisors.add(n // i)
+   537→    if max_val:
+   538→        divisors = {d for d in divisors if d <= max_val}
+   539→    return sorted(divisors)
+   540→
+   541→
+   542→def is_valid_vector_parallel_tiling(
+   543→    vector_parallel_level: List[int],
+   544→    parallel_dims: List[int]
+   545→) -> bool:
+   546→    """
+   547→    Check if vector parallel tiling is valid.
+   548→
+   549→    Remove configs where inner-most parallel dimension is 1 unless all other
+   550→    parallel dimensions are also 1.
+   551→    e.g., [2, 1] => invalid (remove), [1, 1] => valid (keep), [2, 4] => valid
+   552→    """
+   553→    if not parallel_dims:
+   554→        return True
+   555→
+   556→    # Get the parallel dimension values from the tiling level
+   557→    parallel_values = [vector_parallel_level[i] for i in parallel_dims]
+   558→
+   559→    # Inner-most parallel dimension is the last one
+   560→    inner_most_value = parallel_values[-1]
+   561→    other_values = parallel_values[:-1]
+   562→
+   563→    # If inner-most is 1, check if all others are also 1
+   564→    if inner_most_value == 1 and other_values:
+   565→        # If any other value is not 1, this config is invalid
+   566→        if any(v != 1 for v in other_values):
+   567→            return False
+   568→
+   569→    return True
+   570→
+   571→
+   572→def generate_l0_distribution_options(
+   573→    iterator_types: List[str],
+   574→    dim_sizes: List[int],
+   575→    num_operands: int = 2,
+   576→) -> List[List[int]]:
+   577→    """
+   578→    Generate L0 distribution level tiling options (cache-aware).
+   579→
+   580→    All parallel dimensions share the same tile size T chosen from multiples
+   581→    of 64 that fit in cache. For dimensions where T doesn't divide evenly,
+   582→    use the largest factor of D below T instead.
+   583→
+   584→    Cache constraint: T^num_parallel_dims * element_size * num_operands <= CACHE_SIZE_BYTES
+   585→    Element size is always 4 bytes (f32, or i32 accumulator for i8->i32 quantized).
+   586→
+   587→    Rules per parallel dimension D:
+   588→    - D < 64: candidates = {D}
+   589→    - D >= 64: candidates = {multiples of 64 that divide D} filtered to <= D
+   590→      If no multiple of 64 divides D: use largest factor of D below 64
+   591→      Always include D itself
+   592→
+   593→    All parallel dims use the same T; if T doesn't divide D, that dim uses
+   594→    the largest factor of D that is <= T.
+   595→
+   596→    Returns:
+   597→        List of L0 tile size lists (one per option).
+   598→    """
+   599→    ndims = len(iterator_types)
+   600→    parallel_dims = [i for i, t in enumerate(iterator_types) if t == 'parallel']
+   601→
+   602→    if not parallel_dims:
+   603→        return [[0] * ndims]
+   604→
+   605→    # Always use 4 bytes: f32 or i32 accumulator for i8->i32 quantized ops
+   606→    element_size = 4
+   607→    num_parallel = len(parallel_dims)
+   608→
+   609→    # Compute max T that fits in cache: T^num_parallel * element_size * num_operands <= cache
+   610→    num_operands = max(num_operands, 1)
+   611→    max_tile_elements = _config.CACHE_SIZE_BYTES / (element_size * num_operands)
+   612→    max_T = int(max_tile_elements ** (1.0 / num_parallel)) if num_parallel > 0 else 2048
+   613→
+   614→    # Parallel dimension sizes
+   615→    parallel_sizes = [dim_sizes[i] for i in parallel_dims]
+   616→    min_parallel_size = min(parallel_sizes)
+   617→
+   618→    # Cap T to min parallel dim size and cache limit
+   619→    T_cap = min(min_parallel_size, max_T)
+   620→
+   621→    # Collect shared T candidates from multiples of 64
+   622→    shared_T_candidates = set()
+   623→    for m64 in _config.DIST_MULTIPLES_OF_64:
+   624→        if m64 <= T_cap:
+   625→            shared_T_candidates.add(m64)
+   626→
+   627→    l0_options = []
+   628→
+   629→    # For each shared T, compute per-dimension tile sizes
+   630→    for T in sorted(shared_T_candidates):
+   631→        l0 = [0] * ndims
+   632→        for idx in parallel_dims:
+   633→            D = dim_sizes[idx]
+   634→            if D % T == 0:
+   635→                l0[idx] = T
+   636→            else:
+   637→                # Find largest factor of D that is <= T
+   638→                factors = get_divisors(D, max_val=T)
+   639→                l0[idx] = factors[-1] if factors else T
+   640→        l0_options.append(l0)
+   641→
+   642→    # If no multiple of 64 divides min_parallel_size and min_parallel_size >= 64,
+   643→    # add fallback: largest factor of each dim below 64
+   644→    has_exact_m64 = any(min_parallel_size % m64 == 0 for m64 in _config.DIST_MULTIPLES_OF_64
+   645→                        if m64 <= min_parallel_size)
+   646→    if not has_exact_m64 and min_parallel_size >= 64:
+   647→        l0 = [0] * ndims
+   648→        for idx in parallel_dims:
+   649→            D = dim_sizes[idx]
+   650→            factors_below_64 = [f for f in get_divisors(D) if f < 64]
+   651→            l0[idx] = max(factors_below_64) if factors_below_64 else D
+   652→        l0_options.append(l0)
+   653→
+   654→    # Always add D itself for each parallel dim (max tile = full dimension)
+   655→    l0_full = [0] * ndims
+   656→    for idx in parallel_dims:
+   657→        l0_full[idx] = dim_sizes[idx]
+   658→    l0_options.append(l0_full)
+   659→
+   660→    # Deduplicate
+   661→    seen = set()
+   662→    unique_options = []
+   663→    for l0 in l0_options:
+   664→        key = tuple(l0)
+   665→        if key not in seen:
+   666→            seen.add(key)
+   667→            unique_options.append(l0)
+   668→
+   669→    return unique_options
+   670→
+   671→
+   672→def is_6level_op(op_name: str) -> bool:
+   673→    """Check if an operation uses 6-level tiling."""
+   674→    return op_name in SIX_LEVEL_OPS
+   675→
+   676→
+   677→def get_num_levels(op_name: str) -> int:
+   678→    """Get the number of tiling levels for an operation."""
+   679→    return 6 if is_6level_op(op_name) else 4
+   680→
+   681→
+   682→def is_valid_conv_config(config: List[List[int]], op_name: str,
+   683→                         dim_sizes: List[int] = None) -> bool:
+   684→    """
+   685→    Check if a tiling configuration is valid for convolution decomposition.
+   686→
+   687→    IREE's CPUConvTileAndDecomposeExpert requires that after applying all
+   688→    tiling levels, at least one spatial dimension (H or W) has BOTH the
+   689→    kernel size AND output size reduced to 1, so the conv can be decomposed
+   690→    into a simpler operation (e.g., matmul).
+   691→
+   692→    Additionally, the innermost parallel dimension (output channels C) must
+   693→    have a tile size > 1 at the vector level to enable vectorization.
+   694→
+   695→    Args:
+   696→        config: 4-level tiling configuration
+   697→        op_name: Name of the operation (e.g., 'linalg.conv_2d_nhwc_hwcf')
+   698→        dim_sizes: Original dimension sizes for the operation
+   699→
+   700→    Returns:
+   701→        True if the configuration is valid for conv decomposition
+   702→    """
+   703→    op_lower = op_name.lower()
+   704→    if 'conv' not in op_lower and 'pooling' not in op_lower:
+   705→        return True
+   706→
+   707→    # For conv ops, check L1 (vector parallel level)
+   708→    # The innermost parallel dimension (typically position 3 for NHWC - channels)
+   709→    # needs a tile size > 1 to enable vectorization
+   710→    l1 = config[1]  # Vector parallel level
+   711→    if 'conv' in op_lower:
+   712→        if len(l1) >= 4:
+   713→            innermost_parallel = l1[3]  # C dimension for NHWC formats
+   714→            if innermost_parallel <= 1:
+   715→                return False
+   716→
+   717→    # Simulate IREE's verifyConvTileAndDecomposeExpertConfig:
+   718→    # Apply all tiling levels to the original shape, then check that at least
+   719→    # one spatial dim has both kernel and output reduced to 1.
+   720→    if dim_sizes is None:
+   721→        return True
+   722→
+   723→    shape = list(dim_sizes)
+   724→    for level in config:
+   725→        for i, size in enumerate(level):
+   726→            if i >= len(shape):
+   727→                break
+   728→            if size == 1:
+   729→                shape[i] = 1
+   730→            if shape[i] == -1 or size == 0:
+   731→                continue
+   732→            if shape[i] % size != 0:
+   733→                shape[i] = -1
+   734→            else:
+   735→                shape[i] = size
+   736→
+   737→    # Determine KH, KW, OH, OW indices based on operation type
+   738→    if 'conv_2d_nhwc_hwcf' in op_lower or 'depthwise_conv_2d_nhwc_hwc' in op_lower:
+   739→        # Dims: [N, OH, OW, OC, KH, KW, (IC)]
+   740→        if len(shape) >= 6:
+   741→            oh, ow = shape[1], shape[2]
+   742→            kh, kw = shape[4], shape[5]
+   743→            remove_h = (kh == 1 and oh == 1)
+   744→            remove_w = (kw == 1 and ow == 1)
+   745→            if not remove_h and not remove_w:
+   746→                return False
+   747→    elif 'conv_2d_nchw_fchw' in op_lower:
+   748→        # Dims: [N, OC, OH, OW, (IC), KH, KW]
+   749→        if len(shape) >= 7:
+   750→            oh, ow = shape[2], shape[3]
+   751→            kh, kw = shape[5], shape[6]
+   752→            remove_h = (kh == 1 and oh == 1)
+   753→            remove_w = (kw == 1 and ow == 1)
+   754→            if not remove_h and not remove_w:
+   755→                return False
+   756→    elif 'pooling_nhwc' in op_lower:
+   757→        # Dims: [N, OH, OW, OC, KH, KW]
+   758→        if len(shape) >= 6:
+   759→            oh, ow = shape[1], shape[2]
+   760→            kh, kw = shape[4], shape[5]
+   761→            remove_h = (kh == 1 and oh == 1)
+   762→            remove_w = (kw == 1 and ow == 1)
+   763→            if not remove_h and not remove_w:
+   764→                return False
+   765→    elif 'pooling_nchw' in op_lower:
+   766→        # Dims: [N, OC, OH, OW, KH, KW]
+   767→        if len(shape) >= 6:
+   768→            oh, ow = shape[2], shape[3]
+   769→            kh, kw = shape[4], shape[5]
+   770→            remove_h = (kh == 1 and oh == 1)
+   771→            remove_w = (kw == 1 and ow == 1)
+   772→            if not remove_h and not remove_w:
+   773→                return False
+   774→
+   775→    return True
+   776→
+   777→
+   778→def generate_configs_4level(
+   779→    iterator_types: List[str],
+   780→    dim_sizes: List[int],
+   781→    output_dtype: str = 'f32',
+   782→    max_configs: int = 100000,
+   783→    op_name: str = '',
+   784→    num_operands: int = 2,
+   785→    input_dtype: str = 'f32',
+   786→) -> List[List[List[int]]]:
+   787→    """
+   788→    Generate valid 4-level tiling configurations using LMUL-based pruning.
+   789→
+   790→    4-Level Structure:
+   791→    - L0: Distribution (L2 targets x 3 aspect ratios)
+   792→    - L1: Vector parallel (LMUL-based V_inner/V_outer)
+   793→    - L2: Vector reduction (K-peeling)
+   794→    - L3: All zeros (inner)
+   795→    """
+   796→    ndims = len(iterator_types)
+   797→    parallel_dims = [i for i, t in enumerate(iterator_types) if t == 'parallel']
+   798→    reduction_dims = [i for i, t in enumerate(iterator_types) if t == 'reduction']
+   799→
+   800→    if not parallel_dims:
+   801→        return [[[0] * ndims, [0] * ndims, [0] * ndims, [0] * ndims]]
+   802→
+   803→    inner_parallel = parallel_dims[-1]
+   804→    second_inner = parallel_dims[-2] if len(parallel_dims) > 1 else None
+   805→
+   806→    N = dim_sizes[inner_parallel]
+   807→    lmul_tiers = get_lmul_vector_tiles(N, input_dtype)
+   808→
+   809→    # K-peel on inner-most reduction dim only
+   810→    inner_reduction = reduction_dims[-1] if reduction_dims else None
+   811→    if inner_reduction is not None:
+   812→        base_k_peel = list(_config.K_PEEL_CANDIDATES)
+   813→        if N < _config.SMALL_N_THRESHOLD:
+   814→            base_k_peel = sorted(set(base_k_peel + [_config.SMALL_N_K_PEEL]))
+   815→        k_peel_cands = [k for k in base_k_peel if k <= dim_sizes[inner_reduction]]
+   816→        if not k_peel_cands:
+   817→            k_peel_cands = [1]
+   818→    else:
+   819→        k_peel_cands = []
+   820→
+   821→    is_conv = 'conv' in op_name.lower() or 'pooling' in op_name.lower()
+   822→
+   823→    seen = set()
+   824→    configs = []
+   825→    l3 = [0] * ndims
+   826→
+   827→    for v_inner, v_outer_max in lmul_tiers:
+   828→        # Use tier table max for 4-level (no per-dist probing for 4-level ops)
+   829→        max_vo = v_outer_max
+   830→
+   831→        # Compute V_outer candidates
+   832→        if second_inner is not None:
+   833→            dim_M = dim_sizes[second_inner]
+   834→            v_outer_list = compute_v_outer_candidates(max_vo, dim_M)
+   835→        else:
+   836→            v_outer_list = [1]
+   837→
+   838→        for v_outer in v_outer_list:
+   839→            dim_inner = dim_sizes[inner_parallel]
+   840→            dim_outer = dim_sizes[second_inner] if second_inner is not None else 1
+   841→
+   842→            dist_pairs = generate_distribution_configs(
+   843→                v_inner, v_outer, dim_inner, dim_outer)
+   844→
+   845→            for dist_outer, dist_inner in dist_pairs:
+   846→                # Build L0 (other parallel dims = 0)
+   847→                l0 = [0] * ndims
+   848→                l0[inner_parallel] = dist_inner
+   849→                if second_inner is not None:
+   850→                    l0[second_inner] = dist_outer
+   851→
+   852→                # Build L1 (vec parallel, other parallel dims = 1)
+   853→                l1_base = [0] * ndims
+   854→                l1_base[inner_parallel] = v_inner
+   855→                if second_inner is not None:
+   856→                    l1_base[second_inner] = v_outer
+   857→                for idx in parallel_dims:
+   858→                    if idx != inner_parallel and idx != second_inner:
+   859→                        l1_base[idx] = 1
+   860→
+   861→                # K-peeling on inner-most reduction dim
+   862→                if k_peel_cands:
+   863→                    for k_val in k_peel_cands:
+   864→                        l2 = [0] * ndims
+   865→                        l2[inner_reduction] = k_val
+   866→                        if is_conv:
+   867→                            for r_idx in reduction_dims:
+   868→                                if r_idx != inner_reduction:
+   869→                                    l2[r_idx] = 1
+   870→                        config = [l0[:], l1_base[:], l2, l3[:]]
+   871→                        if (is_valid_vector_config(config, dim_sizes, output_dtype) and
+   872→                                is_valid_conv_config(config, op_name, dim_sizes)):
+   873→                            key = tuple(tuple(lev) for lev in config)
+   874→                            if key not in seen:
+   875→                                seen.add(key)
+   876→                                configs.append(config)
+   877→                                if len(configs) >= max_configs:
+   878→                                    return configs
+   879→                else:
+   880→                    # No reduction dims (element-wise)
+   881→                    l2 = [0] * ndims
+   882→                    config = [l0[:], l1_base[:], l2, l3[:]]
+   883→                    if (is_valid_vector_config(config, dim_sizes, output_dtype) and
+   884→                            is_valid_conv_config(config, op_name, dim_sizes)):
+   885→                        key = tuple(tuple(lev) for lev in config)
+   886→                        if key not in seen:
+   887→                            seen.add(key)
+   888→                            configs.append(config)
+   889→                            if len(configs) >= max_configs:
+   890→                                return configs
+   891→
+   892→    return configs
+   893→
+   894→
+   895→def generate_configs_6level(
+   896→    iterator_types: List[str],
+   897→    dim_sizes: List[int],
+   898→    output_dtype: str = 'f32',
+   899→    max_configs: int = 100000,
+   900→    num_operands: int = 2,
+   901→    input_dtype: str = 'f32',
+   902→) -> List[List[List[int]]]:
+   903→    """
+   904→    Generate valid 6-level tiling configurations using LMUL-based pruning.
+   905→
+   906→    6-Level Structure:
+   907→    - L0 = L1: Distribution (L2 targets x 3 aspect ratios)
+   908→    - L2: All zeros (cache level)
+   909→    - L3: Vector parallel (LMUL-based V_inner/V_outer)
+   910→    - L4: Vector reduction (K-peeling)
+   911→    - L5: All zeros (inner)
+   912→    """
+   913→    ndims = len(iterator_types)
+   914→    parallel_dims = [i for i, t in enumerate(iterator_types) if t == 'parallel']
+   915→    reduction_dims = [i for i, t in enumerate(iterator_types) if t == 'reduction']
+   916→
+   917→    if not parallel_dims:
+   918→        return [[[0] * ndims for _ in range(6)]]
+   919→
+   920→    inner_parallel = parallel_dims[-1]
+   921→    second_inner = parallel_dims[-2] if len(parallel_dims) > 1 else None
+   922→
+   923→    N = dim_sizes[inner_parallel]
+   924→    lmul_tiers = get_lmul_vector_tiles(N, input_dtype)
+   925→
+   926→    # K-peel on inner-most reduction dim only
+   927→    inner_reduction = reduction_dims[-1] if reduction_dims else None
+   928→    if inner_reduction is not None:
+   929→        base_k_peel = list(_config.K_PEEL_CANDIDATES)
+   930→        if N < _config.SMALL_N_THRESHOLD:
+   931→            base_k_peel = sorted(set(base_k_peel + [_config.SMALL_N_K_PEEL]))
+   932→        k_peel_cands = [k for k in base_k_peel if k <= dim_sizes[inner_reduction]]
+   933→        if not k_peel_cands:
+   934→            k_peel_cands = [1]
+   935→    else:
+   936→        k_peel_cands = []
+   937→
+   938→    seen = set()
+   939→    configs = []
+   940→    l2 = [0] * ndims
+   941→    l5 = [0] * ndims
+   942→
+   943→    for v_inner, v_outer_max in lmul_tiers:
+   944→        # Use tier table max for 4-level (no per-dist probing for 4-level ops)
+   945→        max_vo = v_outer_max
+   946→
+   947→        # Compute V_outer candidates
+   948→        if second_inner is not None:
+   949→            dim_M = dim_sizes[second_inner]
+   950→            v_outer_list = compute_v_outer_candidates(max_vo, dim_M)
+   951→        else:
+   952→            v_outer_list = [1]
+   953→
+   954→        for v_outer in v_outer_list:
+   955→            dim_inner = dim_sizes[inner_parallel]
+   956→            dim_outer = dim_sizes[second_inner] if second_inner is not None else 1
+   957→
+   958→            dist_pairs = generate_distribution_configs(
+   959→                v_inner, v_outer, dim_inner, dim_outer)
+   960→
+   961→            for dist_outer, dist_inner in dist_pairs:
+   962→                # Build L0 = L1 (other parallel dims = 0)
+   963→                l0 = [0] * ndims
+   964→                l0[inner_parallel] = dist_inner
+   965→                if second_inner is not None:
+   966→                    l0[second_inner] = dist_outer
+   967→                l1 = l0[:]
+   968→
+   969→                # Build L3 (vec parallel, other parallel dims = 1)
+   970→                l3_base = [0] * ndims
+   971→                l3_base[inner_parallel] = v_inner
+   972→                if second_inner is not None:
+   973→                    l3_base[second_inner] = v_outer
+   974→                for idx in parallel_dims:
+   975→                    if idx != inner_parallel and idx != second_inner:
+   976→                        l3_base[idx] = 1
+   977→
+   978→                # K-peeling on inner-most reduction dim only
+   979→                if k_peel_cands:
+   980→                    for k_val in k_peel_cands:
+   981→                        l4 = [0] * ndims
+   982→                        l4[inner_reduction] = k_val
+   983→                        config = [l0[:], l1[:], l2[:], l3_base[:], l4, l5[:]]
+   984→                        if is_valid_vector_config(config, dim_sizes, output_dtype):
+   985→                            key = tuple(tuple(lev) for lev in config)
+   986→                            if key not in seen:
+   987→                                seen.add(key)
+   988→                                configs.append(config)
+   989→                                if len(configs) >= max_configs:
+   990→                                    return configs
+   991→                else:
+   992→                    l4 = [0] * ndims
+   993→                    config = [l0[:], l1[:], l2[:], l3_base[:], l4, l5[:]]
+   994→                    if is_valid_vector_config(config, dim_sizes, output_dtype):
+   995→                        key = tuple(tuple(lev) for lev in config)
+   996→                        if key not in seen:
+   997→                            seen.add(key)
+   998→                            configs.append(config)
+   999→                            if len(configs) >= max_configs:
+  1000→                                return configs
+  1001→
+  1002→    return configs
+  1003→
+  1004→
+  1005→def get_dim_sizes_from_shape_pattern(
+  1006→    op_name: str,
+  1007→    iterator_types: List[str],
+  1008→    shape_pattern: Dict
+  1009→) -> List[int]:
+  1010→    """Extract dimension sizes from shape pattern based on operation type."""
+  1011→    inputs = shape_pattern.get('inputs', [])
+  1012→    outputs = shape_pattern.get('outputs', [])
+  1013→    all_dims = shape_pattern.get('all_dims', [])
+  1014→    ndims = len(iterator_types)
+  1015→
+  1016→    if 'conv_2d_nhwc_hwcf' in op_name:
+  1017→        if outputs:
+  1018→            out_shape = outputs[0]['shape']
+  1019→            kernel_shape = inputs[1]['shape'] if len(inputs) > 1 else [3, 3, 3, 64]
+  1020→            return [out_shape[0], out_shape[1], out_shape[2], out_shape[3],
+  1021→                    kernel_shape[0], kernel_shape[1], kernel_shape[2]]
+  1022→
+  1023→    elif 'depthwise_conv_2d_nhwc_hwc' in op_name:
+  1024→        if outputs:
+  1025→            out_shape = outputs[0]['shape']
+  1026→            kernel_shape = inputs[1]['shape'] if len(inputs) > 1 else [3, 3, 144]
+  1027→            return [out_shape[0], out_shape[1], out_shape[2], out_shape[3],
+  1028→                    kernel_shape[0], kernel_shape[1]]
+  1029→
+  1030→    elif 'pooling_nhwc' in op_name:
+  1031→        if outputs:
+  1032→            out_shape = outputs[0]['shape']
+  1033→            pool_shape = inputs[1]['shape'] if len(inputs) > 1 else [3, 3]
+  1034→            return [out_shape[0], out_shape[1], out_shape[2], out_shape[3],
+  1035→                    pool_shape[0], pool_shape[1]]
+  1036→
+  1037→    elif op_name == 'linalg.matmul':
+  1038→        if inputs and len(inputs) >= 2:
+  1039→            a_shape = inputs[0]['shape']
+  1040→            b_shape = inputs[1]['shape']
+  1041→            return [a_shape[0], b_shape[1], a_shape[1]]
+  1042→
+  1043→    elif op_name == 'linalg.batch_matmul':
+  1044→        if inputs and len(inputs) >= 2:
+  1045→            a_shape = inputs[0]['shape']
+  1046→            b_shape = inputs[1]['shape']
+  1047→            return [a_shape[0], a_shape[1], b_shape[2], a_shape[2]]
+  1048→
+  1049→    elif op_name == 'linalg.vecmat':
+  1050→        if inputs and len(inputs) >= 2:
+  1051→            a_shape = inputs[0]['shape']
+  1052→            b_shape = inputs[1]['shape']
+  1053→            return [b_shape[1], b_shape[0]]
+  1054→
+  1055→    elif op_name == 'linalg.matvec':
+  1056→        if inputs and len(inputs) >= 2:
+  1057→            a_shape = inputs[0]['shape']
+  1058→            b_shape = inputs[1]['shape']
+  1059→            return [a_shape[0], a_shape[1]]
+  1060→
+  1061→    # Fallback: use lowering_config tile_sizes dimensions
+  1062→    lowering_config = shape_pattern.get('lowering_config', {})
+  1063→    if lowering_config:
+  1064→        tile_sizes = lowering_config.get('tile_sizes', [[]])
+  1065→        if tile_sizes and tile_sizes[0]:
+  1066→            ndims_from_tiles = len(tile_sizes[0])
+  1067→            if ndims_from_tiles == ndims:
+  1068→                return [max(64, t * 4) if t > 0 else 64 for t in tile_sizes[0]]
+  1069→
+  1070→    # Last resort: use all_dims or generate defaults
+  1071→    if all_dims and len(all_dims) >= ndims:
+  1072→        return [d if d is not None and d > 0 else 64 for d in all_dims[:ndims]]
+  1073→
+  1074→    return [64] * ndims
+  1075→
+  1076→
+  1077→def get_dtype_from_pattern(shape_pattern: Dict) -> Tuple[str, str]:
+  1078→    """Extract input and output dtypes from shape pattern."""
+  1079→    if shape_pattern is None:
+  1080→        return 'f32', 'f32'
+  1081→
+  1082→    inputs = shape_pattern.get('inputs', [])
+  1083→    outputs = shape_pattern.get('outputs', [])
+  1084→
+  1085→    input_dtype = 'f32'
+  1086→    output_dtype = 'f32'
+  1087→
+  1088→    if inputs and inputs[0]:
+  1089→        input_dtype = inputs[0].get('dtype', 'f32')
+  1090→    if outputs and outputs[0]:
+  1091→        output_dtype = outputs[0].get('dtype', 'f32')
+  1092→
+  1093→    return input_dtype, output_dtype
+  1094→
+  1095→
+  1096→def create_pattern_id(shape_pattern: Dict, op_name: str) -> str:
+  1097→    """Create a unique identifier for a shape pattern."""
+  1098→    if shape_pattern is None:
+  1099→        return "unknown"
+  1100→
+  1101→    inputs = shape_pattern.get('inputs', [])
+  1102→    outputs = shape_pattern.get('outputs', [])
+  1103→
+  1104→    if outputs and outputs[0] and 'shape' in outputs[0]:
+  1105→        shape_str = 'x'.join(str(d) for d in outputs[0]['shape'])
+  1106→        dtype = outputs[0].get('dtype', 'f32')
+  1107→        return f"{shape_str}_{dtype}"
+  1108→    elif inputs and inputs[0] and 'shape' in inputs[0]:
+  1109→        shape_str = 'x'.join(str(d) for d in inputs[0]['shape'])
+  1110→        dtype = inputs[0].get('dtype', 'f32')
+  1111→        return f"{shape_str}_{dtype}"
+  1112→
+  1113→    return "unknown"
+  1114→
+  1115→
+  1116→def _get_dim_label(idx: int, iterator_types: List[str]) -> str:
+  1117→    """Return a role-based label for a dimension index.
+  1118→
+  1119→    For parallel dims: innermost='N(inner)', second-inner='M(outer)',
+  1120→    third='B(batch)'. For reduction dims: 'K(reduction)'.
+  1121→    Additional reduction dims get 'K2(reduction)', etc.
+  1122→    """
+  1123→    parallel_dims = [i for i, t in enumerate(iterator_types) if t == 'parallel']
+  1124→    reduction_dims = [i for i, t in enumerate(iterator_types) if t == 'reduction']
+  1125→
+  1126→    if idx in parallel_dims:
+  1127→        rank = len(parallel_dims) - 1 - parallel_dims.index(idx)
+  1128→        if rank == 0:
+  1129→            return "N(inner)"
+  1130→        elif rank == 1:
+  1131→            return "M(outer)"
+  1132→        else:
+  1133→            return "B(batch)"
+  1134→    elif idx in reduction_dims:
+  1135→        r_rank = reduction_dims.index(idx)
+  1136→        if r_rank == 0 and len(reduction_dims) == 1:
+  1137→            return "K(reduction)"
+  1138→        else:
+  1139→            return f"K{r_rank + 1}(reduction)" if len(reduction_dims) > 1 else "K(reduction)"
+  1140→    return f"d{idx}"
+  1141→
+  1142→
+  1143→def format_search_space_header(
+  1144→    op_name: str,
+  1145→    iterator_types: List[str],
+  1146→    dim_sizes: List[int],
+  1147→    input_dtype: str,
+  1148→    num_levels: int,
+  1149→) -> str:
+  1150→    """
+  1151→    Generate a # comment header block for a search space file.
+  1152→
+  1153→    Includes op name, strategy, iterator types, labeled dimension sizes,
+  1154→    dtype, K-peel candidates, and level format description.
+  1155→    """
+  1156→    strategy_name = "dist_vector"
+  1157→    dim_labels = []
+  1158→    for i, (it, ds) in enumerate(zip(iterator_types, dim_sizes)):
+  1159→        label = _get_dim_label(i, iterator_types)
+  1160→        dim_labels.append(f"{label}={ds}")
+  1161→
+  1162→    if num_levels == 6:
+  1163→        fmt = "[L0:distribution, L1:distribution, L2:cache, L3:vec_parallel, L4:vec_reduction, L5:inner]"
+  1164→    else:
+  1165→        fmt = "[L0:distribution, L1:vec_parallel, L2:vec_reduction, L3:inner]"
+  1166→
+  1167→    # Compute effective k_peel candidates (includes small-N extra value)
+  1168→    k_peel = list(_config.K_PEEL_CANDIDATES) if _config.K_PEEL_CANDIDATES else [1]
+  1169→    parallel_dims = [i for i, t in enumerate(iterator_types) if t == 'parallel']
+  1170→    if parallel_dims:
+  1171→        inner_parallel_idx = parallel_dims[-1]
+  1172→        N = dim_sizes[inner_parallel_idx]
+  1173→        if _config.SMALL_N_THRESHOLD and N < _config.SMALL_N_THRESHOLD and _config.SMALL_N_K_PEEL:
+  1174→            k_peel = sorted(set(k_peel + [_config.SMALL_N_K_PEEL]))
+  1175→
+  1176→    lines = [
+  1177→        f"# Op: {op_name}",
+  1178→        f"# Strategy: {strategy_name}",
+  1179→        f"# Iterator types: {iterator_types}",
+  1180→        f"# Dim sizes: {', '.join(dim_labels)}",
+  1181→        f"# Input dtype: {input_dtype}",
+  1182→        f"# K-peel candidates: {k_peel}",
+  1183→        f"# Format: {fmt}",
+  1184→        "#",
+  1185→    ]
+  1186→
+  1187→    return '\n'.join(lines)
+  1188→
+  1189→
+  1190→def _write_configs(f, configs, strategy):
+  1191→    """Write configs to file, with optional dist group headers.
+  1192→
+  1193→    If the strategy has config_groups (from DistVectorStrategy), writes
+  1194→    group headers before each group's configs. Otherwise writes configs flat.
+  1195→    """
+  1196→    config_groups = getattr(strategy, 'config_groups', None)
+  1197→
+  1198→    if config_groups:
+  1199→        from .strategy_dist_vector import format_dist_group_header
+  1200→        for group in config_groups:
+  1201→            f.write(format_dist_group_header(group) + '\n')
+  1202→            for idx in range(group['start_idx'], group['end_idx']):
+  1203→                f.write(f"{idx}: " + json.dumps(configs[idx], separators=(',', ':')) + '\n')
+  1204→        # Clean up config_groups after writing
+  1205→        strategy.config_groups = None
+  1206→    else:
+  1207→        for idx, config in enumerate(configs):
+  1208→            f.write(f"{idx}: " + json.dumps(config, separators=(',', ':')) + '\n')
+  1209→
+  1210→
+  1211→def _get_default_tile_config(pattern: Dict) -> Optional[List]:
+  1212→    """Extract default tile config from pattern dict.
+  1213→
+  1214→    Looks for 'default_tile_config' (renamed by assign_pattern_ids) or
+  1215→    'lowering_config.tile_sizes' (original field from MLIR analysis).
+  1216→
+  1217→    Returns:
+  1218→        Tile config list, or None if not available.
+  1219→    """
+  1220→    if 'default_tile_config' in pattern:
+  1221→        dtc = pattern['default_tile_config']
+  1222→        if isinstance(dtc, dict):
+  1223→            return dtc.get('tile_sizes')
+  1224→        return dtc
+  1225→    lc = pattern.get('lowering_config')
+  1226→    if lc and isinstance(lc, dict):
+  1227→        return lc.get('tile_sizes')
+  1228→    return None
+  1229→
+  1230→
+  1231→def _generate_pattern_configs_worker(args):
+  1232→    """Worker function: generate configs for a single pattern.
+  1233→
+  1234→    This function is designed to be serializable for multiprocessing.
+  1235→    The probe_fn is created inside the worker to avoid pickling issues.
+  1236→
+  1237→    Args:
+  1238→        args: Tuple of (op_name, pattern, pattern_idx, output_dir, iterator_types,
+  1239→              max_configs, probe_fn_factory, is_generic, verbose, template,
+  1240→              [is_fused, primary_op, extra_inputs_spec, fused_id])
+  1241→
+  1242→    Returns:
+  1243→        Dict with result info: op_name, pattern_idx, config_count, output_file, error
+  1244→    """
+  1245→    from .strategy_dist_vector import DistVectorStrategy
+  1246→
+  1247→    # Unpack with backward-compatible defaults for fused fields
+  1248→    is_fused = False
+  1249→    primary_op = None
+  1250→    extra_inputs_spec = []
+  1251→    fused_id = None
+  1252→    if len(args) > 10:
+  1253→        (
+  1254→            op_name, pattern, pattern_idx, output_dir, iterator_types,
+  1255→            max_configs, probe_fn_factory, is_generic, verbose, template,
+  1256→            is_fused, primary_op, extra_inputs_spec, fused_id
+  1257→        ) = args
+  1258→    else:
+  1259→        (
+  1260→            op_name, pattern, pattern_idx, output_dir, iterator_types,
+  1261→            max_configs, probe_fn_factory, is_generic, verbose, template
+  1262→        ) = args
+  1263→
+  1264→    try:
+  1265→        # Extract pattern info
+  1266→        if is_generic:
+  1267→            # Generic ops use tile_sizes to infer dim_sizes
+  1268→            lowering_config = pattern.get('lowering_config', {}) or {}
+  1269→            tile_sizes = lowering_config.get('tile_sizes', [[]])
+  1270→
+  1271→            if tile_sizes and tile_sizes[0]:
+  1272→                dim_sizes = [max(64, t * 4) if t > 0 else 64 for t in tile_sizes[0]]
+  1273→            else:
+  1274→                dim_sizes = [64] * len(iterator_types)
+  1275→        elif is_fused:
+  1276→            # Fused ops use primary_op for dim extraction (same shapes)
+  1277→            dim_sizes = get_dim_sizes_from_shape_pattern(primary_op, iterator_types, pattern)
+  1278→        else:
+  1279→            # Named ops use shape pattern
+  1280→            dim_sizes = get_dim_sizes_from_shape_pattern(op_name, iterator_types, pattern)
+  1281→
+  1282→        input_dtype, output_dtype = get_dtype_from_pattern(pattern)
+  1283→        num_operands = len(pattern.get('inputs', [])) + len(pattern.get('outputs', []))
+  1284→        num_operands = max(num_operands, 2)
+  1285→
+  1286→        # Create strategy instance
+  1287→        strategy = DistVectorStrategy()
+  1288→
+  1289→        # Wire per-dist probe_fn if factory provided and template exists
+  1290→        if probe_fn_factory and template:
+  1291→            pattern_info = {
+  1292→                "op_name": primary_op if is_fused else op_name,
+  1293→                "iterator_types": iterator_types,
+  1294→                "dim_sizes": dim_sizes,
+  1295→                "input_dtype": input_dtype,
+  1296→                "template": template,
+  1297→                "inputs": pattern.get("inputs", []),
+  1298→                "outputs": pattern.get("outputs", []),
+  1299→            }
+  1300→            if is_fused:
+  1301→                pattern_info["is_fused"] = True
+  1302→                pattern_info["extra_inputs_spec"] = extra_inputs_spec
+  1303→                pattern_info["primary_op"] = primary_op
+  1304→            strategy.probe_fn = probe_fn_factory(pattern_info)
+  1305→
+  1306→        # Generate configs — fused ops use primary_op for level/config logic
+  1307→        config_op_name = primary_op if is_fused else op_name
+  1308→        num_levels = strategy.get_num_levels(config_op_name)
+  1309→        configs = strategy.generate_configs(
+  1310→            iterator_types, dim_sizes, output_dtype, max_configs,
+  1311→            config_op_name, num_operands, input_dtype)
+  1312→
+  1313→        # Clean up probe_fn
+  1314→        if hasattr(strategy, 'probe_fn'):
+  1315→            strategy.probe_fn = None
+  1316→
+  1317→        # Write configs to file
+  1318→        from .mlir_file_ops import get_operator_subdirectory
+  1319→        subdir = get_operator_subdirectory(op_name, is_generic,
+  1320→                                           is_fused=is_fused, primary_op=primary_op)
+  1321→        op_output_dir = os.path.join(output_dir, subdir)
+  1322→        os.makedirs(op_output_dir, exist_ok=True)
+  1323→
+  1324→        if is_fused and primary_op:
+  1325→            safe_fp_key = op_name.replace('.', '_').replace(':', '_').replace('/', '_')
+  1326→            filename = f"{safe_fp_key}_{pattern_idx}_search_space.json"
+  1327→        else:
+  1328→            pattern_name = f"generic_{op_name[:50]}" if is_generic else op_name
+  1329→            safe_name = pattern_name.replace('.', '_').replace(':', '_').replace('/', '_')
+  1330→            filename = f"{safe_name}_{pattern_idx}_search_space.json"
+  1331→        filepath = os.path.join(op_output_dir, filename)
+  1332→
+  1333→        # Extract default tile config
+  1334→        default_tile_config = _get_default_tile_config(pattern)
+  1335→
+  1336→        with open(filepath, 'w') as f:
+  1337→            header = strategy.format_header(
+  1338→                config_op_name, iterator_types, dim_sizes,
+  1339→                input_dtype, num_levels)
+  1340→            f.write(header + '\n')
+  1341→            if default_tile_config is not None:
+  1342→                f.write('# Default tile config:\n')
+  1343→                f.write('# ' + json.dumps(default_tile_config, separators=(',', ':')) + '\n')
+  1344→                f.write('#\n')
+  1345→            _write_configs(f, configs, strategy)
+  1346→
+  1347→        return {
+  1348→            'op_name': op_name,
+  1349→            'pattern_idx': pattern_idx,
+  1350→            'config_count': len(configs),
+  1351→            'output_file': os.path.join(subdir, filename),
+  1352→            'error': None,
+  1353→            'is_generic': is_generic,
+  1354→            'is_fused': is_fused
+  1355→        }
+  1356→
+  1357→    except Exception as e:
+  1358→        return {
+  1359→            'op_name': op_name,
+  1360→            'pattern_idx': pattern_idx,
+  1361→            'config_count': 0,
+  1362→            'output_file': None,
+  1363→            'error': str(e),
+  1364→            'is_generic': is_generic,
+  1365→            'is_fused': is_fused
+  1366→        }
+  1367→
+  1368→
+  1369→def _collect_work_items(stats_data, output_dir, max_configs, probe_fn_factory, verbose, result,
+  1370→                        pattern_idx_filter=None):
+  1371→    """Collect work items from named_ops, generic_ops, and fused_ops.
+  1372→
+  1373→    Args:
+  1374→        stats_data: Statistics dict with 'named_ops', 'generic_ops', and 'fused_ops'.
+  1375→        output_dir: Directory for config files.
+  1376→        max_configs: Maximum configs per pattern.
+  1377→        probe_fn_factory: Probe factory callable.
+  1378→        verbose: Print progress.
+  1379→        result: Result dict to update with op type counts and errors.
+  1380→        pattern_idx_filter: Optional int to filter to a single pattern index.
+  1381→
+  1382→    Returns:
+  1383→        Tuple of (work_items, op_summary).
+  1384→    """
+  1385→    op_summary = {}  # op_name -> {'patterns': int, 'configs': int}
+  1386→    work_items = []
+  1387→
+  1388→    for op_name, op_data in stats_data.get('named_ops', {}).items():
+  1389→        iterator_types = op_data.get('iterator_types', [])
+  1390→        shape_patterns = op_data.get('shape_patterns', [])
+  1391→
+  1392→        if not iterator_types or not shape_patterns:
+  1393→            continue
+  1394→
+  1395→        result['named_op_types'] += 1
+  1396→        if op_name not in op_summary:
+  1397→            op_summary[op_name] = {'patterns': 0, 'configs': 0}
+  1398→
+  1399→        template = op_data.get('template')
+  1400→        for idx, pattern in enumerate(shape_patterns):
+  1401→            if pattern_idx_filter is not None and idx != pattern_idx_filter:
+  1402→                continue
+  1403→            work_items.append((
+  1404→                op_name, pattern, idx, output_dir, iterator_types,
+  1405→                max_configs, probe_fn_factory, False, verbose, template
+  1406→            ))
+  1407→
+  1408→    for pattern_name, op_data in stats_data.get('generic_ops', {}).items():
+  1409→        iterator_types = op_data.get('iterator_types', [])
+  1410→        shape_patterns = op_data.get('shape_patterns', [])
+  1411→
+  1412→        if not iterator_types or not shape_patterns:
+  1413→            continue
+  1414→
+  1415→        result['generic_op_types'] += 1
+  1416→        template = op_data.get('template')
+  1417→
+  1418→        for idx, pattern in enumerate(shape_patterns):
+  1419→            if pattern_idx_filter is not None and idx != pattern_idx_filter:
+  1420→                continue
+  1421→            if pattern is None:
+  1422→                result['total_patterns'] += 1
+  1423→                result['errors'].append({
+  1424→                    'op': pattern_name,
+  1425→                    'pattern': idx,
+  1426→                    'error': 'Pattern is None'
+  1427→                })
+  1428→                continue
+  1429→
+  1430→            work_items.append((
+  1431→                pattern_name, pattern, idx, output_dir, iterator_types,
+  1432→                max_configs, probe_fn_factory, True, verbose, template
+  1433→            ))
+  1434→
+  1435→    # Fused ops: each variant gets its own tile configs with fused-template probing
+  1436→    # Build fused_id_map: sequential index per primary_op (matches compiler.py convention)
+  1437→    fused_ops = stats_data.get('fused_ops', {})
+  1438→    fused_id_map = {}
+  1439→    fused_counter = {}
+  1440→    for fp_key in sorted(fused_ops.keys()):
+  1441→        primary_op = fused_ops[fp_key].get('primary_op', '')
+  1442→        if primary_op not in fused_counter:
+  1443→            fused_counter[primary_op] = 0
+  1444→        fused_id_map[fp_key] = fused_counter[primary_op]
+  1445→        fused_counter[primary_op] += 1
+  1446→
+  1447→    for fp_key, op_data in fused_ops.items():
+  1448→        iterator_types = op_data.get('iterator_types', [])
+  1449→        shape_patterns = op_data.get('shape_patterns', [])
+  1450→        primary_op = op_data.get('primary_op', '')
+  1451→
+  1452→        if not iterator_types or not shape_patterns:
+  1453→            continue
+  1454→
+  1455→        result['fused_op_types'] = result.get('fused_op_types', 0) + 1
+  1456→        template = op_data.get('template')
+  1457→        extra_inputs_spec = op_data.get('extra_inputs_spec', [])
+  1458→        fused_id = fused_id_map[fp_key]
+  1459→
+  1460→        for idx, pattern in enumerate(shape_patterns):
+  1461→            if pattern_idx_filter is not None and idx != pattern_idx_filter:
+  1462→                continue
+  1463→            work_items.append((
+  1464→                fp_key, pattern, idx, output_dir, iterator_types,
+  1465→                max_configs, probe_fn_factory, False, verbose, template,
+  1466→                True, primary_op, extra_inputs_spec, fused_id
+  1467→            ))
+  1468→
+  1469→    return work_items, op_summary
+  1470→
+  1471→
+  1472→def _aggregate_results(results, stats_data, output_dir, result, op_summary, verbose):
+  1473→    """Aggregate worker results and update stats_data with file paths.
+  1474→
+  1475→    Args:
+  1476→        results: List of worker result dicts from _generate_pattern_configs_worker.
+  1477→        stats_data: Statistics dict to update with search_space_filepath fields.
+  1478→        output_dir: Base directory for config files.
+  1479→        result: Summary result dict to update with counts and errors.
+  1480→        op_summary: Per-operator summary dict to update.
+  1481→        verbose: Print summary per operator.
+  1482→    """
+  1483→    generic_patterns = 0
+  1484→    generic_configs = 0
+  1485→    fused_patterns = 0
+  1486→    fused_configs = 0
+  1487→
+  1488→    for idx, work_result in enumerate(results):
+  1489→        result['total_patterns'] += 1
+  1490→
+  1491→        if work_result['error'] is not None:
+  1492→            result['errors'].append({
+  1493→                'op': work_result['op_name'],
+  1494→                'pattern': work_result['pattern_idx'],
+  1495→                'error': work_result['error']
+  1496→            })
+  1497→            continue
+  1498→
+  1499→        result['total_configs'] += work_result['config_count']
+  1500→        result['files_written'].append(work_result['output_file'])
+  1501→
+  1502→        op_name = work_result['op_name']
+  1503→        pattern_idx = work_result['pattern_idx']
+  1504→        is_generic = work_result['is_generic']
+  1505→        is_fused = work_result.get('is_fused', False)
+  1506→
+  1507→        if is_fused:
+  1508→            fused_patterns += 1
+  1509→            fused_configs += work_result['config_count']
+  1510→            op_data = stats_data.get('fused_ops', {}).get(op_name)
+  1511→            if op_data:
+  1512→                shape_patterns = op_data.get('shape_patterns', [])
+  1513→                if pattern_idx < len(shape_patterns):
+  1514→                    filepath = os.path.join(output_dir, work_result['output_file'])
+  1515→                    shape_patterns[pattern_idx]['search_space_filepath'] = filepath
+  1516→        elif is_generic:
+  1517→            generic_patterns += 1
+  1518→            generic_configs += work_result['config_count']
+  1519→            op_data = stats_data.get('generic_ops', {}).get(op_name)
+  1520→            if op_data:
+  1521→                shape_patterns = op_data.get('shape_patterns', [])
+  1522→                if pattern_idx < len(shape_patterns):
+  1523→                    filepath = os.path.join(output_dir, work_result['output_file'])
+  1524→                    shape_patterns[pattern_idx]['search_space_filepath'] = filepath
+  1525→        else:
+  1526→            if op_name not in op_summary:
+  1527→                op_summary[op_name] = {'patterns': 0, 'configs': 0}
+  1528→            op_summary[op_name]['patterns'] += 1
+  1529→            op_summary[op_name]['configs'] += work_result['config_count']
+  1530→
+  1531→            op_data = stats_data.get('named_ops', {}).get(op_name)
+  1532→            if op_data:
+  1533→                shape_patterns = op_data.get('shape_patterns', [])
+  1534→                if pattern_idx < len(shape_patterns):
+  1535→                    filepath = os.path.join(output_dir, work_result['output_file'])
+  1536→                    shape_patterns[pattern_idx]['search_space_filepath'] = filepath
+  1537→
+  1538→    if verbose:
+  1539→        for op_name, stats in sorted(op_summary.items()):
+  1540→            print(f"  {op_name}: {stats['patterns']} patterns, {stats['configs']} configs")
+  1541→        if fused_patterns > 0:
+  1542→            print(f"  fused: {fused_patterns} patterns, {fused_configs} configs")
+  1543→        if generic_patterns > 0:
+  1544→            print(f"  linalg.generic: {generic_patterns} patterns, {generic_configs} configs")
+  1545→
+  1546→
+  1547→def generate_tile_configs_from_statistics(
+  1548→    stats_data: Dict[str, Any],
+  1549→    output_dir: str,
+  1550→    max_configs: int = 100000,
+  1551→    verbose: bool = False,
+  1552→    probe_fn_factory=None,
+  1553→    num_workers: int = 1,
+  1554→    pattern_idx_filter: Optional[int] = None,
+  1555→) -> Dict[str, Any]:
+  1556→    """
+  1557→    Generate tiling configs from in-memory statistics data.
+  1558→
+  1559→    Processes named_ops and generic_ops from the statistics dict,
+  1560→    generates tile config files, and updates the dict with
+  1561→    search_space_filepath fields.
+  1562→
+  1563→    Args:
+  1564→        stats_data: Statistics dict with 'named_ops' and 'generic_ops'
+  1565→        output_dir: Directory to write config files
+  1566→        max_configs: Maximum configs per pattern
+  1567→        verbose: Print progress
+  1568→        probe_fn_factory: Callable(pattern_info) → probe_fn for
+  1569→            per-distribution-pair probing.
+  1570→        num_workers: Number of parallel workers.
+  1571→        pattern_idx_filter: Optional int to filter to a single pattern index.
+  1572→
+  1573→    Returns:
+  1574→        Summary statistics
+  1575→    """
+  1576→    os.makedirs(output_dir, exist_ok=True)
+  1577→
+  1578→    result = {
+  1579→        'named_op_types': 0,
+  1580→        'generic_op_types': 0,
+  1581→        'fused_op_types': 0,
+  1582→        'total_patterns': 0,
+  1583→        'total_configs': 0,
+  1584→        'files_written': [],
+  1585→        'errors': []
+  1586→    }
+  1587→
+  1588→    work_items, op_summary = _collect_work_items(
+  1589→        stats_data, output_dir, max_configs, probe_fn_factory, verbose, result,
+  1590→        pattern_idx_filter=pattern_idx_filter)
+  1591→    total_patterns = len(work_items)
+  1592→
+  1593→    # Process patterns (parallel or sequential)
+  1594→    if num_workers > 1:
+  1595→        import threading
+  1596→        from concurrent.futures import ThreadPoolExecutor
+  1597→
+  1598→        progress = [0]
+  1599→        lock = threading.Lock()
+  1600→
+  1601→        def _worker_with_progress(work_item):
+  1602→            worker_result = _generate_pattern_configs_worker(work_item)
+  1603→            with lock:
+  1604→                progress[0] += 1
+  1605→                current = progress[0]
+  1606→            print(f"\r  Processing pattern {current}/{total_patterns}", end='', flush=True)
+  1607→            return worker_result
+  1608→
+  1609→        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+  1610→            results = list(executor.map(_worker_with_progress, work_items))
+  1611→        print()  # Final newline after progress complete
+  1612→    else:
+  1613→        # Sequential processing with progress messages
+  1614→        results = []
+  1615→        for idx, work_item in enumerate(work_items, 1):
+  1616→            print(f"\r  Processing pattern {idx}/{total_patterns}", end='', flush=True)
+  1617→            result_dict = _generate_pattern_configs_worker(work_item)
+  1618→            results.append(result_dict)
+  1619→        print()  # Final newline after progress complete
+  1620→
+  1621→    _aggregate_results(results, stats_data, output_dir, result, op_summary, verbose)
+  1622→
+  1623→    return result
+  1624→

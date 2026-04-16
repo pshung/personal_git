@@ -1,0 +1,142 @@
+# Implementation Plan: Autonomous Agentic libnn Optimization Workflow
+
+## Context
+
+libnn functions have multi-variant C implementations (plain C / DSP / RVV). Optimizing a function means writing a better RVV implementation for a specific FPGA target. Currently this is manual: read source, write code, build, test on QEMU, profile on FPGA, iterate.
+
+This plan defines how **Claude Code directly drives the optimization loop** -- no Python orchestration framework. The LLM reads source files, parses hardware configs, writes optimized C code, and calls existing shell scripts for build/test/profile. For state persistence across sessions, a simple JSON file tracks progress.
+
+The optimization is specialized for a **designated target configuration** (CPU, VLEN, cache hierarchy, ISA extensions) and **known static-time input shapes** (batch size, spatial dimensions, channel counts, kernel sizes, etc.) extracted from existing test/example C files. Dynamic shapes are not supported -- each optimization run targets a fixed set of input dimensions, enabling aggressive tiling, unrolling, and register allocation decisions that would not be valid for arbitrary shapes.
+
+**The baseline source code is never modified.** Instead, the agent creates a new C file (e.g., `opt/gen/riscv_nn_conv_dw_HWC_u8_u8_u8_asym_bias_any.c`) that defines the same function symbol as the original. The build system substitutes the optimized `.o` for the original at link time. No macros, no `#ifdef` guards, no changes to the original source. A/B comparison is simply linking one `.o` or the other.
+
+The FPGA configuration (Verilog `.inc` file like `ax45mpv_v1024_8mb_config.inc`) provides the ground truth for target features: VLEN, DLEN, L2 cache size, ISA extensions, etc. Cache sizes are especially important since the library's tiling GEMM currently hardcodes L1=512KB -- the actual L2=8MB and L1 D-cache=32KB from the config should drive tiling parameter selection.
+
+## Two Modes of Operation
+
+### Mode 1: Single Function
+
+**Input:** A performance test file from `Examples/unit_performance/`, e.g.:
+```
+Examples/unit_performance/t_pf_conv_dw_HWC_u8_u8_u8_asym_bias_any.c
+```
+
+The LLM reads this file and extracts:
+- **Function name** from the `riscv_nn_*()` call site
+- **All static input shapes** from the `#define` macros at the top of the file (`INPUT_X=16`, `INPUT_Y=15`, `INPUT_CH=4`, `KERNEL_X=2`, `CH_MULT=192`, `STRIDE_X=1`, `PAD_X=0`, etc.)
+- **Quantization parameters** (`OUT_SHIFT`, `OUT_MULT`, `INPUT_OFFSET`, `FILTER_OFFSET`, `OUTPUT_OFFSET`, activation min/max)
+- **Data types** inferred from the function name suffix (`u8_u8_u8`, `s8_s8_s8`, etc.)
+
+No separate TOML or config file needed -- the perf test file *is* the task specification.
+
+### Mode 2: Complete Model
+
+**Input:** A model example C file, e.g.:
+```
+Examples/ARM/arm_nn_examples/cifar10/nds_nn_examples_cifar10.c
+```
+
+The LLM reads the model file and its companion parameter header (found via `#include`) to extract the full op sequence with concrete shapes:
+
+| # | Function | Key shapes |
+|---|----------|-----------|
+| 1 | `conv_HWC_s8_s8_s8_RGB_sft_bias_fast` | im_dim=32, im_ch=3, ker=5, out_ch=32, stride=1, pad=2 |
+| 2 | `relu_s8` | size=32*32*32 |
+| 3 | `maxpool_HWC_s8` | im_dim=32, ch=32, ker=3, stride=2 |
+| 4 | `conv_HWC_s8_s8_s8_sft_bias_fast` | im_dim=16, im_ch=32, ker=5, out_ch=16 |
+| 5 | `relu_s8` | size=16*16*16 |
+| 6 | `maxpool_HWC_s8` | im_dim=16, ch=16, ker=3, stride=2 |
+| 7 | `conv_HWC_s8_s8_s8_sft_bias_fast` | im_dim=8, im_ch=16, ker=5, out_ch=32 |
+| 8 | `relu_s8` | size=8*8*32 |
+| 9 | `maxpool_HWC_s8` | im_dim=8, ch=32, ker=3, stride=2 |
+| 10 | `fc_s8_s8_s8_sft_bias_fast` | in_dim=512, out=10 |
+| 11 | `softmax_s8_fast` | size=10 |
+
+The LLM profiles all (function, shape-set) pairs and optimizes every one of them to reach the best total model cycle count. Cost per pair is measured directly -- baseline cycles at that exact shape, multiplied by how many times the model invokes the function with that shape. Same function with two different shape sets = two independent pairs with independent costs (a 32x32 conv and an 8x8 conv share a name but not a cycle budget). Ranking by per-pair total cycles only sets work *order* so the largest wins land first and model-level cycles drop monotonically; it does not gate coverage. The long tail is still specialized -- a small kernel invoked many times can dominate once the heavy convs are tuned.
+
+## Directory Structure
+
+```
+agentic_libnn_opt/
+  plan.md                                   # This file
+  opt/
+    config.toml                             # Target config (toolchain, FPGA, QEMU paths)
+    state.json                              # Optimization state (persists across sessions)
+    gen/                                    # Generated optimized source files
+      riscv_nn_<func>.c                     # One per optimized function
+    log/                                    # Build/test/perf logs per iteration
+  ax45mpv_v1024_8mb_config.inc              # FPGA Verilog config (input)
+```
+
+## Configuration
+
+Single TOML file at `opt/config.toml` -- read directly by the LLM, no schema validation layer needed:
+
+```toml
+[toolchain]
+bin_dir = "/local/nick/SW_Release_cp/ast530/nds64le-elf-newlib-v5d/bin"
+prefix = "riscv64-elf-"
+
+[target]
+cpu = "AX45MPV"
+fpga_config = "ax45mpv_v1024_8mb_config.inc"
+
+[qemu]
+binary = "/local/nick/qemu_andes/build/qemu-system-riscv64"
+vlen = 1024
+timeout = 120
+
+[fpga]
+host = "sw-boards.andestech.com"
+port = 1116
+timeout = 300
+
+[limits]
+max_iterations = 10
+min_improvement_pct = 2.0
+```
+
+## State File
+
+`opt/state.json` -- simple JSON the LLM reads/writes to track progress across sessions:
+
+```json
+{
+  "mode": "single_function",
+  "function": "conv_dw_HWC_u8_u8_u8_asym_bias_any",
+  "source_input": "Examples/unit_performance/t_pf_conv_dw_HWC_u8_u8_u8_asym_bias_any.c",
+  "phase": "evaluate",
+  "iteration": 3,
+  "baseline": { "cycles": 45200, "instructions": 32100 },
+  "best": { "cycles": 38900, "instructions": 28500, "iteration": 2, "commit": "e4f5a6b" },
+  "history": [
+    { "iteration": 1, "commit": "a1b2c3d", "cycles": 42000, "instructions": 30200, "accepted": true,  "notes": "unrolled inner loop 4x" },
+    { "iteration": 2, "commit": "e4f5a6b", "cycles": 38900, "instructions": 28500, "accepted": true,  "notes": "tiled for L1 dcache 32KB" },
+    { "iteration": 3, "commit": "9c8d7e6", "cycles": 39100, "instructions": 27800, "accepted": false, "notes": "register pressure regression" }
+  ]
+}
+```
+
+Field semantics:
+- `mode`: `"single_function"` or `"model"`. Drives which loop variant runs.
+- `function`: bare function name (no `riscv_nn_` prefix). Keys the `opt/gen/` source path.
+- `source_input`: path to the perf test `.c` (single mode) or model `.c` (model mode). The task spec.
+- `phase`: current loop phase (`gather`, `baseline`, `iterate`, `evaluate`, `done`). Resumed on session restart.
+- `iteration`: count of iterations attempted so far (accepted + rejected).
+- `baseline.cycles` / `baseline.instructions`: unmodified library measurement. Reference point for speedup.
+- `best.cycles` / `best.instructions`: measurements from the winning iteration.
+- `best.iteration`: which `history` entry is the winner.
+- `best.commit`: SHA of the commit holding the winning `opt/gen/<func>.c`. Required -- if the `.o` cache is evicted, check this SHA out and rebuild to regenerate the exact artifact. Also the anchor for `git revert` on reject.
+- `history[i].iteration`: monotonic integer, one per attempt.
+- `history[i].commit`: SHA of that attempt's commit. Required for the same reason as `best.commit`.
+- `history[i].cycles` / `instructions`: measured counts. Comparable only within the same (function, shape-set, target).
+- `history[i].accepted`: `true` only if accuracy passed AND `cycles < best.cycles` at that moment. Rejected entries stay so future sessions don't retry the same idea.
+- `history[i].notes`: one-line description of the idea.
+
+Best selection: `best = argmin(cycles)` over `history` entries with `accepted=true`; `best.commit` points at the source to restore.
+
+## Optimization Loop
+
+The LLM executes this loop directly, calling shell scripts at each mechanical step:
+
+### Phase 1

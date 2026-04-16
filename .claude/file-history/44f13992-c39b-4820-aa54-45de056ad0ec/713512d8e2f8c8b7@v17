@@ -1,0 +1,566 @@
+"""Compile-and-run task: stream MLIR → .adx → board → record → delete.
+
+Generates one MLIR file at a time, compiles to .adx, runs on board via GDB,
+records cycle count, and deletes both temporary files before proceeding.
+At most N files exist on disk at once (one per board).
+"""
+
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+from argparse import Namespace
+
+from ...compiler import (
+    load_configs_to_try,
+    generate_one_fused_mlir,
+    build_fused_work_items,
+    parse_vector_spills,
+    generate_pattern_compile_report,
+)
+from ...shape_source import build_stats_from_shape_source
+from ..stats_filters import filter_stats_by_fused_ids
+from ..validators import parse_fused_ids
+from ._common import (
+    _resolve_splits,
+    print_task_mission,
+    print_subtask_complete,
+)
+
+# Lazy imports for adx_builder (lives outside the package in script/)
+_adx_imports_done = False
+
+
+def _ensure_adx_imports():
+    global _adx_imports_done
+    if _adx_imports_done:
+        return
+    script_dir = str(Path(__file__).parent.parent.parent.parent)
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    _adx_imports_done = True
+
+
+def adx_load_config(toml_path):
+    _ensure_adx_imports()
+    from adx_builder import load_config
+    return load_config(toml_path)
+
+
+def load_boards(cfg):
+    _ensure_adx_imports()
+    from adx_builder import load_boards as _load_boards
+    return _load_boards(cfg)
+
+
+def compile_mlir_to_adx(mlir_file, output_dir, cfg):
+    _ensure_adx_imports()
+    from adx_builder import compile_mlir_to_adx as _compile
+    return _compile(mlir_file, output_dir, cfg)
+
+
+def stage4_run_gdb(adx_path, board, timeout=None):
+    _ensure_adx_imports()
+    from adx_builder import stage4_run_gdb as _run_gdb
+    return _run_gdb(adx_path, board, timeout=timeout)
+
+
+def _parse_cycle_count(gdb_output):
+    _ensure_adx_imports()
+    from adx_builder import _parse_cycle_count as _parse
+    return _parse(gdb_output)
+
+
+def _expand_work_items(fused_work_items):
+    """Expand fused work items with their tile configs.
+
+    Returns list of (fp_key, op_data, template, extra_inputs_spec,
+    primary_op, pattern, pattern_idx, fused_id, config_idx,
+    lowering_config, tile_sizes) tuples.
+    """
+    expanded = []
+    for (fp_key, op_data, template, extra_inputs_spec,
+         primary_op, pattern, pattern_idx, fused_id) in fused_work_items:
+        default_lc = pattern.get("default_tile_config") or pattern.get("lowering_config")
+        search_space_fp = pattern.get("search_space_filepath")
+        configs = load_configs_to_try(
+            default_lc, search_space_fp, f"fused {fp_key}[{pattern_idx}]"
+        )
+        for config_idx, lowering_config, tile_sizes in configs:
+            expanded.append((
+                fp_key, op_data, template, extra_inputs_spec,
+                primary_op, pattern, pattern_idx, fused_id,
+                config_idx, lowering_config, tile_sizes,
+            ))
+    return expanded
+
+
+_TIMEOUT_MULTIPLIER = 1.5
+_MIN_TIMEOUT_SECONDS = 10.0
+# Column definitions: (name, width)
+_TSV_COLUMNS = [
+    ("fp_key",      40),
+    ("pattern_idx",  4),
+    ("config_idx",   8),
+    ("status",      12),
+    ("cycles",      12),
+    ("board",       20),
+]
+
+_TSV_HEADER = "\t".join(name.ljust(w) for name, w in _TSV_COLUMNS)
+
+
+_RETRYABLE_STATUSES = {"RunFail"}
+
+
+def _parse_completed_keys(tsv_path):
+    """Parse a TSV file and return (completed_set, retry_count).
+
+    Items with retryable statuses (RunFail) are excluded so they get re-run.
+    Returns:
+        completed: set of (fp_key, pattern_idx, config_idx) to skip.
+        retry_count: number of items that will be retried.
+    """
+    completed = set()
+    retry_count = 0
+    with open(tsv_path) as f:
+        header = f.readline()  # skip header
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            fields = [f.strip() for f in line.split("\t")]
+            if len(fields) >= 4:
+                status = fields[3]
+                if status in _RETRYABLE_STATUSES:
+                    retry_count += 1
+                else:
+                    completed.add((fields[0], fields[1], fields[2]))
+    return completed, retry_count
+
+
+def _format_tsv_row(r):
+    """Format a result dict as a TSV line with aligned columns."""
+    values = [
+        str(r['fp_key']),
+        str(r['pattern_idx']),
+        str(r['config_idx']),
+        str(r['status']),
+        str(r['cycles'] or ''),
+        str(r.get('board', '')),
+    ]
+    return "\t".join(val.ljust(w) for val, (_, w) in zip(values, _TSV_COLUMNS))
+
+
+def _process_one_item(item, board, board_label, adx_cfg, tmp_dir, timeout=None):
+    """Process a single work item: generate → compile → run → cleanup.
+
+    Returns (result_dict, elapsed_seconds).
+    """
+    (fp_key, op_data, template, extra_inputs_spec,
+     primary_op, pattern, pattern_idx, fused_id,
+     config_idx, lowering_config, tile_sizes) = item
+
+    inputs = pattern.get("inputs", [])
+    outputs = pattern.get("outputs", [])
+    skip_counts = {'wrap_error': 0, 'write_error': 0}
+
+    # Step 1: Generate MLIR
+    item_id = f"{fp_key}_{pattern_idx}_{config_idx}"
+    mlir_dir = tmp_dir / f"{board_label}_{item_id}"
+    mlir_dir.mkdir(parents=True, exist_ok=True)
+    file_tuple = generate_one_fused_mlir(
+        mlir_dir, skip_counts,
+        fp_key, op_data, template, extra_inputs_spec,
+        primary_op, pattern, pattern_idx,
+        inputs, outputs, lowering_config, config_idx, tile_sizes,
+        fused_id,
+    )
+
+    if file_tuple is None:
+        return {
+            "fp_key": fp_key, "pattern_idx": pattern_idx,
+            "config_idx": config_idx, "tile_sizes": tile_sizes,
+            "op_data": op_data,
+            "status": "CompileFail", "error": "MLIR generation failed",
+            "cycles": None, "spill_info": None,
+        }, 0.0
+
+    mlir_path = file_tuple[0]
+
+    # Step 2: Compile to .adx
+    try:
+        adx_path, compile_stderr = compile_mlir_to_adx(mlir_path, mlir_dir, adx_cfg)
+        spill_info = parse_vector_spills(compile_stderr)
+    except Exception as e:
+        _cleanup(mlir_dir)
+        return {
+            "fp_key": fp_key, "pattern_idx": pattern_idx,
+            "config_idx": config_idx, "tile_sizes": tile_sizes,
+            "op_data": op_data,
+            "status": "CompileFail", "error": str(e),
+            "cycles": None, "spill_info": None,
+        }, 0.0
+
+    # Step 3: Run on board (with optional timeout)
+    t0 = time.monotonic()
+    try:
+        gdb_output = stage4_run_gdb(adx_path, board, timeout=timeout)
+        elapsed = time.monotonic() - t0
+        cycles = _parse_cycle_count(gdb_output)
+        status = "Pass" if cycles else "RunFail"
+        error = "" if status == "Pass" else gdb_output
+    except subprocess.TimeoutExpired:
+        elapsed = time.monotonic() - t0
+        cycles = None
+        status = "Timeout"
+        error = f"exceeded {timeout:.1f}s timeout"
+        gdb_output = error
+    except Exception as e:
+        elapsed = time.monotonic() - t0
+        cycles = None
+        status = "RunFail"
+        error = str(e)
+
+    # Step 4: Cleanup
+    _cleanup(mlir_dir)
+    return {
+        "fp_key": fp_key, "pattern_idx": pattern_idx,
+        "config_idx": config_idx, "tile_sizes": tile_sizes,
+        "op_data": op_data,
+        "status": status, "error": error,
+        "cycles": cycles, "spill_info": spill_info,
+    }, elapsed
+
+
+def _group_items(expanded, completed=None):
+    """Group expanded items by (fp_key, pattern_idx), baseline first in each group.
+
+    If completed is provided, filters out already-recorded items. Baselines
+    are kept (for wall-clock timing) if any search config in the group still
+    needs to run, but marked as timing-only so TSV write is skipped.
+
+    Returns list of (group, timing_only_baseline) tuples.
+    timing_only_baseline is True when the baseline is only re-run for timing.
+    """
+    groups = {}
+    for item in expanded:
+        key = (item[0], item[6])  # (fp_key, pattern_idx)
+        groups.setdefault(key, []).append(item)
+
+    result = []
+    for key, items in groups.items():
+        items.sort(key=lambda x: (0 if x[8] == "baseline" else 1, x[8]))
+
+        if completed is None:
+            result.append((items, False))
+            continue
+
+        baseline = [x for x in items if x[8] == "baseline"]
+        search = [x for x in items if x[8] != "baseline"]
+
+        # Filter out completed items
+        pending_search = [
+            x for x in search
+            if (str(x[0]), str(x[6]), str(x[8])) not in completed
+        ]
+
+        if not pending_search:
+            # Everything done for this group
+            continue
+
+        baseline_completed = baseline and (
+            str(baseline[0][0]), str(baseline[0][6]), str(baseline[0][8])
+        ) in completed
+
+        if baseline:
+            # Always include baseline for timing; mark if timing-only
+            result.append((baseline + pending_search, baseline_completed))
+        else:
+            result.append((pending_search, False))
+
+    return result
+
+
+def _board_worker(board, work_queue, result_queue, adx_cfg, tmp_dir,
+                  tsv_fh=None, tsv_lock=None, on_result=None):
+    """Worker thread: pull groups from queue, run baseline then search configs."""
+    board_label = board.get('name') or f"{board.get('remote', '?')}:{board.get('port', '?')}"
+
+    while True:
+        try:
+            group, timing_only_baseline = work_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        baseline_elapsed = None
+        group_results = []
+
+        for item in group:
+            config_idx = item[8]
+
+            # Baseline runs untimed; search configs use 1.5x baseline wall-clock
+            timeout = None
+            if config_idx != "baseline" and baseline_elapsed is not None:
+                timeout = max(baseline_elapsed * _TIMEOUT_MULTIPLIER,
+                              _MIN_TIMEOUT_SECONDS)
+
+            result, elapsed = _process_one_item(
+                item, board, board_label, adx_cfg, tmp_dir, timeout=timeout
+            )
+
+            if config_idx == "baseline":
+                baseline_elapsed = elapsed
+
+            # Skip TSV write for timing-only baselines (already recorded)
+            if not (config_idx == "baseline" and timing_only_baseline):
+                result['board'] = board_label
+                group_results.append(result)
+
+        # Write all group results as a block (no interleaving with other groups)
+        if tsv_fh is not None and tsv_lock is not None and group_results:
+            with tsv_lock:
+                for result in group_results:
+                    tsv_fh.write(_format_tsv_row(result) + "\n")
+                    if on_result:
+                        on_result(result)
+                tsv_fh.flush()
+
+        if result_queue is not None:
+            for result in group_results:
+                result_queue.put(result)
+
+        work_queue.task_done()
+
+
+def _cleanup(mlir_dir):
+    """Remove the entire per-item working directory."""
+    if mlir_dir and mlir_dir.exists():
+        shutil.rmtree(mlir_dir, ignore_errors=True)
+
+
+def run_compile_and_run_task(args: Namespace) -> int:
+    """Run compile-and-run task: stream generate → compile → run → delete.
+
+    For each tile configuration: generates MLIR, compiles to .adx, runs on
+    board via GDB, records cycle count, and deletes temporary files.
+    At most N files exist on disk at once (one per board).
+    """
+    print_task_mission(
+        "COMPILE-AND-RUN",
+        "Stream MLIR → .adx → board → record cycles → delete"
+    )
+
+    if not getattr(args, 'config', None):
+        print("  ✗ Error: --config is required", file=sys.stderr)
+        return 1
+
+    # Load board config
+    try:
+        adx_cfg = adx_load_config(args.config)
+    except Exception as e:
+        print(f"  ✗ Error loading config: {e}", file=sys.stderr)
+        return 1
+
+    boards = load_boards(adx_cfg)
+    if not boards:
+        print("  ✗ Error: no boards configured", file=sys.stderr)
+        return 1
+
+    print(f"  Boards: {len(boards)}")
+
+    input_dir = Path(args.input_dir)
+    output_dir = Path(args.output) if getattr(args, 'output', None) else input_dir
+
+    # Find global patterns file
+    patterns_file = input_dir / "files" / "patterns.json"
+    if not patterns_file.exists():
+        patterns_file = input_dir / "patterns.json"
+
+    split_list = _resolve_splits(
+        input_dir, output_dir, getattr(args, 'pattern_split', None)
+    )
+
+    total_pass = total_fail = 0
+
+    for split_name, split_dir, split_output in split_list:
+        # Find shapes files
+        split_files = split_dir / "files"
+        if not split_files.exists():
+            split_files = split_dir
+        shapes_files = list(split_files.glob("*_shapes.txt"))
+        if not shapes_files:
+            continue
+
+        print(f"\n{'─'*60}")
+        print(f"  [{split_name}]")
+
+        split_output.mkdir(parents=True, exist_ok=True)
+
+        for shapes_file in shapes_files:
+            op_name = shapes_file.stem.replace("_shapes", "")
+
+            try:
+                stats = build_stats_from_shape_source(
+                    str(shapes_file), str(patterns_file), op_name
+                )
+            except Exception as e:
+                print(f"  ✗ Error building stats: {e}", file=sys.stderr)
+                continue
+
+            fused_ids = parse_fused_ids(getattr(args, 'fused_ids', None))
+            stats = filter_stats_by_fused_ids(stats, fused_ids)
+
+            # Link search space files (same logic as compile task)
+            _link_search_spaces(stats, split_dir, op_name)
+
+            fused_work_items, _, _ = build_fused_work_items(
+                stats,
+                op_filter=None,
+                pattern_idx_filter=getattr(args, 'pattern_idx_filter', None),
+            )
+
+            if not fused_work_items:
+                print(f"  [{split_name}] No work items for {op_name}")
+                continue
+
+            expanded = _expand_work_items(fused_work_items)
+            if getattr(args, 'limit', None):
+                expanded = expanded[:args.limit]
+
+
+
+            # Resume: parse existing TSV and filter completed items
+            resume_path = getattr(args, 'resume', None)
+            completed = None
+            if resume_path:
+                resume_file = Path(resume_path)
+                if resume_file.exists():
+                    completed, retry_count = _parse_completed_keys(resume_file)
+                    msg = f"  [{split_name}] Resuming from {resume_file.name}" \
+                          f" ({len(completed)} done"
+                    if retry_count:
+                        msg += f", {retry_count} RunFail to retry"
+                    msg += ")"
+                    print(msg)
+
+            # Group items, filtering out completed ones
+            groups = _group_items(expanded, completed=completed)
+
+            # Count pending items for progress
+            pending_items = sum(
+                len([x for x in grp if not (x[8] == "baseline" and tob)])
+                for grp, tob in groups
+            )
+            new_items = pending_items - (retry_count if completed is not None else 0)
+            if completed is not None and retry_count:
+                print(f"  [{split_name}] {pending_items} configs to run for {op_name}"
+                      f" ({new_items} new + {retry_count} retry)")
+            else:
+                print(f"  [{split_name}] {pending_items} configs to run for {op_name}")
+
+            if not groups:
+                print(f"  [{split_name}] All items already recorded, skipping")
+                continue
+
+            # Open TSV: append to existing or create new
+            if resume_path and Path(resume_path).exists():
+                result_file = Path(resume_path)
+                tsv_fh = open(result_file, 'a')
+            else:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                result_file = split_output / f"compile_and_run_{op_name}_{timestamp}.tsv"
+                tsv_fh = open(result_file, 'w')
+                tsv_fh.write(_TSV_HEADER + "\n")
+                tsv_fh.flush()
+            print(f"  → Results: {result_file.name}")
+
+            tmp_dir = split_output / ".compile_and_run_tmp"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+
+            tsv_lock = threading.Lock()
+            split_pass = split_fail = split_timeout = 0
+
+            def _on_result(r):
+                nonlocal split_pass, split_fail, split_timeout
+                if r["status"] == "Pass":
+                    split_pass += 1
+                elif r["status"] == "Timeout":
+                    split_timeout += 1
+                else:
+                    split_fail += 1
+                done = split_pass + split_fail + split_timeout
+                pct = 100.0 * done / pending_items if pending_items else 100.0
+                print(
+                    f"\r  [{done}/{pending_items}] {pct:.1f}%"
+                    f" Pass={split_pass} Fail={split_fail} Timeout={split_timeout}",
+                    end="", file=sys.stderr,
+                )
+
+            work_q = queue.Queue()
+            for group in groups:
+                work_q.put(group)
+
+            threads = []
+            for board in boards:
+                t = threading.Thread(
+                    target=_board_worker,
+                    args=(board, work_q, None, adx_cfg, tmp_dir),
+                    kwargs={
+                        "tsv_fh": tsv_fh,
+                        "tsv_lock": tsv_lock,
+                        "on_result": _on_result,
+                    },
+                    daemon=True,
+                )
+                t.start()
+                threads.append(t)
+            for t in threads:
+                t.join()
+
+            # Final newline after progress bar
+            print(file=sys.stderr)
+            tsv_fh.close()
+
+            total_pass += split_pass
+            total_fail += split_fail
+
+            # Clean up tmp dir
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # Summary
+    total = total_pass + total_fail
+    print(f"\n{'='*60}")
+    print(f"COMPILE-AND-RUN COMPLETE")
+    print(f"  Pass={total_pass}, Fail={total_fail}, Total={total}")
+    print(f"{'='*60}\n")
+
+    return 0
+
+
+def _link_search_spaces(stats, split_dir, op_name):
+    """Link fused ops to their search space files."""
+    tile_config_dir = split_dir / "tile-configs"
+    if not tile_config_dir.exists():
+        return
+
+    safe_primary = f"linalg_{op_name}"
+    primary_short = op_name
+    fused_ops = stats.get('fused_ops', {})
+
+    for fp_key, fused_data in fused_ops.items():
+        safe_fp_key = fp_key.replace('.', '_').replace(':', '_').replace('/', '_')
+        for idx, pattern in enumerate(fused_data.get('shape_patterns', [])):
+            fused_filename = f"{safe_fp_key}_{idx}_search_space.json"
+            fused_path = tile_config_dir / f"{primary_short}_fused" / fused_filename
+            if fused_path.exists():
+                pattern['search_space_filepath'] = str(fused_path)
+            else:
+                tc_filename = f"{safe_primary}_{idx}_search_space.json"
+                tc_path = tile_config_dir / op_name / tc_filename
+                if tc_path.exists():
+                    pattern['search_space_filepath'] = str(tc_path)

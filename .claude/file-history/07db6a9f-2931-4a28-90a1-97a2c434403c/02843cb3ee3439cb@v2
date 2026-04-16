@@ -1,0 +1,121 @@
+	.text
+	.p2align	2
+	.globl	sinf
+	.type	sinf,@function
+sinf:
+	.globl	__gf_fpsin
+	.type	__gf_fpsin,@function
+__gf_fpsin:
+	# Prologue: 48-byte frame; save ra, callee-saved x9/x18/x19, and input float.
+	addi	sp, sp, -48
+	sw	ra, 32(sp)
+	sw	x9, 16(sp)
+	sw	x18, 20(sp)
+	sw	x19, 24(sp)
+	sw	x10, 4(sp)	# save original IEEE 754 input (sign bit needed later)
+
+	# Argument reduction: divide input by pi/2.
+	# Returns: x10=reduced mantissa (Q1.31, implicit 1 in bit 31),
+	#          x11=reduced exponent (biased-127), x12=quadrant count (0..3).
+	call	__gf_fpreduct
+	mv	x9, x12	# x9 = quadrant
+	mv	x15, x11	# x15 = exponent
+	mv	x14, x10	# x14 = mantissa
+	lw	x10, 4(sp)	# reload original input (provides sign bit for output)
+
+	# Tiny-argument early exit: if reduced exponent < 0, |x| << 1 and sin(x) ~ x.
+	# fpreduct returns the original float in x14; pass it through unchanged.
+	bgez	x15, .Li5
+	mv	x10, x14
+	tail	.LB999
+.Li5:
+	# Result sign = input sign XOR quadrant[1].
+	# Quadrants 2 and 3 negate sin, so bit 1 of quadrant flips the sign bit.
+	slli	x19, x9, 29	# quadrant[1] -> bit 30 of x19
+	xor	x10, x10, x19	# flip sign bit of input when quadrant[1]=1
+	li	x19, 2147483648
+	and	x10, x10, x19	# keep only sign bit; x10 = result sign
+
+	# Compute r^2 in Q.32 fixed-point.
+	# mulhu gives (mantissa^2) >> 32 = r^2 * 2^30.
+	# Right-shifting by 2*(126-exp) yields r^2 * 2^32 (Q.32 in [0,1)).
+	# If shift >= 32 the argument is negligibly small; clamp r^2 to 0.
+	mulhu	x13, x14, x14	# x13 = r^2 * 2^30 (pre-shift)
+	li	x17, 126
+	sub	x11, x17, x15	# x11 = 126 - exp
+	slli	x11, x11, 1	# x11 = 2*(126-exp) -- required right-shift
+	li	x19, 32
+	bltu	x11, x19, .LL4
+	li	x13, 0		# shift >= 32: r^2 underflows to 0
+.LL4:
+	srl	x13, x13, x11	# x13 = r^2 in Q.32
+
+	# Quadrant dispatch: (quadrant-1) & 2 == 0 selects cos path (quadrants 1,2),
+	# non-zero selects sin path (quadrants 0,3).
+	addi	x19, x9, -1
+	andi	x19, x19, 2
+	beqz	x19, .Li6
+
+	# Sin path: evaluate P_sin(r^2) via reverse-Horner on __gf_fpsincof.
+	# Table format: [c0, c1, ..., c_{n-1}, sentinel] where sentinel < 0.
+	# Horner iteration: acc = c[i+1] - r^2 * acc, starting with acc = c[0].
+	# Loop terminates when the loaded coefficient is negative (sentinel).
+	la	x18, __gf_fpsincof
+	lw	x11, 0(x18)	# acc = c[0]
+	addi	x18, x18, 4
+.Lb7:
+	mulhu	x11, x13, x11	# acc = r^2 * acc (Q.32 multiply, high half)
+	lw	x12, 0(x18)	# x12 = next coefficient
+	addi	x18, x18, 4
+	sub	x11, x12, x11	# acc = coeff - acc (Horner step)
+	bgez	x12, .Lb7	# continue while coefficient >= 0
+
+	# Normalize polynomial result: if MSB (implicit 1) is not set, shift left 1
+	# and decrement exponent to keep the unpacked representation canonical.
+	blez	x11, .Li8	# bit 31 set (signed <= 0) -> already normalized
+	slli	x11, x11, 1	# shift mantissa left to set implicit 1
+	addi	x15, x15, -1	# compensate exponent for the left shift
+.Li8:
+	addi	x15, x15, 1	# exponent += 1: account for multiply-by-r below
+	mulhu	x14, x14, x11	# result mantissa = r * P_sin(r^2)
+	tail	.Le6
+
+	# Cos path: evaluate P_cos(r^2) via reverse-Horner on __gf_fpcoscof.
+	# Same loop structure as sin path.  cos(x) ~ P_cos(r^2), no multiply by r.
+.Li6:
+	la	x18, __gf_fpcoscof
+	lw	x14, 0(x18)	# acc = c[0]
+	addi	x18, x18, 4
+.Lb9:
+	mulhu	x14, x13, x14	# acc = r^2 * acc
+	lw	x12, 0(x18)	# next coefficient
+	addi	x18, x18, 4
+	sub	x14, x12, x14	# acc = coeff - acc
+	bgez	x12, .Lb9	# loop while coefficient >= 0
+
+	li	x15, 127	# cos(0) = 1.0: set exponent to bias (2^0 range)
+
+	# IEEE 754 reassembly: pack (sign, exponent, mantissa) into a float.
+	# x14 = result mantissa (Q1.31), x15 = biased exponent, x10 = sign bit.
+.Le6:
+	# Normalize: if MSB of mantissa is 0, shift left 1 and decrement exponent.
+	blez	x14, .LBretx	# bit 31 set -> already normalized
+	slli	x14, x14, 1
+	addi	x15, x15, -1
+.LBretx:
+	slli	x14, x14, 1	# shift out the implicit leading 1 bit
+	srli	x14, x14, 9	# right-align 23-bit mantissa field (bits 22..0)
+	slli	x19, x15, 23	# position 8-bit exponent into bits 30..23
+	or	x14, x14, x19	# combine mantissa and exponent
+	or	x10, x14, x10	# OR in sign bit -> complete IEEE 754 float
+
+	# Epilogue: restore callee-saved registers and return.
+.LB999:
+	lw	x9, 16(sp)
+	lw	x18, 20(sp)
+	lw	x19, 24(sp)
+	lw	ra, 32(sp)
+	addi	sp, sp, 48
+	ret
+.Ltmp0:
+	.size	sinf, .Ltmp0-sinf

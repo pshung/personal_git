@@ -1,0 +1,78 @@
+# Makefile for vsim pipeline benchmark of nn_mat_mult_kernel_s8_offset_v2
+#
+# Usage:
+#   make                    # build test binary + objdump
+#   make run                # quick cycle-count run
+#   make pipeline           # full pipeline analysis (kanata.log)
+#   make functrace          # per-function cycle breakdown
+
+VSIM_ROOT    := /local/nick/vsim-workspace
+VSIM_DEMO    := $(VSIM_ROOT)/vsim-demo
+VSIM_BIN     := $(VSIM_ROOT)/vsim/build/sim_ax45mpv_premium
+VSIM_TOOLS   := $(VSIM_ROOT)/vsim/tools
+LIBNN_ROOT   := $(shell cd ../.. && pwd)
+
+# Use the same toolchain that built libnn.a
+TOOLCHAIN    := /local/nick/SW_Release_cp/ast530/nds64le-elf-newlib-v5d/bin/riscv64-elf-
+CC           := $(TOOLCHAIN)gcc
+OBJDUMP      := $(TOOLCHAIN)objdump
+
+# Must match libnn build flags for ABI/ISA compatibility
+# Use Andes -mext-vector= (not -march=) to enable ACE extensions (vd4dots)
+CFLAGS := -O2 \
+    -mtune=andes-45-series -mext-vector=zve64d -mzfh \
+    -DNDS_VEC_RVV_VERSION=1000 -DENA_NDS_V5_VEC_DOT_PROD \
+    -I$(LIBNN_ROOT)/Include -I$(LIBNN_ROOT)/internal
+
+# vsim bare-metal startup
+VSIM_FLAGS   := -static -Wl,--defsym,_stack=0x3000000
+VSIM_STARTUP := -nostartfiles $(VSIM_DEMO)/crt0.S
+VSIM_GLUE    := $(VSIM_DEMO)/libgloss.c $(VSIM_DEMO)/handler.c $(VSIM_DEMO)/trap.S
+
+TARGET_LOOP  := test_vd4dots_loop
+TARGET_KERN  := test_kernel_v2
+DUMP_LOOP    := $(TARGET_LOOP).dump
+DUMP_KERN    := $(TARGET_KERN).dump
+
+all: $(TARGET_LOOP) $(DUMP_LOOP) $(TARGET_KERN) $(DUMP_KERN)
+
+$(TARGET_LOOP): test_vd4dots_loop.c
+	$(CC) $< -o $@ \
+		$(VSIM_STARTUP) $(VSIM_GLUE) \
+		$(CFLAGS) $(VSIM_FLAGS) -lm
+
+$(TARGET_KERN): test_kernel_v2.c
+	$(CC) $< -o $@ \
+		$(VSIM_STARTUP) $(VSIM_GLUE) \
+		$(CFLAGS) $(VSIM_FLAGS) \
+		$(LIBNN_ROOT)/libnn.a -lm
+
+$(DUMP_LOOP): $(TARGET_LOOP)
+	$(OBJDUMP) -d $< > $@
+
+$(DUMP_KERN): $(TARGET_KERN)
+	$(OBJDUMP) -d $< > $@
+
+run: $(TARGET_LOOP)
+	$(VSIM_BIN) $<
+
+run-kern: $(TARGET_KERN)
+	$(VSIM_BIN) $<
+
+functrace: $(TARGET_LOOP) $(DUMP_LOOP)
+	$(VSIM_BIN) $< --log-level 0 2>&1 | \
+		python3 $(VSIM_TOOLS)/functrace.py $(DUMP_LOOP)
+
+pipeline: $(TARGET_LOOP) $(DUMP_LOOP)
+	ln -sfn $(VSIM_TOOLS) /tmp/vsim
+	PYTHONPATH=/tmp python3 $(VSIM_TOOLS)/konata.py \
+		--cpu ax45mpv_premium \
+		--objdump-file $(DUMP_LOOP) \
+		--output kanata.log \
+		--experimental \
+		$<
+
+clean:
+	rm -f $(TARGET) $(DUMP) kanata.log *.csv
+
+.PHONY: all run functrace pipeline clean

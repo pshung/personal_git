@@ -1,0 +1,195 @@
+#!/bin/bash
+set -e
+
+############################
+# Benchmark all libm functions on Andes FPGA.
+# For each function, measures:
+#   - Plain C (newlib -lm)
+#   - Optimized assembly (Andes .s files, if available)
+# Appends results to CSV after each run.
+#
+# Usage:
+#   ./bench-all.sh [--output results.csv]
+############################
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SOURCE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+A="$SOURCE_DIR/libm/machine/riscv"
+
+GCC=/local/nick/SW_Release_cp/ast530/nds64le-elf-newlib-v5d/bin/riscv64-elf-gcc
+GDB=/local/nick/SW_Release_cp/ast530/nds64le-elf-newlib-v5d/bin/riscv64-elf-gdb-nopython
+
+OUTPUT="results.csv"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --output) OUTPUT="$2"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+ELF="$SOURCE_DIR/bench-one.elf"
+GDB_SCRIPT="$SCRIPT_DIR/run-one.gdb"
+CLZSI2="$SCRIPT_DIR/clzsi2.c"
+
+# Common andes helpers (double-precision) — all on one line
+DP_HELPERS="$A/andes_exmul.s $A/andes_exdiv.s $A/andes_exadd.s $A/andes_exsub.s $A/andes_sigmax.s $A/andes_dpreduct.s $A/andes_dpsincon.s $A/andes_dpcoscon.s $A/andes_dpexatan.s $A/andes_dpexexp.s $A/andes_dpexlog.s $A/andes_dpexsqrt.s $A/andes_dpasncon.s $A/andes_exp.s"
+
+# Common andes helpers (single-precision)
+FP_HELPERS="$A/andes_fpreduct.s $A/andes_fpsincof.s $A/andes_fpcoscof.s $A/andes_fpexatan.s $A/andes_fpexexp.s $A/andes_fpexlog.s $A/andes_fpexsqrt.s"
+
+compile_and_run() {
+    local func="$1"
+    local arg="$2"
+    local arg2="$3"
+    local extra_flags="$4"
+    local asm_files="$5"
+    local variant="$6"
+
+    local defines="-DBENCH_FUNC=$func -DBENCH_ARG=$arg"
+    [ -n "$arg2" ] && defines="$defines -DBENCH_ARG2=$arg2"
+    [ -n "$extra_flags" ] && defines="$defines $extra_flags"
+
+    # Compile
+    if ! $GCC -Os -mvh $defines -o "$ELF" "$SCRIPT_DIR/bench-one.c" "$CLZSI2" $asm_files -lm -lgcc 2>/tmp/bench-compile-err.txt; then
+        echo "  $func ($variant): COMPILE_FAIL" >&2
+        cat /tmp/bench-compile-err.txt >&2
+        echo "$func,$variant,FAIL,FAIL,FAIL" >> "$OUTPUT"
+        return 0
+    fi
+
+    # Run on FPGA (timeout after 60s to avoid hangs)
+    local gdb_out
+    gdb_out=$(cd "$SCRIPT_DIR" && timeout 60 $GDB -batch -x "$GDB_SCRIPT" "$ELF" 2>&1)
+    local csv_line
+    csv_line=$(echo "$gdb_out" | grep "^$func,")
+
+    if [ -n "$csv_line" ]; then
+        local cycles=$(echo "$csv_line" | cut -d, -f2)
+        local instret=$(echo "$csv_line" | cut -d, -f3)
+        local niter=$(echo "$csv_line" | cut -d, -f4)
+        echo "$func,$variant,$cycles,$instret,$niter" >> "$OUTPUT"
+        echo "  $func ($variant): $cycles cycles, $instret instret"
+    else
+        echo "  $func ($variant): RUN_FAIL" >&2
+        echo "$func,$variant,FAIL,FAIL,FAIL" >> "$OUTPUT"
+        return 0
+    fi
+}
+
+# Write CSV header
+echo "function,variant,total_cycles,total_instret,iterations" > "$OUTPUT"
+echo "==> Benchmarking all libm functions"
+echo "==> Output: $OUTPUT"
+echo ""
+
+# ---- Double-precision ----
+echo "--- Double-precision ---"
+
+# func:arg:arg2:asm_file (arg2 empty for 1-arg functions)
+DP_ASM="
+acos:0.5::$A/s_acos.s
+asin:0.5::$A/s_asin.s
+asinh:1.0::$A/s_asinh.s
+atan:1.0::$A/s_atan.s
+atan2:1.0:1.0:$A/s_atan2.s
+cbrt:8.0::$A/s_cbrt.s
+cos:1.0::$A/s_cos.s
+cosh:1.0::$A/s_cosh.s
+erf:1.0::$A/s_erf.s
+erfc:1.0::$A/s_erfc.s
+exp:1.0::$A/s_exp.s
+expm1:0.5::$A/s_expm1.s
+log:2.0::$A/s_log.s
+log10:100.0::$A/s_log10.s
+log1p:0.5::$A/s_log1p.s
+pow:2.0:10.0:$A/s_pow.s
+sin:1.0::$A/s_sin.s
+sinh:1.0::$A/s_sinh.s
+sqrt:2.0::$A/s_sqrt.s
+tan:1.0::$A/s_tan.s
+tanh:1.0::$A/s_tanh.s
+"
+
+for entry in $DP_ASM; do
+    IFS=':' read -r func arg arg2 asm_file <<< "$entry"
+    echo "[$func]"
+    compile_and_run "$func" "$arg" "$arg2" "" "" "c"
+    compile_and_run "$func" "$arg" "$arg2" "" "$asm_file $DP_HELPERS" "asm"
+done
+
+# Double-precision C-only
+DP_CONLY="
+acosh:2.0:
+atanh:0.5:
+exp2:3.0:
+hypot:3.0:4.0
+j0:1.0:
+j1:1.0:
+log2:8.0:
+tgamma:3.5:
+lgamma:3.5:
+"
+
+for entry in $DP_CONLY; do
+    IFS=':' read -r func arg arg2 <<< "$entry"
+    echo "[$func] (C only)"
+    compile_and_run "$func" "$arg" "$arg2" "" "" "c"
+done
+
+# ---- Single-precision ----
+echo ""
+echo "--- Single-precision ---"
+
+FP_ASM="
+acosf:0.5f::$A/sf_acos.s
+asinf:0.5f::$A/sf_asin.s
+atanf:1.0f::$A/sf_atan.s
+atan2f:1.0f:1.0f:$A/sf_atan2.s
+cosf:1.0f::$A/sf_cos.s
+coshf:1.0f::$A/sf_cosh.s
+expf:1.0f::$A/sf_exp.s
+logf:2.0f::$A/sf_log.s
+log10f:100.0f::$A/sf_log10.s
+powf:2.0f:10.0f:$A/sf_pow.s
+sinf:1.0f::$A/sf_sin.s
+sinhf:1.0f::$A/sf_sinh.s
+sqrtf:2.0f::$A/sf_sqrt.s
+tanf:1.0f::$A/sf_tan.s
+tanhf:1.0f::$A/sf_tanh.s
+"
+
+for entry in $FP_ASM; do
+    IFS=':' read -r func arg arg2 asm_file <<< "$entry"
+    echo "[$func]"
+    compile_and_run "$func" "$arg" "$arg2" "-DBENCH_FLOAT" "" "c"
+    compile_and_run "$func" "$arg" "$arg2" "-DBENCH_FLOAT" "$asm_file $FP_HELPERS" "asm"
+done
+
+FP_CONLY="
+acoshf:2.0f:
+asinhf:1.0f:
+atanhf:0.5f:
+cbrtf:8.0f:
+erff:1.0f:
+erfcf:1.0f:
+exp2f:3.0f:
+expm1f:0.5f:
+hypotf:3.0f:4.0f
+j0f:1.0f:
+j1f:1.0f:
+log1pf:0.5f:
+log2f:8.0f:
+tgammaf:3.5f:
+lgammaf:3.5f:
+"
+
+for entry in $FP_CONLY; do
+    IFS=':' read -r func arg arg2 <<< "$entry"
+    echo "[$func] (C only)"
+    compile_and_run "$func" "$arg" "$arg2" "-DBENCH_FLOAT" "" "c"
+done
+
+echo ""
+echo "==> Done! Results in $OUTPUT"
+echo ""
+cat "$OUTPUT"

@@ -1,0 +1,262 @@
+# 1x1 Convolution Optimization Report: Tiling VQMACC vs Direct VD4DOTS
+
+## 0. What This Function Does
+
+`riscv_nn_conv_1x1_HWC_s8_s8_s8_asym_bias_fast_any` implements a **1x1 pointwise convolution** — one of the most common layers in modern CNN architectures (MobileNet, ResNet bottlenecks, EfficientNet).
+
+A 1x1 convolution changes the number of channels at each spatial position without looking at neighboring pixels. For example, projecting a 14×16 feature map from 512 channels down to 32 channels. Every output pixel is a weighted sum of the input channels at that same (x, y) location — no sliding window, no padding, no kernel overlap.
+
+Despite being "pointwise", these layers often dominate total inference time because they run on every pixel in the feature map.
+
+The function name breaks down as:
+- **conv_1x1_HWC** — 1×1 convolution, Height-Width-Channel data layout
+- **s8_s8_s8** — int8 input, int8 weights, int8 output
+- **asym** — asymmetric quantization (zero point ≠ 0, requiring an offset correction term)
+- **bias** — includes per-channel bias addition
+- **fast_any** — optimized variant that works with any channel count (not restricted to multiples of 4 or 8)
+
+## 1. How 1x1 Convolution Becomes Matrix Multiplication
+
+A 1x1 convolution with `in_ch` input channels and `out_ch` output channels is mathematically a matrix multiply. There is no spatial kernel to slide — each output pixel is a linear combination of input channels.
+
+Given:
+- Input tensor: `[H][W][in_ch]` — e.g. `[14][16][512]`
+- Weight matrix: `[out_ch][in_ch]` — e.g. `[32][512]`
+- Output tensor: `[H][W][out_ch]` — e.g. `[14][16][32]`
+
+Flatten the spatial dimensions:
+
+```
+Output[224][32] = Input[224][512] × Weight[32][512]^T
+```
+
+where 224 = H×W = 14×16. Each output pixel `i` and channel `j` is:
+
+```
+output[i][j] = Σ_k  input[i][k] * weight[j][k]  +  bias[j]
+               k=0..511
+```
+
+This is a standard GEMM (General Matrix-Matrix Multiply) with:
+- M = 224 (pixels)
+- N = 32 (output channels)
+- K = 512 (input channels / reduction dimension)
+
+For asymmetric quantization, an additional offset term is precomputed:
+
+```
+contri[j] = bias[j] + in_offset × Σ_k weight[j][k]
+```
+
+This is added to each output after the GEMM.
+
+## 2. Implementation A: Tiling GEMM with VQMACC
+
+**Function chain:** `riscv_nn_conv_1x1_HWC_s8_s8_s8_asym_bias_fast_any` → `nn_mat_mul_kernel_tiling_transpose_q7` → `nn_mat_mul_kernel_tiling_asym_s8_s8_s8` → `vec_mat_mul_rvv_tiling_vq`
+
+### 2.1 Data preparation
+
+Before the GEMM, the weight matrix is explicitly transposed:
+
+```
+Original weight layout:  [out_ch][in_ch] = [32][512]  (row = one filter)
+Transposed layout:       [in_ch][out_ch] = [512][32]  (row = one input channel position)
+```
+
+This transpose (`nn_mat_mul_kernel_tiling_transpose_q7`) rearranges memory so that a single vector load can fetch all 32 output channels for a given K position.
+
+### 2.2 Vectorization strategy
+
+The kernel vectorizes along the **output channel dimension** (N=32).
+
+```
+vsetvli(vl, 32, e8, m2)    // SEW=8bit, LMUL=2 → max VL=256, actual VL=32
+
+Inner loop (K unrolled by 8):
+  Load 8 rows of transposed weights, each 32 elements:
+    v16 = B[k+0][0..31]    // 32 weights for K position k+0, all out channels
+    v18 = B[k+1][0..31]
+    v20 = B[k+2][0..31]
+    v22 = B[k+3][0..31]
+    v24 = B[k+4][0..31]
+    v26 = B[k+5][0..31]
+    v28 = B[k+6][0..31]
+    v30 = B[k+7][0..31]
+
+  Load 8 scalar input values from each of 2 pixel rows:
+    a1..a8  = A[pixel_r  ][k+0 .. k+7]   // 8 scalar loads
+    a1..a8' = A[pixel_r+1][k+0 .. k+7]   // 8 scalar loads
+
+  16 VQMACC instructions (scalar × vector → accumulate into 32-wide i32):
+    v0 += a1 * v16    v8 += a1' * v16    // pixel r and r+1
+    v0 += a2 * v18    v8 += a2' * v18
+    ... (8 pairs total)
+```
+
+Each VQMACC broadcasts one scalar input across all 32 output channels and multiplies against 32 transposed weights. The accumulator is 32-bit (quad-widened from 8-bit inputs).
+
+### 2.3 Loop structure
+
+```
+for kk = 0 to K step tiling_size(256):        // 2 K-tiles
+  for cc = 0 to N step tiling_size(256):       // 1 iteration (32 < 256)
+    for r = 0 to M step 2:                     // 112 pixel-pairs
+      zero accumulators v0, v8
+      for k = kk to kk+256 step 8:            // 32 iterations
+        8 vector loads + 16 scalar loads + 16 VQMACC
+      load partial sums from intermediate buffer
+      accumulate and store back to intermediate buffer
+```
+
+After the tiling GEMM, a separate pass reads the intermediate i32 buffer, adds `contri_buf`, quantizes, clamps, and narrows to int8.
+
+### 2.4 Instruction count analysis
+
+Per pixel-pair (2 pixels × 32 output channels):
+- K-loop: 256/8 = 32 iterations × (8 vector loads + 16 scalar loads + 16 VQMACC) = 32 × 40 = 1,280 ops
+- 2 K-tiles → 2,560 ops
+- Plus buffer load/store per tile: ~8 ops × 2 = 16 ops
+- Total: ~2,576 ops per pixel-pair
+
+For all 224 pixels (112 pixel-pairs): **~288,512 ops** just for the GEMM inner loop, plus weight transpose overhead and the separate quantization pass.
+
+## 3. Implementation B: Direct GEMM with VD4DOTS
+
+**Function chain:** `riscv_nn_conv_1x1_HWC_s8_s8_s8_asym_bias_fast_any` → `nn_mat_mult_nt_t_s8_v2`
+
+### 3.1 Data preparation
+
+**None.** Weights stay in original `[out_ch][in_ch] = [32][512]` layout. No transpose.
+
+### 3.2 Vectorization strategy
+
+The kernel vectorizes along the **K dimension** (K=512) — the dot product reduction axis.
+
+```
+vsetvli(vl, 128, e8, m1)   // SEW=8bit, LMUL=1 → VL=128 at VLEN=1024
+
+Inner loop (K dimension):
+  Load 4 weight rows and 4 input rows, each 128 elements:
+    v16 = weight[ch_j+0][k..k+127]    // 128 weights from output channel j+0
+    v17 = weight[ch_j+1][k..k+127]    // 128 weights from output channel j+1
+    v18 = weight[ch_j+2][k..k+127]
+    v19 = weight[ch_j+3][k..k+127]
+    v20 = input[pixel_i+0][k..k+127]  // 128 inputs from pixel i+0
+    v21 = input[pixel_i+1][k..k+127]
+    v22 = input[pixel_i+2][k..k+127]
+    v23 = input[pixel_i+3][k..k+127]
+
+  16 VD4DOTS instructions (vector × vector → accumulate into i32):
+    v0  += vd4dots(input_i+0, weight_j+0)   // dot product of 128 elements
+    v1  += vd4dots(input_i+0, weight_j+1)
+    v2  += vd4dots(input_i+0, weight_j+2)
+    v3  += vd4dots(input_i+0, weight_j+3)
+    v4  += vd4dots(input_i+1, weight_j+0)
+    ...
+    v15 += vd4dots(input_i+3, weight_j+3)
+```
+
+VD4DOTS groups 4 consecutive int8 elements, multiplies pairwise, sums the 4 products, and accumulates into one int32 element. With VL=128 input elements, it produces 128/4 = 32 int32 partial sums per instruction. Both operands are vectors — no scalar broadcast.
+
+### 3.3 After the K-loop
+
+```
+16 × VREDSUM:   reduce each 32-element i32 vector → 1 scalar
+12 × VSLIDEUP:  pack 16 scalars into 4 vectors of 4 elements
+4  × VADD:      add contri_buf (bias + offset)
+4  × VWMUL:     multiply by per-channel scale (32→64 bit)
+4  × VNSRA:     shift right by per-channel shift (64→32 bit)
+4  × VSSRA:     rounding shift
+4  × VADD:      add output offset
+8  × VMAX/VMIN: clamp to [act_min, act_max]
+8  × VNSRA:     narrow 32→16→8 bit
+4  × VSE8:      store 4 output bytes
+```
+
+Quantization is done inline — no intermediate buffer.
+
+### 3.4 Loop structure
+
+```
+for j = 0 to N=32 step 4:              // 8 output-channel groups
+  load contri_buf[j..j+3], shifts, scales
+  for i = 0 to M=448 step 4:           // 112 pixel groups (448 = 224×2 batches)
+    zero accumulators v0-v15
+    for k = 0 to K=512 step 128:       // 4 iterations
+      8 vector loads + 16 VD4DOTS
+    16 VREDSUM + 12 VSLIDEUP + quantize + store
+```
+
+### 3.5 Instruction count analysis
+
+Per 4×4 block (4 pixels × 4 output channels):
+- K-loop: 4 iterations × (8 vector loads + 16 VD4DOTS) = 4 × 24 = 96 ops
+- Reduction + quantize: 16 + 12 + ~28 = ~56 ops
+- Total: ~152 ops per 4×4 block
+
+For all outputs (8 × 112 = 896 blocks): **~136,192 ops** including quantization.
+
+## 4. Comparison
+
+### 4.1 Work per instruction
+
+| Instruction | Operand style | Multiply-adds per instruction | Input elements consumed |
+|---|---|---|---|
+| VQMACC_VX (VL=32) | scalar × vector | 32 | 32 from vector, 1 scalar |
+| VD4DOTS_VV (VL=128) | vector × vector | 128 | 128 from each vector |
+
+VD4DOTS does **4× more multiply-adds** per instruction because:
+1. VL is 4× larger (128 vs 32) — the vectorized dimension (K=512) is large enough to fill the vector register
+2. Both operands are vectors — no scalar bottleneck
+
+### 4.2 Total work breakdown
+
+| Metric | Tiling VQMACC | Direct VD4DOTS |
+|---|---|---|
+| Weight transpose | Yes (~extra pass over 32×512 bytes) | None |
+| Intermediate buffer | i32[224][32] = 28KB, load+store per tile | None |
+| GEMM vector multiply ops | ~114,688 VQMACC | ~28,672 VD4DOTS |
+| Reduction ops | 0 (results already per-channel) | ~7,168 VREDSUM |
+| Quantization | Separate pass | Inline |
+| **Total instructions (measured)** | **807,631** | **215,681** |
+
+### 4.3 FPGA results (AX45MPV, VLEN=1024)
+
+| Metric | Tiling VQMACC | Direct VD4DOTS | Ratio |
+|---|---|---|---|
+| Cycles | 1,116,941 | 428,860 | **2.60× faster** |
+| Instructions | 807,631 | 215,681 | 3.74× fewer |
+| IPC | 0.72 | 0.50 | 0.70× |
+
+### 4.4 Why IPC is lower but cycles are much better
+
+The tiling kernel has higher IPC (0.72) because VQMACC at VL=32 completes quickly in the vector pipeline — short vectors mean fewer VW (vector writeback) stages. The scalar loads can also dual-issue with vector operations.
+
+The direct kernel has lower IPC (0.50) because VD4DOTS at VL=128 has longer pipeline latency — more elements means more VW stages, and 16 consecutive VD4DOTS writing to different accumulators must wait for pipeline resources. The VREDSUM reductions also serialize.
+
+But IPC is instructions per cycle, not work per cycle. Each VD4DOTS instruction does 4× more useful computation than each VQMACC. The **effective throughput** (multiply-adds per cycle) is higher for VD4DOTS:
+
+```
+VQMACC:  807,631 instrs × ~0.5 VQMACC fraction × 32 MADs / 1,116,941 cycles ≈ 11.6 MADs/cycle
+VD4DOTS: 215,681 instrs × ~0.5 VD4DOTS fraction × 128 MADs / 428,860 cycles ≈ 32.2 MADs/cycle
+```
+
+## 5. Root Cause: Why the Tiling Kernel Was Originally Chosen
+
+The tiling GEMM kernel (`vec_mat_mul_rvv_tiling_vq`) was designed as a general-purpose GEMM that works well when **both matrix dimensions are large**. It vectorizes the N dimension (output channels) and tiles both K and N to fit in cache.
+
+When N is large (e.g., N=1024), VL=256 at LMUL=M2 would be well-utilized, and the tiling approach's cache-friendly access pattern would be advantageous.
+
+However, for this workload with N=32 (output channels), the vectorized dimension is too small. VL is clamped to 32 out of a possible 256, and the kernel degenerates into mostly scalar work (loading one input element at a time). The `#ifdef ENA_TILING` guard unconditionally preferred this path when `ENA_TILING` was defined, regardless of the actual dimension sizes.
+
+The fix was a 2-line `#ifdef` change: when `ENA_VEC_ELEN64` is available (indicating the platform supports the direct VD4DOTS kernel), prefer it over the tiling path. The direct kernel vectorizes K=512, which is always large for convolution workloads, making it a better default choice.
+
+## 6. Summary
+
+The 2.60× speedup comes from three compounding factors:
+
+1. **4× more work per vector instruction** — VD4DOTS at VL=128 does 128 multiply-adds vs VQMACC at VL=32 doing 32
+2. **No weight transpose** — eliminates a full pass over the weight matrix
+3. **No intermediate buffer** — eliminates i32 buffer allocation, load/store per tile, and separate quantization pass
+
+The tradeoff (16 VREDSUM reductions + lower IPC) is far outweighed by the instruction count reduction.

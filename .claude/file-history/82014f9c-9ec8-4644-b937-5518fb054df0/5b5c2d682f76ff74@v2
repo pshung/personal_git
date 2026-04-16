@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+################################################################################
+# vsim Pipeline Analysis for libnn functions
+#
+# Runs AndesCycle (vsim) cycle-accurate simulation and generates pipeline logs
+# for analyzing RVV performance on AX45MPV.
+#
+# Prerequisites:
+#   - vsim built at /local/nick/vsim-workspace/vsim/build/
+#   - Andes toolchain at /local/nick/SW_Release_cp/ast530/
+#   - libnn.a built (run build_libnn.sh first)
+#
+# Usage:
+#   ./run_vsim_pipeline.sh <test_binary.c> [options]
+#
+# Examples:
+#   ./run_vsim_pipeline.sh test_vd4dots_loop.c                 # build + quick run
+#   ./run_vsim_pipeline.sh test_vd4dots_loop.c --functrace     # per-function cycles
+#   ./run_vsim_pipeline.sh test_vd4dots_loop.c --pipeline      # full pipeline log
+#   ./run_vsim_pipeline.sh test_vd4dots_loop.c --link-libnn    # link against libnn.a
+################################################################################
+set -euo pipefail
+
+VSIM_ROOT="/local/nick/vsim-workspace"
+VSIM_DEMO="${VSIM_ROOT}/vsim-demo"
+VSIM_BIN="${VSIM_ROOT}/vsim/build/sim_ax45mpv_premium"
+VSIM_TOOLS="${VSIM_ROOT}/vsim/tools"
+TOOLCHAIN="/local/nick/SW_Release_cp/ast530/nds64le-elf-newlib-v5d/bin/riscv64-elf-"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+CC="${TOOLCHAIN}gcc"
+OBJDUMP="${TOOLCHAIN}objdump"
+
+MODE="run"
+LINK_LIBNN=0
+SRC_FILE=""
+
+#===== Parse arguments =====
+SRC_FILE="${1:-}"
+if [ -z "${SRC_FILE}" ]; then
+    echo "Usage: $0 <source.c> [--functrace] [--pipeline] [--link-libnn]"
+    exit 1
+fi
+shift
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --functrace)  MODE="functrace"; shift ;;
+        --pipeline)   MODE="pipeline"; shift ;;
+        --link-libnn) LINK_LIBNN=1; shift ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+# Derive output names
+BASE="$(basename "${SRC_FILE}" .c)"
+BIN="${BASE}"
+DUMP="${BASE}.dump"
+
+#===== Build flags =====
+# Use Andes -mext-vector= (not -march=) to enable ACE extensions (vd4dots)
+CFLAGS="-O2 -mtune=andes-45-series -mext-vector=zve64d -mzfh"
+CFLAGS="${CFLAGS} -DNDS_VEC_RVV_VERSION=1000 -DENA_NDS_V5_VEC_DOT_PROD"
+CFLAGS="${CFLAGS} -I${LIB_ROOT}/Include -I${LIB_ROOT}/internal"
+
+VSIM_FLAGS="-static -Wl,--defsym,_stack=0x3000000"
+VSIM_STARTUP="-nostartfiles ${VSIM_DEMO}/crt0.S"
+VSIM_GLUE="${VSIM_DEMO}/libgloss.c ${VSIM_DEMO}/handler.c ${VSIM_DEMO}/trap.S"
+
+LINK_LIBS="-lm"
+if [ ${LINK_LIBNN} -eq 1 ]; then
+    if [ ! -f "${LIB_ROOT}/libnn.a" ]; then
+        echo "ERROR: libnn.a not found. Run build_libnn.sh first."
+        exit 1
+    fi
+    LINK_LIBS="${LIB_ROOT}/libnn.a ${LINK_LIBS}"
+fi
+
+#===== Build =====
+echo "[1/2] Compiling ${SRC_FILE}..."
+${CC} "${SRC_FILE}" -o "${BIN}" \
+    ${VSIM_STARTUP} ${VSIM_GLUE} \
+    ${CFLAGS} ${VSIM_FLAGS} \
+    ${LINK_LIBS} 2>&1
+
+echo "  Generating disassembly..."
+${OBJDUMP} -d "${BIN}" > "${DUMP}"
+echo "  OK: ${BIN} + ${DUMP}"
+
+#===== Run =====
+echo ""
+echo "[2/2] Running vsim (mode: ${MODE})..."
+
+case "${MODE}" in
+    run)
+        ${VSIM_BIN} "${BIN}" 2>&1
+        ;;
+    functrace)
+        ${VSIM_BIN} "${BIN}" --log-level 0 2>&1 | \
+            python3 ${VSIM_TOOLS}/functrace.py "${DUMP}"
+        ;;
+    pipeline)
+        ln -sfn ${VSIM_TOOLS} /tmp/vsim
+        PYTHONPATH=/tmp python3 ${VSIM_TOOLS}/konata.py \
+            --cpu ax45mpv_premium \
+            --objdump-file "${DUMP}" \
+            --output kanata.log \
+            --experimental \
+            "${BIN}" 2>&1
+        echo ""
+        echo "Pipeline log saved to: kanata.log"
+        echo "Open with Konata (https://github.com/shioyadan/Konata) for visual analysis."
+        echo "Or analyze specific instruction IDs with:"
+        echo "  grep 'vd4dots\|vle8' kanata.log | head -40"
+        ;;
+esac

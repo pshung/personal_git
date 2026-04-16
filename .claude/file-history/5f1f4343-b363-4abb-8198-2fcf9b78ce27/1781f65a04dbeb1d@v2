@@ -1,0 +1,87 @@
+---
+type: operator
+function: riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any
+source: Source/ConvolutionFunctions/riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any.c
+tags: [conv, s8, asym, bias, any, rvv, vd4dots, im2col]
+current_speedup: 4.97x
+baseline_cycles: 5453441
+current_cycles: 1096855
+---
+
+# conv_HWC_s8_s8_s8_asym_bias_any
+
+## Function Signature
+
+```c
+riscv_nn_status riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any(
+    const int8_t *in_tensor,
+    const uint16_t in_tensor_dim,
+    const uint16_t in_tensor_ch,
+    const int8_t *filt,
+    const uint16_t out_tensor_ch,
+    const uint16_t filt_dim,
+    const uint16_t padding,
+    const uint16_t stride,
+    const int16_t in_offset,
+    const int16_t *filt_offset,
+    const int32_t *bias,
+    const int32_t *out_shift,
+    const int32_t out_scale,
+    const int16_t out_offset,
+    const int16_t act_min,
+    const int16_t act_max,
+    int8_t *out_tensor,
+    const uint16_t out_tensor_dim,
+    int8_t *tmp_buf
+);
+```
+
+## Active Code Path
+
+`#ifdef ENA_VEC_ISA` block.
+
+- Asym quantization requires per-channel offset correction (`in_offset * sum_weights`)
+- Uses `nn_mat_mult_kernel_s8_offset_unroll4` -- vd4dots with offset compensation
+- im2col buffer: 4 columns * K bytes
+
+## Optimization History
+
+| Date | Commit | Approach | Cycles | Speedup | Outcome |
+|---|---|---|---|---|---|
+| 2026-03-21 | baseline | ENA_TILING GEMM (vectorize N=16, out_ch=16 test) | 5,453,441 | 1.00x | baseline |
+| 2026-03-23 | 31ed3665 | Upgrade GEMM: 4x2/M2 v4 -> 4x4/M1 unroll4 | ~5,290,000 | 1.03x | improved |
+| 2026-03-24 | 78371ff0 | im2col 5-region split: bulk row copy for pad=0 center | ~3,470,000 | 1.57x (incremental) | improved |
+| 2026-03-24 | final | Combined: unroll4 GEMM + bulk im2col | 1,096,855 | 4.97x | improved |
+
+Note: The baseline was unusually high (5.4M cycles vs 2.3M for sym_bias_fast) because the asym test case used out_tensor_ch=16 with a large input, exposing the im2col overhead more severely.
+
+## Key Insights
+
+### Round 1: GEMM was not the main bottleneck
+
+The first attempt (upgrading GEMM kernel from v4 to unroll4) gave only 1.03x improvement. This indicated im2col construction was dominating.
+
+### Round 2: im2col bulk copy for center region
+
+The 5-region split (top/mid-left/mid-center/mid-right/bottom) replaces per-element copies in the center region with bulk row copies:
+- **Before:** 9 separate `nn_dup_s8(in_tensor_ch=64)` calls per pixel (576B in 9x64B chunks)
+- **After:** 3 `nn_dup_s8(in_tensor_ch * ker_dim_x = 192)` calls per pixel (576B in 3x192B chunks)
+- For pad=0 test case, ALL pixels fall in mid-center -> maximum benefit
+
+Also fixed boundary clamping bug: `bound_x_end` could exceed `out_tensor_dim_x`.
+
+### 8-pixel double-pump was neutral
+
+After achieving 4.97x, tested batching 8 im2col pixels and calling unroll4 twice (hypothesis: weight data stays in L1 for second call). Result: 1.004x (neutral). Weights already fit in L1 with 4-pixel batching.
+
+## Current State (2026-03-24)
+
+At 4.97x speedup, further improvements are likely marginal. The im2col construction and GEMM kernel are both now efficient. Possible next areas:
+- uarch-level scheduling of the GEMM inner loop
+- Larger pixel batching (but 8-pixel showed neutral)
+
+## Key Techniques Applied
+
+- [[tiling-gemm-to-vd4dots]] -- GEMM kernel upgrade
+- [[im2col-strategies]] -- 5-region split with bulk row copies
+- [[vectorize-k-vs-n]] -- why vectorizing K > N

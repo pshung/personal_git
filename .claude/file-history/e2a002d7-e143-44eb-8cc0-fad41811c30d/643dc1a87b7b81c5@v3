@@ -1,0 +1,161 @@
+---
+description: "Predict optimal tile config for dispatches and generate transform libraries"
+allowed-tools: "Read,Glob,Grep,Write,Edit,Bash,Agent"
+---
+
+# /optimize_subgraph — Generate Transform Libraries with Predicted Tile Configs
+
+You are an expert RISC-V RVV compiler engineer. Given a benchmarks directory, you will:
+1. Read each dispatch's benchmark MLIR and tile_config.json
+2. Reason about the optimal tile configuration
+3. Write the transform library MLIR files
+
+**Target hardware:** AX45_1024 — VLEN=1024 bits, L2=8MB, LMUL ∈ {1,2,4,8}
+
+## Arguments
+
+The user provides a path to a benchmarks directory (or a model working directory containing `benchmarks/`).
+Example: `/optimize_subgraph AutoIREE_zoo/models/Bird/bird/benchmarks`
+
+An output directory for the transform library can be optionally specified after a `--output` flag.
+Default output: `transform_library/` next to `benchmarks/`.
+
+## Step 1: Discover dispatches
+
+Glob for `*_static_tile_config.json` files in the benchmarks directory.
+Each one corresponds to a dispatch. Extract the dispatch ID from the filename pattern:
+`{mname}_{fname}_dispatch_{id}_static_tile_config.json`
+
+The matching benchmark MLIR is:
+`{mname}_{fname}_dispatch_{id}_static_benchmark.mlir`
+
+## Step 2: For each dispatch, read and analyze
+
+### 2a. Read tile_config.json
+
+This JSON maps op names (like `"linalg.generic-0"`, `"linalg.fill-0"`) to their properties:
+- `instruction_seq`: the body operations (e.g. `"arith.mulf-arith.addf-linalg.yield"`)
+- `default`: current tile sizes as string (e.g. `"[[32, 16, 0], [1, 8, 0], [0, 0, 32], [0, 0, 0]]"`)
+- `iteration_space`: loop bounds as string (e.g. `"[12544, 16, 32]"`)
+- `iteration_type`: parallel/reduction per dim (e.g. `"['parallel', 'parallel', 'reduction']"`)
+
+### 2b. Read benchmark MLIR
+
+Extract two critical strings:
+- **func_name**: from `func.func @{func_name}() attributes {translation_info = ...}`
+- **func_attr**: the `#iree_codegen.translation_info<...>` value from the `attributes {translation_info = ...}` annotation
+
+### 2c. Classify the dispatch
+
+Based on op names and instruction_seq:
+- **fill**: `linalg.fill` — no tuning needed, use default
+- **elementwise**: single `linalg.generic` with only parallel dims
+- **matmul-like**: ops with `[parallel, parallel, reduction]` patterns
+- **conv2d**: `linalg.conv_2d_nhwc_hwcf`, `linalg.conv_2d_nchw_fchw`
+- **depthwise_conv**: `linalg.depthwise_conv_2d_nhwc_hwc`
+- **pooling**: `linalg.pooling_nhwc_*`, `linalg.pooling_nchw_*`
+- **generic-with-reduction**: `linalg.generic` with reduction dims
+
+## Step 3: Predict tile configuration
+
+Load principles from `knowledge/principles/{op_type}.md` if available. Otherwise use the hardware rules below.
+
+### Hardware rules (VLEN=1024, f32, VLMAX=32 at LMUL=1)
+
+**Tile size format:** `[[level0], [level1], [level2], [level3]]` where:
+- Level 0: distribution tile (outer parallel)
+- Level 1: vector common parallel tile (or workgroup tile)
+- Level 2: reduction tile (0 for non-reduction dims)
+- Level 3: vector inner parallel tile (0 for non-parallel dims)
+
+For 3-level configs `[[L0], [L1], [L2]]`:
+- Level 0: distribution, Level 1: vector parallel, Level 2: reduction
+
+**Key principles:**
+1. **Innermost parallel dim tile** should be a multiple of VLMAX (32 for f32). Prefer 32 (LMUL=1) or 64 (LMUL=2).
+2. **Reduction tile** should be non-zero for large reduction dims (>64). Values 8-32 are typical.
+3. **Outer parallel tiles** should make the working set fit in L2 (8MB). Working set ≈ product(outer_tiles) × element_size × num_operands.
+4. **LMUL ≤ 4** to avoid register pressure. LMUL=1 or 2 is preferred.
+5. **Vector utilization ≥ 50%**: innermost parallel tile / VLMAX should be ≥ 0.5.
+6. **Fill ops** typically mirror the dominant op's parallel tile sizes.
+
+**Common patterns:**
+- Elementwise 1D `[N]`: `[[4096], [32], [0], [0]]` — large distribution tile, VLMAX-sized inner
+- Matmul `[M, N, K]`: outer `[M_tile, N_tile, 0]`, inner parallel `[1, 32, 0]`, reduction `[0, 0, K_tile]`
+- Conv2d NHWC `[N, OH, OW, OC, KH, KW, IC]`: tile OC at VLMAX, keep spatial dims small
+
+### Multi-op dispatches
+
+When a dispatch has multiple ops (e.g. fill + matmul + generic):
+1. Identify the **dominant op** — the one with reduction dims, or largest iteration space
+2. Optimize tile sizes for the dominant op
+3. Set companion ops (fill, elementwise) to use compatible parallel tile sizes
+4. Each op gets its own lowering_config in the transform library
+
+## Step 4: Write transform library MLIR
+
+For dispatch ID `{id}`, write to: `{output_dir}/transform_library_dispatch_{id}.mlir`
+
+The format MUST be exactly:
+
+```
+module attributes { transform.with_named_sequence } {
+	transform.named_sequence @__kernel_config(%variant_op: !transform.any_op) {
+		%func = transform.structured.match ops{["func.func"]} attributes{sym_name = "{func_name}"} in %variant_op : (!transform.any_op) -> !transform.any_op
+		%attr = transform.param.constant {func_attr} -> !transform.any_param
+		transform.annotate %func "translation_info" =  %attr : !transform.any_op, !transform.any_param
+		transform.foreach %func : !transform.any_op {
+		^bb2(%arg0: !transform.any_op):
+{per_op_blocks}
+		}
+		transform.yield
+	}
+}
+```
+
+### Per-op block format
+
+**Single op with a given dialect name** (e.g. only one `linalg.generic`):
+```
+			%o{id} = transform.structured.match ops {["{op_dialect_name}"]} in %arg0: (!transform.any_op) -> !transform.any_op
+			%conf{id} = transform.param.constant #iree_codegen.lowering_config<tile_sizes = {tile_sizes}> -> !transform.any_param
+			transform.annotate %o{id} "lowering_config" = %conf{id} : !transform.any_op, !transform.any_param
+```
+
+**Multiple ops sharing the same dialect name** (e.g. `linalg.generic-1` and `linalg.generic-2`):
+First emit a split_handle, then annotate each:
+```
+			%g{group} = transform.structured.match ops {["{op_dialect_name}"]} in %arg0: (!transform.any_op) -> !transform.any_op
+			%o{id1},%o{id2} = transform.split_handle %g{group} : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+
+			%conf{id1} = transform.param.constant #iree_codegen.lowering_config<tile_sizes = {tile_sizes_1}> -> !transform.any_param
+			transform.annotate %o{id1} "lowering_config" = %conf{id1} : !transform.any_op, !transform.any_param
+
+			%conf{id2} = transform.param.constant #iree_codegen.lowering_config<tile_sizes = {tile_sizes_2}> -> !transform.any_param
+			transform.annotate %o{id2} "lowering_config" = %conf{id2} : !transform.any_op, !transform.any_param
+```
+
+**CRITICAL**: The op names in the transform library use the dialect name WITHOUT the index suffix.
+- tile_config.json key: `"linalg.generic-1"` → transform match uses: `"linalg.generic"`
+- tile_config.json key: `"linalg.fill-0"` → transform match uses: `"linalg.fill"`
+
+**CRITICAL**: tile_sizes must use Python list-of-lists syntax: `[[32, 16, 0], [1, 8, 0], [0, 0, 32], [0, 0, 0]]`
+
+## Step 5: Report results
+
+After processing all dispatches, output a summary table:
+
+```
+| Dispatch | Op Type | Tile Config | Confidence | Change from Default |
+|----------|---------|-------------|------------|---------------------|
+| dispatch_0 | elementwise | [[4096], [32], ...] | HIGH | same |
+| dispatch_5 | matmul | [[64, 16, 0], ...] | HIGH | changed L0 |
+```
+
+## Important Notes
+
+- Do NOT modify any existing AutoIREE code
+- The transform library files are the ONLY output — they are consumed by `iree-compile --iree-codegen-transform-dialect-library-dir=transform_library/`
+- When in doubt, use the default tile config from tile_config.json (it's a safe fallback)
+- Focus optimization effort on dispatches with reduction dims (matmul, conv) — these benefit most from tuning
+- Fill ops and simple elementwise ops rarely need different tiles from default

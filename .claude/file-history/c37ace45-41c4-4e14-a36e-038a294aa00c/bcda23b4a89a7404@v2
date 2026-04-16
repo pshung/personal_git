@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""Analyze AI-tune results across all AutoIREE_zoo models.
+
+Parses record.json (algorithm=ai_rank) and tile_config.json files to produce:
+1. Summary table: model, dispatches, AI wins, baseline wins, speedup
+2. Regression analysis by rootOp: which ops/shapes the AI struggles with
+3. Recommendations for training improvements
+
+Usage:
+    python3 tmp/analyze_ai_tune.py
+    python3 tmp/analyze_ai_tune.py --zoo-dir /local/nick/AutoIREE_zoo/models
+    python3 tmp/analyze_ai_tune.py --output tmp/ai_tune_report.md
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+
+ZOO_DIR = Path("/local/nick/AutoIREE_zoo/models")
+
+# Dispatch keys to skip (metadata, not dispatch data)
+META_KEYS = {
+    "model", "iterations", "algorithm",
+    "total_default_cycle", "total_best_search_cycle",
+    "total_tuning_time", "fmt tuning time",
+}
+
+
+def find_ai_tune_record(model_dir: Path) -> Path | None:
+    """Find the most recent ai_rank record.json under a model directory."""
+    records = []
+    for rj in model_dir.rglob("record.json"):
+        try:
+            data = json.loads(rj.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("algorithm") == "ai_rank":
+            records.append(rj)
+    if not records:
+        return None
+    # Most recent by folder timestamp (folder name starts with date)
+    return sorted(records, key=lambda p: p.parent.name)[-1]
+
+
+def find_tile_config(model_dir: Path, dispatch_key: str) -> dict | None:
+    """Find tile_config.json for a dispatch and return parsed data."""
+    # dispatch_key like "module_main_dispatch_3"
+    pattern = f"{dispatch_key}_static_tile_config.json"
+    for tc in model_dir.rglob(pattern):
+        try:
+            return json.loads(tc.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+    return None
+
+
+def extract_root_op(tile_config: dict) -> str:
+    """Extract the root op name from tile_config.json.
+
+    The root op is the last op entry (highest index suffix),
+    which is the primary computation.
+    """
+    if not tile_config:
+        return "unknown"
+    # Keys like "linalg.conv_2d_nhwc_hwcf-0", "linalg.fill-1"
+    ops = list(tile_config.keys())
+    if not ops:
+        return "unknown"
+    # Last op is typically the root computation
+    last_op = ops[-1]
+    # Strip the index suffix: "linalg.conv_2d_nhwc_hwcf-0" -> "linalg.conv_2d_nhwc_hwcf"
+    name = last_op.rsplit("-", 1)[0]
+    return name
+
+
+def extract_shape(tile_config: dict, op_key: str | None = None) -> str:
+    """Extract iteration_space from the root op as the shape."""
+    if not tile_config:
+        return "?"
+    if op_key is None:
+        ops = list(tile_config.keys())
+        if not ops:
+            return "?"
+        op_key = ops[-1]
+    return tile_config[op_key].get("iteration_space", "?")
+
+
+def analyze_model(model_name: str, model_dir: Path) -> dict | None:
+    """Analyze a single model's AI-tune results."""
+    record_path = find_ai_tune_record(model_dir)
+    if record_path is None:
+        return None
+
+    data = json.loads(record_path.read_text())
+    dispatches = []
+    for key, val in data.items():
+        if key in META_KEYS or not isinstance(val, dict):
+            continue
+        default = val.get("default_cycle", 0)
+        best = val.get("best_search_cycle", 0)
+        ai_wins = best < default
+        dispatches.append({
+            "dispatch": key,
+            "default_cycle": default,
+            "best_cycle": best,
+            "ai_wins": ai_wins,
+            "speedup": default / best if best > 0 else 0.0,
+        })
+
+    if not dispatches:
+        return None
+
+    total_default = sum(d["default_cycle"] for d in dispatches)
+    total_best = sum(d["best_cycle"] for d in dispatches)
+    ai_win_count = sum(1 for d in dispatches if d["ai_wins"])
+    baseline_win_count = len(dispatches) - ai_win_count
+
+    # Enrich baseline-win dispatches with rootOp info
+    regressions = []
+    for d in dispatches:
+        if not d["ai_wins"]:
+            tc = find_tile_config(model_dir, d["dispatch"])
+            root_op = extract_root_op(tc) if tc else "unknown"
+            shape = extract_shape(tc) if tc else "?"
+            regressions.append({
+                **d,
+                "root_op": root_op,
+                "shape": shape,
+            })
+
+    return {
+        "model": model_name,
+        "record_path": str(record_path),
+        "n_dispatches": len(dispatches),
+        "ai_wins": ai_win_count,
+        "baseline_wins": baseline_win_count,
+        "total_default": total_default,
+        "total_best": total_best,
+        "speedup": total_default / total_best if total_best > 0 else 0.0,
+        "dispatches": dispatches,
+        "regressions": regressions,
+    }
+
+
+def generate_report(results: list[dict]) -> str:
+    """Generate markdown report from analysis results."""
+    lines = []
+    lines.append("# AI-Tune Results: All AutoIREE_zoo Models")
+    lines.append("")
+
+    # Summary table
+    lines.append("## Summary")
+    lines.append("")
+    lines.append("| Model | Dispatches | AI Wins | Baseline Wins | "
+                 "Win Rate | Speedup |")
+    lines.append("|-------|-----------|---------|---------------|"
+                 "----------|---------|")
+
+    total_dispatches = 0
+    total_ai_wins = 0
+    total_baseline_wins = 0
+    grand_default = 0
+    grand_best = 0
+
+    for r in sorted(results, key=lambda x: x["speedup"], reverse=True):
+        win_rate = r["ai_wins"] / r["n_dispatches"] * 100
+        lines.append(
+            f"| {r['model']} | {r['n_dispatches']} | {r['ai_wins']} | "
+            f"{r['baseline_wins']} | {win_rate:.0f}% | "
+            f"{r['speedup']:.2f}x |"
+        )
+        total_dispatches += r["n_dispatches"]
+        total_ai_wins += r["ai_wins"]
+        total_baseline_wins += r["baseline_wins"]
+        grand_default += r["total_default"]
+        grand_best += r["total_best"]
+
+    overall_win_rate = total_ai_wins / total_dispatches * 100 if total_dispatches else 0
+    overall_speedup = grand_default / grand_best if grand_best else 0
+    lines.append(
+        f"| **TOTAL** | **{total_dispatches}** | **{total_ai_wins}** | "
+        f"**{total_baseline_wins}** | **{overall_win_rate:.0f}%** | "
+        f"**{overall_speedup:.2f}x** |"
+    )
+    lines.append("")
+
+    # Regression analysis by rootOp
+    lines.append("## Regression Analysis by rootOp")
+    lines.append("")
+    lines.append("Dispatches where baseline wins (AI couldn't improve):")
+    lines.append("")
+
+    # Group regressions by root_op
+    by_op: dict[str, list[dict]] = defaultdict(list)
+    for r in results:
+        for reg in r["regressions"]:
+            by_op[reg["root_op"]].append({
+                "model": r["model"],
+                **reg,
+            })
+
+    for op_name in sorted(by_op, key=lambda k: len(by_op[k]), reverse=True):
+        regs = by_op[op_name]
+        lines.append(f"### {op_name} ({len(regs)} dispatches)")
+        lines.append("")
+        lines.append("| Model | Dispatch | Shape | Baseline Cycles |")
+        lines.append("|-------|----------|-------|-----------------|")
+        for reg in sorted(regs, key=lambda x: x["default_cycle"], reverse=True):
+            lines.append(
+                f"| {reg['model']} | {reg['dispatch']} | "
+                f"{reg['shape']} | {reg['default_cycle']:,} |"
+            )
+        lines.append("")
+
+    # Recommendations
+    lines.append("## Recommendations")
+    lines.append("")
+    if by_op:
+        top_ops = sorted(by_op, key=lambda k: len(by_op[k]), reverse=True)[:5]
+        lines.append("Priority ops for training data improvement:")
+        lines.append("")
+        for i, op in enumerate(top_ops, 1):
+            count = len(by_op[op])
+            lines.append(f"{i}. **{op}** — {count} baseline-win dispatches")
+        lines.append("")
+
+    # Models with worst win rate
+    worst = sorted(results, key=lambda r: r["ai_wins"] / max(r["n_dispatches"], 1))[:5]
+    lines.append("Models with lowest AI win rate:")
+    lines.append("")
+    for r in worst:
+        wr = r["ai_wins"] / r["n_dispatches"] * 100 if r["n_dispatches"] else 0
+        lines.append(f"- **{r['model']}**: {wr:.0f}% "
+                     f"({r['ai_wins']}/{r['n_dispatches']})")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Analyze AI-tune results")
+    parser.add_argument("--zoo-dir", type=Path, default=ZOO_DIR,
+                        help="Path to AutoIREE_zoo models dir")
+    parser.add_argument("--output", "-o", type=Path,
+                        default=Path("tmp/ai_tune_report.md"),
+                        help="Output report path")
+    args = parser.parse_args()
+
+    models = sorted(p.name for p in args.zoo_dir.iterdir() if p.is_dir())
+    print(f"Scanning {len(models)} models in {args.zoo_dir}")
+
+    results = []
+    for model_name in models:
+        model_dir = args.zoo_dir / model_name
+        r = analyze_model(model_name, model_dir)
+        if r is None:
+            print(f"  {model_name}: no ai_rank record found, skipping")
+            continue
+        print(f"  {model_name}: {r['n_dispatches']} dispatches, "
+              f"{r['ai_wins']} AI wins, {r['speedup']:.2f}x speedup")
+        results.append(r)
+
+    if not results:
+        print("No AI-tune results found.")
+        sys.exit(1)
+
+    report = generate_report(results)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(report)
+    print(f"\nReport written to {args.output}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,85 @@
+---
+type: operator
+function: riscv_nn_avepool_HWC_s8
+source: Source/PoolingFunctions/riscv_nn_avepool_HWC_s8.c
+tags: [avepool, s8, rvv, e16, accumulation]
+current_speedup: 2.78x
+baseline_cycles: 149131
+current_cycles: 53613
+---
+
+# avepool_HWC_s8
+
+## Function Signature
+
+```c
+riscv_nn_status riscv_nn_avepool_HWC_s8(
+    const int8_t *in_tensor,
+    const uint16_t in_tensor_dim,
+    const uint16_t in_tensor_ch,
+    const uint16_t filt_dim,
+    const uint16_t padding,
+    const uint16_t stride,
+    const uint16_t out_tensor_dim,
+    int8_t *in_tmp_buf,
+    int8_t *out_tensor
+);
+```
+
+## What This Function Does
+
+Average pooling: for each output pixel, compute the mean of all input values in the kernel window. The kernel processes `in_tensor_ch` channels simultaneously using RVV, iterating over a `filt_dim x filt_dim` window.
+
+## Active Code Path
+
+`#ifdef ENA_VEC_ISA` block. Key structure:
+
+```
+for each output pixel:
+    zero accumulator
+    for k_y in 0..filt_dim:
+        for k_x in 0..filt_dim:
+            load in_tensor_ch channels (int8)
+            accumulate (widen to int16 or int32)
+    divide accumulator by count
+    clamp to [-128, 127]
+    store int8 result
+```
+
+## Optimization History
+
+| Date | Commit | Approach | Cycles | Speedup | Notes |
+|---|---|---|---|---|---|
+| pre-2026-03-23 | baseline | e32/M2 vqmacc accumulation (VL=64 at VLEN=1024) | 149,131 | 1.00x | 25% VL utilization |
+| 2026-03-23 | 3cc063eb | e16/M4 vwadd accumulation (VL=256 at VLEN=1024) | 53,535 | 2.79x | 4x more elements/instr |
+
+Note: perf_comparison shows 53,613 cycles (slight measurement variation); commit message says 53,535.
+
+## Why e16 Works Here
+
+Average pooling accumulates int8 values. Maximum accumulated value for typical pooling:
+```
+max_accum = count * max_int8 = count * 127
+int16 range: 32767
+safe for e16 when: count <= 258
+```
+
+For a 3x3 pool: count=9. For 5x5: count=25. Even for 16x16: count=256. All fit safely in int16.
+
+Using e16/M4 instead of e32/M2:
+- VL doubles from 64 to 256 at VLEN=1024 (e32/M2 vs e16/M4, same 2 register groups)
+- 4x more channels processed per vwadd instruction
+- Same number of passes over the input data
+
+## Current State (2026-03-23)
+
+At 2.78x, the main VL utilization opportunity is captured. The function may now be approaching memory-bound territory (loading input data dominates). The accumulator e16 path is already near-optimal for the compute side.
+
+Further optimization would require investigating:
+- Whether function is now memory-bound (IPC diagnosis)
+- VLSU prefetching for the input load pattern
+
+## Key Techniques Applied
+
+- [[e16-accumulation]] -- primary technique (halve accumulator width to double VL)
+- [[lmul-selection]] -- M4 with e16 gives VL=256 vs M2 with e32 giving VL=64

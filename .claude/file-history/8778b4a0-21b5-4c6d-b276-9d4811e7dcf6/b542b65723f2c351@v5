@@ -1,0 +1,263 @@
+# Implementation Plan: Autonomous Agentic libnn Optimization Workflow
+
+## Context
+
+libnn functions have multi-variant C implementations (plain C / DSP / RVV). Optimizing a function means writing a better RVV implementation for a specific FPGA target. Currently this is manual: read source, write code, build, test on QEMU, profile on FPGA, iterate.
+
+This plan defines how **Claude Code directly drives the optimization loop** -- no Python orchestration framework. The LLM reads source files, parses hardware configs, writes optimized C code, and calls existing shell scripts for build/test/profile. For state persistence across sessions, a simple JSON file tracks progress.
+
+The optimization is specialized for a **designated target configuration** (CPU, VLEN, cache hierarchy, ISA extensions) and **known static-time input shapes** (batch size, spatial dimensions, channel counts, kernel sizes, etc.) extracted from existing test/example C files. Dynamic shapes are not supported -- each optimization run targets a fixed set of input dimensions, enabling aggressive tiling, unrolling, and register allocation decisions that would not be valid for arbitrary shapes.
+
+**The baseline source code is never modified.** Instead, the agent creates a new C file (e.g., `opt/gen/riscv_nn_conv_dw_HWC_u8_u8_u8_asym_bias_any.c`) that defines the same function symbol as the original. The build system substitutes the optimized `.o` for the original at link time. No macros, no `#ifdef` guards, no changes to the original source. A/B comparison is simply linking one `.o` or the other.
+
+The FPGA configuration (Verilog `.inc` file like `ax45mpv_v1024_8mb_config.inc`) provides the ground truth for target features: VLEN, DLEN, L2 cache size, ISA extensions, etc. Cache sizes are especially important since the library's tiling GEMM currently hardcodes L1=512KB -- the actual L2=8MB and L1 D-cache=32KB from the config should drive tiling parameter selection.
+
+## Two Modes of Operation
+
+### Mode 1: Single Function
+
+**Input:** A performance test file from `Examples/unit_performance/`, e.g.:
+```
+Examples/unit_performance/t_pf_conv_dw_HWC_u8_u8_u8_asym_bias_any.c
+```
+
+The LLM reads this file and extracts:
+- **Function name** from the `riscv_nn_*()` call site
+- **All static input shapes** from the `#define` macros at the top of the file (`INPUT_X=16`, `INPUT_Y=15`, `INPUT_CH=4`, `KERNEL_X=2`, `CH_MULT=192`, `STRIDE_X=1`, `PAD_X=0`, etc.)
+- **Quantization parameters** (`OUT_SHIFT`, `OUT_MULT`, `INPUT_OFFSET`, `FILTER_OFFSET`, `OUTPUT_OFFSET`, activation min/max)
+- **Data types** inferred from the function name suffix (`u8_u8_u8`, `s8_s8_s8`, etc.)
+
+No separate TOML or config file needed -- the perf test file *is* the task specification.
+
+### Mode 2: Complete Model
+
+**Input:** A model example C file, e.g.:
+```
+Examples/ARM/arm_nn_examples/cifar10/nds_nn_examples_cifar10.c
+```
+
+The LLM reads the model file and its companion parameter header (found via `#include`) to extract the full op sequence with concrete shapes:
+
+| # | Function | Key shapes |
+|---|----------|-----------|
+| 1 | `conv_HWC_s8_s8_s8_RGB_sft_bias_fast` | im_dim=32, im_ch=3, ker=5, out_ch=32, stride=1, pad=2 |
+| 2 | `relu_s8` | size=32*32*32 |
+| 3 | `maxpool_HWC_s8` | im_dim=32, ch=32, ker=3, stride=2 |
+| 4 | `conv_HWC_s8_s8_s8_sft_bias_fast` | im_dim=16, im_ch=32, ker=5, out_ch=16 |
+| 5 | `relu_s8` | size=16*16*16 |
+| 6 | `maxpool_HWC_s8` | im_dim=16, ch=16, ker=3, stride=2 |
+| 7 | `conv_HWC_s8_s8_s8_sft_bias_fast` | im_dim=8, im_ch=16, ker=5, out_ch=32 |
+| 8 | `relu_s8` | size=8*8*32 |
+| 9 | `maxpool_HWC_s8` | im_dim=8, ch=32, ker=3, stride=2 |
+| 10 | `fc_s8_s8_s8_sft_bias_fast` | in_dim=512, out=10 |
+| 11 | `softmax_s8_fast` | size=10 |
+
+The LLM profiles all (function, shape-set) pairs and optimizes every one of them to reach the best total model cycle count. Cost per pair is measured directly -- baseline cycles at that exact shape, multiplied by how many times the model invokes the function with that shape. Same function with two different shape sets = two independent pairs with independent costs (a 32x32 conv and an 8x8 conv share a name but not a cycle budget). Ranking by per-pair total cycles only sets work *order* so the largest wins land first and model-level cycles drop monotonically; it does not gate coverage. The long tail is still specialized -- a small kernel invoked many times can dominate once the heavy convs are tuned.
+
+## Directory Structure
+
+```
+agentic_libnn_opt/
+  plan.md                                   # This file
+  opt/
+    config.toml                             # Target config (toolchain, FPGA, QEMU paths)
+    state.json                              # Optimization state (persists across sessions)
+    gen/                                    # Generated optimized source files
+      riscv_nn_<func>.c                     # One per optimized function
+    log/                                    # Build/test/perf logs per iteration
+  ax45mpv_v1024_8mb_config.inc              # FPGA Verilog config (input)
+```
+
+## Configuration
+
+Single TOML file at `opt/config.toml` -- read directly by the LLM, no schema validation layer needed:
+
+```toml
+[toolchain]
+bin_dir = "/local/nick/SW_Release_cp/ast530/nds64le-elf-newlib-v5d/bin"
+prefix = "riscv64-elf-"
+
+[target]
+cpu = "AX45MPV"
+fpga_config = "ax45mpv_v1024_8mb_config.inc"
+
+[qemu]
+binary = "/local/nick/qemu_andes/build/qemu-system-riscv64"
+vlen = 1024
+timeout = 120
+
+[fpga]
+host = "sw-boards.andestech.com"
+port = 1116
+timeout = 300
+
+[limits]
+max_iterations = 10
+min_improvement_pct = 2.0
+```
+
+## State File
+
+`opt/state.json` -- simple JSON the LLM reads/writes to track progress across sessions:
+
+```json
+{
+  "mode": "single_function",
+  "function": "conv_dw_HWC_u8_u8_u8_asym_bias_any",
+  "source_input": "Examples/unit_performance/t_pf_conv_dw_HWC_u8_u8_u8_asym_bias_any.c",
+  "phase": "evaluate",
+  "iteration": 3,
+  "baseline": { "cycles": 45200, "instructions": 32100 },
+  "best": { "cycles": 38900, "instructions": 28500, "iteration": 2 },
+  "history": [
+    { "iteration": 1, "cycles": 42000, "instructions": 30200, "accepted": true, "notes": "unrolled inner loop 4x" },
+    { "iteration": 2, "cycles": 38900, "instructions": 28500, "accepted": true, "notes": "tiled for L1 dcache 32KB" },
+    { "iteration": 3, "cycles": 39100, "instructions": 27800, "accepted": false, "notes": "register pressure regression" }
+  ]
+}
+```
+
+## Optimization Loop
+
+The LLM executes this loop directly, calling shell scripts at each mechanical step:
+
+### Phase 1: Gather Context
+1. Read `opt/config.toml` for paths and target
+2. Read the FPGA `.inc` file -- extract VLEN, DLEN, cache sizes, ISA extensions
+3. Read the input file (perf test or model example) -- extract function names and shapes
+4. Read the original libnn source: `Source/*/riscv_nn_<func>.c`
+5. Read relevant internal headers (`internal_nn_math.h`, `internal_vec_isa_v1_0.h`, etc.)
+
+### Phase 2: Baseline
+1. Build libnn: `bash build.sh AX45MPV`
+2. QEMU correctness check: `bash qemu-validate/run_qemu_test.sh <func> --strace --vlen 1024`
+3. FPGA perf measurement: `bash test_perf.sh ax45mpv riscv64-elf-gcc BOARD <func>`
+4. Record baseline cycles/instructions in `opt/state.json`
+
+### Phase 3: Implement
+1. Analyze the original source, disassembly (`libnn.objdump`), shapes, and hardware features
+2. Write an optimized C file to `opt/gen/riscv_nn_<func>.c`
+   - Same function signature and symbol name as the original
+   - Can hardcode shape constants known at optimization time
+   - Target VLEN, cache sizes, and available ISA extensions from the `.inc` config
+
+### Phase 4: Build + Validate
+1. Compile the optimized file to `.o`
+2. Re-link `libnn.a` with the optimized `.o` replacing the original
+3. QEMU correctness check at VLEN=1024 (and optionally VLEN=256 for portability)
+4. If correctness fails: log the failure, revert to previous best, go to Phase 3
+
+### Phase 5: Measure + Evaluate
+1. FPGA perf measurement
+2. Compare to baseline and best-so-far
+3. If improved: accept, update `opt/state.json`
+4. If regressed: revert to previous best `.o`
+5. If stopping criteria met (max iterations or < min improvement): done
+6. Otherwise: go to Phase 3 with updated context (what worked, what didn't)
+
+### Phase 6: Commit
+Each iteration -- one optimization idea -- is recorded as a single git commit on a dedicated branch (e.g., `opt/<func>`). This gives the LLM a cheap, atomic adopt/revert mechanism: `git revert <sha>` undoes a regression, `git log` enumerates the idea history, and `git show <sha>` recovers the exact diff of any past attempt.
+
+Commit policy:
+- One commit per iteration, regardless of accept/reject -- rejected attempts are still committed so future sessions can see what was tried and avoid repeating it.
+- Commit covers: `opt/gen/riscv_nn_<func>.c`, updated `opt/state.json`, and any per-iteration log under `opt/log/`.
+- Message format:
+  ```
+  [opt/agentic] <func> iter <N>: <one-line idea>
+
+  baseline: <cycles> cyc / <inst> inst
+  this:     <cycles> cyc / <inst> inst  (<+/-pct>%)
+  best:     <cycles> cyc / <inst> inst  (iter <M>)
+  status:   accepted | rejected:<reason>
+
+  Notes: <what was tried, why, what to try next>
+  ```
+- On reject: after committing the rejected attempt, run `git revert --no-edit <sha>` (or `git checkout <best-sha> -- opt/gen/riscv_nn_<func>.c`) to restore the best-so-far working tree before starting the next iteration. The rejected commit stays in history; the revert is its own commit.
+- On accept: `state.json.best.commit` is updated to the new SHA so future reverts have an explicit anchor.
+
+State file gains a `commit` field per history entry:
+```json
+"history": [
+  { "iteration": 1, "commit": "a1b2c3d", "cycles": 42000, "accepted": true,  "notes": "unrolled inner loop 4x" },
+  { "iteration": 2, "commit": "e4f5a6b", "cycles": 38900, "accepted": true,  "notes": "tiled for L1 dcache 32KB" },
+  { "iteration": 3, "commit": "9c8d7e6", "cycles": 39100, "accepted": false, "notes": "register pressure regression" }
+]
+```
+
+### Model Mode Extension
+For model mode, wrap the single-function loop:
+1. Profile all functions in the model to capture per-callsite baselines
+2. Rank by `invocations_at_shape * baseline_cycles_at_shape` per (function, shape-set) pair to set work order (largest first)
+3. Optimize every (function, shape-set) pair -- ranking only schedules order, it does not skip the long tail
+4. Re-profile the full model after each accept to track total-cycle progress, and again at the end
+
+#### Accuracy Verification (Model Mode)
+Two-layer check, both linked against the substituted `libnn.a` (never the toolchain's prebuilt copy -- always rebuild and `ar r` the optimized `.o` before either test):
+
+1. **Per-iteration unit test:** `qemu-validate/run_qemu_test.sh <func> --strace --vlen 1024`. Verify the test binary links to `opt/gen/<func>.o` (e.g. `nm <test_elf> | grep <func>` and confirm the symbol's address matches the substituted object, or check `libnn.objdump` was regenerated). Fast, runs every iteration.
+2. **Per-accept end-to-end model test:** rebuild the model example against the substituted `libnn.a`, run on QEMU, diff the final output tensor against a golden capture taken from the unmodified baseline library. Slow, runs only when an iteration is about to be accepted. Catches cross-layer numerical drift the unit test misses.
+
+If either fails: reject the iteration, `git revert`, restore best-so-far `.o` via `ar r`.
+
+#### Per-Callsite Shape Specialization
+A function called with N distinct shape sets in the model gets N specialized `.o` files, each with a renamed symbol:
+- `riscv_nn_<func>__cs0`, `riscv_nn_<func>__cs1`, ... (one per callsite, or one per unique shape set if multiple callsites share shapes)
+- Each variant hardcodes its own constants (tile sizes, unroll factors, register allocation) for maximum perf.
+
+Build integration:
+1. For each unique shape set, generate `opt/gen/riscv_nn_<func>__cs<i>.c` with the renamed symbol.
+2. Compile each to its own `.o`, add all to `libnn.a` via `ar r`.
+3. Generate a thin dispatcher header `opt/gen/<model>_dispatch.h` that `#define`s the original call site to the specialized symbol, e.g.:
+   ```c
+   #define riscv_nn_conv_HWC_s8_s8_s8_sft_bias_fast_CS0 riscv_nn_conv_HWC_s8_s8_s8_sft_bias_fast__cs0
+   ```
+   Or rewrite the model source to call the specialized symbols directly (preferred -- no macro indirection, easier to audit).
+4. Original symbol `riscv_nn_<func>` remains in `libnn.a` as the generic fallback for any callsite the agent did not specialize.
+
+State file extension for model mode:
+```json
+"functions": {
+  "conv_HWC_s8_s8_s8_sft_bias_fast": {
+    "callsites": [
+      { "id": "cs0", "shapes": { "im_dim": 32, "im_ch": 3, "ker": 5, "out_ch": 32 }, "best": { "cycles": ..., "commit": "..." } },
+      { "id": "cs1", "shapes": { "im_dim": 16, "im_ch": 32, "ker": 5, "out_ch": 16 }, "best": { "cycles": ..., "commit": "..." } }
+    ]
+  }
+}
+```
+
+## Existing Scripts Used
+
+| Step | Script | Purpose |
+|------|--------|---------|
+| Build library | `build.sh AX45MPV` | Full library build |
+| Rebuild single | `qemu-validate/rebuild_single.sh <source>` | Incremental rebuild of one `.o` |
+| QEMU test | `qemu-validate/run_qemu_test.sh <func> --strace --vlen N` | Correctness validation |
+| FPGA perf | `test_perf.sh ax45mpv riscv64-elf-gcc BOARD <func>` | Cycle count measurement |
+| Full test suite | `qemu-validate/run_all_tests.sh 16 1024` | Regression check |
+
+## What's NOT Built
+
+- No Python package, no Pydantic models, no Click CLI
+- No output parsers -- the LLM reads script output directly
+- No config schema validation -- the LLM reads TOML and `.inc` files natively
+- No workflow state machine -- the LLM follows the loop, tracking state in JSON
+- No context gatherer -- the LLM reads the files it needs
+- No test suite for tooling -- the existing QEMU tests validate correctness
+
+## Build Integration for `.o` Substitution
+
+One piece of new scripting needed: a way to link `libnn.a` with a substituted `.o`. Options:
+
+1. **ar replace**: `ar r libnn.a opt/gen/riscv_nn_<func>.o` -- replaces the member in-place
+2. **Makefile patch**: add an `OPT_OVERRIDE` variable that swaps source files before compilation
+
+Option 1 (`ar r`) is simplest. The LLM compiles the optimized source, then uses `ar` to swap the `.o` into `libnn.a`. No build system changes needed.
+
+```bash
+# Compile optimized source
+riscv64-elf-gcc -O3 [flags] -c opt/gen/riscv_nn_<func>.c -o opt/gen/riscv_nn_<func>.o
+
+# Swap into library
+ar r libnn.a opt/gen/riscv_nn_<func>.o
+```

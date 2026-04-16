@@ -1,0 +1,74 @@
+---
+type: technique
+tags: [rvv, gemm, vd4dots, conv_1x1, vl-utilization]
+applies_to: [conv_1x1_HWC_s8_asym_bias_fast_any, conv_HWC_s8]
+---
+
+# Vectorize K vs N: Choosing the Right GEMM Dimension
+
+## The Fundamental Trade-off
+
+A GEMM for convolution has three dimensions:
+- **M** = spatial pixels (output H*W)
+- **N** = output channels
+- **K** = reduction dimension (in_ch * ker_h * ker_w)
+
+When implementing GEMM with RVV, you vectorize ONE of these dimensions per instruction. The choice determines hardware utilization.
+
+## Why K Wins for Convolution
+
+| Dimension | Typical size | VL at VLEN=1024 (e8/M1) | Utilization |
+|---|---|---|---|
+| N (output channels) | 32-1024 | capped at 128 | 25-100% |
+| K (in_ch * ker_h * ker_w) | 512-2304 | 128 (full) | 100% |
+
+K is the reduction axis and is always large for real conv workloads. Vectorizing K means:
+1. VL is always 100% utilized
+2. Both A (input) and B (weight) operands are vectors -- VD4DOTS computes `dot(A[k:k+VL], B[k:k+VL])` for each partial sum
+3. No scalar broadcast overhead
+
+Vectorizing N means:
+1. VL is capped by N, often underutilized (N=32 at VLEN=1024 with LMUL=M2 gives 12.5% utilization)
+2. A is a scalar (one input element broadcast), B is a vector (N weight values)
+3. VQMACC scalar-x-vector is the instruction, doing 1 multiply-add per element
+
+## VD4DOTS: The K-Vectorized Instruction
+
+`vd4dots(v_input, v_weight)`: for each group of 4 elements, multiplies 4 int8 pairs and accumulates into one int32. With VL=128 (VLEN=1024, M1, e8):
+- 128/4 = 32 int32 partial sums per instruction
+- Both operands are vector registers -- no scalar broadcast
+- 128 multiply-adds computed
+
+`vqmacc_vx(scalar, v_weight)`: scalar broadcast. With VL=128:
+- 128 multiply-adds computed
+- But VL=32 is actual (N=32 capped) -- only 32 multiply-adds
+
+## When to Vectorize N Instead (Large N)
+
+VD4DOTS requires VREDSUM to collapse the K-dimension after the loop. For large N (>= VLMAX_e8_m4/4), the overhead of many VREDSUM calls outweighs the VL utilization gain.
+
+The threshold used in runtime dispatch: `N_threshold = VLMAX_e8_m4 / 4`
+- VLEN=1024: threshold = 512/4 = 128 output channels
+- VLEN=512: threshold = 256/4 = 64 output channels
+
+For N >= threshold, tiling GEMM (vectorize N) wins. See [[runtime-dispatch]].
+
+## Work per Instruction Comparison (1x1 conv, N=32, K=512)
+
+| Kernel | VL | Instr type | MADs/instr | Total instrs | Total cycles |
+|---|---|---|---|---|---|
+| Tiling VQMACC | 32 | scalar x vector | 32 | 807,631 | 1,116,941 |
+| Direct VD4DOTS | 128 | vector x vector | 128 | 215,681 | 428,860 |
+
+**Effective throughput:**
+- VQMACC: ~11.6 MADs/cycle
+- VD4DOTS: ~32.2 MADs/cycle
+
+Lower IPC for VD4DOTS (0.50 vs 0.72) is irrelevant -- each instruction does 4x more work. See [[ipc-vs-throughput]].
+
+## Related
+
+- [[tiling-gemm-to-vd4dots]] -- how to apply this for conv_HWC
+- [[runtime-dispatch]] -- when to switch based on actual N
+- [[ipc-vs-throughput]] -- why lower IPC can still be faster
+- [[conv-1x1-asym-bias-fast-any]] -- operator profile with measured numbers

@@ -1,0 +1,103 @@
+"""Training loop with early stopping for modelzoo tile configuration ranking.
+
+Trains ModelzooRanker with top-k ListMLE loss, evaluates on validation set
+each epoch, and restores best model weights when val OPA stops improving.
+"""
+import copy
+
+import torch
+
+from modelzoo_ranker.model.loss import top_k_listmle_loss
+from modelzoo_ranker.training.evaluator import evaluate_batch
+
+
+def train(model, train_loader, val_loader, *, max_epochs=200, lr=1e-3,
+          min_lr=1e-5, weight_decay=1e-4, patience=30, grad_clip=1.0,
+          top_k=5, warmup_epochs=10):
+    """Train model with early stopping on val OPA.
+
+    Returns:
+        History dict with per-epoch metrics and best_epoch / epochs_run.
+    """
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr,
+                                  weight_decay=weight_decay)
+
+    if warmup_epochs > 0:
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-2, total_iters=warmup_epochs)
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max_epochs - warmup_epochs, eta_min=min_lr)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup, cosine],
+            milestones=[warmup_epochs])
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max_epochs, eta_min=min_lr)
+
+    history = {
+        'train_loss': [],
+        'val_ndcg@1': [], 'val_ndcg@3': [], 'val_ndcg@5': [],
+        'val_top1_acc': [], 'val_top3_acc': [], 'val_top5_acc': [],
+        'val_top1_error': [], 'val_top3_error': [], 'val_top5_error': [],
+        'val_opa': [],
+    }
+    best_opa = -1.0
+    best_epoch = 0
+    best_state = copy.deepcopy(model.state_dict())
+    epochs_without_improvement = 0
+
+    for epoch in range(max_epochs):
+        # --- Train ---
+        model.train()
+        epoch_loss = 0.0
+        n_batches = 0
+        for batch in train_loader:
+            optimizer.zero_grad()
+            scores = model(batch['feature_a'], batch['feature_b'], batch['mask'])
+            loss = top_k_listmle_loss(scores, batch['mask'], k=top_k,
+                                     sizes=batch['sizes'])
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            epoch_loss += loss.item()
+            n_batches += 1
+        scheduler.step()
+        history['train_loss'].append(epoch_loss / n_batches)
+
+        # --- Validate ---
+        model.eval()
+        val_totals = {
+            'ndcg@1': 0.0, 'ndcg@3': 0.0, 'ndcg@5': 0.0,
+            'top1_acc': 0.0, 'top3_acc': 0.0, 'top5_acc': 0.0,
+            'top1_error': 0.0, 'top3_error': 0.0, 'top5_error': 0.0,
+            'opa': 0.0,
+        }
+        n_val = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                scores = model(
+                    batch['feature_a'], batch['feature_b'], batch['mask'],
+                )
+                metrics = evaluate_batch(scores, batch['cycles'], batch['mask'])
+                for k in val_totals:
+                    val_totals[k] += metrics[k]
+                n_val += 1
+        for k in val_totals:
+            val_totals[k] /= max(n_val, 1)
+            history[f'val_{k}'].append(val_totals[k])
+
+        # --- Early stopping ---
+        if val_totals['opa'] > best_opa:
+            best_opa = val_totals['opa']
+            best_epoch = epoch
+            best_state = copy.deepcopy(model.state_dict())
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= patience:
+                break
+
+    model.load_state_dict(best_state)
+    history['best_epoch'] = best_epoch
+    history['epochs_run'] = epoch + 1
+    return history

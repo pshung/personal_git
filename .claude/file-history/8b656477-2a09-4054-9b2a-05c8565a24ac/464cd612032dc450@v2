@@ -1,0 +1,125 @@
+"""Tests for modelzoo_ranker.data.features — Feature A and Feature B computation."""
+import math
+
+import numpy as np
+
+from modelzoo_ranker.data.features import (
+    compute_feature_a, compute_feature_b, OP_TYPE_MAP,
+    FEATURE_A_DIM, FEATURE_B_DIM,
+)
+
+
+class TestFeatureA:
+    def test_compute_feature_a_matmul(self):
+        """3D matmul shape produces 12-dim feature with correct op_type."""
+        group = {
+            'op_name': 'linalg.matmul-1',
+            'shape': [64, 32, 16],
+            'configs': [{'lowering_config': [[0]*3]*6, 'cycles': 1.0}],
+        }
+        fa = compute_feature_a(group)
+        assert fa.shape == (FEATURE_A_DIM,)
+        assert fa[0] == OP_TYPE_MAP['linalg.matmul-1']  # op_type
+        assert fa[1] == 3  # num_dims
+        assert fa[2] == pytest.approx(math.log1p(64))   # shape_d0
+        assert fa[3] == pytest.approx(math.log1p(32))   # shape_d1
+        assert fa[4] == pytest.approx(math.log1p(16))   # shape_d2
+        assert fa[5] == 0.0  # shape_d3 (padded)
+        assert fa[9] == pytest.approx(math.log1p(64 * 32 * 16))  # log_total
+        assert fa[10] == 6  # num_levels (matmul = 6)
+        assert fa[11] == 3  # num_tile_dims
+
+    def test_compute_feature_a_conv(self):
+        """7D conv shape produces correct num_dims and padded shape."""
+        group = {
+            'op_name': 'linalg.conv_2d_nhwc_hwcf-0',
+            'shape': [1, 56, 56, 64, 3, 3, 32],
+            'configs': [{'lowering_config': [[0]*7]*4, 'cycles': 1.0}],
+        }
+        fa = compute_feature_a(group)
+        assert fa[1] == 7  # num_dims
+        assert fa[2] == pytest.approx(math.log1p(1))    # shape_d0
+        assert fa[8] == pytest.approx(math.log1p(32))   # shape_d6
+        assert fa[10] == 4  # num_levels (conv = 4)
+        assert fa[11] == 7  # num_tile_dims
+
+    def test_compute_feature_a_generic_1d(self):
+        """1D generic shape pads to 7 dims."""
+        group = {
+            'op_name': 'linalg.generic-0',
+            'shape': [150528],
+            'configs': [{'lowering_config': [[0]]*4, 'cycles': 1.0}],
+        }
+        fa = compute_feature_a(group)
+        assert fa[0] == OP_TYPE_MAP['linalg.generic-0']
+        assert fa[1] == 1  # num_dims
+        assert fa[2] == pytest.approx(math.log1p(150528))
+        assert fa[3] == 0.0  # padded
+        assert fa[10] == 4  # num_levels
+        assert fa[11] == 1  # num_tile_dims
+
+
+class TestFeatureB:
+    def test_compute_feature_b_6level(self):
+        """6-level config (matmul) produces 46-dim feature."""
+        config = {
+            'lowering_config': [
+                [0, 0, 0], [0, 0, 0], [0, 0, 1],
+                [0, 0, 0], [0, 0, 4], [0, 0, 0],
+            ],
+            'cycles': 1000.0,
+        }
+        total_elements = 64 * 32 * 16
+        fb = compute_feature_b(config, total_elements=total_elements)
+        assert fb.shape == (FEATURE_B_DIM,)
+        # First 42 values are tile_flat (6x7 padded)
+        assert fb[0] == 0.0   # level 0, dim 0
+        assert fb[2] == 0.0   # level 0, dim 2 (padded, config has 3 dims)
+        # Check non-zero tile values are present
+        # level 2, dim 2 -> index 2*7+2 = 16
+        assert fb[16] == 1.0  # level 2, dim 2
+        # level 4, dim 2 -> index 4*7+2 = 30
+        assert fb[30] == 4.0  # level 4, dim 2
+        # num_nonzero
+        assert fb[42] == 2.0  # two nonzero tiles: 1, 4
+        # tile_sum
+        assert fb[43] == 5.0  # 1 + 4
+        # tile_max
+        assert fb[44] == 4.0
+
+    def test_compute_feature_b_4level(self):
+        """4-level config (generic) is zero-padded to 6x7=42."""
+        config = {
+            'lowering_config': [[32, 16], [4, 4], [0, 0], [0, 0]],
+            'cycles': 500.0,
+        }
+        total_elements = 128 * 64
+        fb = compute_feature_b(config, total_elements=total_elements)
+        assert fb.shape == (FEATURE_B_DIM,)
+        # 4 levels x 2 dims, padded to 6x7
+        assert fb[0] == 32.0   # level 0, dim 0
+        assert fb[1] == 16.0   # level 0, dim 1
+        assert fb[2] == 0.0    # level 0, dim 2 (padded)
+        assert fb[7] == 4.0    # level 1, dim 0
+        assert fb[8] == 4.0    # level 1, dim 1
+        # Levels 4-5 should be zero (4-level config)
+        assert fb[28] == 0.0   # level 4, dim 0
+        assert fb[35] == 0.0   # level 5, dim 0
+        # num_nonzero
+        assert fb[42] == 4.0   # 32, 16, 4, 4
+
+    def test_compute_feature_b_zeros_padded(self):
+        """All-zero config produces correct padding and zero summary stats."""
+        config = {
+            'lowering_config': [[0, 0, 0]]*6,
+            'cycles': 1000.0,
+        }
+        fb = compute_feature_b(config, total_elements=1000)
+        assert fb[42] == 0.0   # num_nonzero
+        assert fb[43] == 0.0   # tile_sum
+        assert fb[44] == 0.0   # tile_max
+        assert fb[45] == 0.0   # coverage_ratio (no nonzero tiles)
+
+
+# Import pytest here for approx
+import pytest

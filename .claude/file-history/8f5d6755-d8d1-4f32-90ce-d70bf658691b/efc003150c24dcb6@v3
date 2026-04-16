@@ -1,0 +1,175 @@
+# Plan: RVV Optimization of `nn_vec_mat_mult_t_per_ch_s8`
+
+## Target
+
+**File:** `Source/NNSupportFunctions/nn_vec_mat_mult_t_per_ch_s8.c`
+**Called by:** `riscv_nn_fc_per_ch_s8_s8_s8_asym_bias` (always passes `address_offset = 1`)
+**Test:** `t_fc_per_ch_s8_s8_s8_asym_bias`
+
+Only FC compute kernel with zero RVV anywhere in its call chain.
+
+## Current Plain C Structure
+
+Two near-identical branches (`rhs_offset != 0` / `== 0`), each with:
+- 3x row unrolling over `rhs_rows`
+- Inner loop: `(lhs[k] + lhs_offset) * (rhs[k] [+ rhs_offset])` → accumulate into `res00/01/02`
+- Per-row requantization: `nn_requantize(res, dst_multiplier[i], dst_shift[i])`
+- Remainder loop for `rhs_rows % 3`
+
+## Requantization Math
+
+`nn_requantize` (from `internal_nn_math.h:495`):
+```c
+total_shift = 31 - shift;
+new_val = val * (int64_t)multiplier;
+result = new_val >> (total_shift - 1);
+result = (result + 1) >> 1;  // round-to-nearest
+```
+
+In the `_s8` RVV reference (`nn_vec_mat_mult_t_s8.c:94-97`), this maps to:
+```c
+dst_shift2 = 30 - dst_shift;                         // precomputed scalar
+vWmul = vwmul(vRedsum, dst_multiplier);               // i32→i64, scalar multiplier
+vRedsum = vnsra(vWmul, dst_shift2);                    // i64→i32, scalar shift
+vRedsum = vssra(vRedsum, 1, __RISCV_VXRM_RNU);        // rounding shift by 1
+```
+
+**Per-channel difference:** `dst_multiplier[i]` and `dst_shift[i]` are arrays. After `vredsum` packs 2 row results into a `vint32m1`, the requantize must use **vector-vector** operations:
+- Load `dst_multiplier[0..1]` into `vint32m1` → `vwmul_vv` (not `_vx`)
+- Compute `30 - dst_shift[0..1]` into `vint32m1` → `vnsra_wv` (not `_wx`)
+- The `vssra` by constant 1 stays the same
+
+## Implementation Plan
+
+### Step 1: Add RVV 1.0 intrinsic guard
+
+```c
+#if defined(ENA_VEC_ISA) && (NDS_VEC_RVV_VERSION >= 100) && defined(ENA_VEC_INTRINSIC)
+    // RVV path
+#else
+    // existing plain C (unchanged)
+#endif
+```
+
+### Step 2: Main loop — 2 rows at a time
+
+Match the `_s8` reference pattern (2x row tiling, not 3x). Rationale: 2 rows uses 2x `vint32m8` accumulators = 16 vector registers. Adding a 3rd would require 24 regs (out of 32), leaving almost nothing for temporaries.
+
+```
+for (rhs_rows_idx = 0; rhs_rows_idx <= rhs_rows - 2; rhs_rows_idx += 2)
+```
+
+### Step 3: Inner dot-product (strip-mined over rhs_cols)
+
+Same pattern as `_s8` reference:
+```
+vsetvl_e8m2(remaining_cols)
+vle8 lhs, rhs_row0, rhs_row1
+vsext_vf2 → i16m4
+vadd lhs_offset to lhs
+[if rhs_offset branch: vadd rhs_offset to rhs]
+vwmacc into vResult0(i32m8), vResult1(i32m8)
+```
+
+### Step 4: Reduction
+
+```
+vsetvl_e32m8(rhs_cols)
+vredsum vResult0 → vRedsum0 (i32m1)
+vredsum vResult1 → vRedsum1 (i32m1)
+vsetvl_e32m1(2)
+vslideup to pack [res0, res1] into one vint32m1
+```
+
+### Step 5: Bias
+
+```
+if (bias) {
+    vle32 bias[0..1] → vBias (i32m1, vl=2)
+    vadd vRedsum, vBias
+    bias += 2
+}
+```
+
+### Step 6: Per-channel requantization (key difference)
+
+```
+vl = 2
+// Load per-channel multiplier and shift
+vint32m1_t vMult = vle32(dst_multiplier, vl);    // [mult0, mult1]
+vint32m1_t vShift = vle32(dst_shift, vl);         // [shift0, shift1]
+vint32m1_t vShift2 = vrsub(vShift, 30, vl);       // [30-shift0, 30-shift1]
+
+// Widen multiply: i32 * i32 → i64
+vint64m2_t vWmul = vwmul_vv(vRedsum, vMult, vl);
+
+// Narrow shift by per-channel amount: i64 → i32
+// Need vuint32m1_t for shift amount
+vuint32m1_t vUShift2 = vreinterpret_v_i32m1_u32m1(vShift2);
+vRedsum = vnsra_wv(vWmul, vUShift2, vl);
+
+// Rounding shift by 1
+vRedsum = vssra(vRedsum, 1, __RISCV_VXRM_RNU, vl);
+
+dst_multiplier += 2;
+dst_shift += 2;
+```
+
+### Step 7: Clamp + narrow + store
+
+```
+vadd dst_offset
+vmax activation_min
+vmin activation_max
+vnsra i32→i16 (vl at e16mf2)
+vnsra i16→i8  (vl at e8mf4)
+vse8 to dst
+dst += 2;   // address_offset is always 1
+```
+
+### Step 8: Remainder (1 row)
+
+Single-row path for `rhs_rows & 1`. Same pattern but only 1 accumulator, `vl=1` for requantize.
+
+### Step 9: `rhs_offset` branching
+
+Duplicate the RVV loop body: one branch with `vadd(rhs_offset)` on rhs vectors, one without. This avoids a conditional inside the hot inner loop. Matches the plain C structure.
+
+```c
+if (rhs_offset) {
+    // RVV path WITH vadd(rhs_offset) in inner loop
+} else {
+    // RVV path WITHOUT vadd(rhs_offset) in inner loop
+}
+```
+
+## Files to modify
+
+- `Source/NNSupportFunctions/nn_vec_mat_mult_t_per_ch_s8.c` — add RVV path
+
+## Watch-outs
+
+1. **`vnsra_wv` shift operand must be unsigned** — use `vuint32m1_t` via `vreinterpret`
+2. **`vredsum` needs correct AVL** — set `vl = vsetvl_e32m8(rhs_cols)` before reduction (not the strip-mined tail value)
+3. **Zero-init accumulators** — use `vand(v, 0, vl)` at `vsetvl_e32m8(rhs_cols)`, same as `_s8` reference
+4. **`address_offset` is always 1** (wrapper passes `1L`) — safe to use contiguous `vse8`. If this assumption changes, would need strided stores.
+
+## Verification
+
+```bash
+# Build
+/usr/bin/bash /home/nick/work/libnn/qemu-validate/build_libnn.sh
+
+# Primary test at VLEN=1024
+/usr/bin/bash /home/nick/work/libnn/qemu-validate/run_qemu_test.sh fc_per_ch_s8_s8_s8_asym_bias --strace --vlen 1024
+
+# Portability check
+/usr/bin/bash /home/nick/work/libnn/qemu-validate/run_qemu_test.sh fc_per_ch_s8_s8_s8_asym_bias --strace --vlen 512
+/usr/bin/bash /home/nick/work/libnn/qemu-validate/run_qemu_test.sh fc_per_ch_s8_s8_s8_asym_bias --strace --vlen 256
+
+# Regression (related FC tests)
+/usr/bin/bash /home/nick/work/libnn/qemu-validate/run_qemu_test.sh fc_s8_s8_s8_asym_bias --strace --vlen 1024
+
+# Full suite sanity
+/usr/bin/bash /home/nick/work/libnn/qemu-validate/run_all_tests.sh 16 1024
+```

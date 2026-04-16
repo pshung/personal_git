@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+################################################################################
+# Build a minimal kernel harness and run vsim pipeline analysis (konata).
+#
+# Purpose: Extract pipeline behavior (stalls, scheduling) for a function's
+# hot loop. Uses tiny parameters so vsim completes in seconds, not hours.
+#
+# Usage:
+#   run_vsim_profile.sh <harness.c> [--cycles N]
+#
+# The harness is a small C file that #includes the function header and calls
+# it with minimal data. See qemu-validate/vsim-bench/ for examples.
+#
+# Output:
+#   qemu-validate/work/vsim_<name>.kanata.log   — pipeline log
+#   qemu-validate/work/vsim_<name>.objdump      — disassembly
+#
+# Example:
+#   run_vsim_profile.sh qemu-validate/vsim-bench/bench_avepool_HWC_s8.c
+################################################################################
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+CYCLES=50000  # default: enough for a small kernel, fast for vsim
+HARNESS=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cycles) CYCLES="$2"; shift 2 ;;
+        -*)       echo "Unknown option: $1" >&2; exit 1 ;;
+        *)        HARNESS="$1"; shift ;;
+    esac
+done
+
+if [ -z "${HARNESS}" ]; then
+    echo "Usage: $0 <harness.c> [--cycles N]" >&2
+    exit 1
+fi
+
+if [ ! -f "${HARNESS}" ]; then
+    echo "ERROR: Harness not found: ${HARNESS}" >&2
+    exit 1
+fi
+
+# Derive name from harness filename
+BASENAME="$(basename "${HARNESS}" .c)"
+WORK_DIR="${SCRIPT_DIR}/work"
+mkdir -p "${WORK_DIR}"
+
+TOOLCHAIN_BIN="/local/nick/SW_Release_cp/ast530/nds64le-elf-newlib-v5d/bin"
+CC="${TOOLCHAIN_BIN}/riscv64-elf-gcc"
+OBJDUMP="${TOOLCHAIN_BIN}/riscv64-elf-objdump"
+LIBNN="${LIB_ROOT}/libnn.a"
+
+ADX="${WORK_DIR}/vsim_${BASENAME}.adx"
+OBJDUMP_FILE="${WORK_DIR}/vsim_${BASENAME}.objdump"
+KANATA_LOG="${WORK_DIR}/vsim_${BASENAME}.kanata.log"
+
+VSIM_DIR="/local/nick/vsim-workspace/vsim"
+VSIM="${VSIM_DIR}/build/sim_ax45mpv_premium"
+KONATA="${VSIM_DIR}/tools/konata.py"
+
+# Check prerequisites
+for f in "${CC}" "${LIBNN}" "${VSIM}" "${KONATA}"; do
+    if [ ! -f "$f" ]; then
+        echo "ERROR: Not found: $f" >&2
+        exit 1
+    fi
+done
+
+# Compile the harness — same flags as AX45MPV build + link against libnn.a
+echo "[compile] ${BASENAME}"
+${CC} -O3 -Wall -ffunction-sections -fdata-sections -Wl,-gc-sections \
+    -mvh -DENA_FS_VS \
+    -mtune=andes-45-series -mext-vector=zve64d -DNDS_VEC_RVV_VERSION=1000 \
+    -mzfh \
+    -I"${LIB_ROOT}/Include" \
+    -o "${ADX}" "${HARNESS}" "${LIBNN}" -lm 2>&1
+
+if [ $? -ne 0 ]; then
+    echo "RESULT: COMPILE_ERROR" >&2
+    exit 1
+fi
+
+# Generate objdump
+${OBJDUMP} -d "${ADX}" > "${OBJDUMP_FILE}" 2>/dev/null
+
+# Run konata pipeline analysis
+echo "[vsim] konata --cycles ${CYCLES}"
+ln -sfn "${VSIM_DIR}/tools" /tmp/vsim
+PYTHONPATH=/tmp python3 "${KONATA}" \
+    --cpu ax45mpv_premium \
+    --objdump-file "${OBJDUMP_FILE}" \
+    --output "${KANATA_LOG}" \
+    --cycles "${CYCLES}" \
+    --experimental \
+    "${ADX}" 2>&1
+
+echo ""
+echo "--- vsim profile results ---"
+echo "  Pipeline log: ${KANATA_LOG}"
+echo "  Objdump:      ${OBJDUMP_FILE}"
+echo "  Log size:     $(wc -l < "${KANATA_LOG}") lines"
+echo "---"

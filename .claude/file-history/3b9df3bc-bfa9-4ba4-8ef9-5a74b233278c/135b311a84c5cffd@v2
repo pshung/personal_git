@@ -1,0 +1,60 @@
+# Cost Model Validation Against Zoo Data
+
+## Summary
+
+The cost model in `python/auto_iree/cost_model.py` provides useful filtering but has
+some false positive/negative issues when validated against the zoo's best configs.
+
+## False Negatives (best configs that would be rejected)
+
+### 1. LMUL > 4 filter rejects good configs with large N tiles
+- **Matmul [49,1024,1024]**: Best config has N_tile=256 → LMUL=ceil(256/32)=8 → REJECTED
+  - This config achieved 6.56x speedup over default
+  - The LMUL estimate is too conservative: IREE's backend doesn't necessarily
+    use LMUL=8 just because the tile is 256; it may split across multiple vector ops
+- **Impact**: Many of the best matmul configs use N=128-256, which estimate LMUL=4-8
+- **Fix suggestion**: Raise LMUL threshold to 8, or don't use tile/vlmax for LMUL estimation
+  since IREE may decompose large tiles into multiple vector operations
+
+### 2. Working set exceeds L2 for some good configs
+- **Matmul best** [49,1024,1024] with tiles [0,0,16]: ws=9.6MB > 8MB L2
+  - Still achieves 6.56x speedup despite "exceeding" L2
+  - The working set estimate uses product of all tile dims × operands, which over-counts
+    because not all operands span all dimensions simultaneously
+- **Default matmul**: ws=38.5MB (massive overshoot, correctly flagged)
+- **Fix suggestion**: More nuanced working set estimation that accounts for operand shapes
+
+## True Positives (correctly identified)
+
+### 1. Vector utilization filter
+- N_tile=3 → util=0.03 → correctly rejected
+- N_tile=32 → util=1.0 → correctly passed
+- This is the most reliable filter
+
+### 2. Untiled reduction filter
+- Default matmul K=0 (untiled) for K=1024 → correctly flagged
+- Best configs always tile K to 8-32
+
+### 3. Conv2d default working set
+- Default conv2d with tiles [0,32,64,64,...] → ws=906MB → correctly rejected
+- Best conv2d → ws=4.7MB → correctly passed
+
+## Recommendations for cost_model.py
+
+1. **Loosen LMUL filter**: Change `lmul > 4` to `lmul > 8` (or remove)
+   since IREE decomposes large tiles internally
+2. **Refine working set**: Use per-operand dimension analysis instead of
+   full iteration space product
+3. **Add OC/N-dim alignment check**: Reject tiles where innermost parallel
+   dim is not a multiple of VLMAX (32 for f32) unless dim < VLMAX
+4. **Add reduction tile range check**: For matmul K, enforce 4 ≤ K_tile ≤ 128
+   based on zoo evidence (best configs always tile K in this range)
+
+## Key Zoo Statistics for Calibration
+
+| Filter | Best Config Pass Rate | Notes |
+|--------|----------------------|-------|
+| vector_util ≥ 0.5 | ~95% | Most best configs have util=1.0 |
+| ws ≤ L2 | ~85% | Some best configs slightly exceed |
+| lmul ≤ 4 | ~70% | **Too aggressive** — large N tiles get rejected |
+| untiled_reduction | ~99% | Very reliable |

@@ -1,0 +1,1291 @@
+     1→#!/usr/bin/env bash
+     2→################################################################################
+     3→#
+     4→# This script is used to verify libnn accuracy, code coverage and measure
+     5→# performance.
+     6→#
+     7→# Input:
+     8→#   $1: Source code path (without / tailed)
+     9→#       This is a dummy argument, just for making the API be the same as test.sh
+    10→#       of libdsp.
+    11→#   $2: Compiler name (with prefix)
+    12→#       Set it to the compiler name without full path, e.g., nds32le-elf-gcc,
+    13→#       riscv32-elf-clang, riscv64-linux-gcc, etc. This script will try to find
+    14→#       the full path of this specified compiler from the PATH environment
+    15→#       variable; therefore, please export the proper toolcahin path into PATH
+    16→#       environment variable before using this script.
+    17→#   $3: Simulator name
+    18→#       In DAILY test, please give the full path of simulator.
+    19→#   $4: Simulation target
+    20→#       It could be GDB, SID or BOARD.
+    21→#   $5: BS3 / DAILY
+    22→#       BS3:   Verify the accuracy with the built-in multi-lib. (note the sat
+    23→#              extension and code coverage won't be verified here)
+    24→#       DAILY: Use the user specified compiler and compilation options to build
+    25→#              the library, and this built library will be used in the accuracy
+    26→#              tests later. Not only the accuracy but also the code coverage
+    27→#              will be verified in this mode.
+    28→#   $6: Extra flags for selecting multi-lib or the algorithm to be built as library
+    29→#       As the 5th argument is set to BS3, these flags are used to select the
+    30→#       built-in multi-lib. For example, if "-mext-dsp" is contained in this
+    31→#       argument, the DSP version library will be used for linking. By default,
+    32→#       the plain C version library will be used for linking.
+    33→#       As the 5th argument is set to DAILY, these flags will be used to select
+    34→#       the proper algorithm and build them into library. For example, if
+    35→#       "-mext-dsp" is contained in this argument, the DSP algorithm will be
+    36→#       used as building the library. By default, the plain C algorithm will be
+    37→#       used to build the library.
+    38→#   $7: Specified linker
+    39→#       Use the specified linker instead of the default one when building the
+    40→#       executable. If this argument is left to be empty, the default linker
+    41→#       will be used. (e.g., ld, lld, etc.)
+    42→#
+    43→# Example:
+    44→#   mkdir build_dir && cd build_dir
+    45→#
+    46→#   Ex-1: use default linker then test plain C algorithm with V3 GDB run
+    47→#   ../test.sh "" nds32le-elf-gcc nds32le-elf-run GDB BS3
+    48→#
+    49→#   Ex-2: use default linker then test DSP algorithm with RV32 SID
+    50→#   ../test.sh "" riscv32-elf-gcc riscv-sim-wrapper SID BS3 "-mext-dsp"
+    51→#
+    52→#   Ex-3: use lld as linker, clang as compiler then test DSP algorithm with RV64 SID
+    53→#   ../test.sh "" riscv64-linux-clang riscv-sim-wrapper SID BS3 "-mext-dsp" lld
+    54→#
+    55→#   Ex-4: use default linker then test v-ext 0.8 algorithm with SID
+    56→#   ../test.sh "" riscv64-elf-gcc riscv-sim-wrapper SID BS3 "-mext-vector -DNDS_VEC_RVV_VERSION=80"
+    57→#
+    58→#   Ex-5: use default linker then test v-ext 1.0 algorithm with SID
+    59→#   ../test.sh "" riscv64-elf-gcc riscv-sim-wrapper SID BS3 "-mext-vector -DNDS_VEC_RVV_VERSION=1000"
+    60→#
+    61→# Note:
+    62→#   In build-system-3, the 3rd parameter is allways "riscv-sim-wrapper".
+    63→#   build-system-3 will prepare a proper warpper named "riscv-sim-wrapper"
+    64→#   according to the specified simulation target by users, and this wrapper will
+    65→#   be used in the accuray test later.
+    66→#
+    67→################################################################################
+    68→
+    69→#######################################################
+    70→# check the coverage of executed functions
+    71→#######################################################
+    72→function check_coverage {
+    73→    local gcda_list called_fun_list fun_coverage fun_name coverage_status
+    74→    # remember change directory to the folder used to keep gcov outputs
+    75→    cd ${GCOV_DIR}
+    76→
+    77→    gcda_list=($(ls ${LIB_OBJ_DIR}/*.gcda))
+    78→    for gcda in ${gcda_list[@]}; do
+    79→        called_fun_list=$(${GCOV} -f ${gcda} | grep -w "Function" -A1)
+    80→        IFS=-
+    81→        called_fun_list=(${called_fun_list})
+    82→        IFS=
+    83→        coverage_status=""
+    84→        is_coverage_fail=0
+    85→
+    86→        # let the function with riscv_nn prefix be shown first
+    87→        for called_fun in "${called_fun_list[@]}"; do
+    88→            if [[ "${called_fun}" == *"${FUN_PREFIX}"* ]]; then
+    89→                fun_coverage=$(grep -Eo "[[:digit:]]{1,3}.[[:digit:]]{2}%" <<< ${called_fun})
+    90→                # remember to ignore those functions with 0.00% coverage
+    91→                if [[ "${fun_coverage}" != 0.00% ]]; then
+    92→                    fun_name=$(grep -w "Function" <<< ${called_fun} | cut -d "'" -f2)
+    93→                    coverage_status+="${fun_name},${fun_coverage},"
+    94→                    # coverage_status+=""
+    95→                    if [[ "${fun_coverage}" != "100.00%" ]]; then
+    96→                        is_coverage_fail=1
+    97→                    fi
+    98→                fi
+    99→
+   100→                called_fun_list=("${called_fun_list[@]/${called_fun}}")
+   101→                break
+   102→            fi
+   103→        done
+   104→
+   105→        for called_fun in ${called_fun_list[@]}; do
+   106→            fun_coverage=$(grep -Eo "[[:digit:]]{1,3}.[[:digit:]]{2}%" <<< ${called_fun})
+   107→            # remember to ignore those functions with 0.00% coverage
+   108→            if [[ "${fun_coverage}" != 0.00% ]]; then
+   109→                fun_name=$(grep -w "Function" <<< ${called_fun} | cut -d "'" -f2)
+   110→                coverage_status+="${fun_name},${fun_coverage},"
+   111→                if [[ "${fun_coverage}" != "100.00%" ]]; then
+   112→                    is_coverage_fail=1
+   113→                fi
+   114→            fi
+   115→        done
+   116→
+   117→        if [ ${is_coverage_fail} -eq 1 ]; then
+   118→            coverage_fail_list+=("${coverage_status}")
+   119→            echo ${coverage_status} >> ${COVERAGE_FAIL_LIST}
+   120→            cp $(basename ${gcda/gcda/c.gcov}) ${FAILED_GCOV_DIR}
+   121→        fi
+   122→
+   123→        # write coverage results into file
+   124→        echo ${coverage_status} >> ${COV_CSV}
+   125→    done
+   126→
+   127→    # go back to previous path
+   128→    cd ${CURRENT_PATH}
+   129→}
+   130→
+   131→#######################################################
+   132→# collect the code size of each section
+   133→#   $1: test function name
+   134→#######################################################
+   135→calculate_code_size () {
+   136→    local log_file build_cmd tmp_size_log
+   137→
+   138→    echo -n "${1}," >> ${SIZE_CSV}
+   139→    log_file="${LOG_DIR}/${1}_empty.log"
+   140→    build_cmd="${CC} ${DEFAULT_APP_CFLAGS} -O3 ${EXTRA_FLAG} -DENA_DUMP_GOLDEN=${ENA_DUMP_GOLDEN} -DENA_MEASURE_PERF=${ENA_MEASURE_PERF} -DGETENV_TESTDIR=${UNIT_TEST_PATH} ${INC_DIR} -o ${ADX_DIR}/t_$1_empty.adx ${UNIT_TEST_PATH}/t_$1.c ${EMPTY_LIB} -lm"
+   141→    #use the linker specified by the user
+   142→    if [[ -n ${LD} ]]; then
+   143→        build_cmd="${build_cmd} -fuse-ld=${LD}"
+   144→    fi
+   145→
+   146→    # build the executable
+   147→    ${build_cmd} 2>>${log_file} | tee -a ${log_file}
+   148→
+   149→    # get the size info
+   150→    tmp_size_log="${LOG_DIR}/size.log"
+   151→    ${SIZE} ${ADX_DIR}/t_${1}.adx       | tail -1 > ${tmp_size_log}
+   152→    ${SIZE} ${ADX_DIR}/t_${1}_empty.adx | tail -1 >> ${tmp_size_log}
+   153→
+   154→    # calculate the size of each section
+   155→    awk '
+   156→        NR==1 {split($0,non_empty)}
+   157→        NR==2 {split($0,empty)}
+   158→        END {for(i=1;i<=5;i++) printf "%u,", non_empty[i] - empty[i]}
+   159→    ' ${tmp_size_log} >> ${SIZE_CSV}
+   160→    echo >> ${SIZE_CSV}  #new line
+   161→}
+   162→
+   163→#######################################################
+   164→# run the unit test and check the accuracy results
+   165→#   $1: test function name
+   166→#   $2: test function group name (for grouping excel results)
+   167→#######################################################
+   168→function run_and_check {
+   169→    # skip the fp16 functions when the zfh extension is not enabled
+   170→    if [ ${ENA_FP16} -eq 0 ] && [[ "${1}" == *"f16"* ]]; then
+   171→        accuracy_unsupport_num=$((accuracy_unsupport_num + 1))
+   172→        echo "$2,$1,x,x," >> ${PERF_CSV}
+   173→        return
+   174→    fi
+   175→
+   176→    # skip the integer 4-bit functions when the v-ext enabled but the VLN8 not enabled
+   177→    if [[ ${EXTRA_FLAG} =~ -mext-vector ]] && [[ ${ENA_VL4} -eq 0 ]] && [[ ${1} =~ s4 ]]; then
+   178→        accuracy_unsupport_num=$((accuracy_unsupport_num + 1))
+   179→        echo "$2,$1,x,x," >> ${PERF_CSV}
+   180→        return
+   181→    fi
+   182→
+   183→    log "--- $1 ---"
+   184→    local log_file="${LOG_DIR}/${1}.log"
+   185→    build_cmd="${CC} ${DEFAULT_APP_CFLAGS} -O3 -DENA_DUMP_GOLDEN=${ENA_DUMP_GOLDEN} -DENA_MEASURE_PERF=${ENA_MEASURE_PERF} -DGETENV_TESTDIR=${UNIT_TEST_PATH} ${INC_DIR} -o ${ADX_DIR}/t_$1.adx ${UNIT_TEST_PATH}/t_$1.c ${LINKED_LIB} ${EXTRA_FLAG} -lm"
+   186→    #use the linker specified by the user
+   187→    if [[ -n ${LD} ]]; then
+   188→        build_cmd="${build_cmd} -fuse-ld=${LD}"
+   189→    fi
+   190→
+   191→    echo ${build_cmd} > ${log_file}
+   192→    ${build_cmd} 2>>${log_file} | tee -a ${log_file}
+   193→    if [ ${PIPESTATUS[0]} == 0 ]; then  #check the compiling successful or not
+   194→        # dump the disassembly
+   195→        ${OBJDUMP} "${ADX_DIR}/t_${1}.adx" -S > "${OBJDUMP_DIR}/t_${1}.objdump"
+   196→
+   197→        log "Start at $(date)"
+   198→        ${SIM_WRAPPER} ${ADX_DIR}/t_$1.adx >> ${log_file} 2>&1
+   199→        ret=$?
+   200→        log "End at $(date)"
+   201→
+   202→        # check correctness
+   203→        if [ ${ret} == 0 ]; then
+   204→            # check whehter the program is executed (For the case of AndeSim
+   205→            # doesn't launch successfully. BTW, AndeSim doesn't return error
+   206→            # code even if it enounters some issues.)
+   207→            # Here we use the ALWAYS present string as the criteria whether
+   208→            # the test program is executed.
+   209→            grep -w 'pass\|fail' ${log_file} &> /dev/null
+   210→            if [ $? -ne 0 ]; then
+   211→                accuracy_fail_list+=("${1}")
+   212→                echo "Warning! There is no 'pass' or 'fail' string is parsed in this log file; therefore, the program may not executed." >> ${log_file}
+   213→            else
+   214→                accuracy_pass_num=$((accuracy_pass_num + 1))
+   215→            fi
+   216→
+   217→            if [ ${ENA_GREP_PF_TO_CSV} == 1 ]; then
+   218→                #dump inst/cycle into csv
+   219→                echo -e "$2,$1,\c" >> ${PERF_CSV}
+   220→                grep -w 'inst' ${log_file}  | awk '{printf "%ld,", $5}' >> ${PERF_CSV}
+   221→                grep -w 'cycle' ${log_file} | awk '{printf "%ld,", $5}' >> ${PERF_CSV}
+   222→                echo >> ${PERF_CSV}  #new line
+   223→            fi
+   224→
+   225→            if [ ${ENA_GREP_PARAM_TO_CSV} == 1 ]; then
+   226→                # following parser will work properly only as below assumptions
+   227→                # are valid
+   228→                #   (1) each parameter is seperated with semicolon except the
+   229→                #       last one
+   230→                #   (2) the parameters are surrounded by the "param_hint_begin"
+   231→                #       and "param_hint_end"
+   232→
+   233→                #dump the parameters into csv
+   234→                local param_hint_begin="___PARAMETERS_BEGIN___"
+   235→                local param_hint_end="___PARAMETERS_END___"
+   236→                local tmp_param_str=$(sed -n "/${param_hint_begin}/,/${param_hint_end}/p" ${log_file})
+   237→
+   238→                # remove all newlines
+   239→                tmp_param_str=${tmp_param_str//$'\r'/}
+   240→                tmp_param_str=${tmp_param_str//$'\n'/}
+   241→                # remove hint string
+   242→                tmp_param_str=${tmp_param_str//${param_hint_begin}/}
+   243→                tmp_param_str=${tmp_param_str//${param_hint_end}/,}
+   244→                # make each parameter being in one line
+   245→                tmp_param_str=${tmp_param_str//;/;$'\n'}
+   246→                echo -e "$2,$1,${tmp_param_str}" >> ${PARAM_CSV}
+   247→            fi
+   248→        else
+   249→            accuracy_fail_list+=("${1}")
+   250→        fi
+   251→    else
+   252→        # build the executable fail
+   253→        accuracy_fail_list+=("${1}")
+   254→    fi
+   255→
+   256→    if [[ ${ENA_MEASURE_CODE_SIZE} -eq 1 ]]; then
+   257→        calculate_code_size "${1}"
+   258→    fi
+   259→}
+   260→
+   261→###############################################################################
+   262→# build and run the target configuration diagnosis program
+   263→#  $1: source file name of the program
+   264→###############################################################################
+   265→function target_cfg_diagnosis {
+   266→    local src_fname="target_cfg_diagnosis"
+   267→    log "--- ${src_fname} ---"
+   268→    local log_file="${LOG_DIR}/${src_fname}.log"
+   269→    build_cmd="${CC} ${DEFAULT_APP_CFLAGS} -O3 -o ${ADX_DIR}/$src_fname.adx ${UNIT_TEST_PATH}/$src_fname.c ${EXTRA_FLAG}"
+   270→    echo ${build_cmd} > ${log_file}
+   271→
+   272→    ${build_cmd} 2>>${log_file} | tee -a ${log_file}
+   273→    if [ ${PIPESTATUS[0]} == 0 ]; then  #check the compiling successful or not
+   274→        log "Start at $(date)"
+   275→        ${SIM_WRAPPER} ${ADX_DIR}/${src_fname}.adx >> ${log_file} 2>&1
+   276→        ret=$?
+   277→        log "End at $(date)"
+   278→    fi
+   279→}
+   280→
+   281→#######################################################
+   282→# build the executables
+   283→#   $1: test function name
+   284→#######################################################
+   285→function build_executable {
+   286→    log "--- $1 ---"
+   287→    local log_file="${LOG_DIR}/${1}.log"
+   288→    build_cmd="${CC} ${DEFAULT_APP_CFLAGS} -O3 -DENA_DUMP_GOLDEN=${ENA_DUMP_GOLDEN} -DENA_MEASURE_PERF=${ENA_MEASURE_PERF} ${INC_DIR} -o ${ADX_DIR}/t_$1.adx ${UNIT_TEST_PATH}/t_$1.c ${LINKED_LIB} ${EXTRA_FLAG} -lm"
+   289→
+   290→    #use the linker specified by the user
+   291→    if [[ -n ${LD} ]]; then
+   292→        build_cmd+=" -fuse-ld=${LD}"
+   293→    fi
+   294→
+   295→    echo ${build_cmd} > ${log_file}
+   296→    ${build_cmd} 2>>${log_file} | tee -a ${log_file}
+   297→    if [[ ${PIPESTATUS[0]} != 0 ]]; then  #check the compiling successful or not
+   298→        # build the executable fail
+   299→        accuracy_fail_list+=("${1}")
+   300→    fi
+   301→}
+   302→
+   303→#######################################################
+   304→# Some function's algorithm implementaions are hardware
+   305→# configuration dependant; thus, there are mutiple
+   306→# algoirhtms for different hardware configurations and
+   307→# the code coverage is impossible to be 100% as executing
+   308→# the function under one hardware configuration. Here we
+   309→# execute these functions with all hardware configuration
+   310→# simulator warpper to make the coverage reach 100%.
+   311→#######################################################
+   312→function run_special_case_for_rvv () {
+   313→    local sim_wrapper_list=($(ls ${SIM_WRAPPER%v*}*))
+   314→    local log_file="${LOG_DIR}/special_case.log"
+   315→
+   316→    for sim_wrapper in "${sim_wrapper_list[@]}"; do
+   317→      for fun in "${SPECIAL_CASE_RVV[@]}"; do
+   318→          echo "${sim_wrapper} ${ADX_DIR}/t_${fun}.adx" >> ${log_file}
+   319→          ${sim_wrapper} ${ADX_DIR}/t_${fun}.adx >> ${log_file}
+   320→      done
+   321→    done
+   322→}
+   323→
+   324→#######################################################
+   325→# Build the library
+   326→#   $1: flags used to build the library
+   327→#######################################################
+   328→build_lib () {
+   329→    local build_lib_stdout build_lib_stderr
+   330→    build_lib_stdout=${CURRENT_PATH}/${TEST_LOG_DIR}/build_lib.log
+   331→    build_lib_stderr=${CURRENT_PATH}/${TEST_LOG_DIR}/build_lib_error.log
+   332→
+   333→    log "****************************************************"
+   334→    log "Build libnn ..."
+   335→    start_time
+   336→    log "    LIB_CFLAGS= ${1}"
+   337→    log "    Output=${build_lib_stdout}"
+   338→    log "    Error=${build_lib_stderr}"
+   339→    log
+   340→
+   341→    ${LIB_ROOT_PATH}/build.sh "${CPU_NAME}" "${1}" "${CC}" "${CURRENT_PATH}/${TEST_LOG_DIR}" > "${build_lib_stdout}" 2> "${build_lib_stderr}"
+   342→    if [[ ${CC} =~ "linux" ]] && [[ ! ${EXTRA_FLAG} =~ "-static" ]]; then
+   343→        # build the dynamic library for glibc toolcahin ...
+   344→        local all_obj_list=$(ls ${LIB_OBJ_DIR}/*.o)
+   345→        local build_shared_lib_cmd="${CC} -shared -o ${LIB_ROOT_PATH}/${LIB_NAME}.so ${all_obj_list}"
+   346→        echo ${build_shared_lib_cmd} >> "${build_lib_stdout}"
+   347→        ${build_shared_lib_cmd} >> "${build_lib_stdout}" 2> "${build_lib_stderr}"
+   348→    fi
+   349→    build_lib_result=$?
+   350→
+   351→    if [ ${build_lib_result} == 0 ]; then
+   352→        log "Build library done."
+   353→    else
+   354→        log "Build library FAIL !!!"
+   355→    fi
+   356→    end_time
+   357→    log "****************************************************"
+   358→}
+   359→
+   360→function log () {
+   361→    echo "$*" >> ${CURRENT_PATH}/${TEST_LOG_DIR}/${TEST_LOG} 2>&1
+   362→}
+   363→
+   364→function start_time () {
+   365→    log "Start at `date`"
+   366→    S_TIME=`date +%s`
+   367→}
+   368→
+   369→function end_time () {
+   370→    E_TIME=`date +%s`
+   371→    log "End at `date`, takes $((E_TIME-S_TIME)) seconds."
+   372→}
+   373→
+   374→################################################################################
+   375→#                                   main                                       #
+   376→################################################################################
+   377→#----- EDITABLE switches begin -----
+   378→ENA_TEST_ALL=1
+   379→ENA_ACTIVATION_TEST=0
+   380→ENA_BASIC_TEST=0
+   381→ENA_CONCATE_TEST=0
+   382→ENA_CONV_TEST=0
+   383→ENA_FC_TEST=0
+   384→ENA_POOLING_TEST=0
+   385→ENA_SOFTMAX_TEST=0
+   386→ENA_UTIL_TEST=0
+   387→
+   388→ENA_DUMP_GOLDEN=0
+   389→ENA_MEASURE_PERF=0          # only run large test case to measure the performance
+   390→ENA_GREP_PF_TO_CSV=0        # collect instruction and cycle counts into csv
+   391→ENA_GREP_PARAM_TO_CSV=0     # collect parameters into csv
+   392→ENA_MEASURE_CODE_SIZE=0     # measure the code size of each function (as this is enabled, the
+   393→                            # coverage checking will be disabled)
+   394→#----- EDITABLE switches end -----
+   395→
+   396→#----- NON-EDITABLE global variables begin -----
+   397→# lib name
+   398→LIB_NAME="libnn"
+   399→
+   400→#Path info
+   401→CURRENT_PATH=$(pwd)                                 #position of user invokes this script
+   402→LIB_ROOT_PATH=$(readlink -f `dirname ${0}`)         #position of libnn repository root folder
+   403→WRAPPTER_PATH=$(readlink -f ${CURRENT_PATH}/..)     #the wrapper position of BS3
+   404→UNIT_TEST_PATH="${LIB_ROOT_PATH}/Examples/unit_func"
+   405→#export each cpu project here to make sure the sim wrapper could be found in daily test ???
+   406→# export PATH=$( find ${LIB_ROOT_PATH}/project/ -type d -printf ":%p" ):$PATH
+   407→
+   408→#Output files/folders
+   409→TIME_STR=$(date +%Y%m%d%H%M%S)
+   410→TEST_LOG="test_sh_${TIME_STR}.log"      #save the ouput message of this script.
+   411→TEST_LOG_DIR="test_sh_${TIME_STR}"
+   412→PERF_CSV="${CURRENT_PATH}/${TEST_LOG_DIR}/performance.csv"
+   413→PARAM_CSV="${CURRENT_PATH}/${TEST_LOG_DIR}/parameter.csv"
+   414→LOG_DIR="${CURRENT_PATH}/${TEST_LOG_DIR}/log"
+   415→ADX_DIR="${CURRENT_PATH}/${TEST_LOG_DIR}/adx"           # collect the executables into TEST_LOG_DIR
+   416→OBJDUMP_DIR="${CURRENT_PATH}/${TEST_LOG_DIR}/objdump"   # collect the disassembly into TEST_LOG_DIR
+   417→GCOV_DIR="${CURRENT_PATH}/${TEST_LOG_DIR}/gcov"         # temporary folder to keep gcov outputs
+   418→FAILED_GCOV_DIR="${CURRENT_PATH}/${TEST_LOG_DIR}/faild_gcov"
+   419→ERROR_LOG="diff_log"
+   420→ACCURACY_FAIL_LIST="${CURRENT_PATH}/${TEST_LOG_DIR}/accuracy_fail_list"
+   421→COVERAGE_FAIL_LIST="${CURRENT_PATH}/${TEST_LOG_DIR}/coverage_fail_list"
+   422→COV_CSV="${CURRENT_PATH}/${TEST_LOG_DIR}/coverage.csv"  # keep all functions' code coverage
+   423→# COV_FAIL_LIST="${CURRENT_PATH}/${TEST_LOG_DIR}/coverage_fail_list"
+   424→LIB_OBJ_DIR="${CURRENT_PATH}/${TEST_LOG_DIR}/lib_objs"                 # all functions' object file
+   425→TMP_LIB_DIR="${CURRENT_PATH}/${TEST_LOG_DIR}/lib_dir"                  # temporary folder to keep the empty library
+   426→EMPTY_LIB="${TMP_LIB_DIR}/${LIB_NAME}_empty.a"
+   427→SIZE_CSV="${CURRENT_PATH}/${TEST_LOG_DIR}/size.csv"     # keep all functions' code size
+   428→
+   429→#Save input arguments into meaningful variables
+   430→CC="${2}"                   #compiler name
+   431→SIM_WRAPPER="${3}"          #simulator name
+   432→TEST_TARGET="${4}"          #GDB / SID / BOARD
+   433→TEST_TYPE="${5}"            #BS3 / DAILY
+   434→EXTRA_FLAG="${6}"           #extra flags for selecting multi-lib
+   435→LD="${7}"                   #specified linker
+   436→
+   437→# setup the binutil full name
+   438→SIZE="${CC%-*}-size"
+   439→GCOV="${CC%-*}-gcov"
+   440→OBJDUMP="${CC%-*}-objdump"
+   441→
+   442→#Compilation flags and related info
+   443→DEFAULT_LIB_CFLAGS="-O3 -Wall -Werror -ffunction-sections -fdata-sections"
+   444→
+   445→#default CPU option
+   446→if [[ "${CC}" == "nds32"* ]]; then
+   447→    if [[ ${EXTRA_FLAG} = *"-mext-dsp"* ]]; then
+   448→        CPU_NAME="d10"
+   449→    else
+   450→        CPU_NAME="n10"
+   451→    fi
+   452→elif [[ "${CC}" == "riscv32"* ]]; then
+   453→    if [[ ${EXTRA_FLAG} = *"-mext-dsp"* ]] && [[ ${EXTRA_FLAG} = *"-mtune=andes-45-series"* ]]; then
+   454→        CPU_NAME="a45"
+   455→    elif [[ ${EXTRA_FLAG} = *"-mext-dsp"* ]]; then
+   456→        CPU_NAME="a25"
+   457→    elif [[ ${EXTRA_FLAG} = *"-mtune=andes-45-series"* ]]; then
+   458→        CPU_NAME="n45"
+   459→    else
+   460→        CPU_NAME="n25"
+   461→    fi
+   462→elif [[ "${CC}" == "riscv64"* ]]; then
+   463→    if [[ ${EXTRA_FLAG} = *"-mext-dsp"* ]] && [[ ${EXTRA_FLAG} = *"-mtune=andes-45-series"* ]]; then
+   464→        CPU_NAME="ax45"
+   465→    elif [[ ${EXTRA_FLAG} = *"-mext-dsp"* ]]; then
+   466→        CPU_NAME="ax25"
+   467→    elif [[ ${EXTRA_FLAG} = *"-mext-vector"* ]] && [[ ${EXTRA_FLAG} = *"NDS_VEC_RVV_VERSION=100"* ]] && [[ ${EXTRA_FLAG} = *"-mtune=andes-45-series"* ]]; then
+   468→        CPU_NAME="ax45mpv"
+   469→    elif [[ ${EXTRA_FLAG} = *"-mext-vector"* ]] && [[ ${EXTRA_FLAG} = *"NDS_VEC_RVV_VERSION=100"* ]]; then
+   470→        CPU_NAME="nx27v"
+   471→    elif [[ ${EXTRA_FLAG} = *"-mtune=andes-45-series"* ]]; then
+   472→        CPU_NAME="nx45"
+   473→    else
+   474→        CPU_NAME="nx25"
+   475→    fi
+   476→fi
+   477→
+   478→# add the mtune option for 25-series
+   479→if [[ ${CPU_NAME} =~ ^[na](x?)25$ ]] || [[ ${CPU_NAME} == "d25" ]]; then
+   480→    DEFAULT_LIB_CFLAGS="${DEFAULT_LIB_CFLAGS} -mtune=andes-25-series"
+   481→fi
+   482→
+   483→# enable ENA_MEASURE_PERF, ENA_GREP_PF_TO_CSV and ENA_GREP_PARAM_TO_CSV when called from test_perf.sh
+   484→if [[ ${EXTRA_FLAG} == *"-DENA_TEST_PERF"* ]]; then
+   485→    ENA_MEASURE_PERF=1
+   486→    ENA_GREP_PF_TO_CSV=1
+   487→    ENA_GREP_PARAM_TO_CSV=1
+   488→fi
+   489→
+   490→#test sat-ext when using V3 toolcahin and without enabling -mext-dsp
+   491→#(sat-ext will be tested after plain C)
+   492→# if [[ ${CC} == "nds32"* ]] && [[ ${EXTRA_FLAG} != *"-mext-dsp"* ]];
+   493→#     SAT_LIB_CFLAGS="DEFAULT_LIB_CFLAGS -DENA_EXT_SAT_INST"
+   494→#     TEST_SAT_EXT="1"
+   495→# else
+   496→#     TEST_SAT_EXT="0"
+   497→# fi
+   498→
+   499→#check code coverage only on daily test
+   500→#note. the code coverage testing is not supported on board
+   501→if [ "${TEST_TYPE}" == "DAILY" ] && [[ ${TEST_TARGET} =~ ^(SID|QEMU)$ ]] && [[ "${CC}" != *"clang" ]] && [[ ${ENA_MEASURE_CODE_SIZE} -eq 0 ]]; then
+   502→    DEFAULT_LIB_CFLAGS="${DEFAULT_LIB_CFLAGS} --coverage -DGCOV"
+   503→    CODE_COVERAGE="1"
+   504→else
+   505→    CODE_COVERAGE="0"
+   506→fi
+   507→
+   508→DEFAULT_APP_CFLAGS="${DEFAULT_LIB_CFLAGS} -Wl,-gc-sections"
+   509→if [[ ${CC} =~ "elf" ]]; then
+   510→    # only enable the performance counter for elf toolcahins
+   511→    DEFAULT_APP_CFLAGS+=" -DPF_COUNTER"
+   512→
+   513→    # enable virtual hosting / semihosting
+   514→    if [[ ${TEST_TARGET} =~ ^(BOARD|QEMU|ALIOTH)$ ]]; then
+   515→        DEFAULT_APP_CFLAGS="${DEFAULT_APP_CFLAGS} -mvh"
+   516→    fi
+   517→fi
+   518→
+   519→if [[ ${TEST_TARGET} == "BOARD" ]] && [[ ${CC} =~ "elf" ]]; then
+   520→    if [[ ${EXTRA_FLAG} = *"-DENA_QILAI_LD"* ]]; then
+   521→        # applying the customized linker script for Qilai platform
+   522→        DEFAULT_APP_CFLAGS="${DEFAULT_APP_CFLAGS} -Wl,-T ${LIB_ROOT_PATH}/project/nx27v_qilai/qilai.ld"
+   523→    elif [[ "${CC}" == "nds32"* ]]; then
+   524→        # move rodata to LM with the customized linker script (for V3)
+   525→        DEFAULT_APP_CFLAGS="${DEFAULT_APP_CFLAGS} -Wl,-T ${LIB_ROOT_PATH}/project/d10/nds32.ld"
+   526→    elif [[ "${CC}" == "riscv"* ]] && [[ ${EXTRA_FLAG} != *"-mext-vector"* ]] && [[ ${EXTRA_FLAG} =~ "ENA_LM" ]] ; then
+   527→        # move rodata to LM with the customized linker script (for V5)
+   528→        DEFAULT_APP_CFLAGS="${DEFAULT_APP_CFLAGS} -Wl,-T ${LIB_ROOT_PATH}/project/d25/ae350-xip.ld"
+   529→    fi
+   530→fi
+   531→
+   532→# app and lib cflags for v-ext
+   533→if [[ ${EXTRA_FLAG} = *"-mext-vector"* ]]; then
+   534→    DEFAULT_LIB_CFLAGS="${DEFAULT_LIB_CFLAGS} -DENA_VEC_ISA -DMAX_VLEN=1024 -fno-tree-slp-vectorize -fno-tree-vectorize"
+   535→    if [[ ${CC} =~ "elf" ]]; then
+   536→        DEFAULT_APP_CFLAGS="${DEFAULT_APP_CFLAGS} -DENA_FS_VS"
+   537→    fi
+   538→
+   539→    # As using v-ext, now the fast algorithm will be applied by default
+   540→    DEFAULT_APP_CFLAGS="${DEFAULT_APP_CFLAGS} -DENA_FAST_ALGO"
+   541→
+   542→    if [[ ${CC} =~ "elf" ]]; then
+   543→        # As measuring v-ext algorithm on cacheable environment, we can enable
+   544→        # ENA_CACHEABLE_ENV_SETUP switch to get better performance.
+   545→        DEFAULT_APP_CFLAGS="${DEFAULT_APP_CFLAGS} -DENA_CACHEABLE_ENV_SETUP"
+   546→    fi
+   547→fi
+   548→
+   549→# extra cflags for the environment with HVM
+   550→if [[ ${EXTRA_FLAG} = *"-DENA_HVM"* ]]; then
+   551→    DEFAULT_LIB_CFLAGS="${DEFAULT_LIB_CFLAGS} -mcmodel=large"
+   552→    DEFAULT_APP_CFLAGS="${DEFAULT_APP_CFLAGS} -mcmodel=large"
+   553→fi
+   554→
+   555→# setup the extra flags for the glibc toolchain
+   556→if [[ ${CC} =~ "linux" ]] && [[ ! ${EXTRA_FLAG} =~ "-static" ]]; then
+   557→    DEFAULT_LIB_CFLAGS+=" -fpic"
+   558→fi
+   559→
+   560→# customized crt0 for v-ext 0.8
+   561→if [[ ${EXTRA_FLAG} = *"-mext-vector"* ]] && [[ ${EXTRA_FLAG} = *"NDS_VEC_RVV_VERSION=80"* ]]; then
+   562→    DEFAULT_APP_CFLAGS="${DEFAULT_APP_CFLAGS} -nostartfiles ${LIB_ROOT_PATH}/project/nx25v/crt0.s"
+   563→fi
+   564→
+   565→#header files and their search path
+   566→if [[ ${TEST_TYPE} == BS3 ]]; then
+   567→    # As verifying the unit tests with BS3, we should use the header files is
+   568→    # the used toolchain instead of those in libnn repo.
+   569→    TOOLCHAIN_PATH=$(which ${CC})
+   570→    if [[ ${CC} == *elf* ]]; then
+   571→        # for elf toolchain
+   572→        PREFIX=${CC%-*}
+   573→        INC_PATH_IN_TOOLCHAIN=$(readlink -f "${TOOLCHAIN_PATH%/*}/../${PREFIX}/include")
+   574→    else
+   575→        # for linux toolchain
+   576→        INC_PATH_IN_TOOLCHAIN=$(readlink -f "${TOOLCHAIN_PATH%/*}/../sysroot/usr/include")
+   577→    fi
+   578→    INC_DIR="-I${INC_PATH_IN_TOOLCHAIN} -I${UNIT_TEST_PATH}/include"
+   579→else
+   580→    # As verifying the unit tests during developing, we should use the header
+   581→    # files in libnn repo; otherwise, the prototypes of new functions can't
+   582→    # be found by the compiler.
+   583→    INC_DIR="-I${LIB_ROOT_PATH}/Include -I${UNIT_TEST_PATH}/include"
+   584→fi
+   585→
+   586→#Some identification flags
+   587→if [[ ${CC} == "nds32be"* ]]; then
+   588→    ENDIAN="be"
+   589→else
+   590→    ENDIAN="le"
+   591→fi
+   592→
+   593→if [[ ${CC} == *"linux"* ]]; then
+   594→    TOOLCHAIN_IS_GLIBC="1"
+   595→else
+   596→    TOOLCHAIN_IS_GLIBC="0"
+   597→fi
+   598→
+   599→#select the library to be linked (from built-in or manual building library)
+   600→if [ "${TEST_TYPE}" == "BS3" ];then
+   601→    # now the linked libray name needs to be passed manually as linking to the
+   602→    # built-in libraries (owing to there is not enough information to
+   603→    # distinguish the ELEN32 and ELEN64 version v-ext library)
+   604→    LINKED_LIB=""
+   605→else
+   606→    LINKED_LIB="-lnn -L${CURRENT_PATH}/${TEST_LOG_DIR}"
+   607→fi
+   608→
+   609→# setup the linking library and header files searching path for HVM
+   610→if [[ ${EXTRA_FLAG} =~ ENA_HVM ]]; then
+   611→    LINKED_LIB+=" -lhvm"
+   612→    INC_DIR+=" -I${LIB_ROOT_PATH}/libhvm-project/libhvm/include"
+   613→fi
+   614→
+   615→# function prefix
+   616→FUN_PREFIX="riscv_nn"
+   617→
+   618→#timer variables
+   619→BEGIN_TIME=$(date +%s)
+   620→S_TIME=0
+   621→E_TIME=0
+   622→#----- NON-EDITABLE global variables end -----
+   623→
+   624→# init output folder
+   625→mkdir -p ${TEST_LOG_DIR}
+   626→mkdir -p ${ADX_DIR}
+   627→mkdir -p ${OBJDUMP_DIR}
+   628→mkdir -p ${GCOV_DIR}
+   629→mkdir -p ${LOG_DIR}
+   630→mkdir -p ${TMP_LIB_DIR}
+   631→
+   632→# clean old temp files/executables
+   633→rm -f ${ADX_DIR}/*.adx
+   634→rm -f ${OBJDUMP_DIR}/*.adx
+   635→rm -f ${GCOV_DIR}/*
+   636→rm -f ${TMP_LIB_DIR}/*
+   637→rm -f ./${ERROR_LOG}
+   638→rm -f ../${ERROR_LOG}
+   639→
+   640→echo
+   641→echo "Note: All ouput messages are saving into ${TEST_LOG} and will not be shown on console simultaneously."
+   642→echo "      And all log files are saved at ${TEST_LOG_DIR} folder."
+   643→
+   644→
+   645→log "***************************************************************************************"
+   646→log libnn accuracy testing begin ...
+   647→log Begin at `date`
+   648→log "***************************************************************************************"
+   649→log Arguments information:
+   650→log Input 1="${1}"
+   651→log Input 2="${2}"
+   652→log Input 3="${3}"
+   653→log Input 4="${4}"
+   654→log Input 5="${5}"
+   655→log Input 6="${6}"
+   656→log Input 7="${7}"
+   657→log
+   658→log ENDIAN=${ENDIAN}
+   659→log CURRENT_PATH=${CURRENT_PATH}
+   660→log LIB_ROOT_PATH=${LIB_ROOT_PATH}
+   661→log UNIT_TEST_PATH=${UNIT_TEST_PATH}
+   662→log LINKED_LIB=${LINKED_LIB}
+   663→log ERROR_LOG=${ERROR_LOG}
+   664→log "SIM_WRAPPER($3)=`which $3`"
+   665→log Log Folder=${TEST_LOG_DIR}
+   666→log "    Full path=${CURRENT_PATH}/${TEST_LOG_DIR}"
+   667→log
+   668→log TOOLCHAIN_IS_GLIBC=${TOOLCHAIN_IS_GLIBC}
+   669→# log TEST_NORMAL=${TEST_NORMAL}
+   670→# log TEST_DSP_EXT=${TEST_DSP_EXT}
+   671→log CODE_COVERAGE=${CODE_COVERAGE}
+   672→log
+   673→log DEFAULT_LIB_CFLAGS=${DEFAULT_LIB_CFLAGS}
+   674→log DEFAULT_APP_CFLAGS=${DEFAULT_APP_CFLAGS}
+   675→# log DEFAULT_GLIBC_FLAGS=${DEFAULT_GLIBC_FLAGS}
+   676→log
+   677→log PATH=${PATH}
+   678→log
+   679→log Compiler information:
+   680→$CC -v >> ${CURRENT_PATH}/${TEST_LOG_DIR}/${TEST_LOG} 2>&1
+   681→log "****************************************************"
+   682→
+   683→
+   684→# Since strided load is not supported now. If vector extension
+   685→# is enabled, those functions use strided load won't be executed.
+   686→# if [[ "${CFLAGS}" == *"-mext-vector"* ]] && [[ "${CFLAGS}" == *"-mvh"* ]]; then
+   687→#     ENA_UNIT_STRIDE_ONLY=1      #only run the test cases with unit stride acess
+   688→# else
+   689→#     ENA_UNIT_STRIDE_ONLY=0
+   690→# fi
+   691→
+   692→#init global variable
+   693→accuracy_pass_num=0
+   694→accuracy_unsupport_num=0
+   695→build_lib_result=0  #set default building lib result as successful
+   696→
+   697→ACTIVATION=(
+   698→    "activate_s8"
+   699→    "activate_s16"
+   700→    "activate_s16_hp"
+   701→    "hardswish_s8"
+   702→    "leaky_relu_s8"
+   703→    "leaky_relu_s8_asym"
+   704→    "leaky_relu_s16_asym"
+   705→    "prelu_s8_asym"
+   706→    "relu_s8"
+   707→    "relu_s16"
+   708→    "relu_any_s8"
+   709→    "relu_any_s16"
+   710→    "sigmoid_s8"
+   711→    "sigmoid_s16"
+   712→    "silu_s8"
+   713→    "tanh_s8"
+   714→    "tanh_s16"
+   715→
+   716→    "activate_s8_2buf"
+   717→    "activate_s16_2buf"
+   718→    "leaky_relu_s8_2buf"
+   719→    "relu_s8_2buf"
+   720→    "relu_s16_2buf"
+   721→    "relu_any_s8_2buf"
+   722→
+   723→    "gelu_f16"
+   724→    "gelu_f32"
+   725→    "leaky_relu_f16"
+   726→    "relu_f16"
+   727→    "relu_any_f16"
+   728→    "sigmoid_f16"
+   729→    "silu_f16"
+   730→    "silu_f32"
+   731→    "swish_f16"
+   732→    "swish_f32"
+   733→    "tanh_f16"
+   734→    "tanh_f32"
+   735→)
+   736→BASIC=(
+   737→    "add_s8_sym"
+   738→    "add_s8_sym_round"
+   739→    "broadcast_mul_asym_s8"
+   740→    "broadcast_mul_asym_s16"
+   741→    "ew_add_s8_asym"
+   742→    "ew_add_s16_asym"
+   743→    "ew_addc_s8_asym"
+   744→    "ew_addc_s16_asym"
+   745→    "ew_mul_s8_asym"
+   746→    "ew_mul_s16_asym"
+   747→    "ew_mul_s16_s8_asym"
+   748→    "ew_mulc_s8_asym"
+   749→    "ew_mulc_s16_asym"
+   750→    "ew_rsubc_s8_asym"
+   751→    "ew_rsubc_s16_asym"
+   752→    "ew_sub_s8_asym"
+   753→    "ew_sub_s16_asym"
+   754→    "ew_subc_s8_asym"
+   755→    "ew_subc_s16_asym"
+   756→    "max_s8"
+   757→    "min_s8"
+   758→
+   759→    "ew_add_f16"
+   760→    "ew_mul_f16"
+   761→)
+   762→CONCATE=(
+   763→    "concate_s8_w"
+   764→    "concate_s8_x"
+   765→    "concate_s8_y"
+   766→    "concate_s8_z"
+   767→    "concate_s16_w"
+   768→    "concate_s16_x"
+   769→    "concate_s16_y"
+   770→    "concate_s16_z"
+   771→    "pad_s8"
+   772→    "pad_s16"
+   773→    "slice_s16_w"
+   774→    "slice_s16_x"
+   775→    "slice_s16_y"
+   776→    "slice_s16_z"
+   777→    "split_s8_w"
+   778→    "split_s8_x"
+   779→    "split_s8_y"
+   780→    "split_s8_z"
+   781→    "split_s16_w"
+   782→    "split_s16_x"
+   783→    "split_s16_y"
+   784→    "split_s16_z"
+   785→    "strided_slice_s8"
+   786→    "strided_slice_s16"
+   787→
+   788→    "concate_f16_w"
+   789→    "concate_f16_x"
+   790→    "concate_f16_y"
+   791→    "concate_f16_z"
+   792→)
+   793→CONV=(
+   794→    "conv_1x1_HWC_s8_s8_s8_sym_bias_fast_any"
+   795→    "conv_1x1_HWC_s8_s16_s8_sym_bias_fast_any"
+   796→    "conv_1x1_HWC_u8_u8_s8_sym_bias_fast_any"
+   797→    "conv_1x1_HWC_u8_s8_s8_sym_bias_fast_any"
+   798→    "conv_1x1_HWC_u8_s16_s8_sym_bias_fast_any"
+   799→    "conv_1x1_HWC_s8_s8_s8_sym_fast_any"
+   800→    "conv_1x1_HWC_s8_s16_s8_sym_fast_any"
+   801→    "conv_1x1_HWC_u8_u8_s8_sym_fast_any"
+   802→    "conv_1x1_HWC_u8_s8_s8_sym_fast_any"
+   803→    "conv_1x1_HWC_u8_s16_s8_sym_fast_any"
+   804→
+   805→    "conv_HWC_s8_s8_s8_RGB_sym_bias_fast"
+   806→    "conv_HWC_s8_s16_s8_RGB_sym_bias_fast"
+   807→    "conv_HWC_u8_u8_s8_RGB_sym_bias_fast"
+   808→    "conv_HWC_u8_s8_s8_RGB_sym_bias_fast"
+   809→    "conv_HWC_u8_s16_s8_RGB_sym_bias_fast"
+   810→    "conv_HWC_s8_s8_s8_RGB_sym_fast"
+   811→    "conv_HWC_s8_s16_s8_RGB_sym_fast"
+   812→    "conv_HWC_u8_u8_s8_RGB_sym_fast"
+   813→    "conv_HWC_u8_s8_s8_RGB_sym_fast"
+   814→    "conv_HWC_u8_s16_s8_RGB_sym_fast"
+   815→
+   816→    "conv_HWC_s8_s8_s8_sym_bias_fast"
+   817→    "conv_HWC_s8_s16_s8_sym_bias_fast"
+   818→    "conv_HWC_u8_u8_s8_sym_bias_fast"
+   819→    "conv_HWC_u8_s8_s8_sym_bias_fast"
+   820→    "conv_HWC_u8_s16_s8_sym_bias_fast"
+   821→    "conv_HWC_s8_s8_s8_sym_fast"
+   822→    "conv_HWC_s8_s16_s8_sym_fast"
+   823→    "conv_HWC_u8_u8_s8_sym_fast"
+   824→    "conv_HWC_u8_s8_s8_sym_fast"
+   825→    "conv_HWC_u8_s16_s8_sym_fast"
+   826→
+   827→    "conv_HWC_s8_s8_s8_sym_bias_fast_any"
+   828→    "conv_HWC_s8_s16_s8_sym_bias_fast_any"
+   829→    "conv_HWC_u8_u8_s8_sym_bias_fast_any"
+   830→    "conv_HWC_u8_s8_s8_sym_bias_fast_any"
+   831→    "conv_HWC_u8_s16_s8_sym_bias_fast_any"
+   832→    "conv_HWC_s8_s8_s8_sym_fast_any"
+   833→    "conv_HWC_s8_s16_s8_sym_fast_any"
+   834→    "conv_HWC_u8_u8_s8_sym_fast_any"
+   835→    "conv_HWC_u8_s8_s8_sym_fast_any"
+   836→    "conv_HWC_u8_s16_s8_sym_fast_any"
+   837→
+   838→    "conv_dw_HWC_s8_s8_s8_sym_bias"
+   839→    "conv_dw_HWC_s8_s16_s8_sym_bias"
+   840→    "conv_dw_HWC_u8_u8_s8_sym_bias"
+   841→    "conv_dw_HWC_u8_s8_s8_sym_bias"
+   842→    "conv_dw_HWC_u8_s16_s8_sym_bias"
+   843→    "conv_dw_HWC_s8_s8_s8_sym"
+   844→    "conv_dw_HWC_s8_s16_s8_sym"
+   845→    "conv_dw_HWC_u8_u8_s8_sym"
+   846→    "conv_dw_HWC_u8_s8_s8_sym"
+   847→    "conv_dw_HWC_u8_s16_s8_sym"
+   848→
+   849→    "conv_dw_HWC_s8_s8_s8_sym_bias_any"
+   850→    "conv_dw_HWC_s8_s16_s8_sym_bias_any"
+   851→    "conv_dw_HWC_u8_u8_s8_sym_bias_any"
+   852→    "conv_dw_HWC_u8_s8_s8_sym_bias_any"
+   853→    "conv_dw_HWC_u8_s16_s8_sym_bias_any"
+   854→    "conv_dw_HWC_s8_s8_s8_sym_any"
+   855→    "conv_dw_HWC_s8_s16_s8_sym_any"
+   856→    "conv_dw_HWC_u8_u8_s8_sym_any"
+   857→    "conv_dw_HWC_u8_s8_s8_sym_any"
+   858→    "conv_dw_HWC_u8_s16_s8_sym_any"
+   859→
+   860→    "conv_HWC_s8_s8_s8_sym_bias_any"
+   861→
+   862→    "conv_trans_HWC_s8_s8_s8_sym_bias_any"
+   863→    "conv_trans_HWC_s8_s8_s8_asym_bias_any"
+   864→    "conv_trans_HWC_s16_s16_s8_asym_bias_any"
+   865→    "conv_trans_1xn_HWC_s16_s16_s8_asym_bias_any"
+   866→
+   867→    "conv_HWC_s8_s8_s8_sft_bias"
+   868→    "conv_HWC_s8_s8_s8_sft_bias_any"
+   869→    "conv_HWC_s8_s8_s8_sft_bias_fast"
+   870→    "conv_HWC_s8_s8_s8_sft_bias_fast_any"
+   871→    "conv_HWC_s8_s8_s8_RGB_sft_bias"
+   872→    "conv_HWC_s8_s8_s8_RGB_sft_bias_fast"
+   873→    "conv_HWC_s16_s16_s16_sft_bias"
+   874→    "conv_HWC_s16_s16_s16_sft_bias_fast"
+   875→    "conv_HWC_s16_s16_s16_sft_bias_fast_any"
+   876→    "conv_1x1_HWC_s8_s8_s8_sft_bias_fast_any"
+   877→    "conv_dw_HWC_s8_s8_s8_sft_bias"
+   878→    "conv_dw_HWC_s8_s8_s8_sft_bias_any"
+   879→
+   880→    "conv_1x1_HWC_s8_s8_s4_asym_bias_any"
+   881→    "conv_1x1_HWC_s8_s8_s8_asym_bias_fast_any"
+   882→    "conv_1xn_HWC_s8_s8_s4_asym_bias_any"
+   883→    "conv_1xn_HWC_s8_s8_s8_asym_bias_any"
+   884→    "conv_1xn_HWC_s16_s16_s8_asym_bias_any"
+   885→    "conv_HWC_s8_s8_s4_asym_bias_any"
+   886→    "conv_HWC_s8_s8_s8_asym_bias_any"
+   887→    "conv_HWC_s8_s8_s8_asym_bias_any_dilated"
+   888→    "conv_HWC_s16_s16_s8_asym_bias_any"
+   889→    "conv_HWC_s16_s16_s8_asym_bias_fast_any"
+   890→    "conv_dw_HWC_s8_s8_s4_asym_bias_any"
+   891→    "conv_dw_HWC_s8_s8_s8_asym_bias_any"
+   892→    "conv_dw_HWC_s8_s8_s8_asym_bias_fast_any"
+   893→    "conv_dw_HWC_3x3_s8_s8_s8_asym_bias_any"
+   894→    "conv_dw_HWC_u8_u8_u8_asym_bias_any"
+   895→    "conv_dw_HWC_s16_s16_s8_asym_bias_any"
+   896→    "conv_HWC_wrapper_s8_s8_s4_asym"
+   897→    "conv_HWC_wrapper_s8_s8_s8_asym"
+   898→    "conv_HWC_wrapper_s16_s16_s8_asym"
+   899→    "conv_dw_HWC_wrapper_s8_s8_s8_asym"
+   900→
+   901→    "conv_1x1_HWC_f16_f16_f16_bias_any"
+   902→    "conv_dw_HWC_f16_f16_f16_bias"
+   903→    "conv_dw_HWC_f32_f32_f32_bias_any"
+   904→    "conv_HWC_f16_f16_f16_bias"
+   905→)
+   906→FC=(
+   907→    "batch_matmul_s8_s8_s8"
+   908→    "batch_matmul_s16_s16_s16"
+   909→    "fc_s8_s8_s8_sym_bias_fast"
+   910→    "fc_s8_s16_s8_sym_bias_fast"
+   911→    "fc_u8_u8_s8_sym_bias_fast"
+   912→    "fc_u8_s8_s8_sym_bias_fast"
+   913→    "fc_u8_s16_s8_sym_bias_fast"
+   914→    "fc_s8_s8_s8_sym_fast"
+   915→    "fc_s8_s16_s8_sym_fast"
+   916→    "fc_u8_u8_s8_sym_fast"
+   917→    "fc_u8_s8_s8_sym_fast"
+   918→    "fc_u8_s16_s8_sym_fast"
+   919→
+   920→    "fc_s8_s8_s8_sym_bias"
+   921→    "fc_s8_s16_s8_sym_bias"
+   922→    "fc_u8_u8_s8_sym_bias"
+   923→    "fc_u8_s8_s8_sym_bias"
+   924→    "fc_u8_s16_s8_sym_bias"
+   925→    "fc_s8_s8_s8_sym"
+   926→    "fc_s8_s16_s8_sym"
+   927→    "fc_u8_u8_s8_sym"
+   928→    "fc_u8_s8_s8_sym"
+   929→    "fc_u8_s16_s8_sym"
+   930→
+   931→    "fc_s8_s8_s8_sft_bias"
+   932→    "fc_s8_s8_s8_sft_bias_fast"
+   933→    "fc_s16_s16_s16_sft_bias"
+   934→    "fc_s16_s16_s16_sft_bias_fast"
+   935→    "fc_mat_vec_s16_s16_s8_sft_bias"
+   936→    "fc_mat_vec_s16_s16_s8_sft_bias_fast"
+   937→    "fc_per_ch_s8_s8_s8_asym_bias"
+   938→    "fc_s8_s8_s8_asym_bias"
+   939→    "fc_s16_s16_s8_asym_bias"
+   940→    "vector_sum_s8"
+   941→    "vector_sum_s8_s64"
+   942→
+   943→    "fc_f16_f16_f16_bias"
+   944→)
+   945→POOLING=(
+   946→    "avepool_HWC_s8"
+   947→    "avepool_HWC_s8_any"
+   948→    "avepool_HWC_s8_any_act"
+   949→    "avepool_HWC_s8_asym"
+   950→    "avepool_HWC_s16_any_act"
+   951→    "avepool_HWC_s16_asym"
+   952→    "maxpool_HWC_s8"
+   953→    "maxpool_HWC_s8_any_act"
+   954→    "maxpool_HWC_s16_any_act"
+   955→
+   956→    "avepool_HWC_f16_any"
+   957→    "maxpool_HWC_f16_any"
+   958→)
+   959→SOFTMAX=(
+   960→    "softmax_s8_fast"
+   961→    "softmax_s16_fast"
+   962→    "softmax_s8_hp"
+   963→    "softmax_s8_s16_hp"
+   964→    "softmax_u8_hp"
+   965→    "softmax_s16_hp"
+   966→
+   967→    "softmax_f16"
+   968→    "softmax_f16_2pass"
+   969→    "softmax_f32"
+   970→    "softmax_f32_2pass"
+   971→    "softmax2d_f16"
+   972→    "softmax2d_f32"
+   973→)
+   974→UTIL=(
+   975→    "channel_shuffle_CHW_s8"
+   976→    "channel_shuffle_HWC_s8"
+   977→    "gather_HWC_s8"
+   978→    "gather_HWC_s16"
+   979→    "get_version_libnn"
+   980→    "lstm_unidirectional_s8"
+   981→    "lstm_unidirectional_s16_s8"
+   982→    "lstm_unidirectional_s16"
+   983→    "lut_linear_s16_513"
+   984→    "pixel_shuffle_HWC_s8"
+   985→    "reduce_sum_s8"
+   986→    "reduce_sum_s16"
+   987→    "requantize_s8_s8"
+   988→    "requantize_s16_s8"
+   989→    "requantize_s16_s16"
+   990→    "reshape_s8"
+   991→    "reverseV2_s8"
+   992→    "reverseV2_s16"
+   993→    "scatter_nd_s8"
+   994→    "scatter_nd_s16"
+   995→    "space_to_depth_HWC_s8"
+   996→    "svdf_s8"
+   997→    "svdf_s8_state_s8"
+   998→    "top_k_s8"
+   999→    "transpose_4d_s8"
+  1000→    "transpose_4d_s16"
+  1001→    "transpose_4d_s32"
+  1002→    "upsampling2d_HWC_s8"
+  1003→    "upsampling2d_HWC_s16"
+  1004→
+  1005→    "argmax_f32"
+  1006→    "decode_dist2box_f32"
+  1007→    "decode_dist2box_rot_f32"
+  1008→    "dequantize_s8_f16"
+  1009→    "dequantize_s8_f32"
+  1010→    "dequantize_s16_f32"
+  1011→    "distributed_focal_loss_f32"
+  1012→    "exp_f16"
+  1013→    "exp_f32"
+  1014→    "layer_norm_f16"
+  1015→    "layer_norm_f32"
+  1016→    "nms_f32"
+  1017→    "quantize_f16_s8"
+  1018→    "quantize_f32_s8"
+  1019→    "quantize_f32_s16"
+  1020→    "reshape_f16"
+  1021→    "rms_norm_f16"
+  1022→    "rms_norm_f32"
+  1023→    "subspectral_norm_f32"
+  1024→    "top_k_f16"
+  1025→    "upsampling2d_HWC_f16"
+  1026→)
+  1027→
+  1028→SPECIAL_CASE_RVV=(
+  1029→    "activate_s8"
+  1030→    "activate_s16"
+  1031→    "activate_s16_hp"
+  1032→    "relu_s8"
+  1033→    "relu_s16"
+  1034→    "activate_s8_2buf"
+  1035→    "activate_s16_2buf"
+  1036→    "relu_s8_2buf"
+  1037→    "relu_s16_2buf"
+  1038→    "concate_s8_w"
+  1039→    "concate_s8_x"
+  1040→    "concate_s8_y"
+  1041→    "concate_s8_z"
+  1042→    "lstm_unidirectional_s16_s8"
+  1043→    "avepool_HWC_s8_asym"
+  1044→    "avepool_HWC_s16_asym"
+  1045→)
+  1046→# NON_UNIT_STRIDE=(
+  1047→#     #ACTIVATION
+  1048→#     "activate_q7"
+  1049→#     "activate_q15"
+  1050→
+  1051→#     #FC
+  1052→#     "fc_q7_fast_bias_2sft"
+  1053→#     "fc_q7_q15_fast_bias_2sft"
+  1054→#     "fc_u8_fast_bias_2sft"
+  1055→#     "fc_u8_q7_fast_bias_2sft"
+  1056→#     "fc_u8_q15_fast_bias_2sft"
+  1057→#     "fc_q7_fast_2sft"
+  1058→#     "fc_q7_q15_fast_2sft"
+  1059→#     "fc_u8_fast_2sft"
+  1060→#     "fc_u8_q7_fast_2sft"
+  1061→#     "fc_u8_q15_fast_2sft"
+  1062→#     "fc_q7_fast"
+  1063→#     "fc_q15_fast"
+  1064→#     "fc_mat_q7_vec_q15_fast"
+  1065→# )
+  1066→
+  1067→# below functions wil be skipped as measuring the performance
+  1068→PF_SKIP_CASE=(
+  1069→    "get_version_libnn:util"
+  1070→)
+  1071→
+  1072→if [ ${ENA_TEST_ALL} == 1 ] || [ ${ENA_ACTIVATION_TEST} == 1 ]; then
+  1073→    test_list+=("${ACTIVATION[@]/%/:activation}")
+  1074→fi
+  1075→if [ ${ENA_TEST_ALL} == 1 ] || [ ${ENA_BASIC_TEST} == 1 ]; then
+  1076→    test_list+=("${BASIC[@]/%/:basic}")
+  1077→fi
+  1078→if [ ${ENA_TEST_ALL} == 1 ] || [ ${ENA_CONCATE_TEST} == 1 ]; then
+  1079→    test_list+=("${CONCATE[@]/%/:concatenation}")
+  1080→fi
+  1081→if [ ${ENA_TEST_ALL} == 1 ] || [ ${ENA_CONV_TEST} == 1 ]; then
+  1082→    test_list+=("${CONV[@]/%/:convolution}")
+  1083→fi
+  1084→if [ ${ENA_TEST_ALL} == 1 ] || [ ${ENA_FC_TEST} == 1 ]; then
+  1085→    test_list+=("${FC[@]/%/:fully_connected}")
+  1086→fi
+  1087→if [ ${ENA_TEST_ALL} == 1 ] || [ ${ENA_POOLING_TEST} == 1 ]; then
+  1088→    test_list+=("${POOLING[@]/%/:pooling}")
+  1089→fi
+  1090→if [ ${ENA_TEST_ALL} == 1 ] || [ ${ENA_SOFTMAX_TEST} == 1 ]; then
+  1091→    test_list+=("${SOFTMAX[@]/%/:softmax}")
+  1092→fi
+  1093→if [ ${ENA_TEST_ALL} == 1 ] || [ ${ENA_UTIL_TEST} == 1 ]; then
+  1094→    test_list+=("${UTIL[@]/%/:util}")
+  1095→fi
+  1096→
+  1097→#remove non-unit-stride test cases
+  1098→# if [ ${ENA_UNIT_STRIDE_ONLY} == 1 ]; then
+  1099→#     for FUN_NAME in "${NON_UNIT_STRIDE[@]}";
+  1100→#     do
+  1101→#         test_list=(${test_list[@]/$FUN_NAME})
+  1102→#     done
+  1103→# fi
+  1104→
+  1105→# remove the test cases as measuring the performance
+  1106→if [[ ${ENA_MEASURE_PERF} -eq 1 ]]; then
+  1107→    for FUN_NAME in "${PF_SKIP_CASE[@]}";
+  1108→    do
+  1109→        test_list=(${test_list[@]/$FUN_NAME})
+  1110→    done
+  1111→fi
+  1112→
+  1113→# record whether the zfh extension is enabled
+  1114→if [[ ${EXTRA_FLAG} == *"-mzfh"* ]]; then
+  1115→    ENA_FP16=1
+  1116→else
+  1117→    ENA_FP16=0
+  1118→fi
+  1119→
+  1120→# record whether the VL4 extension is enabled
+  1121→if [[ ${EXTRA_FLAG} =~ ENA_VL4 ]]; then
+  1122→    ENA_VL4=1
+  1123→else
+  1124→    ENA_VL4=0
+  1125→fi
+  1126→
+  1127→##################################################
+  1128→# Build the library with empty functions for measuring the code size. Remember
+  1129→# to build this library before building the non-empty version library, or it
+  1130→# will influence the code coveratge checking results.
+  1131→##################################################
+  1132→if [[ ${ENA_MEASURE_CODE_SIZE} -eq 1 ]]; then
+  1133→    build_lib "${DEFAULT_LIB_CFLAGS} ${EXTRA_FLAG} -DENA_EMPTY_FUN"
+  1134→
+  1135→    # move the empty version library to the temporary folder to avoid being
+  1136→    # removed later as bulding the non-empty version library
+  1137→    mv "${LIB_ROOT_PATH}/libnn.a" "${EMPTY_LIB}"
+  1138→fi
+  1139→
+  1140→##################################################
+  1141→# Build the non-empty library.
+  1142→##################################################
+  1143→if [[ ${TEST_TYPE} == DAILY ]]; then
+  1144→    build_lib "${DEFAULT_LIB_CFLAGS} ${EXTRA_FLAG}"
+  1145→fi
+  1146→
+  1147→##################################################
+  1148→# start to execute the unit tests
+  1149→##################################################
+  1150→if [ ${build_lib_result} == 0 ]; then
+  1151→    log
+  1152→    log "****************************************************"
+  1153→    log "Begin the accuracy and performance testing ..."
+  1154→    log
+  1155→
+  1156→    #---- enable the configuration diagnosis program for ELF toolcahins -----
+  1157→    if [ ${ENA_TEST_ALL} == 1 ] && [[ ! ${CC} == *linux* ]]; then
+  1158→        target_cfg_diagnosis
+  1159→    fi
+  1160→
+  1161→    #TODO: the inst/cycle field needs to be mofiled (they may not show just one time)
+  1162→    if [ ${ENA_GREP_PF_TO_CSV} == 1 ]; then
+  1163→        #init csv title
+  1164→        if [ ${ENA_MEASURE_PERF} == 1 ]; then
+  1165→            echo "group, function, inst, cycle" > ${PERF_CSV}
+  1166→        fi
+  1167→    fi
+  1168→
+  1169→    if [ ${ENA_GREP_PARAM_TO_CSV} == 1 ]; then
+  1170→        echo "group, function, parameters" > ${PARAM_CSV}
+  1171→    fi
+  1172→
+  1173→    if [[ ${ENA_MEASURE_CODE_SIZE} -eq 1 ]]; then
+  1174→        # init the csv title
+  1175→        echo "fun_name,text,code,rodata,data,bss" > ${SIZE_CSV}
+  1176→    fi
+  1177→
+  1178→    #----- enable the LM switch -----
+  1179→    if [[ ${EXTRA_FLAG} =~ ENA_LM ]]; then
+  1180→        sed -i 's/CACHE="on"/CACHE="lm"/' ${SIM_WRAPPER}
+  1181→    fi
+  1182→
+  1183→    for item in "${test_list[@]}"; do
+  1184→        fun_name=$(echo ${item} | cut -d ':' -f1)
+  1185→        fun_group=$(echo ${item} | cut -d ':' -f2)
+  1186→
+  1187→        if [[ ${CC} == *linux* ]] && [[ ${TEST_TARGET} == BOARD ]]; then
+  1188→            # As using the linux toolchain and the test target is board, this
+  1189→            # script is only used to generate the executables.
+  1190→            build_executable "${fun_name}"
+  1191→
+  1192→            # copy the required binary files for the unit tests
+  1193→            cp -r ${UNIT_TEST_PATH}/bin ${TEST_LOG_DIR}
+  1194→
+  1195→            # copy the running executables for glibc on board script
+  1196→            cp ${LIB_ROOT_PATH}/run_executable_for_glibc.sh ${TEST_LOG_DIR}
+  1197→
+  1198→            # enable the write permission for others
+  1199→            chmod o+w ${TEST_LOG_DIR}
+  1200→        else
+  1201→            run_and_check "${fun_name}" "${fun_group}"
+  1202→        fi
+  1203→    done
+  1204→
+  1205→    #----- restore the LM switch -----
+  1206→    if [[ ${EXTRA_FLAG} =~ ENA_LM ]]; then
+  1207→        sed -i 's/CACHE="lm"/CACHE="on"/' ${SIM_WRAPPER}
+  1208→    fi
+  1209→
+  1210→    if [ ${CODE_COVERAGE} == "1" ]; then
+  1211→        if [ ${ENA_TEST_ALL} == 1 ] && [[ ${EXTRA_FLAG} = *"-mext-vector"* ]]; then
+  1212→            run_special_case_for_rvv
+  1213→        fi
+  1214→
+  1215→        mkdir -p ${FAILED_GCOV_DIR}
+  1216→        check_coverage
+  1217→
+  1218→        if [ ${#coverage_fail_list[@]} -eq 0 ]; then
+  1219→            rm -rf ${FAILED_GCOV_DIR}
+  1220→        fi
+  1221→    fi
+  1222→
+  1223→    #clean gcov output files
+  1224→    rm -rf ${GCOV_DIR}
+  1225→    rm -f ${ADX_DIR}/*.gc{da,no}
+  1226→    rm -f ${LIB_OBJ_DIR}/*.gc{da,no};
+  1227→
+  1228→    log
+  1229→    log "End of accuracy and performance test."
+  1230→    log "****************************************************"
+  1231→fi
+  1232→
+  1233→##################################################
+  1234→# show accuracy and coverage results only when building library successfully
+  1235→##################################################
+  1236→if [ ${build_lib_result} == 0 ]; then
+  1237→    #show result summary
+  1238→    total_num=${#test_list[@]}
+  1239→    executed_num=$((total_num - accuracy_unsupport_num))
+  1240→    log
+  1241→    log "========== summary =========="
+  1242→    log "Total functions:       ${#test_list[@]}"
+  1243→    log "Executed functions:    ${executed_num}"
+  1244→    if [[ ${executed_num} -eq 0 ]]; then
+  1245→        log "Passed functions:      ${accuracy_pass_num} (pass rate: 0.00%)"
+  1246→    else
+  1247→        log "Passed functions:      ${accuracy_pass_num} (pass rate: $(echo ${accuracy_pass_num}*100/${executed_num} | bc -l | xargs printf "%.2f")%)"
+  1248→    fi
+  1249→    log "Unsupported functions: ${accuracy_unsupport_num}"
+  1250→    log
+  1251→
+  1252→    # show accuracy fail list
+  1253→    if [ ${#accuracy_fail_list[@]} != 0 ]; then
+  1254→        log
+  1255→        log "--- failed funcion list: ---"
+  1256→        for FUN_NAME in "${accuracy_fail_list[@]}"; do
+  1257→            log ${FUN_NAME}
+  1258→            echo ${FUN_NAME} >> ${ACCURACY_FAIL_LIST}
+  1259→        done
+  1260→        log
+  1261→    fi
+  1262→
+  1263→    # show coverage fail list
+  1264→    if [ ${#coverage_fail_list[@]} != 0 ]; then
+  1265→        log
+  1266→        log "--- coverage failed function list: ---"
+  1267→        for FUN_AND_COV in "${coverage_fail_list[@]}"; do
+  1268→            log ${FUN_AND_COV}
+  1269→        done
+  1270→        log
+  1271→    fi
+  1272→fi
+  1273→
+  1274→#generate error log (diff_log)
+  1275→FINAL_RESULT=$(( ${build_lib_result} + ${#accuracy_fail_list[@]} ))
+  1276→if [ ${FINAL_RESULT} -ne 0 ]; then
+  1277→    echo "${FINAL_RESULT}" > ${ERROR_LOG}
+  1278→    cp -f ${ERROR_LOG} ${TEST_LOG_DIR}/${ERROR_LOG}
+  1279→    cp -f ${ERROR_LOG} ../${ERROR_LOG}
+  1280→fi
+  1281→
+  1282→log "***************************************************************************************"
+  1283→log "FINAL_RESULT=${FINAL_RESULT}"
+  1284→log End at `date`
+  1285→FINISH_TIME=`date +%s`
+  1286→log Total time is $((FINISH_TIME-BEGIN_TIME)) seconds.
+  1287→log All log file are saved at ${TEST_LOG_DIR} folder.
+  1288→log "    Full path=${CURRENT_PATH}/${TEST_LOG_DIR}"
+  1289→log libnn accuracy testing end.
+  1290→log "***************************************************************************************"
+  1291→

@@ -1,0 +1,60 @@
+---
+type: operator
+function: riscv_nn_conv_HWC_s8_s8_s8_RGB_sft_bias_fast
+source: Source/ConvolutionFunctions/riscv_nn_conv_HWC_s8_s8_s8_RGB_sft_bias_fast.c
+tags: [conv, s8, rgb, sft, bias, rvv, direct-conv, small-k, cifar10]
+current_speedup: 2.31x
+baseline_cycles: 967797
+current_cycles: 419238
+context: cifar10 conv1 (32x32, 3->32ch, ker=5, pad=2, stride=1, K=75)
+---
+
+# conv_HWC_s8_s8_s8_RGB_sft_bias_fast
+
+## What This Function Does
+
+Convolution for RGB (3-channel) input tensors with shift-based (sft) quantization. Specialized for in_ch=3 (1-3 input channels). The sft variant uses `(acc + bias<<lshift + round) >> rshift` for output quantization.
+
+For cifar10 conv1: K = 3 * 5 * 5 = **75**. N = **32** output channels.
+
+## Active Code Path (AX45MPV)
+
+`#if defined(ENA_TILING) && (NDS_VEC_RVV_VERSION >= 1000)` inside `#elif defined(ENA_VEC_ISA)`.
+
+Direct convolution using VQMACC (vectorize N), no im2col. Ported from `RGB_sym_bias_fast` with sft quantization.
+
+## Optimization History
+
+| Date | Approach | Cycles | Speedup | Notes |
+|---|---|---|---|---|
+| baseline | Original ENA_VEC_ISA: im2col + nn_mat_mul_kernel_q7 (2-pixel batch) | 967,797 | 1.00x | cifar10 FPGA measurement |
+| 2026-04-13 | Direct conv with VQMACC, 4-pixel batch, weight-transposed once | 419,238 | 2.31x | FPGA cifar10 board 1115 |
+
+## Why VQMACC (Not vd4dots)
+
+K=75 for this RGB conv. vd4dots groups input by 4 bytes → VL = 75/4 = 18 at e32/M1, only 7% of VLEN=1024 capacity. VQMACC (vectorize N=32) gives VL=32 at e8/M1 = 25% utilization, and eliminates VREDSUM.
+
+- See [[anti-vd4dots-small-k]] for the full analysis. K=75 is in the same regime as K=27.
+
+## Implementation
+
+Weight transpose: once before the pixel loop:
+```c
+nn_mat_mul_kernel_tiling_transpose_q7(ker_weight, src2, out_tensor_ch, K)
+```
+Transposed layout: `src2[k][n]` allows loading N weights per K position in one VLB.
+
+4-pixel batch inner structure:
+- Accumulators V0/V4/V8/V12 (M4 e32), one per output pixel
+- Bias init: VLB(V17, bias) → VSEXT_VF4(V0) → VSLL → VADD(round), then VMOV to V4/V8/V12
+- Inner K loop (75 iter): VLB(V16, transposed_weight[k*N]) + 4 scalar loads + 4 VQMACC_VX
+- Requantize: VNSRA (e32→e16) + VNCLIP (e16→e8) + VSB, in-place per accumulator
+
+## Buffer Constraint
+
+Weight transpose into `in_tmp_buf` (cast as q7_t): K * N = 75 * 32 = 2400 bytes.
+cifar10 `col_buffer` = 3200 bytes -- fits with 800 bytes to spare.
+
+## Key Technique
+
+- [[anti-vd4dots-small-k]] -- K=75 too small for vd4dots, VQMACC wins

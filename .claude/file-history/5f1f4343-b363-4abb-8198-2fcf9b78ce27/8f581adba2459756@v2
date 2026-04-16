@@ -1,0 +1,71 @@
+---
+type: technique
+tags: [rvv, runtime-dispatch, vlen-portable, conv_1x1]
+applies_to: [conv_1x1_HWC_s8_asym_bias_fast_any]
+---
+
+# Runtime Dispatch for VLEN-Portable Kernel Selection
+
+## Problem: Static Kernel Choice Can Regress at Different N or VLEN
+
+A kernel optimized for small N (vectorize K with VD4DOTS) regresses when N is large enough that VREDSUM overhead dominates. The threshold depends on VLMAX, which itself depends on VLEN.
+
+Without runtime dispatch, a static `#ifdef` chooses one kernel for ALL inputs, causing regressions on edge cases.
+
+## Solution: VLMAX-Based Threshold
+
+Compute the dispatch threshold at runtime using `vsetvlmax`:
+
+```c
+#ifdef ENA_VEC_ELEN64
+    // Get max VL for e8/m4 at current VLEN
+    size_t vlmax_e8_m4;
+    NDS_VEC_VSETVLMAX(vlmax_e8_m4, NDS_VEC_E8, NDS_VEC_M4);
+    size_t n_threshold = vlmax_e8_m4 / 4;
+
+    if (out_tensor_ch <= n_threshold) {
+        // Small N: VD4DOTS direct GEMM wins (vectorize K=512)
+        nn_mat_mult_nt_t_s8_v2(input, weight, bias, output, ...);
+    } else {
+        // Large N: tiling GEMM wins (vectorize N, K is tiled to fit cache)
+        nn_mat_mul_kernel_tiling_asym_s8_s8_s8(input, weight, bias, output, ...);
+    }
+#endif
+```
+
+### Threshold Scaling with VLEN
+
+| VLEN | VLMAX_e8_m4 | n_threshold |
+|---|---|---|
+| 128 | 64 | 16 |
+| 256 | 128 | 32 |
+| 512 | 256 | 64 |
+| 1024 | 512 | 128 |
+
+At VLEN=1024, threshold = 128: functions with N <= 128 use VD4DOTS, N > 128 use tiling.
+
+## Why This Fixes the Large-N Regression
+
+For 1x1 conv with N=2050 (test case 9):
+- VD4DOTS would need 2050/4 = 513 VREDSUM calls per pixel group
+- Tiling GEMM vectorizes N=2050 with VL=512 at VLEN=1024 (25% utilization but amortized over large N)
+- Tiling wins for large N despite lower per-instruction utilization
+
+## Implementation Notes
+
+- `NDS_VEC_VSETVLMAX(vl, sew, lmul)` reads the hardware's actual VLMAX -- correct for any VLEN
+- Guard with `#ifdef ENA_VEC_ELEN64` since VD4DOTS needs 64-bit element operations
+- Keep the tiling path available (do not delete it) as the large-N fallback
+- Buffer allocation (`get_buffer_size`) must account for the worst case: whichever path needs more
+
+## Results (AX45MPV VLEN=1024)
+
+Applied to `riscv_nn_conv_1x1_HWC_s8_s8_s8_asym_bias_fast_any` (commit 0a65e6c7):
+- Tests 1-8 (N <= 32): 2.60x-26x speedup (VD4DOTS path)
+- Test 9 (N=2050): matches baseline (~21M cycles, tiling path)
+- No regressions across all VLEN tested: 128/256/512/1024
+
+## Related
+
+- [[vectorize-k-vs-n]] -- explains why the threshold depends on N vs K
+- [[conv-1x1-asym-bias-fast-any]] -- operator page where this was applied
