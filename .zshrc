@@ -276,9 +276,9 @@ function gllvm() {
 # Other setting
 #########################################################################
 # mount sshfs
-cat /etc/mtab | grep atclnx01 >/dev/null && fusermount -u ~/atclnx01
-sshfs atcsqa06:/NOBACKUP/sqa3/NFSTest/ ~/SW_Release
-sshfs atclnx01:/ ~/atclnx01
+cat /etc/mtab | grep atclnx01 >/dev/null && fusermount -u /local/nick/atclnx01
+sshfs atcsqa06:/NOBACKUP/sqa3/NFSTest/ /local/nick/SW_Release
+sshfs atclnx01:/ /local/nick/atclnx01
 
 #########################################################################
 # Source files
