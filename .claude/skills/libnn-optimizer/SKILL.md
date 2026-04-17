@@ -9,7 +9,7 @@ description: |
   "libnn", "FPGA perf", "optimization loop", "validate config",
   "phase gather/baseline/iterate/evaluate", "perf test", or references opt/config.toml,
   opt/state.json, or any libnn function optimization task.
-argument-hint: "[validate|gather|baseline|iterate|status|reset] [function_name]"
+argument-hint: "[validate|gather|baseline|iterate|status|reset|<function_name>] [function_name]"
 allowed-tools: Read, Grep, Glob, Bash, Edit, Write, Agent
 ---
 
@@ -21,7 +21,8 @@ State persisted in `opt/state.json`.
 
 ## Commands
 
-- `/libnn-optimizer validate` - Run config validation (Step 0)
+- `/libnn-optimizer <function_name>` - **Full auto mode**: run all phases end-to-end (validate -> gather -> baseline -> iterate loop -> evaluate -> done), advancing automatically as long as each phase passes. Stop on first failure or when done.
+- `/libnn-optimizer validate` - Run config validation (Step 0) only
 - `/libnn-optimizer gather <function_perf_test>` - Start Phase 1: parse task spec + target features
 - `/libnn-optimizer baseline` - Run Phase 2: measure unmodified library
 - `/libnn-optimizer iterate` - Run Phase 3: one optimization iteration
@@ -29,6 +30,37 @@ State persisted in `opt/state.json`.
 - `/libnn-optimizer reset` - Reset state to initial
 
 Arguments received: `$ARGUMENTS`
+
+## Argument Dispatch
+
+Parse `$ARGUMENTS` to decide the execution mode:
+
+1. If `$ARGUMENTS` matches a known subcommand (`validate`, `gather`, `baseline`, `iterate`, `status`, `reset`), run that single phase as before.
+2. If `$ARGUMENTS` is a function name (does not match any subcommand, and contains characters like `conv_`, `fc_`, `relu_`, `pool_`, `softmax_`, `add_`, `concat_`, `mul_`, etc.), enter **full auto mode** (see below).
+3. If `$ARGUMENTS` is empty, show status.
+
+## Full Auto Mode
+
+When invoked with just a function name (e.g., `/libnn-optimizer conv_HWC_s8_s8_s8_sym_bias_fast`):
+
+**Execute all phases sequentially, auto-advancing on success, stopping on failure:**
+
+```
+Step 0: validate  -- if FAIL: stop, report error
+Step 1: gather    -- if FAIL: stop, report error
+Step 2: baseline  -- if FAIL: stop, report error
+Step 3: iterate   -- loop until max_iterations or 2 consecutive non-improvements
+Step 4: evaluate  -- if FAIL: stop, report error
+Step 5: done      -- emit report, print summary
+```
+
+**Auto-advance rules:**
+- After each phase completes successfully, immediately proceed to the next phase without waiting for user input.
+- On iterate loop: run iterations until the exit condition (max_iterations reached, or 2 consecutive iterations with no improvement >= min_improvement_pct). Then auto-advance to evaluate.
+- On any phase failure: stop immediately, report which phase failed and why, leave state.json at the failed phase so the user can fix and resume.
+- Print a one-line status update before entering each phase (e.g., "Phase 2/5: baseline - measuring unmodified library...").
+
+**Resume support:** If state.json already has `function` matching the argument and `phase` is not `"done"`, resume from the current phase instead of restarting. This allows recovery after a failure-and-fix without re-running earlier phases.
 
 ## Project Paths
 
