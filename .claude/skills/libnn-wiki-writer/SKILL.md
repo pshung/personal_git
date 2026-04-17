@@ -1,0 +1,354 @@
+---
+name: libnn-wiki-writer
+description: Internal style guide for writing docs/wiki/ pages during /libnn-optimizer learn phase. Not a standalone skill -- read by the optimize agent.
+type: internal
+---
+
+# Wiki Writer
+
+Internal skill: called by `/libnn-optimizer` during the `learn` state. Defines style rules, page templates, and update operations for `docs/wiki/`.
+
+## Purpose
+
+Wiki pages serve two audiences: humans reading them for context, and the `/libnn-optimizer` agent reading them as structured memory. Pages must be clear to both. The failure mode to avoid is jargon-only writing -- pages that assume the reader already knows what GEMM, LMUL, or vd4dots means.
+
+**Three core principles:**
+
+1. **Define every acronym on first use.** Write "GEMM (General Matrix Multiply)" the first time, then "GEMM" after.
+2. **Lead with plain-English summary.** The first content section of every page must explain what this is in terms any engineer understands, with no assumed domain knowledge.
+3. **Use concrete numbers, not vague words.** "2.1x speedup (4,823 to 2,298 cycles)" not "significant improvement". "IPC of 1.04 when the theoretical max is 2.0" not "low IPC".
+
+---
+
+## Jargon Glossary
+
+Reference table for constructing inline definitions. Do not paste these verbatim -- incorporate them naturally into sentences.
+
+| Term | Plain-English Expansion |
+|------|------------------------|
+| GEMM | General Matrix Multiply -- multiplying two matrices together; the core math inside convolution |
+| im2col | "image to column" -- a transform that reshapes a 3D image patch into a flat row so convolution becomes a matrix multiply |
+| LMUL | "length multiplier" -- how many physical vector registers are ganged together into one logical register; higher LMUL = more elements per instruction but fewer usable register names |
+| VL | "vector length" -- how many elements the CPU actually processes in one instruction; set by vsetvli |
+| VLEN | hardware vector register width in bits (e.g., 1024 bits = 128 bytes per register) |
+| vsetvli | "vector set vector length immediate" -- instruction that sets VL and SEW for the next block of vector code |
+| vd4dots | Andes custom dot-product instruction: computes 4 partial dot products per cycle using 4-element int8 groups |
+| SEW | "selected element width" -- the bit width of one element in a vector register (8, 16, 32, or 64 bits) |
+| VLSU | "vector load/store unit" -- the hardware pipeline stage that handles vector memory operations |
+| IPC | "instructions per cycle" -- how many instructions finish per clock; theoretical max on AX45MPV is 2.0 for most code |
+| VQ | vector quarter-width -- element width is VLEN/4 |
+| VD | vector double-width -- element width is VLEN*2 |
+| VC | vector compressed -- used in vector compress/expand operations |
+| VW | "vector widening" -- an instruction that produces a result twice as wide as its inputs (e.g., 8-bit inputs, 16-bit output) |
+| dual-issue | AX45MPV can retire two instructions per cycle when they have no data dependency and use different execution units |
+| VREDSUM | "vector reduction sum" -- collapses all elements in a vector register into a single scalar by adding them |
+| tiling | splitting a large computation into smaller blocks that fit in registers; trades loop overhead for better register reuse |
+
+---
+
+## Style Rules with Before/After Examples
+
+### Rule 1: Explain technique impact with an analogy, not just a metric
+
+**Before (jargon):**
+> Switched from LMUL=1 to LMUL=4, increasing register utilization from 25% to 100%.
+
+**After (naive expression):**
+> The vector unit is like a bus with 128 seats. With LMUL=1 at VLEN=1024 processing int8, each instruction uses all 128 seats. But the old code used LMUL=4 with int32, which means only 32 elements per register -- like running that bus with 32 passengers. We switched to packing 4x more work per instruction.
+
+The analogy makes the performance lever visible. Lead with the analogy, follow with the numbers.
+
+### Rule 2: Name anti-pattern symptoms in plain terms
+
+**Before (jargon):**
+> vd4dots exhibits poor utilization when K < 16 due to partial group completion.
+
+**After (naive expression):**
+> vd4dots works by grouping 4 input channels at a time. When the number of input channels (K) is less than 16, most groups are incomplete -- like a conveyor belt that moves 4 items at a time but only has 1-3 items on most trips. The hardware still pays the full cost per group, so efficiency drops sharply below K=16.
+
+### Rule 3: Explain what pipeline numbers mean, not just what they are
+
+**Before (jargon):**
+> Profile showed IPC=1.04 with high VLSU stalls, indicating memory-bound execution.
+
+**After (naive expression):**
+> The profiler measured 1.04 instructions completed per clock cycle. The AX45MPV can theoretically do 2.0 per cycle, so we are using about half the available throughput. The stall log showed the vector load/store unit (VLSU) was blocked waiting for data from memory on nearly every other cycle -- the computation was fast but data was arriving too slowly to keep it fed.
+
+### Rule 4: Code comments must explain purpose, not restate the instruction
+
+**Before:**
+```c
+vsetvli(t0, a0, e8, m4);   // vsetvli
+```
+
+**After:**
+```c
+// Set VL to process up to 4*VLEN/8 int8 elements per iteration.
+// LMUL=4 groups 4 registers together -- trades register name space
+// for throughput when K is large enough to fill all 4 registers.
+vsetvli(t0, a0, e8, m4);
+```
+
+---
+
+## Page Templates
+
+### Template: `technique`
+
+Use for reusable algorithmic patterns discovered during optimization.
+
+```markdown
+---
+type: technique
+tags: [rvv, <relevant-tags>]
+applies_to: [<function-slug>, ...]
+---
+
+# <Technique Name>
+
+## What This Does (Plain English)
+
+<One paragraph, no acronyms without definition, explain the core idea to a generalist engineer.>
+
+## The Problem
+
+<What situation makes this technique relevant? What was slow or wasteful before?>
+
+Include concrete numbers: cycles, element counts, register utilization percentage.
+
+## The Fix
+
+<Describe the approach. Use the glossary to define terms inline on first use.>
+
+```c
+// Example code snippet if applicable.
+// Comments explain WHY, not just what instruction this is.
+```
+
+## Results
+
+| Function | Before (cycles) | After (cycles) | Speedup |
+|----------|----------------|----------------|---------|
+| <name>   | <N>            | <N>            | <Nx>    |
+
+VLEN=1024, AX45MPV FPGA unless noted.
+
+## When to Apply
+
+- Condition 1 (be specific: "when input channels K >= 16")
+- Condition 2
+
+## When NOT to Apply
+
+- Counter-condition 1 (be specific: "when K < 16, use [[<alternative>]] instead")
+- Counter-condition 2
+```
+
+---
+
+### Template: `anti-pattern`
+
+Use when an approach was tried and regressed or failed. Prefix filename with `anti-`.
+
+```markdown
+---
+type: anti-pattern
+tags: [rvv, <relevant-tags>]
+symptom: <one sentence: when would someone be tempted to apply this>
+---
+
+# Anti-Pattern: <Name>
+
+## What This Is (Plain English)
+
+<One paragraph explaining what this approach is and why it seems appealing.
+Define all acronyms on first use. Make the appeal clear -- why would a reasonable
+engineer try this?>
+
+## Why It Fails
+
+<Explain the failure mode. Include the math or hardware reason.>
+
+Example: vd4dots (Andes custom dot-product, processes 4 int8 elements per group)
+requires a full group of 4 to compute. When K (input channels) = 8, you get
+8/4 = 2 groups. The instruction still takes the same time as K=64 (16 groups),
+but does 8x less work. Utilization: 12.5%.
+
+## Evidence
+
+| Function | K | Approach | Cycles | vs. Baseline |
+|----------|---|----------|--------|-------------|
+| <name>   | <N> | <desc>  | <N>    | <+N% slower> |
+
+## What to Do Instead
+
+- Use [[<alternative-technique>]] when <condition>.
+- Fallback to plain int8 GEMM (see [[<technique>]]) when K < 16.
+```
+
+---
+
+### Template: `pipeline-insight`
+
+Use for AX45MPV-specific pipeline behavior discovered via vsim profiling.
+
+```markdown
+---
+type: pipeline-insight
+tags: [ax45mpv, <relevant-tags>]
+---
+
+# Pipeline Insight: <Name>
+
+## What This Means (Plain English)
+
+<One paragraph. Explain what this pipeline behavior is and why it matters for
+performance. Assume the reader knows C but not CPU microarchitecture.>
+
+Example framing: "The AX45MPV can execute two instructions per clock cycle
+(dual-issue), but only when those instructions use different hardware units
+and have no data dependency between them. When both instructions are vector
+loads, only one fires per cycle -- the other waits."
+
+## How to Detect
+
+Indicators in vsim output or FPGA measurements:
+
+- IPC below <threshold> (e.g., below 1.2 suggests stalls)
+- Specific stall counter name: `<counter>`
+- Assembly pattern that triggers it: `<example>`
+
+## Impact on Optimization
+
+- Which optimization levers address this stall type.
+- Which techniques make it worse.
+- Cross-reference: [[<technique>]], [[<anti-pattern>]]
+```
+
+---
+
+### Template: `operator`
+
+Per-function optimization profile. One file per libnn function.
+
+```markdown
+---
+type: operator
+function: riscv_nn_<full_function_name>
+source: Source/<SubDir>/<filename>.c
+tags: [<conv|pool|fc|...>, s8, rvv, ...]
+current_speedup: <Nx>
+baseline_cycles: <N>
+current_cycles: <N>
+---
+
+# <Function Display Name>
+
+## What This Function Does (Plain English)
+
+<One paragraph. What does this function compute? What does it take as input
+and produce as output? Use concrete examples with shapes/sizes where helpful.
+No assumed NN or RISC-V knowledge.>
+
+Example: "This function applies a 1x1 convolution -- for each spatial location
+in the input image, it multiplies a vector of C_in values by a C_in x C_out
+weight matrix and produces a C_out output. Across all H*W locations, this
+is equivalent to a single large matrix multiply."
+
+## Current Approach
+
+<One paragraph describing the current best implementation. What algorithm?
+What RISC-V vector (RVV) features does it use? Why this approach?>
+
+## Optimization History
+
+| Date | Round | Approach | Cycles | Speedup vs Baseline | Outcome | Notes |
+|------|-------|----------|--------|---------------------|---------|-------|
+| <YYYY-MM-DD> | 1 | <plain-English description> | <N> | <Nx> | <improved/regressed/neutral> | <key lesson> |
+
+## Key Techniques
+
+- [[<technique-slug>]] -- <one-line plain-English description>
+
+## Current State
+
+<One paragraph: what is the current bottleneck? What has been tried? What
+is the most promising next direction? Written so the next optimization round
+can start without re-reading all history.>
+```
+
+---
+
+## Update Operations
+
+Execute all 4 operations in order during the `learn` state.
+
+### Operation 1: Update or Create Operator Page
+
+**Path:** `docs/wiki/operators/<operator-slug>.md`
+
+Derive slug from function name: strip `riscv_nn_` prefix, replace `_` with `-`.
+Example: `riscv_nn_conv_1x1_HWC_s8_s8_s8_asym_bias_fast_any` -> `conv-1x1-hwc-s8-s8-s8-asym-bias-fast-any`
+
+**If page exists:**
+1. Append one row to the "Optimization History" table with: date (YYYY-MM-DD), round, approach (plain English, max 12 words), cycles, speedup vs baseline, outcome (improved/regressed/neutral), key lesson.
+2. If `cycles_after < current_cycles` in frontmatter: update `current_cycles` and `current_speedup`.
+3. Rewrite the "Current State" section to reflect the new best approach and remaining bottleneck.
+
+**If page does not exist:**
+1. Use the operator template above.
+2. Fill "What This Function Does" from reading the source file (already in state as `source_file`).
+3. Set `baseline_cycles` to `cycles_before` from state.
+4. Set `current_cycles` and `current_speedup` from state outcome.
+5. Add one history row.
+
+### Operation 2: Create General Page (conditional)
+
+Only execute if a new reusable pattern was discovered (a technique, anti-pattern, or pipeline insight not already in `docs/wiki/general/`).
+
+1. Read `docs/wiki/index.md` to check existing coverage before creating.
+2. If not covered: create `docs/wiki/general/<slug>.md` using the matching template.
+   - Anti-patterns: prefix slug with `anti-` (e.g., `anti-vd4dots-small-k.md`)
+   - Techniques: descriptive slug (e.g., `direct-gemm-no-tiling.md`)
+   - Pipeline insights: descriptive slug (e.g., `vlsu-stall-back-pressure.md`)
+3. Apply all style rules: define every acronym, include plain-English section first, use concrete numbers with units.
+
+### Operation 3: Update index.md (conditional)
+
+Only execute if Operation 2 created a new page.
+
+**Path:** `docs/wiki/index.md`
+
+1. Add a `[[slug]]` wikilink under the appropriate section (Techniques / Anti-Patterns / Pipeline Insights).
+2. If an operator page was created (not just updated): add a row to the Operator Profiles table with function name and wikilink.
+
+### Operation 4: Append to log.md
+
+**Path:** `docs/wiki/log.md`
+
+Always execute. Append under today's date heading (create heading if date not present).
+
+Format:
+
+```markdown
+## YYYY-MM-DD
+
+- **<function-display-name>** round <N> | <plain-English approach description> | <cycles_before> -> <cycles_after> cycles (<Nx>) | <outcome> | Lesson: <one sentence plain-English lesson, no unexplained jargon>
+```
+
+Apply the glossary when writing the lesson: if you use LMUL, vd4dots, GEMM, or any term from the glossary, define it inline on first use within that log entry.
+
+---
+
+## Style Checklist
+
+Before writing any page or log entry, verify:
+
+- [ ] Every acronym defined on first use in this page (GEMM, LMUL, VL, IPC, etc.)
+- [ ] First content section is "(Plain English)" and explains the concept to a generalist
+- [ ] All numbers include units and context ("4,823 cycles at VLEN=1024 on AX45MPV FPGA")
+- [ ] At least one analogy or concrete example (not required in history table rows)
+- [ ] Any code snippets have comments explaining purpose, not just instruction name
+- [ ] Frontmatter fields match the SCHEMA.md spec for this page type
+- [ ] Wikilinks use `[[filename-stem]]` format (no path, no `.md` extension)
+- [ ] Log entry lesson uses no unexplained jargon
