@@ -1,0 +1,48 @@
+# Optimization Report: conv_dw_HWC_u8_u8_u8_asym_bias_any
+
+## Summary
+
+| Metric | Baseline | Optimized | Delta |
+|--------|----------|-----------|-------|
+| Cycles | 174,553 | 164,347 | -5.85% |
+| Instructions | 124,855 | 119,533 | -4.26% |
+| IPC | 0.715 | 0.727 | +1.68% |
+
+**Target:** AX45MPV FPGA, VLEN=1024
+**Commit:** d5043056
+**QEMU correctness:** 4/4 sub-tests pass
+**FPGA confirmation:** 164,347 cycles (exact match)
+
+## Winning Optimization (Iteration 2): vmulh Requantization
+
+**Problem:** The original requantization uses `vwmul.vx` (e32->e64 widening multiply) which doubles the LMUL requirement. With e32m8 accumulator (192 elements at VLEN=1024), the widening to e64 requires splitting into two passes: part-1 (128 elements at e32m4->e64m8) and part-2 (64 elements). Each part runs the full requantization chain independently.
+
+**Solution:** Replace `vwmul` with `vmulh.vx` (multiply returning high 32 bits) for `out_shift2 >= 32`. `vmulh` stays at e32m8 and processes all 192 elements in a single pass. No widening, no splitting.
+
+**Math equivalence:** For `shift2 = 30 - out_shift`:
+- Original: `(acc * scale) >> shift2` via `vwmul + vnsra(shift2)`
+- New: `(acc * scale) >> 32` via `vmulh`, then `vsra(shift2-32)` if needed
+- Bit-exact for `shift2 >= 32` (verified on all 4 test configurations)
+
+**Savings per chunk (784 total):**
+- Eliminated: ~14 vector ops (full part-2 requantization) + 4 vsetvl transitions
+- Added: 0 overhead
+- Net: ~18 fewer ops per chunk
+
+**Fallback:** For `out_shift2 < 32` (sub-tests 2 and 3), the original `vwmul` path with part-1/part-2 is used.
+
+## Failed Approaches
+
+| Iter | Approach | Cycles | vs Best | Reason |
+|------|----------|--------|---------|--------|
+| 1 | Remove vadd(ker_offset) via math decomposition | 176,823 | +7.6% | Scalar in_sum overhead negated 1-op savings |
+| 3 | vqmaccu.vx + kernel sum accumulation | 164,855 | +0.3% | vwaddu per position + offset correction overhead too high |
+| 4 | ker_x loop unrolling by 2 | 187,223 | +13.9% | Compiler generated worse code with more register spills |
+
+**Key lesson:** On this RISC-V vector pipeline, micro-optimizations to the inner kernel loop (which is already tight at 9 instructions) are ineffective or counterproductive. The winning strategy was eliminating redundant work in the requantization path where a structural improvement (avoiding widening) removed an entire pass.
+
+## Source Location
+
+`Source/ConvolutionFunctions/riscv_nn_conv_dw_HWC_u8_u8_u8_asym_bias_any.c`
+
+Optimized path under `#ifdef ENA_AGENT_OPT_CONV_DW_HWC_U8_U8_U8_ASYM_BIAS_ANY` in the ELEN64 block. Original code preserved in `#else` branch.

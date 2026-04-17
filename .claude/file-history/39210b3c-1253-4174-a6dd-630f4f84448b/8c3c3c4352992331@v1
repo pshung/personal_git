@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""Phase 2: Baseline measurement for libnn optimizer.
+
+Reads config.toml + state.json, builds unmodified libnn, runs QEMU correctness
+check, measures FPGA performance, and outputs JSON result.
+
+All external tool invocations (QEMU, FPGA) go through the config-aware
+iterate-phase scripts in opt/script/, which read toolchain paths from
+config.toml via parse_config.sh. This avoids hardcoded path mismatches.
+
+Usage:
+    python3 run_baseline.py [--skip-qemu] [--skip-fpga] [--json]
+
+Exit codes:
+    0 - baseline completed successfully
+    1 - build or correctness failure
+    2 - FPGA perf measurement failure
+    3 - config/state loading error
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import tomllib
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OPT_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
+CONFIG_PATH = os.path.join(OPT_DIR, "config.toml")
+STATE_PATH = os.path.join(OPT_DIR, "state.json")
+LIBNN_ROOT = os.path.normpath(os.path.join(OPT_DIR, "../.."))
+
+GREEN = "\033[92m"
+RED = "\033[91m"
+RESET = "\033[0m"
+BOLD = "\033[1m"
+
+
+def ok(msg):
+    print(f"  {GREEN}[OK]{RESET} {msg}")
+
+
+def fail(msg):
+    print(f"  {RED}[FAIL]{RESET} {msg}")
+
+
+def header(msg):
+    print(f"\n{BOLD}=== {msg} ==={RESET}")
+
+
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
+
+def load_config(path=CONFIG_PATH):
+    if not os.path.isfile(path):
+        fail(f"config.toml not found: {path}")
+        sys.exit(3)
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def load_state(path=STATE_PATH):
+    if not os.path.isfile(path):
+        fail(f"state.json not found: {path}")
+        sys.exit(3)
+    with open(path) as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# Toolchain environment (for build.sh only)
+# ---------------------------------------------------------------------------
+
+_symlink_tmpdir = None
+
+
+def setup_build_env(cfg):
+    """Return an os.environ copy with toolchain PATH for build.sh."""
+    global _symlink_tmpdir
+    env = os.environ.copy()
+    bin_dir = cfg["toolchain"]["bin_dir"]
+    prefix = cfg["toolchain"]["prefix"]
+
+    gdb_real = os.path.join(bin_dir, f"{prefix}gdb")
+    gdb_nopython = os.path.join(bin_dir, f"{prefix}gdb-nopython")
+
+    extra_paths = []
+    if os.path.isfile(gdb_real) and not os.path.exists(gdb_nopython):
+        _symlink_tmpdir = tempfile.mkdtemp(prefix="baseline_gdb_")
+        link_path = os.path.join(_symlink_tmpdir, f"{prefix}gdb-nopython")
+        os.symlink(gdb_real, link_path)
+        extra_paths.append(_symlink_tmpdir)
+        ok(f"Created gdb-nopython symlink in {_symlink_tmpdir}")
+
+    extra_paths.append(bin_dir)
+    env["PATH"] = ":".join(extra_paths) + ":" + env.get("PATH", "")
+    return env
+
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+
+def build_libnn(libnn_root, cpu, env, extra_flags=None):
+    """Build libnn.a for the given CPU."""
+    header(f"Build libnn for {cpu}")
+
+    cmd = ["/usr/bin/bash", os.path.join(libnn_root, "build.sh"), cpu]
+    if extra_flags:
+        cmd.append(extra_flags)
+
+    proc = subprocess.run(
+        cmd,
+        cwd=libnn_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+    libnn_path = os.path.join(libnn_root, "libnn.a")
+    if proc.returncode != 0 or not os.path.isfile(libnn_path):
+        fail(f"Build failed (exit {proc.returncode})")
+        if proc.stderr:
+            lines = proc.stderr.strip().split("\n")
+            for line in lines[-20:]:
+                print(f"    {line}")
+        return {"success": False, "log": proc.stderr}
+
+    ok(f"libnn.a built: {libnn_path}")
+    return {"success": True, "log": proc.stdout}
+
+
+# ---------------------------------------------------------------------------
+# QEMU correctness (via opt/script/run_qemu_test.sh --config)
+# ---------------------------------------------------------------------------
+
+def run_qemu_test(func, vlen, timeout=300):
+    """Run QEMU strace correctness test via config-aware script."""
+    header(f"QEMU correctness: {func} (VLEN={vlen})")
+
+    script = os.path.join(SCRIPT_DIR, "run_qemu_test.sh")
+    if not os.path.isfile(script):
+        fail(f"run_qemu_test.sh not found: {script}")
+        return {"pass": False, "sub_tests": 0, "log": "script not found"}
+
+    cmd = [
+        "/usr/bin/bash", script, func,
+        "--strace", "--vlen", str(vlen),
+        "--timeout", str(timeout),
+        "--config", CONFIG_PATH,
+    ]
+
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout + 60,
+    )
+
+    output = proc.stdout + proc.stderr
+    passes = output.count("accuracy checking pass")
+    fails = output.count("accuracy checking fail")
+
+    if proc.returncode != 0 or passes == 0 or fails > 0:
+        fail(f"QEMU test failed (pass={passes}, fail={fails}, exit={proc.returncode})")
+        if "COMPILE_ERROR" in output:
+            fail("Compilation error")
+        return {"pass": False, "sub_tests": passes, "log": output}
+
+    ok(f"QEMU passed ({passes} sub-tests)")
+    return {"pass": True, "sub_tests": passes, "log": output}
+
+
+# ---------------------------------------------------------------------------
+# FPGA perf (via opt/script/run_fpga_test.sh --config)
+# ---------------------------------------------------------------------------
+
+def run_fpga_perf(func, timeout=600):
+    """Run FPGA perf measurement via config-aware script."""
+    header(f"FPGA perf: {func}")
+
+    script = os.path.join(SCRIPT_DIR, "run_fpga_test.sh")
+    if not os.path.isfile(script):
+        fail(f"run_fpga_test.sh not found: {script}")
+        return {"success": False, "cycles": 0, "instructions": 0, "log": "script not found"}
+
+    cmd = [
+        "/usr/bin/bash", script, func,
+        "--timeout", str(timeout),
+        "--config", CONFIG_PATH,
+    ]
+
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout + 60,
+    )
+
+    output = proc.stdout + proc.stderr
+
+    inst_match = re.search(r"inst count is (\d+)", output)
+    cycle_match = re.search(r"cycle count is (\d+)", output)
+    accuracy_pass = "accuracy checking pass" in output and "accuracy checking fail" not in output
+
+    cycles = int(cycle_match.group(1)) if cycle_match else None
+    instructions = int(inst_match.group(1)) if inst_match else None
+
+    if proc.returncode != 0:
+        fail(f"FPGA perf failed (exit {proc.returncode})")
+        lines = output.strip().split("\n")
+        for line in lines[-10:]:
+            print(f"    {line}")
+        return {
+            "success": False,
+            "cycles": cycles or 0,
+            "instructions": instructions or 0,
+            "log": output,
+        }
+
+    if cycles is None or instructions is None:
+        fail("Could not parse cycles/instructions from output")
+        return {"success": False, "cycles": 0, "instructions": 0, "log": output}
+
+    if not accuracy_pass:
+        fail("FPGA accuracy check failed")
+        return {"success": False, "cycles": cycles, "instructions": instructions, "log": output}
+
+    ok(f"cycles={cycles}  instructions={instructions}")
+    return {"success": True, "cycles": cycles, "instructions": instructions, "log": output}
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Phase 2: Baseline measurement")
+    parser.add_argument("--skip-qemu", action="store_true", help="Skip QEMU correctness")
+    parser.add_argument("--skip-fpga", action="store_true", help="Skip FPGA perf")
+    parser.add_argument("--json", action="store_true", help="Output JSON result to stdout")
+    parser.add_argument("--extra-cflags", default=None, help="Extra CFLAGS for build")
+    args = parser.parse_args()
+
+    print(f"{BOLD}libnn baseline measurement{RESET}")
+    print(f"Config: {CONFIG_PATH}")
+    print(f"State:  {STATE_PATH}")
+    print(f"libnn:  {LIBNN_ROOT}")
+
+    cfg = load_config()
+    state = load_state()
+
+    func = state.get("function")
+    if not func:
+        fail("No function set in state.json")
+        sys.exit(3)
+
+    cpu = cfg["target"]["cpu"]
+    vlen = cfg["qemu"]["vlen"]
+
+    ok(f"Function: {func}")
+    ok(f"CPU: {cpu}, VLEN: {vlen}")
+    ok(f"FPGA: {cfg['fpga']['host']}:{cfg['fpga']['port']}")
+
+    # Build env only needed for build.sh (QEMU/FPGA scripts read config.toml)
+    build_env = setup_build_env(cfg)
+
+    # Step 1: Build
+    build_result = build_libnn(LIBNN_ROOT, cpu, build_env, args.extra_cflags)
+    if not build_result["success"]:
+        if args.json:
+            print(json.dumps({"status": "build_failed", "error": "build failed"}))
+        sys.exit(1)
+
+    # Step 2: QEMU correctness
+    qemu_result = {"pass": True, "sub_tests": 0, "log": "skipped"}
+    if not args.skip_qemu:
+        qemu_result = run_qemu_test(func, vlen)
+        if not qemu_result["pass"]:
+            if args.json:
+                print(json.dumps({"status": "qemu_failed", "error": "QEMU correctness failed"}))
+            sys.exit(1)
+    else:
+        ok("QEMU skipped (--skip-qemu)")
+
+    # Step 3: FPGA perf
+    fpga_result = {"success": True, "cycles": 0, "instructions": 0}
+    if not args.skip_fpga:
+        fpga_result = run_fpga_perf(func)
+        if not fpga_result["success"]:
+            if args.json:
+                print(json.dumps({"status": "fpga_failed", "error": "FPGA perf failed"}))
+            sys.exit(2)
+    else:
+        ok("FPGA skipped (--skip-fpga)")
+
+    # Summary
+    header("Baseline complete")
+    result = {
+        "status": "ok",
+        "function": func,
+        "cycles": fpga_result["cycles"],
+        "instructions": fpga_result["instructions"],
+        "qemu_sub_tests": qemu_result["sub_tests"],
+    }
+    ok(f"Cycles:       {result['cycles']}")
+    ok(f"Instructions: {result['instructions']}")
+    ok(f"CPI:          {result['cycles'] / max(result['instructions'], 1):.2f}")
+
+    if args.json:
+        print(json.dumps(result))
+
+    print(f"\n{BOLD}=== All steps passed ==={RESET}")
+    return result
+
+
+if __name__ == "__main__":
+    main()

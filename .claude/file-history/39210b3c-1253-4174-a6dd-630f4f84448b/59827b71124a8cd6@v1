@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Tests for validate_config.py - reads expected values from config.toml."""
+
+import os
+import sys
+import subprocess
+import tempfile
+import tomllib
+import unittest
+from unittest.mock import patch, MagicMock
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.normpath(os.path.join(TEST_DIR, ".."))
+OPT_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
+CONFIG_PATH = os.path.join(OPT_DIR, "config.toml")
+LIBNN_ROOT = os.path.normpath(os.path.join(OPT_DIR, "../.."))
+
+sys.path.insert(0, SCRIPT_DIR)
+import validate_config as vc
+
+
+def load_config():
+    with open(CONFIG_PATH, "rb") as f:
+        return tomllib.load(f)
+
+
+CFG = load_config()
+
+
+class TestStepLoadConfig(unittest.TestCase):
+    def test_loads_successfully(self):
+        cfg = vc.step_load_config()
+        self.assertIsInstance(cfg, dict)
+
+    def test_required_sections_present(self):
+        cfg = vc.step_load_config()
+        for section in ["toolchain", "target", "qemu", "fpga", "limits"]:
+            self.assertIn(section, cfg)
+
+    def test_required_keys_present(self):
+        cfg = vc.step_load_config()
+        required = {
+            "toolchain": ["bin_dir", "prefix"],
+            "target": ["cpu", "fpga_config"],
+            "qemu": ["binary", "vlen", "timeout"],
+            "fpga": ["host", "port", "timeout"],
+            "limits": ["max_iterations", "min_improvement_pct"],
+        }
+        for section, keys in required.items():
+            for key in keys:
+                self.assertIn(key, cfg[section], f"Missing [{section}].{key}")
+
+    def test_values_match_config_toml(self):
+        cfg = vc.step_load_config()
+        self.assertEqual(cfg["toolchain"]["bin_dir"], CFG["toolchain"]["bin_dir"])
+        self.assertEqual(cfg["toolchain"]["prefix"], CFG["toolchain"]["prefix"])
+        self.assertEqual(cfg["target"]["cpu"], CFG["target"]["cpu"])
+        self.assertEqual(cfg["qemu"]["vlen"], CFG["qemu"]["vlen"])
+
+    def test_missing_config_exits(self):
+        with patch.object(vc, "CONFIG_PATH", "/nonexistent/config.toml"):
+            with self.assertRaises(SystemExit):
+                vc.step_load_config()
+
+    def test_missing_section_exits(self):
+        incomplete = {"toolchain": {"bin_dir": "/x", "prefix": "y"}}
+        with patch("builtins.open", unittest.mock.mock_open()), \
+             patch("tomllib.load", return_value=incomplete), \
+             patch.object(vc, "CONFIG_PATH", __file__):
+            with self.assertRaises(SystemExit):
+                vc.step_load_config()
+
+    def test_missing_key_exits(self):
+        incomplete = {
+            "toolchain": {"bin_dir": "/x"},  # missing prefix
+            "target": {"cpu": "X", "fpga_config": "x"},
+            "qemu": {"binary": "x", "vlen": 1, "timeout": 1},
+            "fpga": {"host": "x", "port": 1, "timeout": 1},
+            "limits": {"max_iterations": 1, "min_improvement_pct": 1},
+        }
+        with patch("builtins.open", unittest.mock.mock_open()), \
+             patch("tomllib.load", return_value=incomplete), \
+             patch.object(vc, "CONFIG_PATH", __file__):
+            with self.assertRaises(SystemExit):
+                vc.step_load_config()
+
+
+class TestStepToolchain(unittest.TestCase):
+    def test_bin_dir_exists(self):
+        bin_dir = CFG["toolchain"]["bin_dir"]
+        self.assertTrue(
+            os.path.isdir(bin_dir),
+            f"bin_dir not found: {bin_dir}"
+        )
+
+    def test_gcc_exists(self):
+        bin_dir = CFG["toolchain"]["bin_dir"]
+        prefix = CFG["toolchain"]["prefix"]
+        gcc = os.path.join(bin_dir, f"{prefix}gcc")
+        self.assertTrue(os.path.isfile(gcc), f"gcc not found: {gcc}")
+
+    def test_step_returns_gcc_path(self):
+        gcc = vc.step_toolchain(CFG)
+        self.assertTrue(gcc.endswith("gcc"))
+        self.assertTrue(os.path.isfile(gcc))
+
+    def test_gcc_supports_andes_flags(self):
+        bin_dir = CFG["toolchain"]["bin_dir"]
+        prefix = CFG["toolchain"]["prefix"]
+        gcc = os.path.join(bin_dir, f"{prefix}gcc")
+        r = subprocess.run(
+            [gcc, "-mtune=andes-45-series", "-mext-vector",
+             "-x", "c", "-c", "/dev/null", "-o", "/dev/null"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(r.returncode, 0, f"Andes flags failed: {r.stderr}")
+
+    def test_nonexistent_bin_dir_exits(self):
+        bad_cfg = {**CFG, "toolchain": {"bin_dir": "/nonexistent", "prefix": "riscv64-elf-"}}
+        with self.assertRaises(SystemExit):
+            vc.step_toolchain(bad_cfg)
+
+
+class TestStepCompile(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="test_validate_")
+        bin_dir = CFG["toolchain"]["bin_dir"]
+        prefix = CFG["toolchain"]["prefix"]
+        self.gcc = os.path.join(bin_dir, f"{prefix}gcc")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_compile_produces_riscv_elf(self):
+        elf = vc.step_compile(CFG, self.gcc, self.tmpdir)
+        self.assertTrue(os.path.isfile(elf))
+        r = subprocess.run(["file", elf], capture_output=True, text=True)
+        self.assertIn("RISC-V", r.stdout)
+
+    def test_elf_path_in_build_dir(self):
+        elf = vc.step_compile(CFG, self.gcc, self.tmpdir)
+        self.assertIn("build", elf)
+        self.assertTrue(elf.endswith(".adx"))
+
+
+class TestStepQemu(unittest.TestCase):
+    def test_qemu_binary_exists(self):
+        qemu_bin = CFG["qemu"]["binary"]
+        self.assertTrue(
+            os.path.isfile(qemu_bin),
+            f"QEMU binary not found: {qemu_bin}"
+        )
+
+    def test_qemu_config_file_exists(self):
+        qemu_cfg = os.path.join(
+            LIBNN_ROOT,
+            "project/ax45mpv/qemu_cfg/zve64d/ADP-AE350-AX45MPV-1C_dw0_mw1.cfg",
+        )
+        self.assertTrue(
+            os.path.isfile(qemu_cfg),
+            f"QEMU config not found: {qemu_cfg}"
+        )
+
+    def test_nonexistent_qemu_exits(self):
+        bad_cfg = {**CFG, "qemu": {"binary": "/nonexistent/qemu", "vlen": 1024, "timeout": 10}}
+        with tempfile.NamedTemporaryFile(suffix=".adx") as f:
+            with self.assertRaises(SystemExit):
+                vc.step_qemu(bad_cfg, f.name)
+
+
+class TestStepFpgaConfig(unittest.TestCase):
+    def test_fpga_config_file_exists(self):
+        path = CFG["target"]["fpga_config"]
+        if not os.path.isabs(path):
+            path = os.path.join(OPT_DIR, path)
+        self.assertTrue(os.path.isfile(path), f"FPGA config not found: {path}")
+
+    def test_returns_feature_dict(self):
+        features = vc.step_fpga_config(CFG)
+        self.assertIsInstance(features, dict)
+
+    def test_vlen_matches_qemu_vlen(self):
+        features = vc.step_fpga_config(CFG)
+        if "vlen" in features:
+            self.assertEqual(
+                features["vlen"], CFG["qemu"]["vlen"],
+                "FPGA VLEN and QEMU VLEN should match"
+            )
+
+    def test_rvv_enabled(self):
+        features = vc.step_fpga_config(CFG)
+        self.assertTrue(features.get("rvv"), "RVV should be enabled for AX45MPV")
+
+    def test_expected_int_keys_parsed(self):
+        features = vc.step_fpga_config(CFG)
+        for key in ["vlen", "dlen", "elen", "cache_line"]:
+            self.assertIn(key, features, f"Missing feature: {key}")
+            self.assertIsInstance(features[key], int)
+
+    def test_expected_bool_keys_parsed(self):
+        features = vc.step_fpga_config(CFG)
+        for key in ["rvv", "vdot", "bf16", "qmac"]:
+            self.assertIn(key, features, f"Missing feature: {key}")
+            self.assertIsInstance(features[key], bool)
+
+    def test_nonexistent_fpga_config_exits(self):
+        bad_cfg = {**CFG, "target": {**CFG["target"], "fpga_config": "/nonexistent.inc"}}
+        with self.assertRaises(SystemExit):
+            vc.step_fpga_config(bad_cfg)
+
+
+
+class TestMainArgparse(unittest.TestCase):
+    def test_strace_flag_parsed(self):
+        with patch("sys.argv", ["validate_config.py", "--strace"]):
+            import argparse
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--strace", action="store_true")
+            args = parser.parse_args()
+            self.assertTrue(args.strace)
+
+    def test_no_flags_default(self):
+        with patch("sys.argv", ["validate_config.py"]):
+            import argparse
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--strace", action="store_true")
+            args = parser.parse_args()
+            self.assertFalse(args.strace)
+
+
+if __name__ == "__main__":
+    unittest.main()

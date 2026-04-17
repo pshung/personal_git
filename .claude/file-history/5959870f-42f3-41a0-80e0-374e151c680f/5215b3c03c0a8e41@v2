@@ -1,0 +1,554 @@
+/******************************************************************************
+ * Copyright (C) 2010-2025 Arm Limited or its affiliates. All rights reserved.*
+ * Copyright (C) 2018-2025 Andes Technology Corporation. All rights reserved. *
+ *                                                                            *
+ * SPDX-License-Identifier: Apache-2.0                                        *
+ *                                                                            *
+ * Licensed under the Apache License, Version 2.0 (the License); you may      *
+ * not use this file except in compliance with the License.                   *
+ * You may obtain a copy of the License at                                    *
+ *                                                                            *
+ * www.apache.org/licenses/LICENSE-2.0                                        *
+ *                                                                            *
+ * Unless required by applicable law or agreed to in writing, software        *
+ * distributed under the License is distributed on an AS IS BASIS, WITHOUT    *
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.           *
+ * See the License for the specific language governing permissions and        *
+ * limitations under the License.                                             *
+ ******************************************************************************/
+
+/** @file*/
+
+#include "internal_nn_math.h"
+#include "riscv_nn_support.h"
+
+//// Convolution Functions
+
+int32_t riscv_nn_conv_dw_HWC_u8_u8_u8_asym_bias_any(const uint8_t * in_tensor,
+                                                    const uint16_t in_tensor_dim_x,
+                                                    const uint16_t in_tensor_dim_y,
+                                                    const uint16_t in_tensor_ch,
+                                                    const uint8_t * ker_weight,
+                                                    const uint16_t ker_dim_x,
+                                                    const uint16_t ker_dim_y,
+                                                    const int16_t ch_mult,
+                                                    const int16_t pad_x,
+                                                    const int16_t pad_y,
+                                                    const int16_t stride_x,
+                                                    const int16_t stride_y,
+                                                    const int16_t dilation_x,
+                                                    const int16_t dilation_y,
+                                                    const int32_t * bias,
+                                                    const int32_t in_offset,    //assume (in + offset) is in the range of int16
+                                                    const int32_t ker_offset,   //assume (kernel + offset) is in the range of int16
+                                                    const int32_t out_offset,   //assume (output + offset) is in the range of int16
+                                                    uint8_t * out_tensor,
+                                                    const uint16_t out_tensor_dim_x,
+                                                    const uint16_t out_tensor_dim_y,
+                                                    const int32_t act_min,
+                                                    const int32_t act_max,
+                                                    const int32_t out_shift,
+                                                    const int32_t out_scale)
+{
+    int32_t status = 0;
+
+#ifdef ENA_EMPTY_FUN
+    //empty body
+#else
+    //check input constraints
+    if((ch_mult & 1) || (ker_dim_x & 1))
+    {
+        return -1;
+    }
+    //to be checked: it seems pad_x must be even
+    // if(pad_x & 1)
+    // {
+    //     return 1;
+    // }
+#if defined(ENA_VEC_ISA) && (NDS_VEC_RVV_VERSION >= 100) && (ENA_VEC_INTRINSIC)
+    long vl;
+    long out_shift2 = 30 - out_shift;
+
+    for (long i_out_y = 0; i_out_y < out_tensor_dim_y; i_out_y++)
+    {
+        long base_idx_y = (i_out_y * stride_y) - pad_y;
+        // ker_weight start position: (base_idx_y + ker_y_start) >= 0
+        long ker_y_start = MAX(0, -base_idx_y);
+        // ker_weight end position: (base_idx_y + ker_y_end) < in_tensor_dim_y
+        long ker_y_end = MIN(ker_dim_y, in_tensor_dim_y - base_idx_y);
+
+        for (long i_out_x = 0; i_out_x < out_tensor_dim_x; i_out_x++)
+        {
+            long base_idx_x = (i_out_x * stride_x) - pad_x;
+            // ker_weight start position: (base_idx_x + ker_x_start) >= 0
+            long ker_x_start = MAX(0, -base_idx_x);
+            // ker_weight end position: (base_idx_x + ker_x_end) < in_tensor_dim_x
+            long ker_x_end = MIN(ker_dim_x, in_tensor_dim_x - base_idx_x);
+
+            int32_t *bias2 = (int32_t *)bias;
+
+            for (long i_input_ch = 0; i_input_ch < in_tensor_ch; i_input_ch++)
+            {
+                long i_ch_mult = 0;
+                int ch_mult_rest = ch_mult;
+                for (; i_ch_mult < ch_mult; i_ch_mult += vl)
+                {
+                    long idx_out_ch = i_ch_mult + i_input_ch * ch_mult;
+                    vl = __riscv_vsetvl_e32m8(ch_mult_rest);
+                    vint32m8_t vBias2 = __riscv_vle32_v_i32m8(bias2, vl);
+                    bias2 += vl;
+
+                    vl = __riscv_vsetvl_e16m4(ch_mult_rest);
+                    for (long i_ker_y = ker_y_start; i_ker_y < ker_y_end; i_ker_y++)
+                    {
+                        long idx_y = base_idx_y + i_ker_y;
+                        long ker_idx_0 = (i_ker_y * ker_dim_x + ker_x_start) * (in_tensor_ch * ch_mult) + idx_out_ch;
+                        uint8_t *kernel_ptr = (uint8_t *)&ker_weight[ker_idx_0];
+
+                        long idx_x = base_idx_x + ker_x_start;
+                        long idx_0 = (idx_y * in_tensor_dim_x + idx_x) * in_tensor_ch + i_input_ch;
+                        uint8_t *in_ptr = (uint8_t *)&in_tensor[idx_0];
+                        long i_ker_x;
+                        for (i_ker_x = ker_x_start; i_ker_x < ker_x_end; i_ker_x++)
+                        {
+                            long in = *in_ptr + in_offset;
+                            vuint8m2_t vKernelPtr = __riscv_vle8_v_u8m2(kernel_ptr, vl);
+                            vuint16m4_t vKernelPtrExt = __riscv_vzext_vf2(vKernelPtr, vl);
+                            vKernelPtrExt = __riscv_vadd(vKernelPtrExt, ker_offset, vl);
+                            vint16m4_t vKernelPtrExtSigned = __riscv_vreinterpret_i16m4(vKernelPtrExt);
+                            vBias2 = __riscv_vwmacc(vBias2, in, vKernelPtrExtSigned, vl);
+                            in_ptr += in_tensor_ch;
+                            kernel_ptr += in_tensor_ch * ch_mult;
+                        }
+                    }
+
+                    vl = __riscv_vsetvl_e32m8(ch_mult_rest);
+
+                    //requantization
+                    //part-1
+                    long vl2;
+                    vl2 = __riscv_vsetvl_e32m4(ch_mult_rest);
+                    vint32m4_t vBias2Part1 = __riscv_vget_i32m4(vBias2, 0);
+                    vint64m8_t vOutTensorPart1 = __riscv_vwmul(vBias2Part1, out_scale, vl2);
+
+                    vint32m4_t vOutTensorPart1_i32m4 = __riscv_vnsra(vOutTensorPart1, out_shift2, vl2);
+                    vOutTensorPart1_i32m4 = __riscv_vssra(vOutTensorPart1_i32m4, 1, __RISCV_VXRM_RNU, vl2);
+
+                    vOutTensorPart1_i32m4 = __riscv_vadd(vOutTensorPart1_i32m4, out_offset, vl2);
+                    vOutTensorPart1_i32m4 = __riscv_vmax(vOutTensorPart1_i32m4, act_min, vl2);
+                    vOutTensorPart1_i32m4 = __riscv_vmin(vOutTensorPart1_i32m4, act_max, vl2);
+
+                    vl2 = __riscv_vsetvl_e16m2(vl2);
+                    vint16m2_t vOutTensorPart1_i16m2 = __riscv_vnsra(vOutTensorPart1_i32m4, 0, vl2);
+                    vl2 = __riscv_vsetvl_e8m1(vl2);
+                    vint8m1_t vOutTensorPart1_i8m1 = __riscv_vnsra(vOutTensorPart1_i16m2, 0, vl2);
+                    vuint8m1_t vOutTensorPart1_u8m1 = __riscv_vreinterpret_u8m1(vOutTensorPart1_i8m1);
+                    __riscv_vse8(out_tensor, vOutTensorPart1_u8m1, vl2);
+                    ch_mult_rest -= vl2;
+                    out_tensor += vl2;
+
+                    //part-2
+                    if(ch_mult_rest > 0)
+                    {
+                        vl2 = __riscv_vsetvl_e32m4(ch_mult_rest);
+                        vint32m4_t vBias2Part2 = __riscv_vget_i32m4(vBias2, 1);
+                        vint64m8_t vOutTensorPart2 = __riscv_vwmul(vBias2Part2, out_scale, vl2);
+                        vint32m4_t vOutTensorPart2_i32m4 = __riscv_vnsra(vOutTensorPart2, out_shift2, vl2);
+                        vOutTensorPart2_i32m4 = __riscv_vssra(vOutTensorPart2_i32m4, 1, __RISCV_VXRM_RNU, vl2);
+
+                        vOutTensorPart2_i32m4 = __riscv_vadd(vOutTensorPart2_i32m4, out_offset, vl2);
+                        vOutTensorPart2_i32m4 = __riscv_vmax(vOutTensorPart2_i32m4, act_min, vl2);
+                        vOutTensorPart2_i32m4 = __riscv_vmin(vOutTensorPart2_i32m4, act_max, vl2);
+
+                        vl2 = __riscv_vsetvl_e16m2(vl2);
+                        vint16m2_t vOutTensorPart2_i16m2 = __riscv_vnsra(vOutTensorPart2_i32m4, 0, vl2);
+                        vl2 = __riscv_vsetvl_e8m1(vl2);
+                        vint8m1_t vOutTensorPart2_i8m1 = __riscv_vnsra(vOutTensorPart2_i16m2, 0, vl2);
+                        vuint8m1_t vOutTensorPart2_u8m1 = __riscv_vreinterpret_u8m1(vOutTensorPart2_i8m1);
+                        __riscv_vse8(out_tensor, vOutTensorPart2_u8m1, vl2);
+                        ch_mult_rest -= vl2;
+                        out_tensor += vl2;
+                    }
+                }
+            }
+        }
+    }
+#elif defined(ENA_VEC_ISA) && (NDS_VEC_RVV_VERSION >= 100) && defined(ENA_VEC_ELEN64)
+    long vl;
+    long out_shift2 = 30 - out_shift;
+    long vmulh_extra_shift = out_shift2 - 32;
+
+    for (long i_out_y = 0; i_out_y < out_tensor_dim_y; i_out_y++)
+    {
+        long base_idx_y = (i_out_y * stride_y) - pad_y;
+        // ker_weight start position: (base_idx_y + ker_y_start) >= 0
+        long ker_y_start = MAX(0, -base_idx_y);
+        // ker_weight end position: (base_idx_y + ker_y_end) < in_tensor_dim_y
+        long ker_y_end = MIN(ker_dim_y, in_tensor_dim_y - base_idx_y);
+
+        for (long i_out_x = 0; i_out_x < out_tensor_dim_x; i_out_x++)
+        {
+            long base_idx_x = (i_out_x * stride_x) - pad_x;
+            // ker_weight start position: (base_idx_x + ker_x_start) >= 0
+            long ker_x_start = MAX(0, -base_idx_x);
+            // ker_weight end position: (base_idx_x + ker_x_end) < in_tensor_dim_x
+            long ker_x_end = MIN(ker_dim_x, in_tensor_dim_x - base_idx_x);
+
+            int32_t *bias2 = (int32_t *)bias;
+
+            for (long i_input_ch = 0; i_input_ch < in_tensor_ch; i_input_ch++)
+            {
+                long i_ch_mult = 0;
+                int ch_mult_rest = ch_mult;
+                for (; i_ch_mult < ch_mult; i_ch_mult += vl)
+                {
+                    long idx_out_ch = i_ch_mult + i_input_ch * ch_mult;
+                    NDS_VEC_VSETVLI(vl, ch_mult_rest, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M8);
+                    NDS_VEC_VLE32_V(NDS_VEC_V0, bias2);
+                    bias2 += vl;
+
+                    NDS_VEC_VSETVLI(vl, ch_mult_rest, NDS_VEC_VTYPE_SEW_E16, NDS_VEC_VTYPE_LMUL_M4);
+                    for (long i_ker_y = ker_y_start; i_ker_y < ker_y_end; i_ker_y++)
+                    {
+                        long idx_y = base_idx_y + i_ker_y;
+                        long ker_idx_0 = (i_ker_y * ker_dim_x + ker_x_start) * (in_tensor_ch * ch_mult) + idx_out_ch;
+                        uint8_t *kernel_ptr = (uint8_t *)&ker_weight[ker_idx_0];
+
+                        long idx_x = base_idx_x + ker_x_start;
+                        long idx_0 = (idx_y * in_tensor_dim_x + idx_x) * in_tensor_ch + i_input_ch;
+                        uint8_t *in_ptr = (uint8_t *)&in_tensor[idx_0];
+                        long i_ker_x;
+                        for (i_ker_x = ker_x_start; i_ker_x < ker_x_end; i_ker_x++)
+                        {
+                            long in = *in_ptr + in_offset;
+                            NDS_VEC_VLE8_V(NDS_VEC_V12, kernel_ptr);
+                            NDS_VEC_VZEXT_VF2(NDS_VEC_V8, NDS_VEC_V12);
+                            NDS_VEC_VADD_VX(NDS_VEC_V8, NDS_VEC_V8, ker_offset);
+                            NDS_VEC_VWMACC_VX(NDS_VEC_V0, in, NDS_VEC_V8);
+                            in_ptr += in_tensor_ch;
+                            kernel_ptr += in_tensor_ch * ch_mult;
+                        }
+                    }
+
+                    NDS_VEC_VSETVLI(vl, ch_mult_rest, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M8);
+
+                    if (out_shift2 >= 32)
+                    {
+                        //requantization using vmulh (single pass, no widening)
+                        NDS_VEC_VMULH_VX(NDS_VEC_V0, NDS_VEC_V0, out_scale);
+                        if (vmulh_extra_shift > 0)
+                        {
+                            NDS_VEC_VSRA_VX(NDS_VEC_V0, NDS_VEC_V0, vmulh_extra_shift);
+                        }
+                        NDS_VEC_VSSRA_VI(NDS_VEC_V0, NDS_VEC_V0, 1);
+
+                        NDS_VEC_VADD_VX(NDS_VEC_V0, NDS_VEC_V0, out_offset);
+                        NDS_VEC_VMAX_VX(NDS_VEC_V0, NDS_VEC_V0, act_min);
+                        NDS_VEC_VMIN_VX(NDS_VEC_V0, NDS_VEC_V0, act_max);
+
+                        long vl2;
+                        NDS_VEC_VSETVLI(vl2, ch_mult_rest, NDS_VEC_VTYPE_SEW_E16, NDS_VEC_VTYPE_LMUL_M4);
+                        NDS_VEC_VNSRA_WI(NDS_VEC_V0, NDS_VEC_V0, 0);
+                        NDS_VEC_VSETVLI(vl2, vl2, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M2);
+                        NDS_VEC_VNSRA_WI(NDS_VEC_V0, NDS_VEC_V0, 0);
+                        NDS_VEC_VSE8_V(NDS_VEC_V0, out_tensor);
+                        ch_mult_rest -= vl2;
+                        out_tensor += vl2;
+                    }
+                    else
+                    {
+                        //requantization fallback (vwmul with part-1/part-2)
+                        long vl2;
+                        NDS_VEC_VSETVLI(vl2, ch_mult_rest, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M4);
+                        NDS_VEC_VWMUL_VX(NDS_VEC_V24, NDS_VEC_V0, out_scale);
+                        NDS_VEC_VNSRA_WX(NDS_VEC_V24, NDS_VEC_V24, out_shift2);
+                        NDS_VEC_VSSRA_VI(NDS_VEC_V24, NDS_VEC_V24, 1);
+
+                        NDS_VEC_VADD_VX(NDS_VEC_V24, NDS_VEC_V24, out_offset);
+                        NDS_VEC_VMAX_VX(NDS_VEC_V24, NDS_VEC_V24, act_min);
+                        NDS_VEC_VMIN_VX(NDS_VEC_V24, NDS_VEC_V24, act_max);
+
+                        NDS_VEC_VSETVLI(vl2, vl2, NDS_VEC_VTYPE_SEW_E16, NDS_VEC_VTYPE_LMUL_M2);
+                        NDS_VEC_VNSRA_WI(NDS_VEC_V24, NDS_VEC_V24, 0);
+                        NDS_VEC_VSETVLI(vl2, vl2, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M1);
+                        NDS_VEC_VNSRA_WI(NDS_VEC_V24, NDS_VEC_V24, 0);
+                        NDS_VEC_VSE8_V(NDS_VEC_V24, out_tensor);
+                        ch_mult_rest -= vl2;
+                        out_tensor += vl2;
+
+                        if(ch_mult_rest > 0)
+                        {
+                            NDS_VEC_VSETVLI(vl2, ch_mult_rest, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M4);
+                            NDS_VEC_VWMUL_VX(NDS_VEC_V24, NDS_VEC_V4, out_scale);
+                            NDS_VEC_VNSRA_WX(NDS_VEC_V24, NDS_VEC_V24, out_shift2);
+                            NDS_VEC_VSSRA_VI(NDS_VEC_V24, NDS_VEC_V24, 1);
+
+                            NDS_VEC_VADD_VX(NDS_VEC_V24, NDS_VEC_V24, out_offset);
+                            NDS_VEC_VMAX_VX(NDS_VEC_V24, NDS_VEC_V24, act_min);
+                            NDS_VEC_VMIN_VX(NDS_VEC_V24, NDS_VEC_V24, act_max);
+
+                            NDS_VEC_VSETVLI(vl2, vl2, NDS_VEC_VTYPE_SEW_E16, NDS_VEC_VTYPE_LMUL_M2);
+                            NDS_VEC_VNSRA_WI(NDS_VEC_V24, NDS_VEC_V24, 0);
+                            NDS_VEC_VSETVLI(vl2, vl2, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M1);
+                            NDS_VEC_VNSRA_WI(NDS_VEC_V24, NDS_VEC_V24, 0);
+                            NDS_VEC_VSE8_V(NDS_VEC_V24, out_tensor);
+                            ch_mult_rest -= vl2;
+                            out_tensor += vl2;
+                        }
+                    }
+                }
+            }
+        }
+    }
+#elif defined(ENA_DSP_ISA_64)
+    int32_t input_offset_dual = NDS_DSP_PKBB16(in_offset, in_offset);
+    int32_t kernel_offset_dual = NDS_DSP_PKBB16(ker_offset, ker_offset);
+
+    for (int32_t i_out_y = 0; i_out_y < out_tensor_dim_y; i_out_y++)
+    {
+        int32_t base_idx_y = (i_out_y * stride_y) - pad_y;
+        // ker_weight start position: (base_idx_y + ker_y_start) >= 0
+        int32_t ker_y_start = MAX(0, -base_idx_y);
+        // ker_weight end position: (base_idx_y + ker_y_end) < in_tensor_dim_y
+        int32_t ker_y_end = MIN(ker_dim_y, in_tensor_dim_y - base_idx_y);
+
+        for (int32_t i_out_x = 0; i_out_x < out_tensor_dim_x; i_out_x++)
+        {
+            int32_t base_idx_x = (i_out_x * stride_x) - pad_x;
+            // ker_weight start position: (base_idx_x + ker_x_start) >= 0
+            int32_t ker_x_start = MAX(0, -base_idx_x);
+            // ker_weight end position: (base_idx_x + ker_x_end) < in_tensor_dim_x
+            int32_t ker_x_end = MIN(ker_dim_x, in_tensor_dim_x - base_idx_x);
+
+            for (int32_t i_input_ch = 0; i_input_ch < in_tensor_ch; i_input_ch++)
+            {
+                int32_t i_ch_mult = 0;
+                for (; (i_ch_mult + 4) <= ch_mult; i_ch_mult += 4)
+                {
+                    int32_t idx_out_ch = i_ch_mult + i_input_ch * ch_mult;
+                    long acc_q31x2_0 = *((long*)(bias + idx_out_ch));
+                    long acc_q31x2_1 = *((long*)(bias + idx_out_ch + 2));
+
+                    for (int32_t i_ker_y = ker_y_start; i_ker_y < ker_y_end; i_ker_y++)
+                    {
+                        int32_t idx_y = base_idx_y + i_ker_y;
+                        int32_t i_ker_x;
+                        for (i_ker_x = ker_x_start; i_ker_x < ker_x_end; i_ker_x++)
+                        {
+                            int32_t idx_x = base_idx_x + i_ker_x;
+                            int32_t idx_0 = (idx_y * in_tensor_dim_x + idx_x) * in_tensor_ch + i_input_ch;
+                            int32_t ker_idx_0 = (i_ker_y * ker_dim_x + i_ker_x) * (in_tensor_ch * ch_mult) + idx_out_ch;
+
+                            long input_dual = NDS_DSP_PKBB16(in_tensor[idx_0], in_tensor[idx_0]);
+                            int32_t ker_q7x4 = *((int32_t*)(ker_weight + ker_idx_0));
+                            long ker_dual0 = NDS_DSP_ZUNPKD810(ker_q7x4);
+                            long ker_dual1 = NDS_DSP_ZUNPKD832(ker_q7x4);
+
+                            input_dual = NDS_DSP_ADD16(input_dual, input_offset_dual);
+                            ker_dual0 = NDS_DSP_ADD16(ker_dual0, kernel_offset_dual);
+                            ker_dual1 = NDS_DSP_ADD16(ker_dual1, kernel_offset_dual);
+
+                            long tmp_q31x2_0 = NDS_DSP_SMUL16(input_dual, ker_dual0);
+                            long tmp_q31x2_1 = NDS_DSP_SMUL16(input_dual, ker_dual1);
+                            acc_q31x2_0 = NDS_DSP_ADD32(acc_q31x2_0, tmp_q31x2_0);
+                            acc_q31x2_1 = NDS_DSP_ADD32(acc_q31x2_1, tmp_q31x2_1);
+                        }
+                    }
+
+                    int32_t acc_0 = acc_q31x2_0,
+                            acc_1 = (acc_q31x2_0 >> 32),
+                            acc_2 = acc_q31x2_1,
+                            acc_3 = (acc_q31x2_1 >> 32);
+
+                    // Requantize and clip output into specified range
+                    acc_0 = nn_requantize(acc_0, out_scale, out_shift);
+                    acc_0 += out_offset;
+                    acc_0 = MAX(acc_0, act_min);
+                    acc_0 = MIN(acc_0, act_max);
+                    *out_tensor++ = acc_0;
+
+                    acc_1 = nn_requantize(acc_1, out_scale, out_shift);
+                    acc_1 += out_offset;
+                    acc_1 = MAX(acc_1, act_min);
+                    acc_1 = MIN(acc_1, act_max);
+                    *out_tensor++ = acc_1;
+
+                    acc_2 = nn_requantize(acc_2, out_scale, out_shift);
+                    acc_2 += out_offset;
+                    acc_2 = MAX(acc_2, act_min);
+                    acc_2 = MIN(acc_2, act_max);
+                    *out_tensor++ = acc_2;
+
+                    acc_3 = nn_requantize(acc_3, out_scale, out_shift);
+                    acc_3 += out_offset;
+                    acc_3 = MAX(acc_3, act_min);
+                    acc_3 = MIN(acc_3, act_max);
+                    *out_tensor++ = acc_3;
+                }
+
+                for (; i_ch_mult < ch_mult; i_ch_mult += 2)
+                {
+                    int32_t idx_out_ch = i_ch_mult + i_input_ch * ch_mult;
+                    long acc_q31x2_0 = *((long*)(bias + idx_out_ch));
+
+                    for (int32_t i_ker_y = ker_y_start; i_ker_y < ker_y_end; i_ker_y++)
+                    {
+                        int32_t idx_y = base_idx_y + i_ker_y;
+                        int32_t i_ker_x;
+                        for (i_ker_x = ker_x_start; i_ker_x < ker_x_end; i_ker_x++)
+                        {
+                            int32_t idx_x = base_idx_x + i_ker_x;
+                            int32_t idx_0 = (idx_y * in_tensor_dim_x + idx_x) * in_tensor_ch + i_input_ch;
+                            int32_t ker_idx_0 = (i_ker_y * ker_dim_x + i_ker_x) * (in_tensor_ch * ch_mult) + idx_out_ch;
+
+                            long input_dual = NDS_DSP_PKBB16(in_tensor[idx_0], in_tensor[idx_0]);
+                            int32_t ker_q7x2 = *((int16_t*)(ker_weight + ker_idx_0));
+                            long ker_dual0 = NDS_DSP_ZUNPKD810(ker_q7x2);
+
+                            input_dual = NDS_DSP_ADD16(input_dual, input_offset_dual);
+                            ker_dual0 = NDS_DSP_ADD16(ker_dual0, kernel_offset_dual);
+
+                            long tmp_q31x2_0 = NDS_DSP_SMUL16(input_dual, ker_dual0);
+                            acc_q31x2_0 = NDS_DSP_ADD32(acc_q31x2_0, tmp_q31x2_0);
+                        }
+                    }
+
+                    int32_t acc_0 = acc_q31x2_0,
+                            acc_1 = (acc_q31x2_0 >> 32);
+
+                    // Requantize and clip output into specified range
+                    acc_0 = nn_requantize(acc_0, out_scale, out_shift);
+                    acc_0 += out_offset;
+                    acc_0 = MAX(acc_0, act_min);
+                    acc_0 = MIN(acc_0, act_max);
+                    *out_tensor++ = acc_0;
+
+                    acc_1 = nn_requantize(acc_1, out_scale, out_shift);
+                    acc_1 += out_offset;
+                    acc_1 = MAX(acc_1, act_min);
+                    acc_1 = MIN(acc_1, act_max);
+                    *out_tensor++ = acc_1;
+                }
+            }
+        }
+    }
+#elif defined(ENA_DSP_ISA)
+    int32_t input_offset_dual = NDS_DSP_PKBB16(in_offset, in_offset);
+    int32_t kernel_offset_dual = NDS_DSP_PKBB16(ker_offset, ker_offset);
+
+    for (int32_t i_out_y = 0; i_out_y < out_tensor_dim_y; i_out_y++)
+    {
+        int32_t base_idx_y = (i_out_y * stride_y) - pad_y;
+        // ker_weight start position: (base_idx_y + ker_y_start) >= 0
+        int32_t ker_y_start = MAX(0, -base_idx_y);
+        // ker_weight end position: (base_idx_y + ker_y_end) < in_tensor_dim_y
+        int32_t ker_y_end = MIN(ker_dim_y, in_tensor_dim_y - base_idx_y);
+
+        for (int32_t i_out_x = 0; i_out_x < out_tensor_dim_x; i_out_x++)
+        {
+            int32_t base_idx_x = (i_out_x * stride_x) - pad_x;
+            // ker_weight start position: (base_idx_x + ker_x_start) >= 0
+            int32_t ker_x_start = MAX(0, -base_idx_x);
+            // ker_weight end position: (base_idx_x + ker_x_end) < in_tensor_dim_x
+            int32_t ker_x_end = MIN(ker_dim_x, in_tensor_dim_x - base_idx_x);
+
+            for (int32_t i_input_ch = 0; i_input_ch < in_tensor_ch; i_input_ch++)
+            {
+                int32_t i_ch_mult = 0;
+                for (; i_ch_mult < ch_mult; i_ch_mult += 2)
+                {
+                    int32_t idx_out_ch = i_ch_mult + i_input_ch * ch_mult;
+                    int32_t acc_0 = bias[idx_out_ch];
+                    int32_t acc_1 = bias[idx_out_ch + 1];
+
+                    for (int32_t i_ker_y = ker_y_start; i_ker_y < ker_y_end; i_ker_y++)
+                    {
+                        int32_t idx_y = base_idx_y + i_ker_y;
+                        int32_t i_ker_x;
+                        for (i_ker_x = ker_x_start; i_ker_x < ker_x_end; i_ker_x+=2)
+                        {
+                            int32_t idx_x = base_idx_x + i_ker_x;
+                            int32_t idx_0 = (idx_y * in_tensor_dim_x + idx_x) * in_tensor_ch + i_input_ch;
+                            int32_t ker_idx_0 = (i_ker_y * ker_dim_x + i_ker_x) * (in_tensor_ch * ch_mult) + idx_out_ch;
+
+                            int32_t input_dual = NDS_DSP_PKBB16(in_tensor[idx_0 + in_tensor_ch], in_tensor[idx_0]);
+                            int32_t ker_daul1 = NDS_DSP_PKBB16(ker_weight[ker_idx_0 + in_tensor_ch * ch_mult], ker_weight[ker_idx_0]);
+                            int32_t ker_daul2 = NDS_DSP_PKBB16(ker_weight[ker_idx_0 + in_tensor_ch * ch_mult + 1], ker_weight[ker_idx_0 + 1]);
+
+                            input_dual = NDS_DSP_ADD16(input_dual, input_offset_dual);
+                            ker_daul1 = NDS_DSP_ADD16(ker_daul1, kernel_offset_dual);
+                            ker_daul2 = NDS_DSP_ADD16(ker_daul2, kernel_offset_dual);
+
+                            acc_0 = NDS_DSP_KMADA(acc_0, input_dual, ker_daul1);
+                            acc_1 = NDS_DSP_KMADA(acc_1, input_dual, ker_daul2);
+                        }
+                    }
+
+                    // Requantize and clip output into specified range
+                    acc_0 = nn_requantize(acc_0, out_scale, out_shift);
+                    acc_0 += out_offset;
+                    acc_0 = MAX(acc_0, act_min);
+                    acc_0 = MIN(acc_0, act_max);
+                    *out_tensor++ = acc_0;
+
+                    acc_1 = nn_requantize(acc_1, out_scale, out_shift);
+                    acc_1 += out_offset;
+                    acc_1 = MAX(acc_1, act_min);
+                    acc_1 = MIN(acc_1, act_max);
+                    *out_tensor++ = acc_1;
+                }
+            }
+        }
+    }
+#else
+    for (int32_t i_out_y = 0; i_out_y < out_tensor_dim_y; i_out_y++)
+    {
+        int32_t base_idx_y = (i_out_y * stride_y) - pad_y;
+        for (int32_t i_out_x = 0; i_out_x < out_tensor_dim_x; i_out_x++)
+        {
+            int32_t base_idx_x = (i_out_x * stride_x) - pad_x;
+            for (int32_t i_input_ch = 0; i_input_ch < in_tensor_ch; i_input_ch++)
+            {
+                int32_t i_ch_mult = 0;
+                for (; i_ch_mult < ch_mult; i_ch_mult++)
+                {
+                    int32_t idx_out_ch = i_ch_mult + i_input_ch * ch_mult;
+                    // calculate ker_weight start position
+                    // (base_idx_x + ker_x_start) >= 0
+                    // (base_idx_y + ker_y_start) >= 0
+                    int32_t ker_y_start = MAX(0, -base_idx_y);
+                    int32_t ker_x_start = MAX(0, -base_idx_x);
+                    // calculate ker_weight end position
+                    // (base_idx_x + ker_x_end) < in_tensor_dim_x
+                    // (base_idx_y + ker_y_end) < in_tensor_dim_y
+                    int32_t ker_y_end = MIN(ker_dim_y, in_tensor_dim_y - base_idx_y);
+                    int32_t ker_x_end = MIN(ker_dim_x, in_tensor_dim_x - base_idx_x);
+                    int32_t acc_0 = bias[idx_out_ch];
+
+                    for (int32_t i_ker_y = ker_y_start; i_ker_y < ker_y_end; i_ker_y++)
+                    {
+                        int32_t idx_y = base_idx_y + i_ker_y;
+                        for (int32_t i_ker_x = ker_x_start; i_ker_x < ker_x_end; i_ker_x++)
+                        {
+                            int32_t idx_x = base_idx_x + i_ker_x;
+                            int32_t idx_0 = (idx_y * in_tensor_dim_x + idx_x) * in_tensor_ch + i_input_ch;
+                            int32_t ker_idx_0 = (i_ker_y * ker_dim_x + i_ker_x) * (in_tensor_ch * ch_mult) + idx_out_ch;
+
+                            acc_0 += (in_tensor[idx_0] + in_offset) * (ker_weight[ker_idx_0] + ker_offset);
+                        }
+                    }
+
+                    // Requantize and clip output into specified range
+                    acc_0 = nn_requantize(acc_0, out_scale, out_shift);
+                    acc_0 += out_offset;
+                    acc_0 = MAX(acc_0, act_min);
+                    acc_0 = MIN(acc_0, act_max);
+                    *out_tensor++ = acc_0;
+                }
+            }
+        }
+    }
+#endif
+#endif  //ENA_EMPTY_FUN
+    return status;
+}

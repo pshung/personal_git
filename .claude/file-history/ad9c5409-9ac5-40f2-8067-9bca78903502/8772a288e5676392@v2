@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Tests for run_baseline.py.
+
+Tests verify that run_baseline.py uses the config-aware iterate-phase scripts
+(opt/script/run_qemu_test.sh and opt/script/run_fpga_test.sh) with --config,
+rather than hardcoded-path scripts from qemu-validate/ or libnn/.
+"""
+
+import json
+import os
+import sys
+import tempfile
+import tomllib
+import unittest
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.normpath(os.path.join(TEST_DIR, ".."))
+OPT_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
+CONFIG_PATH = os.path.join(OPT_DIR, "config.toml")
+STATE_PATH = os.path.join(OPT_DIR, "state.json")
+LIBNN_ROOT = os.path.normpath(os.path.join(OPT_DIR, "../.."))
+
+sys.path.insert(0, SCRIPT_DIR)
+import run_baseline as rb
+
+
+def load_config():
+    with open(CONFIG_PATH, "rb") as f:
+        return tomllib.load(f)
+
+
+def load_state():
+    with open(STATE_PATH) as f:
+        return json.load(f)
+
+
+CFG = load_config()
+STATE = load_state()
+
+
+class TestLoadInputs(unittest.TestCase):
+    def test_load_config(self):
+        cfg = rb.load_config(CONFIG_PATH)
+        self.assertIn("toolchain", cfg)
+        self.assertIn("target", cfg)
+        self.assertIn("qemu", cfg)
+        self.assertIn("fpga", cfg)
+
+    def test_load_state(self):
+        state = rb.load_state(STATE_PATH)
+        self.assertIn("function", state)
+        self.assertIn("phase", state)
+
+    def test_load_config_missing_file(self):
+        with self.assertRaises(SystemExit):
+            rb.load_config("/nonexistent/config.toml")
+
+    def test_load_state_missing_file(self):
+        with self.assertRaises(SystemExit):
+            rb.load_state("/nonexistent/state.json")
+
+
+class TestSetupBuildEnv(unittest.TestCase):
+    def test_returns_env_with_toolchain_in_path(self):
+        env = rb.setup_build_env(CFG)
+        bin_dir = CFG["toolchain"]["bin_dir"]
+        self.assertIn(bin_dir, env["PATH"].split(":"))
+
+    def test_gdb_nopython_symlink_created(self):
+        env = rb.setup_build_env(CFG)
+        prefix = CFG["toolchain"]["prefix"]
+        gdb_nopython = f"{prefix}gdb-nopython"
+        paths = env["PATH"].split(":")
+        found = any(
+            os.path.exists(os.path.join(p, gdb_nopython))
+            for p in paths
+        )
+        self.assertTrue(found, f"{gdb_nopython} not found in PATH")
+
+    def test_no_qemu_bin_in_env(self):
+        """Build env should not set QEMU_BIN - scripts read config.toml."""
+        env = rb.setup_build_env(CFG)
+        self.assertNotIn("QEMU_BIN", env)
+
+
+class TestScriptPaths(unittest.TestCase):
+    """Verify run_baseline uses config-aware scripts, not hardcoded-path ones."""
+
+    def test_qemu_script_is_opt_script(self):
+        """QEMU script must be opt/script/run_qemu_test.sh (config-aware)."""
+        expected = os.path.join(SCRIPT_DIR, "run_qemu_test.sh")
+        self.assertTrue(os.path.isfile(expected),
+                        f"Config-aware QEMU script missing: {expected}")
+
+    def test_fpga_script_is_opt_script(self):
+        """FPGA script must be opt/script/run_fpga_test.sh (config-aware)."""
+        expected = os.path.join(SCRIPT_DIR, "run_fpga_test.sh")
+        self.assertTrue(os.path.isfile(expected),
+                        f"Config-aware FPGA script missing: {expected}")
+
+    def test_qemu_script_supports_config_flag(self):
+        """opt/script/run_qemu_test.sh must accept --config."""
+        script = os.path.join(SCRIPT_DIR, "run_qemu_test.sh")
+        with open(script) as f:
+            content = f.read()
+        self.assertIn("--config", content)
+
+    def test_fpga_script_supports_config_flag(self):
+        """opt/script/run_fpga_test.sh must accept --config."""
+        script = os.path.join(SCRIPT_DIR, "run_fpga_test.sh")
+        with open(script) as f:
+            content = f.read()
+        self.assertIn("--config", content)
+
+
+class TestBuildLibnn(unittest.TestCase):
+    def test_build_succeeds(self):
+        env = rb.setup_build_env(CFG)
+        cpu = CFG["target"]["cpu"]
+        result = rb.build_libnn(LIBNN_ROOT, cpu, env)
+        self.assertTrue(result["success"])
+
+    def test_build_produces_libnn_a(self):
+        libnn_path = os.path.join(LIBNN_ROOT, "libnn.a")
+        self.assertTrue(os.path.isfile(libnn_path))
+
+
+class TestQemuCorrectness(unittest.TestCase):
+    def test_qemu_pass(self):
+        func = STATE["function"]
+        vlen = CFG["qemu"]["vlen"]
+        result = rb.run_qemu_test(func, vlen)
+        self.assertTrue(result["pass"])
+        self.assertGreater(result["sub_tests"], 0)
+
+    def test_qemu_bad_function_fails(self):
+        result = rb.run_qemu_test("nonexistent_func", 1024)
+        self.assertFalse(result["pass"])
+
+
+class TestFpgaPerf(unittest.TestCase):
+    def test_fpga_returns_cycles_and_instructions(self):
+        func = STATE["function"]
+        result = rb.run_fpga_perf(func)
+        self.assertTrue(result["success"])
+        self.assertGreater(result["cycles"], 0)
+        self.assertGreater(result["instructions"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

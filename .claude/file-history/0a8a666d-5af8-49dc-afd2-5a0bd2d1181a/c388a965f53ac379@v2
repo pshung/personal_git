@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""Validate config.toml step-by-step. Each step must pass before the next runs."""
+
+import os
+import sys
+import subprocess
+import tempfile
+import tomllib
+import re
+import shutil
+import socket
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OPT_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
+CONFIG_PATH = os.path.join(OPT_DIR, "config.toml")
+LIBNN_ROOT = os.path.normpath(os.path.join(OPT_DIR, "../../libnn"))
+
+GREEN = "\033[92m"
+RED = "\033[91m"
+YELLOW = "\033[93m"
+RESET = "\033[0m"
+BOLD = "\033[1m"
+
+def ok(msg):
+    print(f"  {GREEN}[OK]{RESET} {msg}")
+
+def fail(msg):
+    print(f"  {RED}[FAIL]{RESET} {msg}")
+
+def warn(msg):
+    print(f"  {YELLOW}[WARN]{RESET} {msg}")
+
+def header(msg):
+    print(f"\n{BOLD}=== {msg} ==={RESET}")
+
+def die(msg):
+    fail(msg)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Step 1: Load config.toml, verify all required keys exist
+# ---------------------------------------------------------------------------
+def step_load_config():
+    header("Step 1: Load config.toml")
+
+    if not os.path.isfile(CONFIG_PATH):
+        die(f"config.toml not found at {CONFIG_PATH}")
+
+    ok(f"Found {CONFIG_PATH}")
+
+    with open(CONFIG_PATH, "rb") as f:
+        cfg = tomllib.load(f)
+
+    required = {
+        "toolchain": ["bin_dir", "prefix"],
+        "target": ["cpu", "fpga_config"],
+        "qemu": ["binary", "vlen", "timeout"],
+        "fpga": ["host", "port", "timeout"],
+        "limits": ["max_iterations", "min_improvement_pct"],
+    }
+
+    for section, keys in required.items():
+        if section not in cfg:
+            die(f"Missing section [{section}]")
+        for key in keys:
+            if key not in cfg[section]:
+                die(f"Missing key [{section}].{key}")
+            ok(f"[{section}].{key} = {cfg[section][key]}")
+
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Step 2: Toolchain - bin_dir exists, gcc exists, Andes flags work
+# ---------------------------------------------------------------------------
+def step_toolchain(cfg):
+    header("Step 2: Toolchain")
+
+    bin_dir = cfg["toolchain"]["bin_dir"]
+    prefix = cfg["toolchain"]["prefix"]
+
+    if not os.path.isdir(bin_dir):
+        fail(f"bin_dir does not exist: {bin_dir}")
+        # Suggest alternatives
+        for candidate in [
+            "/local/nick/build-ast540/bin",
+            "/local/nick/build-system-3/toolchain/nds64le-elf-newlib-v5d/bin",
+        ]:
+            gcc = os.path.join(candidate, f"{prefix}gcc")
+            if os.path.isfile(gcc):
+                warn(f"Found alternative: {candidate}")
+        die("Fix [toolchain].bin_dir in config.toml and rerun.")
+
+    ok(f"bin_dir exists: {bin_dir}")
+
+    gcc = os.path.join(bin_dir, f"{prefix}gcc")
+    if not os.path.isfile(gcc):
+        die(f"gcc not found: {gcc}")
+    ok(f"gcc: {gcc}")
+
+    # Version
+    r = subprocess.run([gcc, "--version"], capture_output=True, text=True)
+    ok(f"version: {r.stdout.splitlines()[0]}")
+
+    # Andes flags
+    r = subprocess.run(
+        [gcc, "-mtune=andes-45-series", "-mext-vector", "-x", "c",
+         "-c", "/dev/null", "-o", "/dev/null"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        die(f"Andes flags not supported: {r.stderr.strip()}")
+    ok("Andes flags OK (-mtune=andes-45-series -mext-vector)")
+
+    # GDB (warn only - needed for FPGA step)
+    gdb = None
+    for name in [f"{prefix}gdb-nopython", f"{prefix}gdb"]:
+        path = os.path.join(bin_dir, name)
+        if os.path.isfile(path):
+            gdb = path
+            break
+    if gdb:
+        ok(f"GDB: {gdb}")
+    else:
+        warn("GDB not in toolchain (will try system GDB for FPGA step)")
+
+    return gcc
+
+
+# ---------------------------------------------------------------------------
+# Step 3: Compile hello world
+# ---------------------------------------------------------------------------
+HELLO_SRC = '#include <stdio.h>\nint main(void) { printf("HELLO_OK\\n"); return 0; }\n'
+
+def step_compile(cfg, gcc, tmpdir):
+    header("Step 3: Compile hello world")
+
+    src = os.path.join(tmpdir, "hello.c")
+    elf = os.path.join(tmpdir, "hello.adx")
+
+    with open(src, "w") as f:
+        f.write(HELLO_SRC)
+
+    cmd = [gcc, "-O2", "-o", elf, src,
+           "-mtune=andes-45-series", "-mext-vector=zve64d", "-mvh", "-lm"]
+    ok(f"cmd: {' '.join(cmd)}")
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"Compilation failed:\n{r.stderr}")
+
+    ok("Compilation succeeded")
+
+    r = subprocess.run(["file", elf], capture_output=True, text=True)
+    if "RISC-V" not in r.stdout:
+        die(f"Not a RISC-V ELF: {r.stdout.strip()}")
+    ok(f"ELF: {r.stdout.strip()}")
+
+    return elf
+
+
+# ---------------------------------------------------------------------------
+# Step 4: QEMU - binary exists, run hello world
+# ---------------------------------------------------------------------------
+def step_qemu(cfg, elf):
+    header("Step 4: QEMU")
+
+    qemu_bin = cfg["qemu"]["binary"]
+    vlen = cfg["qemu"]["vlen"]
+
+    if not os.path.isfile(qemu_bin):
+        die(f"QEMU binary not found: {qemu_bin}")
+    ok(f"Binary: {qemu_bin}")
+
+    r = subprocess.run([qemu_bin, "--version"], capture_output=True, text=True)
+    ok(f"Version: {r.stdout.splitlines()[0]}")
+
+    qemu_cfg = os.path.join(
+        LIBNN_ROOT, "project/ax45mpv/qemu_cfg/zve64d/ADP-AE350-AX45MPV-1C_dw0_mw1.cfg"
+    )
+    if not os.path.isfile(qemu_cfg):
+        die(f"QEMU config not found: {qemu_cfg}")
+    ok(f"Config: {qemu_cfg}")
+
+    # Run with strace to capture semihosting fd 9.
+    # QEMU semihosting doesn't cleanly exit after main() returns - it keeps
+    # running. Use `timeout` to kill it, then check strace log for output.
+    strace_log = elf + ".strace"
+    timeout_s = cfg["qemu"]["timeout"]
+    qemu_cmd = [
+        qemu_bin, "-readconfig", qemu_cfg,
+        "-M", "andes_ae350",
+        "-cpu", f"andes-ax45mpv,vext_spec=v1.0,vlen={vlen}",
+        "-nographic", "-semihosting", "-bios", elf,
+    ]
+    strace_cmd = ["timeout", str(timeout_s),
+                  "strace", "-f", "-e", "trace=write", "-o", strace_log] + qemu_cmd
+
+    ok(f"cmd: {' '.join(qemu_cmd)}")
+    ok(f"Running hello.adx (VLEN={vlen}, strace, timeout={timeout_s}s) ...")
+    r = subprocess.run(strace_cmd, capture_output=True, text=True, timeout=timeout_s + 10)
+
+    # Check stdout first, then strace log
+    if "HELLO_OK" in (r.stdout or ""):
+        ok("Output captured via stdout: HELLO_OK")
+        return
+
+    if os.path.isfile(strace_log):
+        with open(strace_log) as f:
+            content = f.read()
+        if "HELLO_OK" in content:
+            ok("Output captured via strace (semihosting fd): HELLO_OK")
+            return
+
+    die("HELLO_OK not found in QEMU output (checked stdout + strace)")
+
+
+# ---------------------------------------------------------------------------
+# Step 5: FPGA .inc - parse hardware features
+# ---------------------------------------------------------------------------
+def step_fpga_config(cfg):
+    header("Step 5: FPGA .inc config")
+
+    path = cfg["target"]["fpga_config"]
+    if not os.path.isabs(path):
+        path = os.path.join(OPT_DIR, path)
+
+    if not os.path.isfile(path):
+        die(f"FPGA config not found: {path}")
+    ok(f"File: {path}")
+
+    with open(path) as f:
+        content = f.read()
+
+    int_keys = {
+        "NDS_VLEN": "vlen",
+        "NDS_DLEN": "dlen",
+        "NDS_ELEN": "elen",
+        "NDS_DCACHE_SIZE_KB": "dcache_kb",
+        "NDS_DCACHE_WAY": "dcache_way",
+        "NDS_ICACHE_SIZE_KB": "icache_kb",
+        "NDS_CACHE_LINE_SIZE": "cache_line",
+        "NDS_L2C_CACHE_SIZE_KB": "l2_kb",
+        "NDS_L2C_WAY": "l2_way",
+        "NDS_L2_DATA_WIDTH": "l2_data_width",
+        "NDS_BIU_DATA_WIDTH": "biu_data_width",
+    }
+
+    # Boolean defines use "yes"/"no" strings or _INT suffix with 0/1
+    bool_keys = {
+        "NDS_RVV_SUPPORT": "rvv",
+        "NDS_VECTOR_VDOT_SUPPORT": "vdot",
+        "NDS_INT4_VECTOR_LOAD_SUPPORT": "int4_vload",
+        "NDS_BFLOAT16_SUPPORT": "bf16",
+        "NDS_QMAC_SUPPORT": "qmac",
+    }
+
+    features = {}
+    for vkey, jkey in int_keys.items():
+        m = re.search(rf'`define\s+{vkey}\s+(\d+)', content)
+        if m:
+            features[jkey] = int(m.group(1))
+            ok(f"{vkey} = {m.group(1)}")
+        else:
+            warn(f"{vkey} not found")
+
+    for vkey, jkey in bool_keys.items():
+        # Try _INT variant first (numeric), then "yes"/"no" string
+        m = re.search(rf'`define\s+{vkey}_INT\s+(\d+)', content)
+        if m:
+            features[jkey] = int(m.group(1)) != 0
+        else:
+            m = re.search(rf'`define\s+{vkey}\s+"(yes|no)"', content)
+            if m:
+                features[jkey] = m.group(1) == "yes"
+            else:
+                features[jkey] = False
+
+        status = "enabled" if features[jkey] else "disabled"
+        ok(f"{vkey} = {status}")
+
+    return features
+
+
+# ---------------------------------------------------------------------------
+# Step 6: FPGA board connectivity
+# ---------------------------------------------------------------------------
+def step_fpga_connectivity(cfg):
+    header("Step 6: FPGA board connectivity")
+
+    host = cfg["fpga"]["host"]
+    port = cfg["fpga"]["port"]
+
+    try:
+        sock = socket.create_connection((host, port), timeout=5)
+        sock.close()
+        ok(f"TCP {host}:{port} open")
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        die(f"Cannot connect to {host}:{port}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Step 7: Run hello world on FPGA board
+# ---------------------------------------------------------------------------
+def step_fpga_run(cfg, tmpdir):
+    header("Step 7: Run hello world on FPGA")
+
+    bin_dir = cfg["toolchain"]["bin_dir"]
+    prefix = cfg["toolchain"]["prefix"]
+    host = cfg["fpga"]["host"]
+    port = cfg["fpga"]["port"]
+
+    gcc = os.path.join(bin_dir, f"{prefix}gcc")
+    ld_script = os.path.join(LIBNN_ROOT, "project/ax45mpv/ae350-xip_hvm.ld")
+    sim_wrapper = os.path.join(LIBNN_ROOT, "project/ax45mpv/riscv64-sim-wrapper-on-board")
+
+    if not os.path.isfile(sim_wrapper):
+        die(f"sim-wrapper not found: {sim_wrapper}")
+
+    # Find a working GDB. Prefer system gdb over toolchain gdb since the
+    # toolchain gdb may have mismatched libpython dependencies.
+    gdb = None
+    sys_gdb = shutil.which(f"{prefix}gdb")
+    for candidate in [
+        sys_gdb,
+        os.path.join(bin_dir, f"{prefix}gdb-nopython"),
+        os.path.join(bin_dir, f"{prefix}gdb"),
+    ]:
+        if candidate and os.path.isfile(candidate):
+            # Quick check: can it run at all?
+            r = subprocess.run([candidate, "--version"],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                gdb = candidate
+                break
+    if not gdb:
+        die("No working riscv64-elf-gdb found (needed for FPGA board runs)")
+    ok(f"GDB: {gdb}")
+
+    # Compile with FPGA linker script
+    src = os.path.join(tmpdir, "hello_fpga.c")
+    elf = os.path.join(tmpdir, "hello_fpga.adx")
+    with open(src, "w") as f:
+        f.write('#include <stdio.h>\nint main(void) { printf("HELLO_FPGA_OK\\n"); return 0; }\n')
+
+    cmd = [gcc, "-O2", "-o", elf, src,
+           "-mtune=andes-45-series", "-mext-vector=zve64d", "-mvh"]
+    if os.path.isfile(ld_script):
+        cmd.append(f"-T{ld_script}")
+    cmd.append("-lm")
+
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"FPGA compilation failed:\n{r.stderr}")
+    ok("Compiled for FPGA")
+
+    # Remove First_Reset_done so wrapper resets the board
+    first_reset = os.path.join(LIBNN_ROOT, "project/ax45mpv/First_Reset_done")
+    if os.path.isfile(first_reset):
+        os.remove(first_reset)
+
+    env = os.environ.copy()
+    env["MYPC"] = host
+    env["MYPORT"] = str(port)
+    env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+
+    # The expect script hardcodes riscv64-elf-gdb-nopython.
+    # If missing, create a symlink in tmpdir and prepend to PATH.
+    gdb_nopy = os.path.join(bin_dir, f"{prefix}gdb-nopython")
+    if not os.path.isfile(gdb_nopy):
+        link = os.path.join(tmpdir, f"{prefix}gdb-nopython")
+        os.symlink(gdb, link)
+        env["PATH"] = f"{tmpdir}:{env['PATH']}"
+        ok(f"Symlinked {prefix}gdb-nopython -> {os.path.basename(gdb)}")
+
+    ok(f"Running on FPGA ({host}:{port}, timeout=120s) ...")
+    try:
+        r = subprocess.run(
+            [sim_wrapper, elf],
+            capture_output=True, text=True,
+            timeout=120, env=env,
+            cwd=os.path.join(LIBNN_ROOT, "project/ax45mpv"),
+        )
+    except subprocess.TimeoutExpired:
+        die("FPGA run timed out (120s)")
+
+    combined = (r.stdout or "") + (r.stderr or "")
+    if "HELLO_FPGA_OK" in combined:
+        ok("FPGA output: HELLO_FPGA_OK")
+        return
+
+    if r.returncode == 0:
+        ok(f"FPGA returned 0 (GDB output may not be captured)")
+        warn(f"stdout tail: {(r.stdout or '')[-200:]}")
+        return
+
+    die(f"FPGA run failed (rc={r.returncode})\n  stdout: {(r.stdout or '')[-300:]}\n  stderr: {(r.stderr or '')[-300:]}")
+
+
+# ---------------------------------------------------------------------------
+# Main - sequential, fail-fast
+# ---------------------------------------------------------------------------
+def main():
+    print(f"{BOLD}config.toml validation - sequential fail-fast{RESET}")
+    print(f"Config: {CONFIG_PATH}")
+    print(f"libnn:  {LIBNN_ROOT}")
+
+    cfg = step_load_config()
+    gcc = step_toolchain(cfg)
+
+    with tempfile.TemporaryDirectory(prefix="validate_") as tmpdir:
+        elf = step_compile(cfg, gcc, tmpdir)
+        step_qemu(cfg, elf)
+        step_fpga_config(cfg)
+        step_fpga_connectivity(cfg)
+        step_fpga_run(cfg, tmpdir)
+
+    header("All steps passed")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,2 @@
+- [Do not modify config.toml](feedback_no_modify_config.md) - config.toml is user-owned, LLM must never edit it
+- [Never commit system.log](feedback_no_commit_systemlog.md) - opt/log/system.log* must never be git committed

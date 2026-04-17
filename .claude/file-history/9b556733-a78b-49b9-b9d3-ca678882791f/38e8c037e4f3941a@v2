@@ -1,0 +1,70 @@
+# Optimization Report: conv_HWC_s8_s8_s8_sym_bias_fast
+
+## Summary
+
+| Metric | Baseline | Optimized | Delta |
+|--------|----------|-----------|-------|
+| Cycles | 2,294,079 | 553,088 | **-75.9%** |
+| Instructions | 1,698,203 | 325,140 | -80.9% |
+| IPC | 1.35 | 0.59 | -0.76 |
+| QEMU correctness | 3/3 pass | 3/3 pass | - |
+
+## Target
+
+- Function: `riscv_nn_conv_HWC_s8_s8_s8_sym_bias_fast`
+- CPU: AX45MPV, VLEN=1024, 32KB D-cache, 8MB L2
+- Perf test: 22x22x128 input, 3x3 kernel, 32 out_ch, stride=1, pad=0
+
+## Change
+
+**File:** `Source/ConvolutionFunctions/riscv_nn_conv_HWC_s8_s8_s8_sym_bias_fast.c` line 51
+
+**Diff:** Single preprocessor guard addition:
+```diff
+-#if defined(ENA_VEC_ISA) && defined(ENA_TILING)
++#if defined(ENA_VEC_ISA) && defined(ENA_TILING) && !defined(ENA_AGENT_OPT_CONV_HWC_S8_S8_S8_SYM_BIAS_FAST)
+```
+
+**Macro:** `ENA_AGENT_OPT_CONV_HWC_S8_S8_S8_SYM_BIAS_FAST`
+
+## Root Cause Analysis
+
+The tiling matmul path (`vec_mat_mul_rvv_tiling_vq`) uses `vqmacc_vx` with LMUL=M2
+at SEW=E8. With VLEN=1024, VLMAX=256 e8 elements. But this function's output
+dimension (col2) is only 32 (= out_tensor_ch), meaning only 32 of 256 vector
+lanes are active -- **12.5% vector utilization**.
+
+The non-tiling path uses `nn_mat_mul_kernel_q7_bias_2sft` with `vd4dots_vv` at
+LMUL=M2 for dot-product reductions along the 1152-element im2col columns.
+At e8/m2, VLMAX=256 elements per pass, processing the full 1152 elements in ~5
+passes with near-100% lane utilization.
+
+Additionally, the tiling path has overhead from:
+- Weight matrix transpose (nn_mat_mul_kernel_tiling_transpose_q7)
+- Output buffer zero-initialization
+- Separate bias + quantization post-processing loop
+
+The non-tiling path fuses bias addition and 2-stage shift into the matmul kernel.
+
+## IPC Analysis
+
+IPC dropped from 1.35 to 0.59 despite the massive cycle reduction. This is because
+the non-tiling path loads the full 36KB weight matrix for each pair of output pixels
+(200 pairs x 36KB = 7.2MB total weight traffic), and the weights exceed the 32KB
+D-cache. The tiling path amortized weight loads across 256 pixels, but at the cost
+of 87.5% wasted compute.
+
+## Rejected Iteration
+
+Iteration 2 attempted 4-pixel batching via `nn_mat_mul_kernel_q7_bias_2sft_unroll4`
+to halve weight traffic. This failed correctness (2/3 tests) due to a latent bug
+in the unroll4 function: the weight pointer `pA` advances by 1 row per iteration
+instead of 4, causing overlapping channel computation. The bug is masked when
+`out_tensor_ch % 4 == 0` but produces wrong results otherwise.
+
+## Iterations
+
+| Iter | Proposal | Cycles | Delta | Status |
+|------|----------|--------|-------|--------|
+| 1 | Bypass tiling for vd4dots path | 553,088 | -75.9% | Accepted |
+| 2 | 4-pixel unroll4 batching | N/A | N/A | Rejected (correctness) |

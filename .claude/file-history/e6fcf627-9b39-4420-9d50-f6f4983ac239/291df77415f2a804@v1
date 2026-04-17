@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+################################################################################
+# Build and run a single libnn unit test on AX45MPV FPGA board via GDB
+# Captures cycle counts from PF_COUNTER output.
+#
+# Usage:
+#   run_fpga_test.sh <test_name> [--timeout N] [--config <config.toml>]
+#
+# Examples:
+#   run_fpga_test.sh conv_HWC_s8_s8_s8_RGB_sft_bias --config /path/to/config.toml
+#   run_fpga_test.sh relu_s8 --timeout 600
+################################################################################
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_ROOT="${LIBNN_ROOT:-/home/nick/work/agentic_libnn_opt}"
+
+# Defaults
+TIMEOUT=300
+TEST_NAME=""
+CONFIG_TOML=""
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --timeout) TIMEOUT="$2"; shift 2 ;;
+        --config)  CONFIG_TOML="$2"; shift 2 ;;
+        -*)        echo "Unknown option: $1" >&2; exit 1 ;;
+        *)         TEST_NAME="$1"; shift ;;
+    esac
+done
+
+if [ -z "${TEST_NAME}" ]; then
+    echo "Usage: $0 <test_name> [--timeout N] [--config <config.toml>]" >&2
+    exit 1
+fi
+
+# Load config if provided, else use hardcoded defaults
+TOOLCHAIN_BIN="/local/nick/SW_Release_cp/ast530/nds64le-elf-newlib-v5d/bin"
+FPGA_HOST="sw-boards.andestech.com"
+FPGA_PORT="1115"
+
+if [ -n "${CONFIG_TOML}" ]; then
+    source "${SCRIPT_DIR}/parse_config.sh" "${CONFIG_TOML}"
+    TOOLCHAIN_BIN="${CFG_TOOLCHAIN_BIN:-${TOOLCHAIN_BIN}}"
+    FPGA_HOST="${CFG_FPGA_HOST:-${FPGA_HOST}}"
+    FPGA_PORT="${CFG_FPGA_PORT:-${FPGA_PORT}}"
+    TIMEOUT="${CFG_FPGA_TIMEOUT:-${TIMEOUT}}"
+fi
+
+# Paths
+UNIT_TEST_DIR="${LIB_ROOT}/Examples/unit_func"
+TEST_SRC="${UNIT_TEST_DIR}/t_${TEST_NAME}.c"
+WORK_DIR="${SCRIPT_DIR}/work"
+BOARD_DIR="${LIB_ROOT}/project/ax45mpv"
+WRAPPER="${BOARD_DIR}/riscv64-sim-wrapper-on-board"
+
+# FPGA board connection (env vars override config, config overrides defaults)
+export MYPC="${MYPC:-${FPGA_HOST}}"
+export MYPORT="${MYPORT:-${FPGA_PORT}}"
+
+# Validate
+for f in "${TOOLCHAIN_BIN}/riscv64-elf-gcc" "${TEST_SRC}" "${WRAPPER}"; do
+    if [ ! -f "$f" ]; then
+        echo "ERROR: Not found: $f" >&2
+        exit 1
+    fi
+done
+
+# Create gdb-nopython symlink if needed (GDB expect script requires it)
+GDB_REAL="${TOOLCHAIN_BIN}/riscv64-elf-gdb"
+GDB_NOPYTHON="${TOOLCHAIN_BIN}/riscv64-elf-gdb-nopython"
+GDB_EXTRA_PATH=""
+if [ -f "${GDB_REAL}" ] && [ ! -e "${GDB_NOPYTHON}" ]; then
+    GDB_TMPDIR=$(mktemp -d /tmp/fpga_gdb_XXXXXX)
+    ln -sf "${GDB_REAL}" "${GDB_TMPDIR}/riscv64-elf-gdb-nopython"
+    GDB_EXTRA_PATH="${GDB_TMPDIR}:"
+fi
+
+export PATH="${GDB_EXTRA_PATH}${TOOLCHAIN_BIN}:${LIB_ROOT}:${PATH}"
+mkdir -p "${WORK_DIR}"
+
+# Check libnn.a exists
+LIBNN="${LIB_ROOT}/libnn.a"
+if [ ! -f "${LIBNN}" ]; then
+    echo "ERROR: libnn.a not found. Run build_libnn.sh first." >&2
+    exit 1
+fi
+
+# Compile with performance counters
+CC="riscv64-elf-gcc"
+ADX="${WORK_DIR}/t_${TEST_NAME}_perf.adx"
+OBJDUMP_FILE="${WORK_DIR}/t_${TEST_NAME}_perf.objdump"
+
+echo "[compile] ${TEST_NAME} (with PF_COUNTER)"
+${CC} -O3 -Wall -Werror -ffunction-sections -fdata-sections -Wl,-gc-sections \
+    -DPF_COUNTER -mvh -DENA_FS_VS -DENA_FAST_ALGO \
+    -mtune=andes-45-series -mext-vector=zve64d -DNDS_VEC_RVV_VERSION=1000 \
+    -DENA_RUN_TWICE -DENA_CACHEABLE_ENV_SETUP -mzfh \
+    -DENA_TEST_PERF -DENA_DUMP_PARAMETERS \
+    -DENA_DUMP_GOLDEN=0 -DENA_MEASURE_PERF=1 \
+    -DGETENV_TESTDIR="${UNIT_TEST_DIR}" \
+    -I"${TOOLCHAIN_BIN}/../riscv64-elf/include" \
+    -I"${UNIT_TEST_DIR}/include" \
+    -I"${LIB_ROOT}/Include" \
+    -o "${ADX}" "${TEST_SRC}" "${LIBNN}" -lm 2>&1
+
+if [ $? -ne 0 ]; then
+    echo "RESULT: COMPILE_ERROR" >&2
+    exit 1
+fi
+
+# Generate objdump for analysis
+riscv64-elf-objdump -d "${ADX}" > "${OBJDUMP_FILE}" 2>/dev/null || true
+
+# Reset board state
+rm -f "${BOARD_DIR}/First_Reset_done"
+
+# Run on FPGA via GDB expect script
+echo "[run] FPGA board ${MYPC}:${MYPORT} (timeout=${TIMEOUT}s)"
+LOG="${WORK_DIR}/fpga_${TEST_NAME}.log"
+
+timeout "${TIMEOUT}" "${WRAPPER}" "${ADX}" 2>&1 | tee "${LOG}"
+FPGA_RC=${PIPESTATUS[0]}
+
+echo ""
+
+if [ "${FPGA_RC}" -eq 124 ]; then
+    echo "RESULT: TIMEOUT (${TIMEOUT}s)"
+    exit 1
+fi
+
+# Parse cycle counts
+CYCLE_COUNT=$(grep -o "The cycle count is [0-9]*" "${LOG}" | tail -1 | grep -o "[0-9]*" || echo "")
+INST_COUNT=$(grep -o "The inst count is [0-9]*" "${LOG}" | tail -1 | grep -o "[0-9]*" || echo "")
+
+# Parse accuracy
+if grep -qi "accuracy checking pass" "${LOG}"; then
+    PASS_COUNT=$(grep -ci "accuracy checking pass" "${LOG}" || true)
+    FAIL_COUNT=$(grep -ci "accuracy checking fail\|accuracy checking FAIL" "${LOG}" || true)
+
+    echo "--- FPGA Results ---"
+    echo "  Cycles: ${CYCLE_COUNT:-unknown}"
+    echo "  Instructions: ${INST_COUNT:-unknown}"
+    if [ -n "${CYCLE_COUNT}" ] && [ -n "${INST_COUNT}" ]; then
+        IPC=$(python3 -c "print(f'{${INST_COUNT}/${CYCLE_COUNT}:.2f}')" 2>/dev/null || echo "?")
+        echo "  IPC: ${IPC}"
+    fi
+    echo "  Accuracy: ${PASS_COUNT} pass, ${FAIL_COUNT} fail"
+    echo "  ADX: ${ADX}"
+    echo "  Objdump: ${OBJDUMP_FILE}"
+    echo "---"
+
+    if [ "${FAIL_COUNT}" -gt 0 ]; then
+        echo "RESULT: FAIL"
+        exit 1
+    else
+        echo "RESULT: PASS (cycles=${CYCLE_COUNT})"
+        exit 0
+    fi
+else
+    echo "RESULT: UNKNOWN (no pass/fail detected)"
+    exit 1
+fi

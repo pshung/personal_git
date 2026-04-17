@@ -6,7 +6,7 @@ if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]
 fi
 
 export
-PATH=~/.python_venv/bin/:/home/nick/myusr/bin:/home/nick/myusr/local/bin:/home/nick/mybin/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/bin/vendor_perl:/home/nick/myTool/arcanist/bin:/usr/share:/home/nick/.cargo/bin/:/home/nick/.local/bin
+PATH=~/.nix-profile/bin/:~/.python_venv/bin/:/home/nick/myusr/bin:/home/nick/myusr/local/bin:/home/nick/mybin/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/bin/vendor_perl:/home/nick/myTool/arcanist/bin:/usr/share:/home/nick/.cargo/bin/:/home/nick/.local/bin
 
 DEFAULT_EDITOR='/usr/bin/nvim'
 
@@ -175,10 +175,28 @@ function append_path {
   export PATH=$PATH:$1
 }
 
+# less: render .md files with glow, pass everything else to real less
+function less() {
+  local md_found=0 args=()
+  for arg in "$@"; do
+    if [[ "$arg" == *.md ]]; then
+      md_found=1
+    fi
+    args+=("$arg")
+  done
+  if (( md_found )); then
+    glow -n -t "${args[@]}"
+  else
+    command less "${args[@]}"
+  fi
+}
+
 
 #########################################################################
 # Custom Aliases
 #########################################################################
+alias ls='eza --icons --group-directories-first'
+alias ll='eza -lh --icons --git'
 
 # define an associative key-value array
 typeset -A disabledCMD=(
@@ -248,6 +266,8 @@ alias f="\fd"
 alias v="\$DEFAULT_EDITOR"
 # wiki
 alias w="wiki"
+# bat
+alias r="bat"
 
 #########################################################################
 # short name (two characters)

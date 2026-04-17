@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Tests for iterate phase bash scripts: parse_config.sh, rebuild_single.sh,
+run_qemu_test.sh, run_fpga_test.sh.
+
+Unit tests use mocked/temp configs. Integration tests hit real toolchain/QEMU/FPGA.
+Mark integration tests with 'integration' in name so they can be filtered.
+"""
+
+import json
+import os
+import subprocess
+import tempfile
+import unittest
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.normpath(os.path.join(TEST_DIR, ".."))
+OPT_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
+CONFIG_PATH = os.path.join(OPT_DIR, "config.toml")
+STATE_PATH = os.path.join(OPT_DIR, "state.json")
+LIBNN_ROOT = os.path.normpath(os.path.join(OPT_DIR, "../.."))
+
+PARSE_CONFIG = os.path.join(SCRIPT_DIR, "parse_config.sh")
+REBUILD_SINGLE = os.path.join(SCRIPT_DIR, "rebuild_single.sh")
+RUN_QEMU_TEST = os.path.join(SCRIPT_DIR, "run_qemu_test.sh")
+RUN_FPGA_TEST = os.path.join(SCRIPT_DIR, "run_fpga_test.sh")
+
+
+def run_bash(cmd, timeout=30):
+    """Run a bash command string and return CompletedProcess."""
+    return subprocess.run(
+        ["/usr/bin/bash", "-c", cmd],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def load_state():
+    with open(STATE_PATH) as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# parse_config.sh
+# ---------------------------------------------------------------------------
+
+class TestParseConfig(unittest.TestCase):
+
+    def test_exports_all_cfg_vars(self):
+        cmd = (
+            f'source {PARSE_CONFIG} {CONFIG_PATH} && '
+            f'echo "$CFG_TOOLCHAIN_BIN|$CFG_TOOLCHAIN_PREFIX|$CFG_QEMU_BIN|'
+            f'$CFG_QEMU_VLEN|$CFG_FPGA_HOST|$CFG_FPGA_PORT|$CFG_CPU"'
+        )
+        result = run_bash(cmd)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parts = result.stdout.strip().split("|")
+        self.assertEqual(len(parts), 7)
+        # All non-empty
+        for i, name in enumerate([
+            "TOOLCHAIN_BIN", "TOOLCHAIN_PREFIX", "QEMU_BIN",
+            "QEMU_VLEN", "FPGA_HOST", "FPGA_PORT", "CPU",
+        ]):
+            self.assertTrue(len(parts[i]) > 0, f"CFG_{name} is empty")
+
+    def test_toolchain_bin_matches_config(self):
+        cmd = f'source {PARSE_CONFIG} {CONFIG_PATH} && echo "$CFG_TOOLCHAIN_BIN"'
+        result = run_bash(cmd)
+        self.assertIn("nds64le-elf-newlib-v5d/bin", result.stdout.strip())
+
+    def test_fpga_port_matches_config(self):
+        cmd = f'source {PARSE_CONFIG} {CONFIG_PATH} && echo "$CFG_FPGA_PORT"'
+        result = run_bash(cmd)
+        self.assertEqual(result.stdout.strip(), "1119")
+
+    def test_qemu_vlen_matches_config(self):
+        cmd = f'source {PARSE_CONFIG} {CONFIG_PATH} && echo "$CFG_QEMU_VLEN"'
+        result = run_bash(cmd)
+        self.assertEqual(result.stdout.strip(), "1024")
+
+    def test_missing_file_is_noop(self):
+        cmd = f'source {PARSE_CONFIG} /nonexistent/config.toml && echo "ok"'
+        result = run_bash(cmd)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("ok", result.stdout)
+
+    def test_custom_config_values(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
+            f.write(
+                '[toolchain]\n'
+                'bin_dir = "/custom/bin"\n'
+                'prefix = "custom-prefix-"\n'
+                '[qemu]\n'
+                'binary = "/custom/qemu"\n'
+                'vlen = 512\n'
+                'timeout = 60\n'
+                '[fpga]\n'
+                'host = "my-fpga.local"\n'
+                'port = 9999\n'
+                '[target]\n'
+                'cpu = "TEST_CPU"\n'
+            )
+            f.flush()
+            cmd = (
+                f'source {PARSE_CONFIG} {f.name} && '
+                f'echo "$CFG_TOOLCHAIN_BIN|$CFG_FPGA_PORT|$CFG_QEMU_VLEN|$CFG_CPU"'
+            )
+            result = run_bash(cmd)
+            os.unlink(f.name)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parts = result.stdout.strip().split("|")
+        self.assertEqual(parts[0], "/custom/bin")
+        self.assertEqual(parts[1], "9999")
+        self.assertEqual(parts[2], "512")
+        self.assertEqual(parts[3], "TEST_CPU")
+
+
+# ---------------------------------------------------------------------------
+# rebuild_single.sh
+# ---------------------------------------------------------------------------
+
+class TestRebuildSingle(unittest.TestCase):
+
+    def test_missing_source_file_exits_error(self):
+        result = run_bash(
+            f'/usr/bin/bash {REBUILD_SINGLE} /nonexistent/file.c '
+            f'--config {CONFIG_PATH} 2>&1'
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ERROR", result.stdout + result.stderr)
+
+    def test_no_args_prints_usage(self):
+        result = run_bash(f'/usr/bin/bash {REBUILD_SINGLE} 2>&1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Usage", result.stdout + result.stderr)
+
+    def test_unknown_option_exits_error(self):
+        result = run_bash(f'/usr/bin/bash {REBUILD_SINGLE} --bogus 2>&1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unknown option", result.stdout + result.stderr)
+
+    def test_integration_rebuild_with_config(self):
+        src = "Source/ConvolutionFunctions/riscv_nn_conv_HWC_s8_s8_s8_RGB_sft_bias.c"
+        result = run_bash(
+            f'/usr/bin/bash {REBUILD_SINGLE} {src} --config {CONFIG_PATH} 2>&1',
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("[done]", result.stdout)
+        self.assertIn("[rebuild]", result.stdout)
+        self.assertIn("[archive]", result.stdout)
+
+    def test_integration_rebuild_with_extra_cflags(self):
+        src = "Source/ConvolutionFunctions/riscv_nn_conv_HWC_s8_s8_s8_RGB_sft_bias.c"
+        macro = "-DENA_AGENT_OPT_CONV_HWC_S8_S8_S8_RGB_SFT_BIAS"
+        result = run_bash(
+            f'/usr/bin/bash {REBUILD_SINGLE} {src} '
+            f'--config {CONFIG_PATH} --extra-cflags "{macro}" 2>&1',
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("[done]", result.stdout)
+
+
+# ---------------------------------------------------------------------------
+# run_qemu_test.sh
+# ---------------------------------------------------------------------------
+
+class TestRunQemuTest(unittest.TestCase):
+
+    def test_no_args_prints_usage(self):
+        result = run_bash(f'/usr/bin/bash {RUN_QEMU_TEST} 2>&1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Usage", result.stdout + result.stderr)
+
+    def test_bad_test_name_fails(self):
+        result = run_bash(
+            f'/usr/bin/bash {RUN_QEMU_TEST} nonexistent_func_xyz '
+            f'--strace --config {CONFIG_PATH} 2>&1',
+            timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_integration_qemu_correctness_pass(self):
+        state = load_state()
+        func = state["function"]
+        result = run_bash(
+            f'/usr/bin/bash {RUN_QEMU_TEST} {func} '
+            f'--strace --config {CONFIG_PATH} 2>&1',
+            timeout=360,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("RESULT: PASS", result.stdout)
+
+
+# ---------------------------------------------------------------------------
+# run_fpga_test.sh
+# ---------------------------------------------------------------------------
+
+class TestRunFpgaTest(unittest.TestCase):
+
+    def test_no_args_prints_usage(self):
+        result = run_bash(f'/usr/bin/bash {RUN_FPGA_TEST} 2>&1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Usage", result.stdout + result.stderr)
+
+    def test_bad_test_name_fails(self):
+        result = run_bash(
+            f'/usr/bin/bash {RUN_FPGA_TEST} nonexistent_func_xyz '
+            f'--config {CONFIG_PATH} 2>&1',
+            timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_integration_fpga_perf_pass(self):
+        state = load_state()
+        func = state["function"]
+        result = run_bash(
+            f'/usr/bin/bash {RUN_FPGA_TEST} {func} '
+            f'--config {CONFIG_PATH} 2>&1',
+            timeout=600,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("RESULT: PASS", result.stdout)
+        self.assertIn("Cycles:", result.stdout)
+        self.assertIn("Instructions:", result.stdout)
+
+    def test_integration_fpga_uses_config_port(self):
+        state = load_state()
+        func = state["function"]
+        result = run_bash(
+            f'/usr/bin/bash {RUN_FPGA_TEST} {func} '
+            f'--config {CONFIG_PATH} 2>&1',
+            timeout=600,
+        )
+        # Should use port 1119 from config.toml, not default 1115
+        self.assertIn(":1119", result.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+################################################################################
+# Incrementally rebuild a single source file and update libnn.a
+# ~100x faster than full build.sh (1 file vs ~400 files)
+#
+# Usage:
+#   rebuild_single.sh <source_file.c> [--config <config.toml>] [--extra-cflags <flags>]
+#
+# Examples:
+#   rebuild_single.sh Source/ConvolutionFunctions/riscv_nn_conv_HWC_s8_s8_s8_RGB_sft_bias.c
+#   rebuild_single.sh Source/ConvolutionFunctions/riscv_nn_conv_HWC_s8_s8_s8_RGB_sft_bias.c \
+#     --config /path/to/config.toml \
+#     --extra-cflags "-DENA_AGENT_OPT_CONV_HWC_S8_S8_S8_RGB_SFT_BIAS"
+#
+# Prerequisites:
+#   - libnn.a must already exist (run build_libnn.sh first for initial build)
+#   - lib_objs/ directory must exist from prior build
+################################################################################
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_ROOT="${LIBNN_ROOT:-/home/nick/work/agentic_libnn_opt}"
+
+# Parse arguments
+SRC_FILE=""
+CONFIG_TOML=""
+EXTRA_CFLAGS=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --config)       CONFIG_TOML="$2"; shift 2 ;;
+        --extra-cflags) EXTRA_CFLAGS="$2"; shift 2 ;;
+        -*)             echo "Unknown option: $1" >&2; exit 1 ;;
+        *)              SRC_FILE="$1"; shift ;;
+    esac
+done
+
+if [ -z "${SRC_FILE}" ]; then
+    echo "Usage: $0 <source_file.c> [--config <config.toml>] [--extra-cflags <flags>]" >&2
+    exit 1
+fi
+
+# Resolve to absolute path if relative
+if [[ "${SRC_FILE}" != /* ]]; then
+    SRC_FILE="${LIB_ROOT}/${SRC_FILE}"
+fi
+
+if [ ! -f "${SRC_FILE}" ]; then
+    echo "ERROR: Source file not found: ${SRC_FILE}" >&2
+    exit 1
+fi
+
+# Load config if provided, else use hardcoded defaults
+TOOLCHAIN_BIN="/local/nick/SW_Release_cp/ast530/nds64le-elf-newlib-v5d/bin"
+
+if [ -n "${CONFIG_TOML}" ]; then
+    source "${SCRIPT_DIR}/parse_config.sh" "${CONFIG_TOML}"
+    TOOLCHAIN_BIN="${CFG_TOOLCHAIN_BIN:-${TOOLCHAIN_BIN}}"
+fi
+
+export PATH="${TOOLCHAIN_BIN}:${PATH}"
+
+CC="riscv64-elf-gcc"
+AR="riscv64-elf-ar"
+RANLIB="riscv64-elf-ranlib"
+OBJDUMP="riscv64-elf-objdump"
+
+OBJ_DIR="${LIB_ROOT}/lib_objs"
+LIBNN="${LIB_ROOT}/libnn.a"
+
+# Verify prerequisites
+if [ ! -f "${LIBNN}" ]; then
+    echo "ERROR: libnn.a not found. Run build_libnn.sh first." >&2
+    exit 1
+fi
+if [ ! -d "${OBJ_DIR}" ]; then
+    echo "ERROR: lib_objs/ not found. Run build_libnn.sh first." >&2
+    exit 1
+fi
+
+# AX45MPV build flags (must match build.sh ax45mpv config)
+CFLAGS="-I${LIB_ROOT}/Include -I${LIB_ROOT}/internal -c"
+CFLAGS+=" -Wall -Werror -O3 -ffunction-sections -fdata-sections"
+CFLAGS+=" -mtune=andes-45-series -fno-strict-aliasing"
+CFLAGS+=" -mext-vector -DENA_VEC_ISA -DMAX_VLEN=1024"
+CFLAGS+=" -DNDS_VEC_RVV_VERSION=1000 -DENA_NDS_V5_VEC_DOT_PROD"
+CFLAGS+=" -fno-tree-slp-vectorize -fno-tree-vectorize"
+
+# Detect zfh support
+if ${CC} -mzfh -E -dM ${CFLAGS} - < /dev/null &> /dev/null; then
+    ${CC} -mzfh -E -dM ${CFLAGS} - < /dev/null 2>/dev/null | grep -q '__riscv_float_abi_single\|__riscv_float_abi_double' && CFLAGS+=" -mzfh"
+fi
+
+# Append extra CFLAGS if provided
+if [ -n "${EXTRA_CFLAGS}" ]; then
+    CFLAGS+=" ${EXTRA_CFLAGS}"
+fi
+
+# Object file name (strip path, change .c to .o)
+OBJ_NAME="$(basename "${SRC_FILE}" .c).o"
+OBJ_FILE="${OBJ_DIR}/${OBJ_NAME}"
+
+# Step 1: Recompile single file
+echo "[rebuild] ${SRC_FILE##*/}"
+${CC} ${CFLAGS} -o "${OBJ_FILE}" "${SRC_FILE}"
+
+# Step 2: Replace object in archive
+echo "[archive] updating ${OBJ_NAME} in libnn.a"
+${AR} rD "${LIBNN}" "${OBJ_FILE}"
+${RANLIB} -D "${LIBNN}"
+
+# Step 3: Regenerate objdump
+echo "[objdump] libnn.objdump"
+${OBJDUMP} -S "${LIBNN}" > "${LIB_ROOT}/libnn.objdump"
+
+echo "[done] Rebuilt ${OBJ_NAME} in $(date +%Ts)"

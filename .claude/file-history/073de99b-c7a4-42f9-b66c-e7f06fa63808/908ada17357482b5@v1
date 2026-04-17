@@ -1,0 +1,367 @@
+---
+name: libnn-optimizer
+description: |
+  Autonomous optimization workflow for libnn RISC-V neural network library functions
+  in the agentic_libnn_opt project. Use this skill when the user wants to optimize a
+  libnn function for FPGA performance, run the libnn optimization loop, validate the
+  optimization config, parse FPGA hardware features, extract shapes from perf test files,
+  or manage the optimization state machine. Trigger when: user mentions "optimize",
+  "libnn", "FPGA perf", "optimization loop", "validate config",
+  "phase validate/gather/baseline/iterate/evaluate", "perf test", or references opt/config.toml,
+  opt/state.json, or any libnn function optimization task.
+argument-hint: "[validate|gather|baseline|iterate|status|reset] [pattern]"
+allowed-tools: Read, Grep, Glob, Bash, Edit, Write, Agent
+---
+
+# libnn Optimizer
+
+Autonomous optimization of libnn NN operator functions targeting RISC-V FPGA hardware.
+Six-phase FSM: validate -> gather -> baseline -> iterate -> evaluate -> done.
+State persisted in `opt/state.json`.
+
+## Commands
+
+- `/libnn-optimizer validate` - Run Phase 0: config validation (pass -> gather, fail -> report)
+- `/libnn-optimizer gather <pattern>` - Run Phase 1: resolve function via pattern match, parse task spec + target features
+- `/libnn-optimizer baseline` - Run Phase 2: measure unmodified library
+- `/libnn-optimizer iterate` - Run Phase 3: one optimization iteration
+- `/libnn-optimizer status` - Show current state from opt/state.json
+- `/libnn-optimizer reset` - Rotate system.log, reset state to `validate` phase
+
+Arguments received: `$ARGUMENTS`
+
+## Project Paths
+
+| Path | Purpose |
+|------|---------|
+| `$CWD/opt/config.toml` | Target config (user-owned, NEVER modify) |
+| `$CWD/opt/state.json` | Optimization state (LLM reads/writes) |
+| `$CWD/opt/script/` | Validation and helper scripts |
+| `$CWD/opt/fpga_config/` | FPGA Verilog .inc files |
+| `$CWD/opt/patches/` | Per-iteration diffs (audit trail) |
+| `$CWD/opt/build/` | Build artifacts |
+| `$CWD/opt/log/` | Build/test/perf logs |
+| `$CWD/opt/log/system.log` | Structured JSONL event log (append-only) |
+| `$CWD/plan.md` | Full implementation plan |
+| `/home/nick/work/libnn/` | libnn source tree |
+
+## System Logging
+
+Append-only JSONL log at `opt/log/system.log`. One JSON object per line. Used for human review and LLM evaluator feedback.
+
+### Log Entry Schema
+
+Every entry has these common fields:
+
+```json
+{"ts": "<ISO-8601>", "phase": "<phase_name>", "event": "<event_type>", "status": "<ok|fail|skip>", "duration_s": <float>, "detail": {}}
+```
+
+### Event Types by Phase
+
+| Phase | Events | Detail Fields |
+|-------|--------|---------------|
+| validate | `phase_start`, `phase_end` | `{steps_passed, steps_failed, errors[]}` |
+| gather | `phase_start`, `phase_end` | `{function, source_file, shapes_count, features_count}` |
+| baseline | `phase_start`, `phase_end` | `{cycles, instructions, qemu_pass}` |
+| iterate | `iter_start` | `{iteration, proposal_summary, target_lines}` |
+| iterate | `iter_build` | `{iteration, compile_ok, retries}` |
+| iterate | `iter_correctness` | `{iteration, qemu_pass, pass_count, fail_count}` |
+| iterate | `iter_perf` | `{iteration, cycles, instructions, ipc}` |
+| iterate | `iter_end` | `{iteration, accepted, cycles, delta_vs_baseline_pct, delta_vs_best_pct, proposal_summary, change_summary, reject_reason}` |
+| iterate | `loop_exit` | `{reason, total_iterations, best_iteration, best_cycles, speedup_pct}` |
+| evaluate | `phase_start`, `phase_end` | `{best_cycles, confirmed_cycles, delta_pct, qemu_suite_pass}` |
+
+### Logging Rules
+
+1. **Append only.** Never truncate or rewrite system.log.
+2. **Log before and after** each phase transition and each iteration step.
+3. **Include proposal and change summaries** in iterate events so the evaluator can correlate ideas with outcomes.
+4. **Compute deltas** as percentages vs baseline and vs current best.
+5. **On failure**, include error message in `detail.error`.
+6. **Timestamp** in ISO-8601 UTC (`datetime.utcnow().isoformat() + "Z"`).
+
+### How to Append a Log Entry
+
+```python
+import json, datetime, os
+def log_event(phase, event, status="ok", duration_s=0, detail=None):
+    entry = {
+        "ts": datetime.datetime.utcnow().isoformat() + "Z",
+        "phase": phase,
+        "event": event,
+        "status": status,
+        "duration_s": round(duration_s, 2),
+        "detail": detail or {}
+    }
+    log_path = os.path.join(os.environ.get("CWD", "."), "opt/log/system.log")
+    with open(log_path, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+```
+
+In practice the main agent writes log entries inline via python3 one-liners or by reading/appending to the file directly.
+
+## Phase 0: Validate
+
+Initial FSM phase. Validates config.toml and all referenced resources before any optimization work.
+
+**Entry condition:** `phase == "validate"` (initial state) or `/libnn-optimizer validate` command.
+
+```bash
+python3 $CWD/opt/script/validate_config.py --strace
+```
+
+**On pass ("All steps passed"):**
+1. Log `phase_start` then `phase_end` with `status: "ok"` and `{steps_passed, steps_failed: 0}`.
+2. Print full output to the user.
+3. Write/update `opt/state.json` setting `phase` to `"gather"`.
+4. Report: validation passed, ready for gather phase.
+
+**On fail (any step fails):**
+1. Log `phase_end` with `status: "fail"` and `{steps_passed, steps_failed, errors: [...]}`.
+2. Print full output to the user.
+3. Keep `phase` as `"validate"` in state.json (or do not advance).
+4. Report which steps failed. Do NOT proceed to gather.
+
+## Phase 1: Gather
+
+Parse task spec and target features. No builds.
+
+0. **Resolve function name** from user-supplied pattern:
+   ```bash
+   python3 $CWD/opt/script/resolve_function.py <pattern>
+   ```
+   - Exit 0 (one match): use the printed function name, proceed.
+   - Exit 2 (multiple matches): show the numbered list to user, ask them to pick. Re-run with a narrower pattern or use the exact name.
+   - Exit 1 (no match): report error, do NOT proceed.
+
+   Pattern examples: `conv_dw u8 asym`, `relu_s8`, `sigmoid`.
+
+1. **Read config.toml.** Extract toolchain PATH, QEMU binary, FPGA host:port, CPU, VLEN.
+
+2. **Read FPGA .inc file** (path from `[target].fpga_config`, relative to `opt/`). Extract:
+   - Vector: `NDS_VLEN`, `NDS_DLEN`, `NDS_ELEN`
+   - D-cache: `NDS_DCACHE_SIZE_KB`, `NDS_DCACHE_WAY`
+   - I-cache: `NDS_ICACHE_SIZE_KB`, `NDS_CACHE_LINE_SIZE`
+   - L2: `NDS_L2C_CACHE_SIZE_KB`, `NDS_L2C_WAY`, `NDS_L2_DATA_WIDTH`
+   - ISA: `NDS_RVV_SUPPORT`, `NDS_VECTOR_VDOT_SUPPORT`, `NDS_INT4_VECTOR_LOAD_SUPPORT`, `NDS_BFLOAT16_SUPPORT`, `NDS_QMAC_SUPPORT`
+   - Bus: `NDS_BIU_DATA_WIDTH`
+
+   Parse using regex: `` `define\s+<KEY>\s+(\d+) `` for integers, `` `define\s+<KEY>_INT\s+(\d+) `` or `` `define\s+<KEY>\s+"(yes|no)" `` for booleans.
+
+3. **Read source_input** (perf test C file):
+   Parse `#define` block from `Examples/unit_performance/t_pf_<func>.c`. Extract shapes (INPUT_X, INPUT_Y, INPUT_CH, KERNEL_X, etc.), quantization params (OUT_SHIFT, OUT_MULT, offsets, activation min/max), buffer sizes. Resolve function name from `riscv_nn_*()` call site.
+
+4. **Locate baseline source** at `/home/nick/work/libnn/Source/<Category>/riscv_nn_<func>.c`. Record path.
+
+5. **Derive optimization macro:** `ENA_AGENT_OPT_<FUNC_UPPER>`.
+
+6. **Write state.json.** Set `phase` to `"baseline"`.
+
+7. **Log** `phase_end` with `{function, source_file, shapes_count, features_count}`.
+
+**Verification:** state.json must contain:
+- All shapes from the perf test `#define` block
+- `target_features.vlen == 1024`
+- `target_features.dcache_kb == 32`
+- `target_features.l2_kb == 8192`
+- Correct `source_file` path under `Source/`
+
+## Phase 2: Baseline
+
+Measure unmodified library on target. Automated by `run_baseline.py`.
+
+```bash
+python3 $CWD/opt/script/run_baseline.py --json
+```
+
+The script reads `config.toml` + `state.json`, then:
+1. Sets up toolchain PATH and gdb-nopython symlink from config
+2. Builds libnn.a for the configured CPU
+3. Runs QEMU correctness test (strace mode)
+4. Runs FPGA perf measurement with correct host:port from config
+
+**On success** (exit 0, JSON `status == "ok"`):
+1. Parse `cycles` and `instructions` from the JSON output.
+2. Update `state.json`: set `baseline`, initialize `best` to baseline values, set `phase` to `"iterate"`.
+3. Log `phase_end` with `status: "ok"` and `{cycles, instructions, qemu_pass: true}`.
+
+**On failure** (exit 1/2/3):
+1. Log `phase_end` with `status: "fail"` and `{error: "<which step failed>"}`.
+2. Print script output to user.
+3. Keep `phase` as `"baseline"`.
+4. Report which step failed. Do NOT proceed.
+
+Options: `--skip-qemu` (skip correctness), `--skip-fpga` (skip perf), `--extra-cflags <flags>` (extra build flags).
+
+## Phase 3: Iterate
+
+Fully autonomous multi-round optimization loop. No human intervention between iterations.
+Loop until exit condition is met.
+
+### Iterate Scripts
+
+All iterate scripts live in `$CWD/opt/script/` and accept `--config $CWD/opt/config.toml` to read toolchain, QEMU, and FPGA settings from config.toml.
+
+| Script | Purpose | Time |
+|--------|---------|------|
+| `rebuild_single.sh <src> --config <cfg> --extra-cflags <flags>` | Recompile single .c, update libnn.a + objdump | ~1s |
+| `run_qemu_test.sh <test> --strace --config <cfg>` | QEMU correctness (strace for fd 9 capture) | ~10s |
+| `run_fpga_test.sh <test> --config <cfg>` | FPGA cycle count via GDB | ~30s |
+| `parse_config.sh <cfg>` | Shared config parser, sourced by above scripts | - |
+
+### Exit Conditions (any triggers exit to evaluate)
+
+- Proposer finds no optimization opportunity
+- 2 consecutive iterations without >= `min_improvement_pct` (from config.toml `[limits]`)
+- `iteration >= max_iterations` (from config.toml `[limits]`)
+
+### Autonomous Loop
+
+```
+iterate entry
+  |
+  v
+[1] PROPOSER subagent (read-only Explore agent)
+    - Reads current source, libnn.objdump, history[]
+    - Proposes 1-3 ranked ideas or "no opportunity"
+    - No opportunity -> log loop_exit {reason: "no_opportunity"}, exit to evaluate
+    - LOG iter_start {iteration, proposal_summary, target_lines}
+  |
+  v
+[2] IMPLEMENT subagent (Edit-only agent)
+    - Takes winning idea, edits source under #ifdef ENA_AGENT_OPT_<FUNC>
+    - Baseline #else stays byte-for-byte intact
+    - Returns description of changes
+  |
+  v
+[3] BUILD (main agent, direct)
+    /usr/bin/bash $CWD/opt/script/rebuild_single.sh \
+      Source/<Category>/riscv_nn_<func>.c \
+      --config $CWD/opt/config.toml \
+      --extra-cflags "-DENA_AGENT_OPT_<FUNC>"
+    - On compile error: launch ERROR-FIX subagent (max 3 retries)
+    - LOG iter_build {iteration, compile_ok, retries}
+  |
+  v
+[4] CORRECTNESS (main agent, direct)
+    /usr/bin/bash $CWD/opt/script/run_qemu_test.sh <func> \
+      --strace --config $CWD/opt/config.toml
+    - LOG iter_correctness {iteration, qemu_pass, pass_count, fail_count}
+    - Fail -> revert source (git checkout in libnn), record failure, loop to [1]
+  |
+  v
+[5] PERF (main agent, direct)
+    /usr/bin/bash $CWD/opt/script/run_fpga_test.sh <func> \
+      --config $CWD/opt/config.toml
+    - Parse cycles from "RESULT: PASS (cycles=N)"
+    - Parse instructions from "Instructions: N"
+    - LOG iter_perf {iteration, cycles, instructions, ipc}
+  |
+  v
+[6] ACCEPT/REJECT
+    - accepted = correctness_pass AND new_cycles < best.cycles
+    - Update best if accepted
+    - Append to history[]
+    - Git commit in libnn tree
+    - Save diff to opt/patches/iter_<N>_<func>.patch
+    - LOG iter_end {iteration, accepted, cycles, delta_vs_baseline_pct, delta_vs_best_pct,
+        proposal_summary, change_summary, reject_reason}
+    - Check exit conditions -> log loop_exit {reason, total_iterations, best_iteration,
+        best_cycles, speedup_pct}, exit to evaluate or loop to [1]
+  |
+  v
+[7] Loop back to [1]
+```
+
+### Subagent Roles
+
+**Proposer subagent** (Explore agent, read-only):
+- Tools: Read, Grep, Glob (NO Edit, NO Bash builds)
+- Reads: source file, libnn.objdump (active code path), history[] from state.json
+- On round > 1: reviews prior iteration results to avoid repeating failed approaches
+- Output: 1-3 ranked ideas with what to change, which lines, expected impact, risk
+- If no concrete opportunity: output "no opportunity" -> main agent exits to evaluate
+
+**Implement subagent** (Edit-only):
+- Tools: Read, Grep, Glob, Edit (NO Bash)
+- Takes the winning idea from proposer
+- Edits source under `#ifdef ENA_AGENT_OPT_<FUNC>` / `#else` / `#endif`
+- CRITICAL: Use `NDS_VEC_*` macros only in `ENA_VEC_ISA` blocks. Never `__riscv_*` intrinsics.
+- Output: description of exact code change
+
+**Error-fix subagent** (on compile failure):
+- Tools: Read, Grep, Glob, Edit (NO Bash except grep)
+- Input: compile error output + source file path
+- Fixes the compilation error. Max 3 retries before reverting and looping to proposer.
+
+### Regression Handling
+
+If an iteration regresses (new_cycles >= best.cycles):
+- Revert the source: `git checkout -- <source_file>` in libnn tree
+- Record the failed approach in history[] so proposer avoids it
+- Increment consecutive_no_improvement counter
+- Loop to proposer for next attempt
+
+## Phase 4: Evaluate
+
+1. Log `phase_start`.
+2. Restore `best.commit` in libnn worktree.
+3. Rerun full QEMU suite for touched functions.
+4. Rerun FPGA perf, confirm within +/- 0.5% of `best.cycles`.
+5. Emit `opt/report.md`: baseline -> best cycles, speedup, commit SHA, rationale.
+6. Log `phase_end` with `{best_cycles, confirmed_cycles, delta_pct, qemu_suite_pass}`.
+7. Set `phase` to `"done"`.
+
+## Phase 5: Done
+
+Terminal. Human reviews `opt/report.md`. Winning commits in libnn tree are the deliverable.
+
+## Reset
+
+Triggered by `/libnn-optimizer reset`. Steps:
+
+1. **Rotate system.log** - if `opt/log/system.log` exists, rename to `opt/log/system.log.<YYYYMMDD_HHMMSS>`. Previous runs are preserved for the evaluator.
+2. **Reset state.json** - set `phase` to `"validate"`, clear `iteration`, `baseline`, `best`, `history`, `shapes`, `quant_params`, `buffer_sizes`, `target_features`. Keep `mode` and `function` if present.
+3. Report: state reset, ready for validate.
+
+## State Machine
+
+Read `opt/state.json` field `phase` to determine where to resume:
+
+```
+validate -> gather -> baseline -> iterate (loop) -> evaluate -> done
+```
+
+## State File Format
+
+```json
+{
+  "mode": "single_function",
+  "function": "conv_dw_HWC_u8_u8_u8_asym_bias_any",
+  "source_input": "Examples/unit_performance/t_pf_<func>.c",
+  "source_file": "Source/<Category>/riscv_nn_<func>.c",
+  "macro": "ENA_AGENT_OPT_<FUNC>",
+  "phase": "validate|gather|baseline|iterate|evaluate|done",
+  "iteration": 0,
+  "baseline": {"cycles": 0, "instructions": 0},
+  "best": {"cycles": 0, "instructions": 0, "iteration": 0, "commit": ""},
+  "history": [],
+  "shapes": {},
+  "quant_params": {},
+  "data_types": {"input": "", "weight": "", "output": ""},
+  "buffer_sizes": {},
+  "target_features": {}
+}
+```
+
+## Key Rules
+
+1. **Never modify `opt/config.toml`** -- user-owned configuration.
+2. **Baseline code is never modified** -- optimized paths go under `#ifdef ENA_AGENT_OPT_<FUNC>`.
+3. **QEMU is for correctness only** -- FPGA cycle counts are ground truth.
+4. **Primary target: AX45MPV VLEN=1024** -- do not sacrifice VLEN=1024 perf.
+5. **Use `NDS_VEC_*` macros only** in `ENA_VEC_ISA` blocks. Never `__riscv_*` intrinsics.
+6. Macro naming: `ENA_AGENT_OPT_<FUNC>`.
+7. Validation is Phase 0 of the FSM. Gather phase requires `phase == "gather"` (validation must have passed).
+8. Scripts are the single source of truth for builds and tests -- never construct gcc/QEMU/GDB commands manually.

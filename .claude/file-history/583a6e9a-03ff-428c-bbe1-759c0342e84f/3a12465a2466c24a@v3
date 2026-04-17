@@ -1,0 +1,202 @@
+---
+name: libnn-optimizer
+description: |
+  Autonomous optimization workflow for libnn RISC-V neural network library functions
+  in the agentic_libnn_opt project. Use this skill when the user wants to optimize a
+  libnn function for FPGA performance, run the libnn optimization loop, validate the
+  optimization config, parse FPGA hardware features, extract shapes from perf test files,
+  or manage the optimization state machine. Trigger when: user mentions "optimize",
+  "libnn", "FPGA perf", "optimization loop", "validate config",
+  "phase gather/baseline/iterate/evaluate", "perf test", or references opt/config.toml,
+  opt/state.json, or any libnn function optimization task.
+argument-hint: "[validate|gather|baseline|iterate|status|reset] [function_name]"
+allowed-tools: Read, Grep, Glob, Bash, Edit, Write, Agent
+---
+
+# libnn Optimizer
+
+Autonomous optimization of libnn NN operator functions targeting RISC-V FPGA hardware.
+Five-phase FSM: gather -> baseline -> iterate -> evaluate -> done.
+State persisted in `opt/state.json`.
+
+## Commands
+
+- `/libnn-optimizer validate` - Run config validation (Step 0)
+- `/libnn-optimizer gather <function_perf_test>` - Start Phase 1: parse task spec + target features
+- `/libnn-optimizer baseline` - Run Phase 2: measure unmodified library
+- `/libnn-optimizer iterate` - Run Phase 3: one optimization iteration
+- `/libnn-optimizer status` - Show current state from opt/state.json
+- `/libnn-optimizer reset` - Reset state to initial
+
+Arguments received: `$ARGUMENTS`
+
+## Project Paths
+
+| Path | Purpose |
+|------|---------|
+| `/home/nick/work/agentic_libnn_opt/opt/config.toml` | Target config (user-owned, NEVER modify) |
+| `/home/nick/work/agentic_libnn_opt/opt/state.json` | Optimization state (LLM reads/writes) |
+| `/home/nick/work/agentic_libnn_opt/opt/script/` | Validation and helper scripts |
+| `/home/nick/work/agentic_libnn_opt/opt/fpga_config/` | FPGA Verilog .inc files |
+| `/home/nick/work/agentic_libnn_opt/opt/patches/` | Per-iteration diffs (audit trail) |
+| `/home/nick/work/agentic_libnn_opt/opt/build/` | Build artifacts |
+| `/home/nick/work/agentic_libnn_opt/opt/log/` | Build/test/perf logs |
+| `/home/nick/work/agentic_libnn_opt/plan.md` | Full implementation plan |
+| `/home/nick/work/libnn/` | libnn source tree |
+
+## Step 0: Validate Configuration
+
+Run before any optimization work. Validates config.toml and all referenced resources.
+
+```bash
+python3 /home/nick/work/agentic_libnn_opt/opt/script/validate_config.py --strace
+```
+
+**IMPORTANT:** Run the script, print its full output to the user, and STOP. Do NOT take any further action regardless of pass or fail. The user decides next steps.
+
+Seven sequential checks, fail-fast:
+
+| Step | Check                                                               | On Failure                                   |
+|------|---------------------------------------------------------------------|----------------------------------------------|
+| 1    | Load config.toml - all required sections/keys                       | config.toml                                  |
+| 2    | Toolchain - bin_dir exists, gcc with Andes flags                    | Script suggests alternatives found on system |
+| 3    | Compile hello world using the above toolchain - RISC-V ELF produced | Toolchain issue                              |
+| 4    | QEMU - binary exists, runs hello.adx via strace semihosting         | Check QEMU path                              |
+| 5    | FPGA .inc - parse hardware features (VLEN, cache, ISA)              | Check fpga_config path                       |
+| 6    | FPGA connectivity - TCP to board host:port                          | Network/board issue                          |
+| 7    | FPGA run - compile + run hello on board via GDB                     | Board/GDB issue                              |
+
+## Phase 1: Gather
+
+Parse task spec and target features. No builds.
+
+1. **Read config.toml.** Extract toolchain PATH, QEMU binary, FPGA host:port, CPU, VLEN.
+
+2. **Read FPGA .inc file** (path from `[target].fpga_config`, relative to `opt/`). Extract:
+   - Vector: `NDS_VLEN`, `NDS_DLEN`, `NDS_ELEN`
+   - D-cache: `NDS_DCACHE_SIZE_KB`, `NDS_DCACHE_WAY`
+   - I-cache: `NDS_ICACHE_SIZE_KB`, `NDS_CACHE_LINE_SIZE`
+   - L2: `NDS_L2C_CACHE_SIZE_KB`, `NDS_L2C_WAY`, `NDS_L2_DATA_WIDTH`
+   - ISA: `NDS_RVV_SUPPORT`, `NDS_VECTOR_VDOT_SUPPORT`, `NDS_INT4_VECTOR_LOAD_SUPPORT`, `NDS_BFLOAT16_SUPPORT`, `NDS_QMAC_SUPPORT`
+   - Bus: `NDS_BIU_DATA_WIDTH`
+
+   Parse using regex: `` `define\s+<KEY>\s+(\d+) `` for integers, `` `define\s+<KEY>_INT\s+(\d+) `` or `` `define\s+<KEY>\s+"(yes|no)" `` for booleans.
+
+3. **Read source_input** (perf test or model C file):
+   - **Single mode:** parse `#define` block from `Examples/unit_performance/t_pf_<func>.c`. Extract shapes (INPUT_X, INPUT_Y, INPUT_CH, KERNEL_X, etc.), quantization params (OUT_SHIFT, OUT_MULT, offsets, activation min/max), buffer sizes. Resolve function name from `riscv_nn_*()` call site.
+   - **Model mode:** parse model `.c` and `#include`d param headers. Build ordered `(function, shape-set)` list with call counts.
+
+4. **Locate baseline source** at `/home/nick/work/libnn/Source/<Category>/riscv_nn_<func>.c`. Record path.
+
+5. **Derive optimization macro:** `ENA_AGENT_OPT_<FUNC_UPPER>` (single) or `ENA_AGENT_OPT_<FUNC_UPPER>_S<N>` (model).
+
+6. **Write state.json.** Set `phase` to `"baseline"`.
+
+**Verification:** state.json must contain:
+- All shapes from the perf test `#define` block
+- `target_features.vlen == 1024`
+- `target_features.dcache_kb == 32`
+- `target_features.l2_kb == 8192`
+- Correct `source_file` path under `Source/`
+
+## Phase 2: Baseline
+
+Measure unmodified library on target.
+
+1. Rebuild baseline:
+   ```bash
+   /usr/bin/bash /home/nick/work/libnn/build.sh <cpu>
+   ```
+
+2. QEMU correctness (strace mode for semihosting fd 9):
+   ```bash
+   /usr/bin/bash /home/nick/work/libnn/qemu-validate/run_qemu_test.sh <test> --strace --vlen <vlen>
+   ```
+   Accept only "accuracy checking pass". Failure aborts -- baseline is broken.
+
+3. FPGA perf measurement:
+   ```bash
+   mkdir -p /home/nick/work/libnn/build_perf && cd /home/nick/work/libnn/build_perf
+   /usr/bin/bash /home/nick/work/libnn/test_perf.sh ax45mpv riscv64-elf-gcc BOARD <function>
+   ```
+   Parse `performance.csv` for cycles and instructions.
+
+4. Write `baseline` to state.json. Initialize empty `history`. Set `phase` to `"iterate"`.
+
+## Phase 3: Iterate
+
+One iteration = one candidate optimization. Loop until `max_iterations` or no improvement >= `min_improvement_pct` for 2 consecutive attempts.
+
+Per iteration:
+
+1. **Plan** - Inspect current best source (or baseline on iter 1). Pick one concrete change. Record in `notes`.
+
+2. **Edit** - Modify `Source/<Category>/riscv_nn_<func>.c`: add optimized path under `#ifdef ENA_AGENT_OPT_<FUNC>`. Replace prior iteration's block if present. Baseline `#else` stays byte-for-byte intact.
+
+3. **Build** - Rebuild `libnn.a` twice:
+   - Without macro (sanity -- baseline still compiles)
+   - With `-DENA_AGENT_OPT_<FUNC>` for perf
+
+4. **Correctness** - QEMU strace test. Fail -> `accepted=false`, skip perf.
+
+5. **Perf** - `test_perf.sh`. Collect cycles/instructions.
+
+6. **Commit** - Git commit in libnn tree. Snapshot diff to `opt/patches/iter_<N>_<func>.patch`.
+
+7. **Accept/reject** - `accepted = pass && cycles < best.cycles`. Update `best` if accepted.
+
+8. Append to `history`. Persist state.json.
+
+## Phase 4: Evaluate
+
+1. Restore `best.commit` in libnn worktree.
+2. Rerun full QEMU suite for touched functions.
+3. Rerun FPGA perf, confirm within +/- 0.5% of `best.cycles`.
+4. Model mode only: re-profile all (function, shape-set) pairs.
+5. Emit `opt/report.md`: per-pair baseline -> best cycles, speedup, commit SHA, rationale.
+6. Set `phase` to `"done"`.
+
+## Phase 5: Done
+
+Terminal. Human reviews `opt/report.md`. Winning commits in libnn tree are the deliverable.
+
+## State Machine
+
+Read `opt/state.json` field `phase` to determine where to resume:
+
+```
+gather -> baseline -> iterate (loop) -> evaluate -> done
+```
+
+## State File Format
+
+```json
+{
+  "mode": "single_function|model",
+  "function": "conv_dw_HWC_u8_u8_u8_asym_bias_any",
+  "source_input": "Examples/unit_performance/t_pf_<func>.c",
+  "source_file": "Source/<Category>/riscv_nn_<func>.c",
+  "macro": "ENA_AGENT_OPT_<FUNC>",
+  "phase": "gather|baseline|iterate|evaluate|done",
+  "iteration": 0,
+  "baseline": {"cycles": 0, "instructions": 0},
+  "best": {"cycles": 0, "instructions": 0, "iteration": 0, "commit": ""},
+  "history": [],
+  "shapes": {},
+  "quant_params": {},
+  "data_types": {"input": "", "weight": "", "output": ""},
+  "buffer_sizes": {},
+  "target_features": {}
+}
+```
+
+## Key Rules
+
+1. **Never modify `opt/config.toml`** -- user-owned configuration.
+2. **Baseline code is never modified** -- optimized paths go under `#ifdef ENA_AGENT_OPT_<FUNC>`.
+3. **QEMU is for correctness only** -- FPGA cycle counts are ground truth.
+4. **Primary target: AX45MPV VLEN=1024** -- do not sacrifice VLEN=1024 perf.
+5. **Use `NDS_VEC_*` macros only** in `ENA_VEC_ISA` blocks. Never `__riscv_*` intrinsics.
+6. Macro naming: `ENA_AGENT_OPT_<FUNC>` (single) or `ENA_AGENT_OPT_<FUNC>_S<N>` (model).
+7. Always validate config before first build (Step 0).
+8. Scripts are the single source of truth for builds and tests -- never construct gcc/QEMU/GDB commands manually.

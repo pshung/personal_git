@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Tests for run_baseline.py."""
+
+import json
+import os
+import sys
+import subprocess
+import tempfile
+import tomllib
+import unittest
+from unittest.mock import patch, MagicMock, call
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.normpath(os.path.join(TEST_DIR, ".."))
+OPT_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
+CONFIG_PATH = os.path.join(OPT_DIR, "config.toml")
+STATE_PATH = os.path.join(OPT_DIR, "state.json")
+LIBNN_ROOT = os.path.normpath(os.path.join(OPT_DIR, "../../libnn"))
+
+sys.path.insert(0, SCRIPT_DIR)
+import run_baseline as rb
+
+
+def load_config():
+    with open(CONFIG_PATH, "rb") as f:
+        return tomllib.load(f)
+
+
+def load_state():
+    with open(STATE_PATH) as f:
+        return json.load(f)
+
+
+CFG = load_config()
+STATE = load_state()
+
+
+class TestLoadInputs(unittest.TestCase):
+    def test_load_config(self):
+        cfg = rb.load_config(CONFIG_PATH)
+        self.assertIn("toolchain", cfg)
+        self.assertIn("target", cfg)
+        self.assertIn("qemu", cfg)
+        self.assertIn("fpga", cfg)
+
+    def test_load_state(self):
+        state = rb.load_state(STATE_PATH)
+        self.assertIn("function", state)
+        self.assertIn("phase", state)
+
+    def test_load_config_missing_file(self):
+        with self.assertRaises(SystemExit):
+            rb.load_config("/nonexistent/config.toml")
+
+    def test_load_state_missing_file(self):
+        with self.assertRaises(SystemExit):
+            rb.load_state("/nonexistent/state.json")
+
+
+class TestSetupToolchain(unittest.TestCase):
+    def test_returns_env_with_toolchain_in_path(self):
+        env = rb.setup_toolchain_env(CFG)
+        bin_dir = CFG["toolchain"]["bin_dir"]
+        self.assertIn(bin_dir, env["PATH"].split(":"))
+
+    def test_gdb_nopython_symlink_created(self):
+        env = rb.setup_toolchain_env(CFG)
+        prefix = CFG["toolchain"]["prefix"]
+        # The symlink dir should be in PATH before toolchain bin_dir
+        gdb_nopython = f"{prefix}gdb-nopython"
+        # Should be findable via the env PATH
+        paths = env["PATH"].split(":")
+        found = False
+        for p in paths:
+            candidate = os.path.join(p, gdb_nopython)
+            if os.path.exists(candidate):
+                found = True
+                break
+        self.assertTrue(found, f"{gdb_nopython} not found in PATH")
+
+
+class TestBuildLibnn(unittest.TestCase):
+    def test_build_returns_libnn_path(self):
+        env = rb.setup_toolchain_env(CFG)
+        cpu = CFG["target"]["cpu"]
+        result = rb.build_libnn(LIBNN_ROOT, cpu, env)
+        self.assertTrue(result["success"])
+        self.assertTrue(os.path.isfile(result["libnn_path"]))
+
+    def test_build_produces_libnn_a(self):
+        env = rb.setup_toolchain_env(CFG)
+        cpu = CFG["target"]["cpu"]
+        result = rb.build_libnn(LIBNN_ROOT, cpu, env)
+        self.assertTrue(result["libnn_path"].endswith("libnn.a"))
+
+
+class TestQemuCorrectness(unittest.TestCase):
+    def test_qemu_pass(self):
+        env = rb.setup_toolchain_env(CFG)
+        func = STATE["function"]
+        vlen = CFG["qemu"]["vlen"]
+        result = rb.run_qemu_test(LIBNN_ROOT, func, vlen, env)
+        self.assertTrue(result["pass"])
+        self.assertGreater(result["sub_tests"], 0)
+
+    def test_qemu_bad_function_fails(self):
+        env = rb.setup_toolchain_env(CFG)
+        result = rb.run_qemu_test(LIBNN_ROOT, "nonexistent_func", 1024, env)
+        self.assertFalse(result["pass"])
+
+
+class TestFpgaPerf(unittest.TestCase):
+    def test_fpga_returns_cycles_and_instructions(self):
+        env = rb.setup_toolchain_env(CFG)
+        func = STATE["function"]
+        host = CFG["fpga"]["host"]
+        port = CFG["fpga"]["port"]
+        cpu = CFG["target"]["cpu"]
+        result = rb.run_fpga_perf(LIBNN_ROOT, func, cpu, host, port, env)
+        self.assertTrue(result["success"])
+        self.assertGreater(result["cycles"], 0)
+        self.assertGreater(result["instructions"], 0)
+
+    def test_fpga_result_has_accuracy_pass(self):
+        env = rb.setup_toolchain_env(CFG)
+        func = STATE["function"]
+        host = CFG["fpga"]["host"]
+        port = CFG["fpga"]["port"]
+        cpu = CFG["target"]["cpu"]
+        result = rb.run_fpga_perf(LIBNN_ROOT, func, cpu, host, port, env)
+        self.assertTrue(result["accuracy_pass"])
+
+
+class TestParseTestPerfOutput(unittest.TestCase):
+    def test_parse_inst_cycle(self):
+        log = "The inst count is 474854\nThe cycle count is 626433\naccuracy checking pass\n"
+        result = rb.parse_perf_output(log)
+        self.assertEqual(result["instructions"], 474854)
+        self.assertEqual(result["cycles"], 626433)
+        self.assertTrue(result["accuracy_pass"])
+
+    def test_parse_no_match(self):
+        log = "some random output\n"
+        result = rb.parse_perf_output(log)
+        self.assertIsNone(result["instructions"])
+        self.assertIsNone(result["cycles"])
+        self.assertFalse(result["accuracy_pass"])
+
+    def test_parse_accuracy_fail(self):
+        log = "The inst count is 100\nThe cycle count is 200\naccuracy checking fail\n"
+        result = rb.parse_perf_output(log)
+        self.assertEqual(result["instructions"], 100)
+        self.assertEqual(result["cycles"], 200)
+        self.assertFalse(result["accuracy_pass"])
+
+
+if __name__ == "__main__":
+    unittest.main()
