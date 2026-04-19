@@ -12,7 +12,7 @@ allowed-tools: Read, Bash, Edit, Write, Glob, Grep, Agent
 
 # cc-log: Claude Code Behavior Logger
 
-Records Claude Code behavior as human/LLM-readable plain text logs.
+Records all Claude Code behavior via async hooks for offline analysis.
 
 ## Commands
 
@@ -21,7 +21,7 @@ Records Claude Code behavior as human/LLM-readable plain text logs.
 - `/cc-log status` - Show whether logging is active and current log name.
 - `/cc-log list` - List all saved logs with sizes and line counts.
 - `/cc-log analyze [name]` - Analyze a named log (tool frequency, agent stats, timelines).
-- `/cc-log tail [name]` - Show last 20 lines of a log.
+- `/cc-log tail [name]` - Show last 20 entries of a log.
 
 Arguments received: `$ARGUMENTS`
 
@@ -48,14 +48,16 @@ HOOK_TAG="cc-log"
 
 ## Hook Events
 
-Only events relevant to harness behavior are logged. The script silently drops other tool events.
+The following events are logged. All use the same hook entry pattern:
 
-**Lifecycle**: SessionStart, SessionEnd, Stop
-**User input**: UserPromptSubmit
-**Tool use**: PreToolUse, PostToolUse, PostToolUseFailure (filtered to Bash, Agent, Skill in script)
-**Subagents**: SubagentStart, SubagentStop
+**Core lifecycle**: SessionStart, SessionEnd
+**Per-turn**: UserPromptSubmit, Stop, StopFailure
+**Per-tool-call**: PreToolUse, PostToolUse, PostToolUseFailure, PermissionRequest, PermissionDenied
+**Agent**: SubagentStart, SubagentStop, TaskCreated, TaskCompleted
+**Context**: PreCompact, PostCompact
+**Reactive** (optional - not enabled by default): FileChanged, CwdChanged, Notification, WorktreeCreate, WorktreeRemove, InstructionsLoaded, ConfigChange, Elicitation, ElicitationResult, TeammateIdle
 
-The Enable procedure installs 9 hooks. The script filters PreToolUse to Bash/Agent/Skill and Post* to Bash only.
+The Enable procedure installs the core, per-turn, per-tool-call, agent, and context events (16 hooks). Reactive events can be added manually if needed.
 
 ## Enable Procedure
 
@@ -72,12 +74,12 @@ The Enable procedure installs 9 hooks. The script filters PreToolUse to Bash/Age
 }
 ```
 
-5. Use Bash with jq to atomically merge hooks into settings.json (see Merge Strategy below). The 9 events are:
+5. Use Bash with jq to atomically merge hooks into settings.json (see Merge Strategy below). The 16 default events are:
 
-SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, SubagentStart, SubagentStop, Stop
+SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, SubagentStart, SubagentStop, PreCompact, PostCompact, Stop, StopFailure, PermissionRequest, PermissionDenied, TaskCreated, TaskCompleted
 
 6. CRITICAL: Preserve all existing settings (permissions, model, statusLine, plugins, etc.). Only add/replace the `hooks` key. If `hooks` already exists with non-cc-log entries, merge - do NOT overwrite other hooks.
-7. Confirm to user: "Logging enabled. Log: `~/.claude/logs/<LOG_NAME>.log`"
+7. Confirm to user: "Logging enabled. Log: `~/.claude/logs/<LOG_NAME>.jsonl`"
 8. Note: hooks take effect on next session or after `/hooks refresh`.
 
 ## Disable Procedure
@@ -101,57 +103,51 @@ SessionStart, SessionEnd, UserPromptSubmit, PreToolUse, PostToolUse, PostToolUse
 
 ## List Procedure
 
-1. Run: `ls -lh $LOG_DIR/*.log $LOG_DIR/*.jsonl 2>/dev/null`
+1. Run: `ls -lh $LOG_DIR/*.jsonl 2>/dev/null`
 2. For each file, count lines: `wc -l`
 3. Display as table: Name | Lines | Size | Last Modified
 
 ## Analyze Procedure
 
 1. If no name given, use the most recent log file.
-2. Read the log file with the Read tool.
-3. Produce analysis by scanning the plain text:
-   - **Bash command count**: lines matching `PostToolUse Bash`
-   - **Subagent count**: lines matching `SubagentStart`
-   - **Skill invocations**: lines matching `Skill |`
-   - **Failures**: lines matching `PostToolUseFailure`
-   - **User prompts**: lines starting with `>`
-   - **Session count**: lines matching `== session=`
+2. Read the JSONL file.
+3. Produce analysis with jq:
+   - **Event distribution**: count per event type
+   - **Tool usage**: frequency of each tool, sorted descending
+   - **Subagent stats**: count, agent types
+   - **Compaction events**: count
+   - **Timeline**: first and last event timestamps, total duration
+   - **Permission events**: what was requested, what was denied
+   - **Error rate**: PostToolUseFailure / total PostToolUse
+   - **Session count**: unique session_ids
+
 4. Present as a concise markdown report.
 
 ## Tail Procedure
 
 1. If no name given, use the most recent log or active log.
-2. Run: `tail -20 $LOG_DIR/<name>.log`
-3. Display output.
+2. Run: `tail -20 $LOG_DIR/<name>.jsonl | jq .`
+3. Display formatted output.
 
 ## Merge Strategy for settings.json
 
 Use jq in Bash for atomic read-modify-write. This is safer than manual Edit for complex JSON merges.
 
-**Enable** - set cc-log hooks (replaces any existing cc-log hooks):
-
-Hook entries use the nested format `[{matcher, hooks: [{type, command, async}]}]`.
+**Enable** - add cc-log hooks (preserving existing non-cc-log hooks):
 
 ```bash
 LOGGER_SCRIPT="$HOME/.claude/skills/cc-log/cc-log.sh"
 SETTINGS_FILE="$HOME/.claude/settings.json"
 LOG_NAME="<LOG_NAME>"
+EVENTS="SessionStart SessionEnd UserPromptSubmit PreToolUse PostToolUse PostToolUseFailure SubagentStart SubagentStop PreCompact PostCompact Stop StopFailure PermissionRequest PermissionDenied TaskCreated TaskCompleted"
+
 CMD="$LOGGER_SCRIPT \"$LOG_NAME\""
+FILTER='.hooks //= {}'
+for evt in $EVENTS; do
+  FILTER="$FILTER | .hooks.${evt} //= [] | .hooks.${evt} += [{\"type\":\"command\",\"command\":\$cmd,\"async\":true}]"
+done
 
-HOOK='[{"matcher":"","hooks":[{"type":"command","command":$cmd,"async":true}]}]'
-
-jq --arg cmd "$CMD" "
-  .hooks //= {}
-  | .hooks.SessionStart = $HOOK
-  | .hooks.SessionEnd = $HOOK
-  | .hooks.UserPromptSubmit = $HOOK
-  | .hooks.PreToolUse = $HOOK
-  | .hooks.PostToolUse = $HOOK
-  | .hooks.PostToolUseFailure = $HOOK
-  | .hooks.SubagentStart = $HOOK
-  | .hooks.SubagentStop = $HOOK
-  | .hooks.Stop = $HOOK
-" "$SETTINGS_FILE" > /tmp/cc-log-settings.json && mv /tmp/cc-log-settings.json "$SETTINGS_FILE"
+jq --arg cmd "$CMD" "$FILTER" "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
 ```
 
 **Disable** - remove cc-log hooks (preserving other hooks):
@@ -160,56 +156,38 @@ jq --arg cmd "$CMD" "
 jq '
   if .hooks then
     .hooks |= with_entries(
-      .value |= map(
-        .hooks |= map(select(.command | tostring | contains("cc-log") | not))
-        | select(.hooks | length > 0)
-      )
+      .value |= map(select(.command | tostring | contains("cc-log") | not))
       | select(.value | length > 0)
     )
     | if (.hooks | length) == 0 then del(.hooks) else . end
   else . end
-' "$SETTINGS_FILE" > /tmp/cc-log-settings.json && mv /tmp/cc-log-settings.json "$SETTINGS_FILE"
+' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
 ```
 
-## Log Format
+## Log Entry Schema
 
-Plain text, no timestamps, no JSON. Each event is one or more lines:
+Each line in the JSONL log:
 
-```
-== session=2d7369bd | model=claude-opus-4-6[1m] | cwd=/home/nick/project ==
-
-> fix the bug in auth.py
-
-PreToolUse Bash | cmd: npm test
-  desc: Run test suite
-
-PostToolUse Bash | cmd: npm test
-  desc: Run test suite
-  stdout: 3 passed, 1 failed
-  stderr: WARN deprecated
-
-Skill | name=cc-log
-  args: enable test
-
-Agent | desc="Explore auth flow" | type=Explore
-  prompt: Investigate the authentication flow in auth.py...
-
-SubagentStart | id=a4aec043c | type=Explore
-[agent:a4aec043c] PostToolUse Bash | cmd: grep -r "token" src/
-  stdout: line 42: validate_token(...)
-SubagentStop | id=a4aec043c
-
-Stop
-
-== SessionEnd ==
+```json
+{
+  "ts": "2026-04-19T14:32:01Z",
+  "session_id": "abc123",
+  "event": "PostToolUse",
+  "tool": "Bash",
+  "tool_use_id": "toolu_abc123",
+  "input": {"command": "npm test", "description": "Run tests"},
+  "output": "(tool response, may be truncated)",
+  "prompt": "(user prompt text, UserPromptSubmit only)",
+  "source": "(session source, SessionStart only: startup|resume|clear|compact)",
+  "model": "(model name, SessionStart only)",
+  "agent_id": "(subagent id, SubagentStart/SubagentStop only)",
+  "agent_type": "(subagent type, SubagentStart/SubagentStop only)",
+  "cwd": "/home/nick/project",
+  "permission_mode": "default"
+}
 ```
 
-Key rules:
-- Subagent tool calls are prefixed with `[agent:<short_id>]`
-- Agent prompts are never truncated
-- Bash stdout/stderr truncated to 300 chars
-- Bash commands truncated to 200 chars
-- Events not listed above are silently dropped
+Fields are omitted when null/empty to keep logs compact. Most entries will only have a subset of these fields depending on the event type.
 
 ## Design Principles
 
@@ -218,4 +196,3 @@ Key rules:
 - **Atomic**: jq read-modify-write prevents settings corruption.
 - **Incremental**: Multiple enables with different names are allowed (just switches the active log name).
 - **Non-destructive**: Disable never deletes log files. Only removes hooks.
-- **LLM-optimized**: Plain text format designed for LLM consumption to analyze and improve harness behavior.
