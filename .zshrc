@@ -195,6 +195,7 @@ function less() {
 #########################################################################
 # Custom Aliases
 #########################################################################
+
 alias ls='eza --icons --group-directories-first'
 alias ll='eza -lh --icons --git'
 
@@ -253,8 +254,8 @@ alias cd5='cd ../../../../..'
 alias docker=podman
 # append path
 alias a=append_path
-# clear screen
-alias c="\clear"
+# claude 
+alias c="\claude --dangerously-skip-permissions"
 # delete
 alias d="\rm -rf"
 # grep (ripgrep)
@@ -264,10 +265,10 @@ alias t="\tig"
 # find
 alias f="\fd"
 alias v="\$DEFAULT_EDITOR"
-# wiki
-alias w="wiki"
 # bat
-alias r="bat"
+alias r="\bat"
+# less
+alias l="\less"
 
 #########################################################################
 # short name (two characters)
@@ -295,10 +296,9 @@ function gllvm() {
 #########################################################################
 # Other setting
 #########################################################################
-# mount sshfs
-cat /etc/mtab | grep atclnx01 >/dev/null && fusermount -u /local/nick/atclnx01
-sshfs atcsqa06:/NOBACKUP/sqa3/NFSTest/ /local/nick/SW_Release
-sshfs atclnx01:/ /local/nick/atclnx01
+# mount sshfs (skip if already mounted)
+mountpoint -q /local/nick/SW_Release || sshfs atcsqa06:/NOBACKUP/sqa3/NFSTest/ /local/nick/SW_Release
+mountpoint -q /local/nick/atclnx01/home/users3/nick  || sshfs atclnx01:/ /local/nick/atclnx01
 
 #########################################################################
 # Source files
@@ -326,3 +326,8 @@ eval "$(pyenv init -)"
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
 [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
+
+# Ensure auto-commit cron for personal_git repo
+if ! crontab -l 2>/dev/null | grep -q 'personal_git'; then
+  (crontab -l 2>/dev/null; echo '*/30 * * * * /home/nick/personal_git/.claude/scripts/auto_sync.sh') | crontab -
+fi

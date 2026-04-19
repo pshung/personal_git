@@ -1,0 +1,75 @@
+module @mmt_tuning_spec attributes { transform.with_named_sequence } {
+
+  // Reusable base matcher: identifies f16*f16->f32 MMT pattern
+  transform.named_sequence @match_mmt_f16_f16_f32(
+      %root: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    transform.match.operation_name %root ["linalg.generic"] : !transform.any_op
+    %ins, %outs = transform.iree.match.cast_compatible_dag_from_root %root {
+      ^bb0(%lhs: tensor<?x?xf16>, %rhs: tensor<?x?xf16>, %out: tensor<?x?xf32>):
+      %r = linalg.generic {
+        indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                         affine_map<(d0, d1, d2) -> (d1, d2)>,
+                         affine_map<(d0, d1, d2) -> (d0, d1)>],
+        iterator_types = ["parallel", "parallel", "reduction"]}
+        ins(%lhs, %rhs : tensor<?x?xf16>, tensor<?x?xf16>)
+        outs(%out : tensor<?x?xf32>) {
+      ^bb0(%in: f16, %in_0: f16, %acc: f32):
+        %0 = arith.extf %in : f16 to f32
+        %1 = arith.extf %in_0 : f16 to f32
+        %2 = arith.mulf %0, %1 : f32
+        %3 = arith.addf %acc, %2 : f32
+        linalg.yield %3 : f32
+      } -> tensor<?x?xf32>
+    } : (!transform.any_op) -> (!transform.any_value, !transform.any_value)
+    transform.yield %root : !transform.any_op
+  }
+
+  // Shape-specific matcher: LHS 4096x4096, RHS 1024x4096
+  transform.named_sequence @match_mmt_4096x1024x4096(
+      %op: !transform.any_op {transform.readonly})
+    -> (!transform.any_op, !transform.any_param) {
+    %mmt = transform.include @match_mmt_f16_f16_f32 failures(propagate) (%op)
+      : (!transform.any_op) -> !transform.any_op
+    %lhs = transform.get_operand %op[0] : (!transform.any_op) -> !transform.any_value
+    %rhs = transform.get_operand %op[1] : (!transform.any_op) -> !transform.any_value
+    transform.iree.match.cast_compatible_type %lhs = tensor<4096x4096xf16>
+      : !transform.any_value
+    transform.iree.match.cast_compatible_type %rhs = tensor<1024x4096xf16>
+      : !transform.any_value
+    %config = transform.param.constant #iree_codegen.compilation_info<
+      lowering_config = #iree_gpu.lowering_config<{
+        promote_operands = [0, 1],
+        mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16>,
+        subgroup_m_count = 2, subgroup_n_count = 2,
+        reduction = [0, 0, 64],
+        workgroup = [64, 128, 0]}>,
+      translation_info = #iree_codegen.translation_info<
+        pipeline = LLVMGPUVectorDistribute
+        workgroup_size = [256, 1, 1] subgroup_size = 64,
+        {gpu_pipeline_options = #iree_gpu.pipeline_options<
+          prefetch_shared_memory = true>}>
+    > -> !transform.any_param
+    transform.yield %op, %config : !transform.any_op, !transform.any_param
+  }
+
+  // Generic annotator
+  transform.named_sequence @apply_op_config(
+      %op: !transform.any_op {transform.readonly},
+      %config: !transform.any_param {transform.readonly}) {
+    transform.annotate %op "compilation_info" = %config
+      : !transform.any_op, !transform.any_param
+    transform.annotate %op "__tuning_spec_applied__" : !transform.any_op
+    transform.yield
+  }
+
+  // Entry point
+  transform.named_sequence @__kernel_config(
+      %variant_op: !transform.any_op {transform.consumed})
+    -> !transform.any_op
+    attributes { iree_codegen.tuning_spec_entrypoint } {
+    %res = transform.foreach_match in %variant_op
+      @match_mmt_4096x1024x4096 -> @apply_op_config
+      : (!transform.any_op) -> !transform.any_op
+    transform.yield %res : !transform.any_op
+  }
+}
