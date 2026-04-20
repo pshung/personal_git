@@ -68,12 +68,8 @@ idle → gather → baseline → analyze ──→ implement ──→ compile_m
                               │    (no opportunity)         ↓                      │
                               │                          error_fix                 │
                               │                             │                      │
-                              │                             ↓                      │
-                              │                        skill_feedback              │
-                              │                             │                      │
                               │                             ├→ compile_measure     │
-                              │                             │ (fix applied,        │
-                              │                             │  retry<3)            │
+                              │                             │ (fixed, retry<3)     │
                               │                             │                      │
                               │                             └→ restore_best        │
                               │                               (retries exhausted)  │
@@ -91,11 +87,6 @@ analyze internal flow:
     → propose 1-3 ranked hypotheses based on LMUL/VLmax/register pressure
     → pick top → implement
     → no viable hypothesis → restore_best → evaluate
-
-skill_feedback internal flow:
-  classify error (novel vs already documented in mlir-transform-writer
-  Pitfalls) → if novel, append a Pitfall entry citing the error message
-  and the fix pattern → record feedback event in state.skill_feedback_log
 ```
 
 `restore_best` is an inline primitive (not a state) used at 3 points:
@@ -271,48 +262,24 @@ Compile with the new transform, benchmark, disassemble.
       <working_dir>/transform_library/transform_library_dispatch_<N>.mlir
    ```
 
-2. Snapshot the current kernel.o md5 **before** compiling. This is the
-   guardrail for silent library-load failures:
-   ```bash
-   md5_before=$(md5sum <working_dir>/temp/kernel.o 2>/dev/null | awk '{print $1}')
-   ```
-
-3. Compile + run:
+2. Compile + run:
    ```bash
    ./iree_tuner.py <model_path> --profile -s <N> -p <platform_toml> \
      --with-transform --show-cycle
    ```
 
-4. Parse:
-   - Success exit + stdout has `module_main_dispatch_<N>\t<cycles>` → candidate cycles recorded
-   - Compile error exit → stderr has compile failure; capture first 500 chars
-   - Run error → stderr has run failure; treat as regression with `cycles=null`
+3. Parse:
+   - Success: `module_main_dispatch_<N>\t<cycles>` on stdout → record `cycles`
+   - Compile error: stderr contains compile failure → capture first 500 chars
+   - Run error: stderr contains run failure → treat as regression with `cycles=null`
 
-5. **Silent-no-op check** (IREE's `--iree-codegen-transform-dialect-library[-dir]`
-   does not emit a diagnostic when a library fails to parse - the compile
-   succeeds with the default pipeline). After a "success":
+4. On success, disassemble:
    ```bash
-   md5_after=$(md5sum <working_dir>/temp/kernel.o | awk '{print $1}')
-   ```
-   If `md5_after == md5_before` AND `state.best.asm_file` exists AND
-   `md5sum <working_dir>/temp/kernel.o` equals
-   `md5sum <<(objdump-hash-of-baseline)>>` (i.e. byte-identical to the
-   last known kernel), then the transform was silently ignored. Treat this
-   as a compile error with the synthetic message:
-   `"silent no-op: kernel.o unchanged from previous build; transform library likely rejected during parse/verify"`.
-   Re-run the underlying iree-compile command manually with
-   `--iree-codegen-notify-transform-strategy-application` to surface the
-   real error and capture it for `error_fix`.
-
-6. On a real success, disassemble with a clobbering redirect (plain `>` is
-   blocked by zsh `noclobber`):
-   ```bash
-   riscv64-elf-objdump -d <working_dir>/temp/kernel.o \
-     >| opt/dispatch_<N>/asm/iter_M.s
+   riscv64-elf-objdump -d <working_dir>/temp/kernel.o > opt/dispatch_<N>/asm/iter_M.s
    ```
 
 **Transition (success):** → `learn`
-**Transition (compile error or silent no-op):** → `error_fix` (bump `state.current_iter.compile_retries`)
+**Transition (compile error):** → `error_fix` (bump `state.current_iter.compile_retries`)
 **Transition (run error):** → `learn` (treat as regression, outcome=error)
 
 ---
@@ -336,102 +303,10 @@ Fix the transform in place. Delegated to the **transform-error-fixer subagent**.
 
 ### Output
 
-Edit `iter_M.mlir` in place (same file path, no new iter_M+1). Return:
+Edit `iter_M.mlir` in place (same file path, no new iter_M+1).
 
-- The edit description (1-2 sentences explaining what was wrong and why the
-  fix works). This is consumed by `skill_feedback` so it can decide whether
-  the lesson is worth teaching to the transform writer.
-- The error class (one of: `HandleInvalidation`, `TypeMismatch`,
-  `OpNotFound`, `BufferizationFailure`, `SilentNoOp`, `MissingDecompose`,
-  `UnknownOp`, or `Other`). Pattern-matched against the error text.
-
-**Transition:** → `skill_feedback` (unconditional - always pass through, so
-the lesson is captured before retry or abandon).
-
----
-
-## State: `skill_feedback`
-
-Compound-effect step: every compile failure in `error_fix` is a concrete
-datum about how the transform writer misfires. Capture the lesson once,
-not every iteration. Long-term this shrinks `error_fix` to a no-op because
-the same error class never recurs.
-
-### Inputs
-
-1. `state.current_iter.hypothesis`
-2. `state.current_iter.error` (first 500 chars of stderr, set by
-   `compile_measure`)
-3. `state.current_iter.error_class` (set by `error_fix`)
-4. `state.current_iter.fix_description` (set by `error_fix`)
-5. The pre/post diff of `opt/dispatch_<N>/transforms/iter_M.mlir` (obtain
-   via `git diff --no-index <pre> <post>` or by diffing against the
-   previous iter_M if available)
-6. `~/.claude/skills/mlir-transform-writer/SKILL.md` - the target of any
-   update; specifically its `## Pitfalls` section
-
-### Algorithm
-
-1. **Novelty check.** Grep the mlir-transform-writer SKILL.md for the
-   error_class keyword AND the key phrase from the error text. If both
-   appear in an existing Pitfalls subsection, skip - the lesson is
-   already there.
-2. **Scope check.** The lesson only applies to mlir-transform-writer if
-   it is *authoring-related* (an op that doesn't exist, a pattern order
-   requirement, a missing decompose step, a required closing annotation,
-   etc.). Infrastructure failures (flag incompatibility, toolchain path
-   issues) belong in the iree-optimizer skill's own prerequisites or in
-   harness code - not in mlir-transform-writer.
-3. **Emit the update.** If novel and in-scope, append a new subsection
-   under `## Pitfalls` in `~/.claude/skills/mlir-transform-writer/SKILL.md`:
-
-   ```
-   ### <short title, e.g. "Missing decompose before vectorize">
-
-   <1-2 sentences describing the failure: what error the writer sees, and
-   under which IR preconditions it happens.>
-
-   Error signature: `<the distinctive substring from the compile error,
-   trimmed to a grep-friendly length>`
-
-   Fix: <1-2 sentences on the corrective edit, citing the transform op
-   that resolves it.>
-   ```
-
-   Use the `Edit` tool with `old_string = "## How to use this skill"` and
-   `new_string = "<new subsection>\n\n## How to use this skill"` to insert
-   before the final section. Never overwrite the whole file.
-4. **Record the event.** Append to `state.skill_feedback_log`:
-   ```json
-   {
-     "iteration": M,
-     "error_class": "...",
-     "error_signature": "...",
-     "action": "appended_pitfall" | "skipped_known" | "skipped_out_of_scope",
-     "timestamp": "2026-04-20T12:34:56"
-   }
-   ```
-
-### Constraints
-
-- **Do not call this state's logic recursively.** If the novelty check is
-  ambiguous (close match but not identical), prefer `skipped_known` over
-  appending a near-duplicate.
-- **Authoring lessons only.** Harness bugs (wrong cl flag, missing
-  toolchain, Python errors in iree_tuner.py) must not land in
-  mlir-transform-writer - they don't belong to that skill's scope.
-- **One writer SKILL edit per optimizer run per dispatch at most.** If
-  multiple iterations hit the same error class, the first one teaches the
-  writer; subsequent iterations see the novelty check return "known" and
-  skip. This keeps the skill from accumulating near-duplicate entries.
-
-### Transitions
-
-- **From `error_fix` with retry<3:** → `compile_measure` (re-run with the
-  patched transform). The fix is already on disk.
-- **From `error_fix` with retries exhausted:** record iter_M as
-  `outcome=error` in history, run `restore_best`, → `analyze` with a
-  different approach. The feedback is already recorded regardless.
+**Transition (retry<3):** → `compile_measure`
+**Transition (retries exhausted):** record iter_M as `outcome=error` in history, run `restore_best`, → `analyze` with a different approach.
 
 ---
 
@@ -512,7 +387,7 @@ round | outcome  | cycles     | insight
 {
   "schema_version": 2,
   "dispatch_id": 1,
-  "phase": "idle|gather|baseline|analyze|implement|compile_measure|error_fix|skill_feedback|learn|evaluate",
+  "phase": "idle|gather|baseline|analyze|implement|compile_measure|error_fix|learn|evaluate",
   "func_name": "main_dispatch_1_...",
   "mlir_file": "models/.../module_main_dispatch_1_static_benchmark.mlir",
   "tile_config_file": "models/.../module_main_dispatch_1_static_tile_config.json",
@@ -585,9 +460,8 @@ Reasoning steps use subagents; mechanical steps run inline.
 | idle / gather / baseline | main | shell commands only |
 | **analyze** | subagent (strategy-proposer) | reads asm + ir_analysis + history, forms hypothesis |
 | **implement** | subagent (mlir-transform-writer skill) | generates transform .mlir with domain knowledge |
-| compile_measure | main | shell commands, parse stdout/stderr, kernel.o md5 guardrail |
-| **error_fix** | subagent (transform-error-fixer) | diagnoses compile error, edits transform, returns error class + fix description |
-| **skill_feedback** | main | novelty-check the error class, append a Pitfall to mlir-transform-writer SKILL.md if new |
+| compile_measure | main | shell commands, parse stdout/stderr |
+| **error_fix** | subagent (transform-error-fixer) | diagnoses compile error, edits transform |
 | learn | main | record outcome, synthesize insight, decide |
 | evaluate | main | restore_best, re-run, print summary |
 
@@ -608,8 +482,7 @@ Reasoning steps use subagents; mechanical steps run inline.
 - Tools: Read, Grep, Glob, Edit
 - MUST NOT: run any Bash commands, generate new iter_M+1 files
 - MUST: edit `iter_M.mlir` in place, based on the compile error class
-- Output: `{fix_description: str, error_class: str}` - consumed by `skill_feedback`
-  to decide whether to teach `mlir-transform-writer`
+- Output: description of the edit
 
 ---
 
@@ -630,8 +503,6 @@ Reasoning steps use subagents; mechanical steps run inline.
 13. **Run everything from AutoIREE root.** Paths in state are relative to that.
 14. **Conv2D is hard.** The default `CPUConvTileAndDecomposeExpert` pipeline does specialized decomposition TransformDialectCodegen cannot replicate. If baseline wins on conv2d after 3 rounds, accept and move on.
 15. **Do not edit iter_M.mlir after it is measured.** Only the error_fix state edits an iter_M, and only before it has successfully compiled.
-16. **Compound effect: teach the writer, don't just fix.** Every compile error routes through `skill_feedback`. If the error class is authoring-related and not already in `mlir-transform-writer`'s Pitfalls section, append a short subsection so the next run avoids the same mistake. Harness/infrastructure failures (flags, toolchain, harness Python bugs) are out-of-scope for `mlir-transform-writer` and must not be written there - they go in this skill's Prerequisites or in harness code.
-17. **Silent no-op is a compile error.** If `kernel.o` is byte-identical to the pre-compile snapshot after a "successful" build, treat it as a compile error and route to `error_fix` with the synthetic message above. This catches silently-rejected transform libraries that IREE's library-dir loader does not diagnose.
 
 ---
 

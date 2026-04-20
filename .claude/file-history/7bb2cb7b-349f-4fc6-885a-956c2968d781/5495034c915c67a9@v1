@@ -1,0 +1,516 @@
+from __future__ import annotations
+import glob
+from pathlib import Path
+import re
+import subprocess
+from typing import TYPE_CHECKING
+
+from auto_iree.context import singleton_context as ctx
+from auto_iree.device import GDBDevice
+from auto_iree.log import setup_logger
+from auto_iree.utils import isFileExist
+
+if TYPE_CHECKING:
+    from auto_iree.target import Target
+
+logger = setup_logger("iree_helper")
+
+_static_libs: list[str] = []
+
+
+def _get_iree_compile_base_args():
+    return [
+        "-iree-input-type=auto",
+        "--iree-llvmcpu-stack-allocation-limit=0x999999",
+        "--iree-hal-target-device=local",
+        "--iree-hal-local-target-device-backends=llvm-cpu",
+        "--iree-global-opt-propagate-transposes=False"
+    ]
+
+
+def _get_iree_compile_llvm_args(target: Target):
+    return [
+        f"-iree-llvmcpu-target-triple={target.triple}",
+        f"-iree-llvmcpu-target-cpu={target.cpu}",
+        f"-iree-llvmcpu-target-abi={target.abi}",
+        f"-iree-llvmcpu-target-cpu-features={','.join(target.attr)}",
+        f"-iree-llvmcpu-target-vector-width-in-bytes={int(target.vlen/8)}",
+        "--iree-llvmcpu-loop-interleaving",
+        "--iree-llvmcpu-loop-vectorization",
+        "--iree-llvmcpu-loop-unrolling",
+        "--iree-llvmcpu-slp-vectorization",
+    ]
+
+def _get_llvm_riscv_args(target: Target):
+    return [
+        f"-riscv-v-vector-bits-min={target.vlen}",
+        "-riscv-v-fixed-length-vector-lmul-max=8",
+    ]
+
+def _get_static_libs():
+    if len(_static_libs) == 0:
+        lib_dir = ctx.get_iree_riscv_runtime_lib_dir()
+        lib_files = glob.glob(r"lib*.a",
+                              root_dir=lib_dir)
+        if len(lib_files) == 0:
+            logger.error("Cannot find any libs in %s", str(lib_dir))
+            raise FileNotFoundError
+
+        for lib_file in lib_files:
+            _static_libs.append(lib_file[3:-2])
+    return _static_libs
+
+
+def _iree_compile_mlir_to_bin(mlir_file: Path,
+                              out_path: Path,
+                              build_full=False,
+                              transform_dir: Path | None = None,
+                              extra_args: list[str] = [],
+                              timeout=300,
+                              tuning=False):
+    cmd = [
+        str(ctx.get_iree_compiler()),
+        str(mlir_file),
+        "-o", f"{str(out_path)}",
+    ]
+    cmd.extend(_get_iree_compile_base_args())
+    cmd.extend(_get_llvm_riscv_args(ctx.get_target()))
+
+    if build_full:
+        cmd.extend(_get_iree_compile_llvm_args(ctx.get_target()))
+
+    if transform_dir is not None:
+        cmd.append(
+            f"--iree-codegen-transform-dialect-library-dir={str(transform_dir)}"
+        )
+
+    cmd.extend(extra_args)
+
+    logger.debug(' '.join(str(x) for x in cmd))
+    try:
+        res = subprocess.run(cmd,
+                             timeout=timeout,
+                             check=True,
+                             capture_output=True)
+        logger.debug("Compile mlir done")
+    except subprocess.TimeoutExpired as te:
+        if tuning:
+            logger.debug("Compile mlir timeout!")
+        else:
+            logger.error("Compile mlir timeout!")
+        raise
+    except subprocess.CalledProcessError as cpe:
+        if tuning:
+            logger.debug("Compile mlir error:")
+            logger.debug(cpe.stderr.decode())
+        else:
+            logger.error("Compile mlir error:")
+            logger.error(cpe.stderr.decode())
+        raise
+
+
+def _iree_compile_mlir_to_vmfb(mlir_file: Path,
+                               out_path: Path,
+                               build_full=False,
+                               transform_dir: Path | None = None,
+                               extra_args: list[str] = [],
+                               timeout=1800):
+    cmd = [
+        str(ctx.get_iree_compiler()),
+        str(mlir_file),
+        "-o", f"{str(out_path)}",
+    ]
+    cmd.extend(_get_iree_compile_base_args())
+    cmd.extend(_get_llvm_riscv_args(ctx.get_target()))
+
+    if build_full:
+        cmd.extend(_get_iree_compile_llvm_args(ctx.get_target()))
+
+    if transform_dir is not None:
+        cmd.append(
+            f"--iree-codegen-transform-dialect-library-dir={str(transform_dir)}"
+        )
+
+    cmd.extend(extra_args)
+
+    logger.debug(' '.join(str(x) for x in cmd))
+    try:
+        res = subprocess.run(cmd,
+                             timeout=timeout,
+                             check=True,
+                             capture_output=True)
+        logger.debug("Compile mlir done")
+    except subprocess.TimeoutExpired as te:
+        logger.error("Compile mlir timeout!")
+        raise
+    except subprocess.CalledProcessError as cpe:
+        logger.error("Compile mlir error:")
+        logger.error(cpe.stderr)
+        raise
+
+
+def gen_benchmarks_vmc(mlir_file: Path, dst: Path, timeout=300):
+    if not mlir_file.is_file():
+        raise FileNotFoundError("MLIR file not found")
+
+    cmd = [
+        str(ctx.get_iree_compiler()),
+        str(mlir_file),
+        "--compile-to=executable-configurations",
+        f"--iree-hal-dump-executable-benchmarks-to={str(dst)}"
+    ]
+    cmd.extend(_get_iree_compile_base_args())
+    cmd.extend(_get_iree_compile_llvm_args(ctx.get_target()))
+    # vm-c only args
+    cmd.extend([
+        "--output-format=vm-c",
+        "-iree-llvmcpu-link-embedded=false",
+        "-iree-llvmcpu-link-static",
+        "--iree-llvmcpu-static-library-output-path=temp/kernel.o"  # must be relpath
+    ])
+
+    logger.debug(' '.join(str(x) for x in cmd))
+    try:
+        res = subprocess.run(cmd,
+                             timeout=timeout,
+                             check=True,
+                             capture_output=True)
+        logger.debug("generate benchmark done")
+    except subprocess.TimeoutExpired as te:
+        logger.error("Generate benchmarks timeout!")
+        raise
+    except subprocess.CalledProcessError as cpe:
+        logger.error("Generate benchmarks error:")
+        logger.error(cpe.stderr)
+        raise
+
+
+def build_subgraph_vmc_obj(subgraph_file: Path, use_transform: bool, tuning=False, timeout=300):
+
+    host_c_h = Path("temp/host-c.h")
+    try:
+        _iree_compile_mlir_to_bin(
+            subgraph_file,
+            host_c_h,
+            False,
+            Path("transform_library") if use_transform else None,
+            ["--output-format=vm-c",
+             # skip done passes as much as possible
+             "-compile-from=executable-sources"],
+             timeout=timeout,
+             tuning=tuning
+        )
+    except Exception as e:
+        raise e
+
+    kernel_o = Path("temp/kernel.o")
+    kernel_h = Path("temp/kernel.h")
+    if not isFileExist(kernel_o):
+        logger.error("Generated file %s not found", str(kernel_o))
+        raise FileNotFoundError
+
+    if not isFileExist(kernel_h):
+        logger.error("Generated file %s not found", str(kernel_h))
+        raise FileNotFoundError
+
+    if not isFileExist(host_c_h):
+        logger.error("Generated file %s not found", str(host_c_h))
+        raise FileNotFoundError
+
+    return host_c_h, kernel_h, kernel_o
+
+
+def compile_entry_code_to_obj(kernel_h: Path, kernel_o: Path, entry_func: str, build_full: bool, timeout=60):
+    with open(kernel_h, 'r') as f:
+        lines = f.readlines()
+
+    query_name = None
+    for idx, line in enumerate(lines):
+        if re.match(r'^const\s+iree_hal_executable_library_header_t\*\*', line):
+            for next_line in lines[idx+1:]:
+                if re.match(r'^\s*$', next_line):
+                    break
+                words = next_line.strip().split()
+                if words:
+                    query_name = words[0].replace('(', '')
+                    break
+            break
+
+    if not query_name:
+        logger.debug("Not Found ...")
+        raise ValueError
+
+    append_code = "\nconst iree_hal_executable_library_query_fn_t libraries[] = {\n"
+    append_code += f"    {query_name},\n"
+    append_code += "};\n"
+
+    with open(kernel_h, 'a') as f:
+        f.write(append_code)
+
+    entry_o = kernel_o.parent / "entry.o"
+    # subgraph required c symobl to link
+    entry_c = ctx.get_entry_src_dir() /\
+        ("runtime.cc" if build_full else "dispatch_driver.c")
+
+    cmd = [
+        str(ctx.get_clang_cc() if build_full else ctx.get_clang()),
+        str(entry_c),
+        "-c",
+        "-o",
+        str(entry_o),
+        f"-I{str(kernel_h.parent)}",
+        f"-I{str(ctx.get_entry_src_dir())}",
+        f"-I{str(ctx.get_iree_riscv_runtime_src_dir())}",
+        f"-mabi={ctx.get_target().abi}",
+        "-DIREE_PLATFORM_GENERIC=1",
+        "-DEMITC_IMPLEMENTATION",
+        "-DPF_COUNTER",
+        "-O3"
+    ]
+
+    if build_full:
+        cmd.extend([
+            f'-I{str(ctx.get_thirdparty_dir() / "cnpy")}',
+        ])
+    else:
+        cmd.append(f"-DQUERY={query_name}")
+        # _FUNC as "entry_function", use '' for f-string
+        cmd.append(f'-D_FUNC="{entry_func}"')
+
+    logger.debug(" ".join(cmd))
+    try:
+        res = subprocess.run(cmd,
+                             timeout=timeout,
+                             check=True,
+                             capture_output=True)
+        logger.debug("Compile entry done")
+    except subprocess.TimeoutExpired:
+        logger.error("Compile entry timeout!")
+        raise
+    except subprocess.CalledProcessError as cpe:
+        logger.error("Compile entry error:")
+        logger.error(cpe.stderr)
+        raise
+
+    return entry_o
+
+
+def compile_model_entry_to_obj(model_h: Path, entry_func: str, timeout=600):
+    entry_c = ctx.get_entry_src_dir() / "runtime.cc"
+    entry_o = model_h.parent / "entry.o"
+    cmd = [
+        str(ctx.get_clang_cc()),
+        str(entry_c),
+        "-c",
+        "-o",
+        str(entry_o),
+        f"-I{model_h.parent}",
+        f"-I{str(ctx.get_entry_src_dir())}",
+        f"-I{str(ctx.get_iree_riscv_runtime_src_dir())}",
+        f'-I{str(ctx.get_thirdparty_dir() / "cnpy")}',
+        f"-mabi={ctx.get_target().abi}",
+        "-DIREE_PLATFORM_GENERIC=1",
+        "-DEMITC_IMPLEMENTATION",
+        "-DPF_COUNTER",
+        f'-D_FUNC="{entry_func}"',
+        "-O3"
+    ]
+
+    device = ctx.get_device()
+    if isinstance(device, GDBDevice):
+        if device.interactive:
+            cmd.append("-g")
+
+    logger.debug(" ".join(cmd))
+    try:
+        res = subprocess.run(cmd,
+                             timeout=timeout,
+                             check=True,
+                             capture_output=True)
+        logger.debug("Compile entry done")
+    except subprocess.TimeoutExpired:
+        logger.error("Compile entry timeout!")
+        raise
+    except subprocess.CalledProcessError as cpe:
+        logger.error("Compile entry error:")
+        logger.error(cpe.stderr)
+        raise
+    return entry_o
+
+
+def compile_cnpy():
+    cmd = [
+        str(ctx.get_clang_cc()),
+        str(ctx.get_thirdparty_dir() / "cnpy" / "cnpy.cpp"),
+        "-c", "-o", "temp/cnpy.o",
+        f"-I{str(ctx.get_thirdparty_dir() / 'cnpy')}",
+        f"-mabi={ctx.get_target().abi}",
+    ]
+    logger.debug(" ".join(cmd))
+    try:
+        res = subprocess.run(cmd,
+                             timeout=60,
+                             check=True,
+                             capture_output=True)
+        logger.debug("Compile entry done")
+    except subprocess.TimeoutExpired:
+        logger.error("Compile entry timeout!")
+        raise
+    except subprocess.CalledProcessError as cpe:
+        logger.error("Compile entry error:")
+        logger.error(cpe.stderr)
+        raise
+
+    return Path("temp/cnpy.o")
+
+
+def link_to_vmc_exe(entry_o: Path, out_name: str, extras: list[Path] = [], timeout=60, tuning=False):
+    link_script = ctx.get_link_script_ae350()
+    if not isFileExist(link_script):
+        logger.error("link script %s not found", str(link_script))
+        raise FileNotFoundError
+
+    device = ctx.get_device()
+    out_adx = Path(f"OUTPUT/{out_name}")
+    cmd = [
+        str(ctx.get_clang_cc()),
+        "-o",
+        str(out_adx)
+    ]
+    if device.isSemiHost():
+        cmd.append("-mvh")
+
+    if device.useLinkScipt():
+        cmd.append("-T")
+        cmd.append(f"{str(link_script)}")
+
+    cmd.append(f"{str(entry_o)}")
+    for extra in extras:
+        cmd.append(str(extra))
+
+    libs = _get_static_libs()
+    cmd.append("-lm")
+    cmd.append(f"-L{str(ctx.get_iree_riscv_runtime_lib_dir())}")
+    cmd.append("-Wl,--start-group")
+    for lib in libs:
+        cmd.append(f"-l{lib}")
+    cmd.append("-Wl,--end-group")
+
+    logger.debug(" ".join(cmd))
+    try:
+        res = subprocess.run(cmd,
+                             timeout=timeout,
+                             check=True,
+                             capture_output=True)
+        logger.debug("Link executable done")
+    except subprocess.TimeoutExpired as te:
+        if tuning:
+            logger.debug("Link executable timeout!")
+        else:
+            logger.error("Link executable timeout!")
+        raise
+    except subprocess.CalledProcessError as cpe:
+        logger.error("Link executable error:")
+        logger.error(cpe.stderr)
+        raise
+
+    return out_adx
+
+
+def build_model_adx(mlir_file: Path,
+                    fallback_fname: str,
+                    fallback_mname: str,
+                    use_transform=False,
+                    timeout=3600):
+    if not isFileExist(mlir_file):
+        raise FileNotFoundError(f"MLIR file not found: {str(mlir_file)}")
+
+    with open(mlir_file, 'r') as f:
+        try:
+            content = f.read()
+        except:
+            module_match = None
+            func_match = None
+        else:
+            module_match = re.search(r'module\s+@(.+)\s+{', content)
+            if not module_match:
+                module_match = re.search(r'(module)\s+{', content)
+            func_match = re.search(r'func\.func\s+@(\w+)\(', content)
+    if module_match:
+        mname = module_match.group(1)
+    else:
+        logger.warning(
+            "Could not extract module name from file, "
+            f"use option module name: {fallback_mname}. "
+            "Option: --module-name")
+        mname = fallback_mname
+    if func_match:
+        fname = func_match.group(1)
+    else:
+        logger.warning(
+            "Could not extract function name from file, "
+            f"use option function name: {fallback_fname}. "
+            "Option: --entry-func")
+        fname = fallback_fname
+
+    entry_func = mname + "." + fname
+
+    model_vmfb = Path("temp/model.vmfb")
+    extra_options = [
+        "-iree-llvmcpu-link-embedded=True"
+    ]
+    try:
+        _iree_compile_mlir_to_bin(
+            mlir_file,
+            model_vmfb,
+            True,
+            Path("transform_library") if use_transform else None,
+            extra_options,
+            timeout
+        )
+    except Exception as e:
+        raise e
+
+    if not isFileExist(model_vmfb):
+        logger.error("Generated file %s not found", str(model_vmfb))
+        raise FileNotFoundError
+
+    model_h = Path("temp/model.h")
+    try:
+        cmd = ["xxd", "-i", str(model_vmfb), str(model_h)]
+        subprocess.run(cmd, timeout=60, check=True)
+    except:
+        raise
+
+    entry_o = compile_model_entry_to_obj(model_h, entry_func)
+    cnpy_o = compile_cnpy()
+    model_adx = link_to_vmc_exe(entry_o, mlir_file.stem + ".adx", [cnpy_o])
+    return model_adx
+
+
+def build_model_vmfb(mlir_file: Path,
+                     use_transform=False,
+                     timeout=3600):
+    if not isFileExist(mlir_file):
+        raise FileNotFoundError(f"MLIR file not found: {str(mlir_file)}")
+
+    output = Path("OUTPUT") / (mlir_file.stem + ".vmfb")
+    vmfb_options = [
+        "--output-format=vm-bytecode",
+        "-iree-llvmcpu-link-embedded=false",
+        f"--iree-llvmcpu-system-linker-path={ctx.get_ld_lld()}"
+    ]
+    try:
+        _iree_compile_mlir_to_vmfb(
+            mlir_file,
+            output,
+            True,
+            Path("transform_library") if use_transform else None,
+            vmfb_options,
+            timeout
+        )
+    except Exception as e:
+        raise e
+
+    model_vmfb = output
+    return model_vmfb

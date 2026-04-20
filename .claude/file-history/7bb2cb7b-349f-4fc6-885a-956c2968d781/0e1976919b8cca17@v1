@@ -63,28 +63,12 @@ module attributes { transform.with_named_sequence } {
 }
 ```
 
-For IREE kernel config, the entry point is `@__kernel_config` (double
-underscore). The correct skeleton depends on *which* compiler flag invokes it:
+For IREE kernel config / tuning specs, the entry point uses a different
+convention:
 
 ```mlir
-// Flow A: invoked via --iree-codegen-transform-dialect-library=<file>@__kernel_config
-//         or --iree-codegen-transform-dialect-library-dir=<dir> (file per dispatch).
-// The iree_codegen.tuning_spec_entrypoint attribute is NOT required (and not
-// checked) on this path. The entry point can have any signature.
 module attributes { transform.with_named_sequence } {
-  transform.named_sequence @__kernel_config(
-      %variant_op: !transform.any_op {transform.consumed})
-    -> !transform.any_op {
-    // ... matcher/annotator logic ...
-    transform.yield %variant_op : !transform.any_op
-  }
-}
 
-// Flow B: invoked via --iree-codegen-tuning-spec-path=<file> (user tuning spec)
-//         or shipped as default tuning spec. Here the attribute IS required
-//         and the signature MUST be exactly (any_op) -> any_op.
-module attributes { transform.with_named_sequence,
-                    iree_codegen.tuning_spec_with_default_entrypoint } {
   transform.named_sequence @__kernel_config(
       %variant_op: !transform.any_op {transform.consumed})
     -> !transform.any_op
@@ -94,12 +78,6 @@ module attributes { transform.with_named_sequence,
   }
 }
 ```
-
-The two flows coexist in IREE but are driven by different cl::opts. Picking
-the wrong attribute set makes the script either silently ignored (library
-flow, harmless extra attribute) or rejected at verification time (tuning-
-spec flow missing the attribute). When in doubt, omit the attribute - that
-works for the library/library-dir path, which is the common case.
 
 For full codegen strategies (TransformDialectCodegen pipeline), the strategy
 is a named sequence referenced from the annotation:
@@ -136,13 +114,11 @@ module attributes { transform.with_named_sequence } {
     transform.yield
   }
 
-  // Entry: walk IR matching ops to strategies. No tuning_spec_entrypoint
-  // attribute because this library is loaded through
-  // --iree-codegen-transform-dialect-library (preprocessing + codegen_spec
-  // resolution both read the same library file).
+  // Entry: walk IR matching ops to strategies
   transform.named_sequence @__kernel_config(
       %variant_op: !transform.any_op {transform.consumed})
-    -> !transform.any_op {
+    -> !transform.any_op
+    attributes { iree_codegen.tuning_spec_entrypoint } {
     %res = transform.foreach_match in %variant_op
       @match_target -> @annotate_target
       : (!transform.any_op) -> !transform.any_op
@@ -150,57 +126,6 @@ module attributes { transform.with_named_sequence } {
   }
 }
 ```
-
-### How `codegen_spec` actually resolves
-
-`@my_strategy` is looked up by its **leaf** symbol name in
-`LowerExecutableUsingTransformDialect` (see
-`compiler/src/iree/compiler/Codegen/Common/LowerExecutableUsingTransformDialect.cpp`).
-The interpreter pass reads the library path from the cl::opt bound to
-`--iree-codegen-transform-dialect-library=<file>` - not `-library-dir=`.
-So:
-
-- If the harness passes `--iree-codegen-transform-dialect-library=<file>@__kernel_config`,
-  both preprocessing (`@__kernel_config`) and codegen_spec lookup
-  (`@my_strategy`) work from the same file.
-- If the harness passes only `--iree-codegen-transform-dialect-library-dir=<dir>`,
-  preprocessing still runs the per-dispatch `@__kernel_config`, but the
-  codegen_spec resolver has an empty library path and fails with
-  "could not find a nested named sequence with name: my_strategy".
-
-When authoring a `TransformDialectCodegen` strategy, confirm the harness
-uses the file form of the flag, or fall back to inlining the whole strategy
-inside `@__kernel_config` and setting `translation_info` to a standard
-pipeline instead of `TransformDialectCodegen`.
-
-### Strategy must set translation_info to None
-
-After the codegen_spec strategy runs, the pass checks that the strategy
-has **reset** the func's `translation_info` to
-`DispatchLoweringPassPipeline::None`:
-
-```
-// LowerExecutableUsingTransformDialect.cpp:58-65
-if (translationInfoModified.getDispatchLoweringPassPipeline() !=
-    DispatchLoweringPassPipeline::None)
-  funcOp->emitOpError("expected transform dialect lowering to set the "
-                      "translation_info to use None");
-```
-
-So every `@<strategy>` must end with something like:
-
-```mlir
-%func = transform.structured.match ops{["func.func"]} in %variant_op
-  : (!transform.any_op) -> !transform.any_op
-%none_info = transform.param.constant
-  #iree_codegen.translation_info<pipeline = None> -> !transform.any_param
-transform.annotate %func "translation_info" = %none_info
-  : !transform.any_op, !transform.any_param
-transform.yield
-```
-
-Otherwise the whole pass fails after the strategy runs, even if every
-transform op succeeded.
 
 ## GPU codegen strategy template
 
@@ -344,43 +269,6 @@ transform.named_sequence @cpu_strategy(%variant_op: !transform.any_op) {
 }
 ```
 
-### Conv2D variant
-
-Named conv ops (`linalg.conv_2d_nhwc_hwcf`, `linalg.depthwise_conv_2d_*`)
-cannot be vectorized directly - `transform.structured.vectorize_children_and_apply_patterns`
-will fail with "failed to apply" because the vectorizer does not know how
-to lower the window-reduction semantics in one shot. IREE's own
-`CPUConvTileAndDecomposeExpert` pipeline decomposes the conv to
-1x1 im2col-style matmul-like ops first; a hand-authored strategy must do
-the same before vectorizing:
-
-```mlir
-%conv = transform.structured.match ops{["linalg.conv_2d_nhwc_hwcf"]}
-    in %variant_op : (!transform.any_op) -> !transform.any_op
-
-// Tile the spatial + reduction dims down to 1-extent so the residual op
-// is a 1x1 conv that the decomposer can split into linalg.generic.
-%tiled, %loops:3 = transform.structured.tile_using_for %conv
-    tile_sizes [0, 0, 0, 0, 1, 1, 0]
-  : (!transform.any_op) -> (!transform.any_op,
-      !transform.op<"scf.for">, !transform.op<"scf.for">,
-      !transform.op<"scf.for">)
-
-// Decompose the 1x1 residual into matmul-equivalent linalg ops.
-%decomposed = transform.structured.decompose %tiled
-  : (!transform.any_op) -> !transform.any_op
-
-// Now vectorize normally.
-%func = transform.structured.match ops{["func.func"]} in %variant_op
-  : (!transform.any_op) -> !transform.any_op
-%func_v = transform.structured.vectorize_children_and_apply_patterns %func
-  : (!transform.any_op) -> !transform.any_op
-```
-
-Don't skip the decomposition step for conv. If you try to vectorize before
-decomposing, the whole strategy fails and IREE falls back to the default
-pipeline, wasting an optimizer iteration.
-
 ## Matching patterns
 
 ### Match by operation name
@@ -475,71 +363,6 @@ transform.named_sequence @match_specific_mmt(
 
 7. **yield is mandatory**: Every `transform.named_sequence` must end with
    `transform.yield` (with or without return values matching the signature).
-
-## Pitfalls
-
-The following patterns look reasonable but do not work in mainline IREE.
-Avoid them; each one wasted an iteration of the agentic optimizer loop on
-2026-04-20.
-
-### `transform.match.operation_attribute` does not exist
-
-There is no `match.operation_attribute` op in the IREE bundled LLVM. A
-script that uses it fails to parse - and the library-dir loader swallows
-the parse error silently, so the compile proceeds with the default pipeline
-and the transform looks like it just produced a no-op. Symptoms: `kernel.o`
-byte-identical to baseline, cycle count within noise. Surface the real
-error with `--iree-codegen-notify-transform-strategy-application` or by
-invoking `iree-compile` directly with the library argument.
-
-To match a specific op within a specific function, match by op name, then
-use `transform.get_parent_op {op_name = "func.func"}` and compare the
-func's symbol via `transform.include` to a matcher that checks
-`transform.match.operation_name`. For one-op-per-dispatch cases (common in
-IREE dispatches) just matching the op name is sufficient - each dispatch
-compiles independently.
-
-### Unqualified vs `@__transform::` qualified codegen_spec
-
-Both forms end up using only the leaf name (`my_strategy`) at symbol
-resolution time (`SymbolRefAttr::getLeafReference()`). Qualifying the
-reference adds no lookup power. Use the short form.
-
-### Conv ops without decomposition
-
-As noted in the Conv2D variant above: named conv ops cannot be vectorized
-in one shot. Without `transform.structured.decompose` between tile and
-vectorize, the strategy fails at the `vectorize_children_and_apply_patterns`
-line and the whole dispatch falls back to the default pipeline.
-
-### `transform.iree.bufferize { target_gpu }` on a CPU target
-
-`target_gpu` is a CPU/GPU selector. For CPU strategies, omit the attribute:
-`transform.iree.bufferize %func_v : (!transform.any_op) -> (!transform.any_op)`.
-Leaving `target_gpu` on a CPU compile produces a GPU-specific buffer
-allocation that the CPU pipeline cannot lower.
-
-### Handle threading across tile + decompose
-
-`transform.structured.decompose` produces a fresh handle for the decomposed
-op. Don't try to keep using the pre-decompose handle for further tiling -
-re-match the resulting linalg.generic by op name if you need to tile it
-again.
-
-### Silent library load failures
-
-The `--iree-codegen-transform-dialect-library[-dir]` flag family does not
-emit a diagnostic when the library file fails to parse or verify. The
-compile succeeds and uses the default pipeline. When debugging a strategy
-that seems to have no effect:
-
-1. Compare `kernel.o` md5 before and after - identical means the transform
-   never applied.
-2. Re-run with `--iree-codegen-notify-transform-strategy-application`;
-   look for `remark: Applied transform configuration strategy @__transform::@__kernel_config`.
-   Absence of the remark means the library was silently rejected.
-3. Invoke `iree-compile` directly (bypass the harness) with the same
-   arguments to see stderr.
 
 ## How to use this skill
 

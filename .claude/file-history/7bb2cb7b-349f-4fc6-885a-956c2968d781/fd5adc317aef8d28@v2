@@ -1,0 +1,196 @@
+# Feedback for `iree-optimizer` skill (run: dispatch 1, mobilenet, 2026-04-20)
+
+Recorded during an end-to-end invocation that failed to apply any codegen
+strategy. Ranked by severity.
+
+## 1. BLOCKER: skill's codegen_spec pattern cannot be applied through iree_tuner.py
+
+The skill is built around a `TransformDialectCodegen` + `codegen_spec`
+strategy authored by the `mlir-transform-writer` subagent. That pattern
+compiles to IR correctly and `@__kernel_config` is invoked as preprocessing
+(verified via `--iree-codegen-notify-transform-strategy-application`), which
+successfully annotates the func with
+`translation_info = #iree_codegen.translation_info<pipeline =
+TransformDialectCodegen, codegen_spec = @conv_strategy>`.
+
+However, the downstream pass `LowerExecutableUsingTransformDialect` (source:
+`third-party/iree-src/compiler/src/iree/compiler/Codegen/Common/LowerExecutableUsingTransformDialect.cpp:44-49`)
+creates a `TransformDialectInterpreterPass` which looks up the codegen_spec
+symbol through:
+
+```cpp
+// TransformDialectInterpreterPass.cpp:87-93
+llvm::SplitString(llvm::StringRef(clCodegenTransformDialectLibraryFileName),
+                  parts, "@");
+if (!parts.empty()) libraryPath = parts[0];
+```
+
+That cl::opt is bound to `--iree-codegen-transform-dialect-library=<path>`
+(file form). `iree_tuner.py` / `iree_helper.py:84` passes the **dir** form
+`--iree-codegen-transform-dialect-library-dir=<dir>`, which drives only
+preprocessing. So the codegen phase has an empty library path and cannot
+resolve `@conv_strategy`, yielding:
+
+```
+error: could not find a nested named sequence with name: conv_strategy
+error: failed to find transform entry point 'conv_strategy'
+error: 'builtin.module' op failed to run transform dialect passes
+```
+
+**Impact:** the skill's entire rationale (richer codegen strategies beyond
+tile-size tuning) is unreachable with the current harness flag. The two
+ways to fix:
+
+- (skill side) Add a prerequisite/self-check that compiles a known-good
+  `TransformDialectCodegen` strategy and verifies the codegen_spec resolves.
+  If it doesn't, abort with an instruction to patch `iree_helper.py:84` to
+  emit `--iree-codegen-transform-dialect-library=<dir>/transform_library_dispatch_<N>.mlir@__kernel_config`
+  instead of the `-library-dir=` form.
+- (infra side) Update `iree_tuner.py` / `iree_helper.py` to pass the file
+  form for dispatches that contain a `TransformDialectCodegen` translation_info.
+
+The skill's prerequisite section currently validates only the existence of
+`iree-compile`, the toolchain, benchmarks dir, and objdump. It does not
+sanity-check that the full codegen path is reachable.
+
+## 2. High: mlir-transform-writer generated a non-compiling match pattern
+
+First attempt used `transform.match.operation_attribute` which does not
+exist in the bundled IREE build. Error surfaced only after I ran
+`iree-compile` manually with
+`--iree-codegen-notify-transform-strategy-application`; the tuner wrapper
+swallowed it.
+
+**Ask:** `mlir-transform-writer` should restrict itself to the subset of
+`transform.match.*` ops actually present in the target IREE build, or the
+skill should document a diagnostic step to grep
+`third-party/iree-src/compiler/src/iree/compiler/Codegen/.../*Match*.cpp`
+before picking matchers. The available matchers list is IREE-version
+dependent.
+
+## 3. High: transform library errors are silent through the tuner
+
+When the library module fails to parse (e.g. invalid op, wrong symbol),
+`iree_tuner.py --profile --with-transform` completes successfully and
+reports cycles that appear only slightly different from baseline (FPGA
+noise ~0.5-1%). In both of my first two attempts the kernel.o was
+byte-identical to the baseline and the "improvement" was measurement noise.
+
+This is dangerous: the FSM would record false "neutral" outcomes and waste
+iterations. The `compile_measure` state in the skill says "parse `module_main_dispatch_<N>\t<cycles>` on stdout" - there is no signal in that output that the transform was applied or skipped.
+
+**Ask:** `compile_measure` should add a post-compile check:
+1. `md5sum` the kernel.o before vs after and treat "identical" as a
+   compile-error-level outcome (transform not applied).
+2. OR re-run `iree-compile` with
+   `--iree-codegen-notify-transform-strategy-application 2>&1 | grep
+   "Applied transform configuration strategy"` to confirm the strategy ran.
+3. OR parse stderr for any `error:` / `failed to` lines and escalate to
+   error_fix.
+
+## 4. High: mlir-transform-writer added `iree_codegen.tuning_spec_entrypoint`
+
+This attribute is for `--iree-codegen-tuning-spec-path=<file>`, not for
+`-transform-dialect-library[-dir]`. With it present, the entry point is
+registered as a tuning spec and not invoked via the library-dir
+preprocessing slot. Without it, the library-dir flow runs `@__kernel_config`
+successfully.
+
+**Ask:** the skill's "Format contract" for `mlir-transform-writer` must
+forbid this attribute when the harness uses `-transform-dialect-library`
+or `-transform-dialect-library-dir`.
+
+## 5. Med: skill conflates two IREE mechanisms
+
+The skill describes "TransformDialectCodegen + codegen_spec" as the
+canonical pattern, but the repo's only working example
+(`transform_library_dispatch_0.mlir`) uses the simpler pattern: set
+`translation_info` to a standard IREE pipeline
+(`CPUBufferOpsTileAndVectorize`, `CPUConvTileAndDecomposeExpert`, etc.)
+and override `lowering_config` (tile sizes) via `transform.annotate`. That
+works through `-library-dir` without any codegen_spec lookup.
+
+These are two valid but distinct approaches. The skill should either:
+- Document both and pick based on `iree_tuner.py` flag support, OR
+- State up front which one it targets and check prerequisites accordingly.
+
+User feedback on 2026-04-20 was explicit: tile-size-only is insufficient
+(it underuses the optimizer). So the skill is right to target full codegen
+strategies - but that path is currently blocked per item 1.
+
+## 6. Med: state schema v1 -> v2 migration unclear
+
+Before `reset`, `opt/dispatch_1/state.json` existed with `schema_version=1`
+(legacy fields: `description`, `accepted: false` bool, no `insight`, no
+`asm_file` per entry, `phase: "done"` which is not in the v2 FSM). The
+skill uses v2. Behavior on re-invoking an already-converged dispatch with
+a legacy state file is undefined.
+
+**Ask:** idle state's description should handle:
+- `schema_version=1` or missing: migrate or require explicit `reset`
+- `phase="done"` (v1) or `phase="idle"` (v2) with complete history: print
+  prior summary and exit without re-running
+- any other phase: resume from that phase
+
+## 7. Med: `ir_analysis` naming inconsistency
+
+The skill's state schema example shows `"target": {"vlen_bits": 1024, ...}`
+but `extract_dispatch_info.py` emits `"native_vector_size": 128` (bytes).
+The strategy-proposer then has to derive VLEN in bits from
+`native_vector_size * 8`.
+
+**Ask:** extractor should emit `vlen_bits` explicitly, or the skill's schema
+should document `native_vector_size` (bytes) as the source of truth.
+
+## 8. Low: zsh `noclobber` trips objdump redirect
+
+The skill's compile_measure step does
+`riscv64-elf-objdump -d <working_dir>/temp/kernel.o > opt/dispatch_<N>/asm/iter_M.s`.
+On zsh with `noclobber` set (common default), the second time this fires
+the shell refuses to overwrite. Needs `>|` or `rm -f` first.
+
+**Ask:** the skill's command should be
+`riscv64-elf-objdump -d ... >| opt/dispatch_<N>/asm/iter_M.s`
+or prefix with `rm -f opt/dispatch_<N>/asm/iter_M.s && ...`.
+For `baseline.s` on a fresh state, `>` works because the file doesn't exist
+yet, so the bug is latent and triggered on re-runs or re-disassembly.
+
+## 9. Low: `/iree-optimizer reset` with no dispatch id
+
+User ran `/iree-optimizer reset` (no id). The documented signature is
+`reset <dispatch_id>`. The main agent has to guess (I picked "the only
+existing dispatch"). Either:
+- Command definition should require the id and error without one, or
+- Define a `reset all` behavior for the bare `reset` case.
+
+## 10. Low: `strategy-proposer` subagent invocation is not tool-isolated
+
+The skill says strategy-proposer is restricted to
+`Read, Grep, Glob, Bash (only grep/head/wc)`. The `general-purpose` agent
+has all tools. There is no way to pass a tool allowlist to the Agent tool,
+so the skill's "MUST NOT" constraints are advisory only. If the subagent
+edits files in violation, the FSM state becomes inconsistent.
+
+**Ask:** either define a real `strategy-proposer` sub-agent in
+`~/.claude/agents/` with tool restrictions baked in, or relax the skill's
+claim that tools are constrained.
+
+## 11. Low: `compile_measure` assumes fixed kernel.o path
+
+`<working_dir>/temp/kernel.o` is derived from the `static_library_output`
+attribute in the dispatch mlir. If iree_tuner.py ever changes the output
+directory, this assumption breaks silently (we'd disassemble the wrong or
+stale object). A more robust approach: read the path from the compiled
+mlir's `static_library_output` attribute, or let iree_tuner.py print it.
+
+---
+
+## Summary
+
+The skill's design is coherent and the FSM runs, but it cannot produce
+non-trivial optimizations in this repo because the harness flag doesn't
+wire through to the codegen phase (item 1). Before iterating on strategy
+authoring, fix the infrastructure: patch `iree_helper.py` to emit
+`--iree-codegen-transform-dialect-library=<file>@__kernel_config` per
+dispatch, then re-run the skill. Items 2-4 are orthogonal hardening
+improvements that become relevant once item 1 unblocks real iterations.

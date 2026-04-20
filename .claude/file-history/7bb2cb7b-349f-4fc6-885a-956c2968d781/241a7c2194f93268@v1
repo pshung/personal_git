@@ -1,0 +1,164 @@
+// iter_1.mlir - Transform dialect codegen strategy for
+// main_dispatch_1_conv_2d_nhwc_hwcf_1x112x112x32x3x3x3_f32
+//
+// Hypothesis: Fuse KH/KW/IC reduction tile to [3,3,3] to fully unroll
+// the 27-element filter window, eliminating inner backedges observed
+// in the baseline assembly.
+//
+// Tiles (dims: N, OH, OW, OC, KH, KW, IC):
+//   Distribution (forall): [1, 16, 56, 32, 0, 0, 0]
+//   Inner parallel (for):  [1, 1, 8, 32, 0, 0, 0]
+//   Reduction (for):       [0, 0, 0, 0, 3, 3, 3]  (was [0,0,0,0,1,1,3])
+
+module attributes { transform.with_named_sequence } {
+
+  // -------------------------------------------------------------------------
+  // Codegen strategy - the full lowering pipeline for this dispatch.
+  // -------------------------------------------------------------------------
+  transform.named_sequence @conv_strategy(%variant_op: !transform.any_op) {
+
+    // Step 1. Re-match the conv and its producers/consumers.
+    // =======================================================================
+    %conv = transform.structured.match
+        ops{["linalg.conv_2d_nhwc_hwcf"]} in %variant_op
+      : (!transform.any_op) -> !transform.any_op
+
+    // Step 2. Distribution tile via forall (workgroup level).
+    //         Tile sizes: [N=1, OH=16, OW=56, OC=32].
+    // =======================================================================
+    %tiled_dist, %forall =
+        transform.structured.tile_using_forall %conv
+        tile_sizes [1, 16, 56, 32]
+      : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.iree.populate_workgroup_count_region_using_num_threads_slice
+        %forall : (!transform.any_op) -> ()
+
+    // Step 3. Fuse the linalg.fill producer and the bias+clip consumer
+    //         into the forall loop.
+    // =======================================================================
+    %fill = transform.structured.match ops{["linalg.fill"]} in %variant_op
+      : (!transform.any_op) -> !transform.any_op
+    %fused_fill, %forall_1 =
+        transform.structured.fuse_into_containing_op %fill into %forall
+      : (!transform.any_op, !transform.any_op)
+      -> (!transform.any_op, !transform.any_op)
+
+    // Step 4. Inner parallel tile via scf.for.
+    //         Tile sizes: [N=1, OH=1, OW=8, OC=32].
+    // =======================================================================
+    %tiled_inner, %loop_n, %loop_oh, %loop_ow, %loop_oc =
+        transform.structured.tile_using_for %tiled_dist
+        tile_sizes [1, 1, 8, 32]
+      : (!transform.any_op)
+      -> (!transform.any_op,
+          !transform.any_op, !transform.any_op,
+          !transform.any_op, !transform.any_op)
+
+    // Step 5. Reduction tile via scf.for - FULL unroll of the 3x3x3 window.
+    //         Tile sizes: [0,0,0,0, KH=3, KW=3, IC=3].
+    // =======================================================================
+    %tiled_red, %loop_kh, %loop_kw, %loop_ic =
+        transform.structured.tile_using_for %tiled_inner
+        tile_sizes [0, 0, 0, 0, 3, 3, 3]
+      : (!transform.any_op)
+      -> (!transform.any_op,
+          !transform.any_op, !transform.any_op, !transform.any_op)
+
+    // Step 6. Vectorize everything inside the function.
+    // =======================================================================
+    %func = transform.structured.match ops{["func.func"]} in %variant_op
+      : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %func {
+      transform.apply_patterns.iree.fold_reshape_into_tensor_hal_interface
+      transform.apply_patterns.linalg.fold_unit_extent_dims_via_slices
+      transform.apply_patterns.vector.cast_away_vector_leading_one_dim
+    } : !transform.any_op
+    %func_v =
+        transform.structured.vectorize_children_and_apply_patterns %func
+      : (!transform.any_op) -> !transform.any_op
+
+    // Step 7. Canonicalize, CSE, eliminate empty tensors pre-bufferize.
+    // =======================================================================
+    transform.apply_patterns to %func_v {
+      transform.apply_patterns.iree.fold_fill_into_pad
+      transform.apply_patterns.linalg.tiling_canonicalization
+      transform.apply_patterns.scf.for_loop_canonicalization
+    } : !transform.any_op
+    transform.apply_patterns to %func_v {
+      transform.apply_patterns.tensor.reassociative_reshape_folding
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %func_v : !transform.any_op
+    transform.iree.eliminate_empty_tensors %variant_op
+      : (!transform.any_op) -> ()
+    transform.apply_patterns to %func_v {
+      transform.apply_patterns.linalg.erase_unnecessary_inputs
+    } : !transform.any_op
+
+    // Step 8. One-shot bufferize to memref form (CPU).
+    // =======================================================================
+    %memref_func = transform.iree.bufferize %func_v
+      : (!transform.any_op) -> (!transform.any_op)
+
+    // Step 9. Lower vectors and remaining ops toward scalar/vector loops.
+    // =======================================================================
+    %func_final = transform.structured.match ops{["func.func"]}
+        in %variant_op : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %func_final {
+      transform.apply_patterns.vector.lower_contraction
+          {lowering_strategy = outerproduct}
+      transform.apply_patterns.vector.lower_multi_reduction
+          {lowering_strategy = innerparallel}
+      transform.apply_patterns.vector.transfer_permutation_patterns
+      transform.apply_patterns.vector.lower_transfer
+      transform.apply_patterns.vector.lower_shape_cast
+      transform.apply_patterns.vector.lower_transpose
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %func_final : !transform.any_op
+
+    transform.yield
+  }
+
+  // -------------------------------------------------------------------------
+  // Annotator - tags the dispatch func with the codegen strategy.
+  // -------------------------------------------------------------------------
+  transform.named_sequence @annotate_conv(
+      %conv: !transform.any_op {transform.readonly}) {
+    %variant_op = transform.get_parent_op %conv
+        {op_name = "hal.executable.variant"}
+      : (!transform.any_op) -> !transform.any_op
+    %funcs = transform.structured.match ops{["func.func"]} in %variant_op
+      : (!transform.any_op) -> !transform.any_op
+    %info = transform.param.constant
+        #iree_codegen.translation_info<pipeline = TransformDialectCodegen
+                                       codegen_spec = @conv_strategy>
+      -> !transform.any_param
+    transform.annotate %funcs "translation_info" = %info
+      : !transform.any_op, !transform.any_param
+    transform.yield
+  }
+
+  // -------------------------------------------------------------------------
+  // Matcher - selects the target conv by op name.
+  // -------------------------------------------------------------------------
+  transform.named_sequence @match_conv(
+      %op: !transform.any_op {transform.readonly}) -> (!transform.any_op) {
+    transform.match.operation_name %op ["linalg.conv_2d_nhwc_hwcf"]
+      : !transform.any_op
+    transform.yield %op : !transform.any_op
+  }
+
+  // -------------------------------------------------------------------------
+  // Entry point - walks the IR and wires up matchers to annotators.
+  // -------------------------------------------------------------------------
+  transform.named_sequence @__kernel_config(
+      %variant_op: !transform.any_op {transform.consumed})
+    -> !transform.any_op
+    attributes { iree_codegen.tuning_spec_entrypoint } {
+    %res = transform.foreach_match in %variant_op
+        @match_conv -> @annotate_conv
+      : (!transform.any_op) -> (!transform.any_op)
+    transform.yield %res : !transform.any_op
+  }
+}
