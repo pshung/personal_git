@@ -216,43 +216,23 @@ These are illustrative only. The proposer derives the actual hypothesis from the
 specific asm + ir_analysis of the current dispatch, not by pattern-matching this
 table. Every hypothesis must cite the asm lines that justify it.
 
-- Low LMUL with no spills → push toward wider vector grouping
-- Inner tile smaller than VLmax → push toward fuller vector lane utilization
-- Innermost iteration is a reduction with poor vector op density → push toward making a parallel dim innermost
-- High load:compute ratio → push toward more operand reuse per load
-- Spills under wide LMUL → push toward less register pressure
-- Scalar ops dominate hot loop → push toward amortizing scalar overhead across more vector work
+- Low LMUL with no spills → investigate whether a wider LMUL is viable
+- Inner tile smaller than VLmax → investigate whether enlarging it helps
+- Innermost iteration is a reduction with poor vector op density → investigate interchange
+- High load:compute ratio → investigate reduction-dim tiling for operand reuse
+- Spills under wide LMUL → investigate shrinking tiles or LMUL
+- Scalar ops dominate hot loop → investigate tile enlargement to amortize overhead
 - Asm already dense with vector ops and no spills, plus prior attempts regressed → output "no clear opportunity"
 
 ### Subagent output
 
-1-3 ranked hypotheses. **The proposer describes the diagnosis, not the
-prescription.** It must NOT name specific transform dialect ops
-(`tile_using_for`, `vectorize`, etc.) - that is the writer's job. Each
-hypothesis is a JSON object:
+1-3 ranked hypotheses. Each hypothesis specifies:
+- What to change (tile sizes, LMUL, loop order, vectorization axis)
+- Expected LMUL / VLmax / tile size after the change
+- Which mlir-transform ops to compose (tile_using_for / tile_using_forall / vectorize / ...)
+- Risk (compilation failure likelihood, regression likelihood)
 
-```json
-{
-  "metric_issue": "<what the asm shows is wrong, citing specific lines and the
-                   numbers that prove it. e.g. 'asm lines 142-189: 24 vle32.v
-                   vs 8 vfmacc in the hot loop, load:compute = 3:1, memory-bound'>",
-  "improvement_direction": "<the direction to push, in metric terms, not
-                            transform-op terms. e.g. 'increase operand reuse
-                            along the reduction dimension so each loaded vector
-                            feeds more FMA ops'>",
-  "expected_metric_change": "<the asm-observable change that would confirm
-                             the hypothesis worked. e.g. 'load:compute drops
-                             to ~1:1; vle count roughly halves; instruction
-                             count may rise from epilogue but net cycles fall'>",
-  "risk": "<compilation failure likelihood + regression likelihood, with
-           reasoning grounded in ir_analysis (e.g. 'reduction-dim tiling on
-           CPUConvTileAndDecomposeExpert is fragile - high compile-failure
-           risk') >"
-}
-```
-
-Pick top. Record `state.current_iter = {hypothesis, compile_retries: 0}` where
-`hypothesis` is the JSON object above (not a free-form string).
+Pick top. Record `state.current_iter = {hypothesis, compile_retries: 0}`.
 
 **Transition:** → `implement` (hypothesis chosen) | → `evaluate` via `restore_best` (no opportunity)
 
@@ -264,31 +244,10 @@ Generate the transform script. Delegated to the **mlir-transform-writer skill**.
 
 ### Subagent inputs
 
-The optimizer hands the writer a **problem statement**, not a recipe. The writer
-owns all decisions about which transform dialect ops to use and in what order.
-
-1. `state.current_iter.hypothesis.metric_issue` - what the current asm shows is
-   wrong, with citations.
-2. `state.current_iter.hypothesis.improvement_direction` - the direction to push,
-   stated in metric/IR terms (not transform-op terms).
-3. `state.current_iter.hypothesis.expected_metric_change` - the asm-observable
-   change that would confirm success. The writer can use this as a sanity check.
-4. `state.ir_analysis` (full structure: op_type, iteration_space,
-   iteration_type, tensors, pipeline, default_tile_sizes, target, func_name).
-5. `state.best.transform_file` contents if non-null (evolution starting point).
-   `null` means start from the IREE default pipeline.
-6. `state.best.asm_file` contents - the writer can re-read the asm to confirm
-   the diagnosis before committing to a transform.
-7. Format contract: `TransformDialectCodegen` named_sequence with `codegen_spec`.
-
-The writer is free to:
-- Pick any combination of transform ops (tiling, fusion, vectorization,
-  bufferization, GPU mapping, etc.) that addresses the `improvement_direction`.
-- Reject the hypothesis if the asm/IR contradicts it (return
-  `implement_error` with a 1-2 sentence justification - the optimizer will
-  surface this back to `analyze`).
-- Choose tile sizes / LMUL / loop order based on its own knowledge of the
-  target (`state.ir_analysis.target.vlen_bits`, `features`, etc.).
+1. `state.current_iter.hypothesis` (the description to realize)
+2. `state.ir_analysis.op_type`, `shapes`, `dtypes`, `target`, `func_name`
+3. `state.best.transform_file` contents (evolution starting point, or null)
+4. Format contract: `TransformDialectCodegen` named_sequence with `codegen_spec`
 
 ### Output
 
@@ -297,8 +256,7 @@ Write transform to `opt/dispatch_<N>/transforms/iter_M.mlir` where
 
 **Transition:** → `compile_measure`
 **Fail:** mlir-transform-writer refuses or errors → record in history as
-"implement_error" with the writer's justification, → `analyze` for a different
-hypothesis.
+"implement_error", → `analyze` for a different hypothesis.
 
 ---
 
@@ -590,24 +548,14 @@ round | outcome  | cycles     | insight
   "consecutive_non_improvements": 1,
 
   "current_iter": {
-    "hypothesis": {
-      "metric_issue": "asm lines 142-189: 24 vle32.v vs 8 vfmacc, load:compute=3:1, memory-bound hot loop",
-      "improvement_direction": "increase operand reuse along reduction dimension",
-      "expected_metric_change": "load:compute drops to ~1:1, vle count roughly halves",
-      "risk": "low compile risk; possible regression if epilogue overhead exceeds load savings"
-    },
+    "hypothesis": "Raise K-tile to 64 for more reuse",
     "compile_retries": 0
   },
 
   "history": [
     {
       "iteration": 1,
-      "hypothesis": {
-        "metric_issue": "...",
-        "improvement_direction": "...",
-        "expected_metric_change": "...",
-        "risk": "..."
-      },
+      "hypothesis": "...",
       "transform_file": "opt/dispatch_1/transforms/iter_1.mlir",
       "asm_file": "opt/dispatch_1/asm/iter_1.s",
       "cycles": 360067008,
@@ -647,25 +595,14 @@ Reasoning steps use subagents; mechanical steps run inline.
 
 **strategy-proposer** (analyze):
 - Tools: Read, Grep, Glob, Bash (only `grep`/`head`/`wc` on `.s` files)
-- MUST NOT: edit files, run compile/benchmark, read mlir-transform docs, name
-  specific transform dialect ops in the hypothesis
-- MUST: read `state.best.asm_file`, extract LMUL/VLmax/spill metrics, cite
-  specific asm lines when justifying a hypothesis
-- Output: 1-3 ranked hypotheses, each as the `{metric_issue,
-  improvement_direction, expected_metric_change, risk}` JSON object defined
-  above, OR `"no clear opportunity"` with justification. The hypothesis
-  describes the *problem* and the *direction* in metric terms - it never
-  prescribes which transform ops to use (that is the writer's choice).
+- MUST NOT: edit files, run compile/benchmark, read mlir-transform docs (the implement subagent handles that)
+- MUST: read `state.best.asm_file`, extract LMUL/VLmax/spill metrics, cite specific asm lines when justifying a hypothesis
+- Output: 1-3 ranked hypotheses OR `"no clear opportunity"` with justification
 
 **mlir-transform-writer skill** (implement):
 - Invoked via Skill tool or by reading `~/.claude/skills/mlir-transform-writer/SKILL.md`
-- Receives the hypothesis as a problem statement (metric_issue +
-  improvement_direction + expected_metric_change), not as a recipe. Owns all
-  decisions about which transform ops to compose.
 - Writes `opt/dispatch_<N>/transforms/iter_M.mlir` only
 - Follows the TransformDialectCodegen format (named_sequence + codegen_spec)
-- May reject the hypothesis if asm/IR contradicts it, returning a 1-2
-  sentence justification (recorded as `implement_error` in history)
 
 **transform-error-fixer** (error_fix):
 - Tools: Read, Grep, Glob, Edit
