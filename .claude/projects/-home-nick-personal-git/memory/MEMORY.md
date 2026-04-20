@@ -1,0 +1,1 @@
+- [Git commit exclusion list](feedback_git_exclude_list.md) - Never commit .claude.json, cache, debug, file-history, logs, paste-cache, plans, plugins, projects, session-env, sessions, shell-snapshots, statsig, tasks
