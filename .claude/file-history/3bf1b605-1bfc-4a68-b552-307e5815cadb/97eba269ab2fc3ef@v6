@@ -25,6 +25,8 @@ performance feedback.
 Before running the optimizer, ensure:
 
 1. **IREE compiler** is installed at `third-party/iree-install/bin/iree-compile`.
+   If only the build tree exists (`third-party/iree-build/tools/iree-compile`),
+   symlink it: `mkdir -p third-party/iree-install/bin && ln -sf $(pwd)/third-party/iree-build/tools/iree-compile third-party/iree-install/bin/iree-compile`
 2. **RISC-V toolchain** is configured in the platform TOML (see `[build]` section)
 3. **Benchmarks directory** contains dispatch files. If empty or missing, generate:
    ```bash
@@ -46,13 +48,11 @@ command above before proceeding.
 compilation, benchmarking, and state management. You never invoke the IREE
 compiler directly - always use the harness scripts.
 
-**iree_tuner.py** (at AutoIREE root) handles compilation and benchmarking:
-- `--init` - generate benchmark dispatches from model MLIR
-- `--profile -s <N> --show-cycle` - compile+benchmark dispatch N with IREE defaults
-- `--profile -s <N> --with-transform --show-cycle` - compile+benchmark with custom transform
-
-**Helper scripts** (in `opt/script/`):
+**Harness scripts** (in the AutoIREE repo at `opt/script/`):
 - `extract_dispatch_info.py` - parse dispatch .mlir into structured JSON
+- `profile_dispatch.py` - compile+benchmark with IREE defaults
+- `compile_dispatch.py` - compile with a candidate transform library
+- `benchmark_dispatch.py` - run a compiled dispatch, extract cycles
 - `state.py` - state management (read/write/advance phase)
 
 **Your responsibilities**:
@@ -94,10 +94,8 @@ Given `<model_mlir>` (e.g., `models/mobilenet_f32/mobilenet.mlir`):
    `*_dispatch_<N>_static_benchmark.mlir` for the requested dispatch_id.
    For `all`, list available dispatches: `ls <benchmarks_dir>/*_static_benchmark.mlir`
 
-Use these resolved paths in all `iree_tuner.py` and script invocations below:
-- `model_path` as the positional model argument to `iree_tuner.py`
-- `benchmarks_dir` for `--benchmarks-dir` in `extract_dispatch_info.py`
-- `platform_toml` for `-p` in `iree_tuner.py`
+Use `model_path` for `--model`, `benchmarks_dir` for `--benchmarks-dir`, and
+`platform_toml` for `--platform` in all harness script invocations below.
 
 ## Phase Execution
 
@@ -118,13 +116,15 @@ This produces the `ir_analysis` JSON. Create initial state by writing
 
 ### Phase 2: BASELINE
 
-Profile the dispatch with IREE defaults to get baseline cycle count:
+Run the profile script to establish default performance:
 
 ```bash
-./iree_tuner.py <model_path> --profile -s <N> -p <platform_toml> --show-cycle
+python opt/script/profile_dispatch.py \
+  --dispatch-id <N> \
+  --benchmarks-dir <benchmarks_dir> \
+  --model <model_path> \
+  --platform <platform_toml>
 ```
-
-Output format: `module_main_dispatch_<N>\t<cycle_count>`
 
 Record baseline cycles in state. Advance to "iterate".
 
@@ -165,29 +165,30 @@ This is where your reasoning drives optimization. Each iteration:
 
    Save the output to `opt/dispatch_N/transforms/iter_M.mlir`.
 
-5. **Install transform and compile+benchmark** -
-   Copy the transform file into the model's working directory where
-   `iree_tuner.py` expects it:
+5. **Compile** - Run the compile script:
 
    ```bash
-   # working_dir = <model_mlir_parent>/<model_mlir_stem>/
-   mkdir -p <working_dir>/transform_library
-   cp opt/dispatch_N/transforms/iter_M.mlir \
-      <working_dir>/transform_library/transform_library_dispatch_<N>.mlir
+   python opt/script/compile_dispatch.py \
+     --dispatch-id <N> \
+     --benchmarks-dir <benchmarks_dir> \
+     --transform-file opt/dispatch_N/transforms/iter_M.mlir \
+     --work-dir /tmp/agentic_compile_N_M \
+     --model <model_path> \
+     --platform <platform_toml>
    ```
 
-   Then compile and benchmark in one step:
+   If compilation fails, record the error in history and proceed to step 7.
+
+6. **Benchmark** - If compilation succeeded:
 
    ```bash
-   ./iree_tuner.py <model_path> --profile -s <N> -p <platform_toml> \
-     --with-transform --show-cycle
+   python opt/script/benchmark_dispatch.py \
+     --exe-path <exe_path_from_compile> \
+     --model <model_path> \
+     --platform <platform_toml>
    ```
 
-   Output: `module_main_dispatch_<N>\t<cycle_count>`
-   If compilation fails, the error is printed to stderr. Record it in history
-   and proceed to step 7.
-
-6. **Record and evaluate** - Update state.json:
+7. **Record and evaluate** - Use state.py to record the iteration:
    - If cycles < best: accepted, update best, reset non-improvement counter
    - If cycles >= best or error: rejected, increment non-improvement counter
 
@@ -254,10 +255,10 @@ Access via: `ls opt/dispatch_*/state.json`
 
 ## Important Notes
 
-- Always run from the AutoIREE root directory.
-- Use `iree_tuner.py` for compilation and benchmarking. Never run iree-compile directly.
-- Always save transform scripts to `opt/dispatch_N/transforms/` before compiling.
+- Always run scripts from the AutoIREE root directory.
+- Always use the harness scripts. Never run iree-compile directly.
+- Always save transform scripts before compiling (for reproducibility).
 - Keep strategy descriptions concise but specific in the history.
 - Truncate compiler error messages to 500 chars in state.json.
 - Derive model_path, benchmarks_dir, and platform_toml from command arguments
-  per the Model Resolution section.
+  per the Model Resolution section. Pass them to every harness script invocation.
