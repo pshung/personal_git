@@ -8324,6 +8324,19 @@ alias -- zimrc='/usr/bin/nvim ~/.zimrc'
 alias -- zshrc='/usr/bin/nvim ~/.zshrc'
 # Check for rg availability
 if ! (unalias rg 2>/dev/null; command -v rg) >/dev/null 2>&1; then
-  alias rg='/home/nick/.nvm/versions/node/v22.5.1/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg'
+  function rg {
+  local _cc_bin="${CLAUDE_CODE_EXECPATH:-}"
+  [[ -x $_cc_bin ]] || _cc_bin=$(command -v claude 2>/dev/null)
+  if [[ ! -x $_cc_bin ]]; then command rg "$@"; return; fi
+  if [[ -n $ZSH_VERSION ]]; then
+    ARGV0=rg "$_cc_bin" "$@"
+  elif [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]] || [[ "$OSTYPE" == "win32" ]]; then
+    ARGV0=rg "$_cc_bin" "$@"
+  elif [[ $BASHPID != $$ ]]; then
+    exec -a rg "$_cc_bin" "$@"
+  else
+    (exec -a rg "$_cc_bin" "$@")
+  fi
+}
 fi
 export PATH=/home/nick/.nvm/versions/node/v22.5.1/bin:/home/nick/.pyenv/shims:/home/nick/.pyenv/bin:/home/nick/.nix-profile/bin/:/home/nick/.python_venv/bin/:/home/nick/myusr/bin:/home/nick/myusr/local/bin:/home/nick/mybin/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/bin/vendor_perl:/home/nick/myTool/arcanist/bin:/usr/share:/home/nick/.cargo/bin/:/home/nick/.local/bin:/home/nick/.fzf/bin:/home/nick/.claude/plugins/cache/claude-plugins-official/ralph-loop/1.0.0/bin
