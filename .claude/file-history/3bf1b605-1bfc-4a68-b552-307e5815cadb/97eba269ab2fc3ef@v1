@@ -10,7 +10,7 @@ description: >
   replace GA-based tile size search with intelligent codegen exploration.
   Also trigger when the user says "iree optimize", "optimize dispatch",
   "agentic tune", or references dispatch .mlir files for performance tuning.
-argument-hint: "<model_mlir> <dispatch_id|all> [<platform_toml>] [--max-iter N] | status | reset <dispatch_id>  (platform defaults to config/AX45_1024.toml)"
+argument-hint: "[dispatch_id|all|status|reset] [--max-iter N]"
 ---
 
 # IREE Dispatch Optimizer
@@ -19,27 +19,6 @@ An agentic optimization loop that replaces blind GA search with LLM-driven
 codegen strategy exploration. You analyze dispatch IR, propose full
 TransformDialectCodegen strategies, and iterate based on compilation and
 performance feedback.
-
-## Prerequisites
-
-Before running the optimizer, ensure:
-
-1. **IREE compiler** is installed at `third-party/iree-install/bin/iree-compile`
-2. **RISC-V toolchain** is configured in the platform TOML (see `[build]` section)
-3. **Benchmarks directory** exists. If not, generate it:
-   ```bash
-   python3 iree_tuner.py <model_mlir> --init --platform <platform_toml>
-   ```
-   This runs iree-compile with `--iree-hal-dump-executable-benchmarks-to=benchmarks/`
-   to produce `*_static_benchmark.mlir` and `*_static_tile_config.json` files.
-4. **FPGA target** is accessible for cycle-accurate benchmarking (default).
-   QEMU (`config/qemu.toml`) can verify functional correctness but does not
-   provide cycle counts needed for performance optimization.
-
-If validation fails because `benchmarks_dir` does not exist, run the init command
-above before proceeding.
-
-**Working directory**: All harness scripts must be run from the AutoIREE root directory.
 
 ## Architecture: Harness + LLM
 
@@ -63,16 +42,11 @@ compiler directly - always use the harness scripts.
 
 ## Commands
 
-### `/iree-optimizer <model_mlir> <dispatch_id> [<platform_toml>]`
+### `/iree-optimizer <dispatch_id>`
 Full auto: gather -> baseline -> iterate -> evaluate -> done for one dispatch.
-- `<model_mlir>` - path to the model's .mlir file relative to AutoIREE root
-  (e.g., `models/mobilenet_f32/mobilenet.mlir`)
-- `<platform_toml>` - optional, path to platform config TOML relative to AutoIREE root.
-  Defaults to `config/AX45_1024.toml` (FPGA, provides cycle counts).
-  Other options: `config/AX45_512.toml` (FPGA, VLEN=512), `config/qemu.toml` (functional correctness only, no cycle counts)
 
-### `/iree-optimizer <model_mlir> all [<platform_toml>]`
-Optimize all dispatches for the given model, heaviest first.
+### `/iree-optimizer all`
+Optimize all dispatches in the benchmarks/ directory, heaviest first.
 
 ### `/iree-optimizer status`
 Show current state of all dispatches being optimized.
@@ -80,22 +54,9 @@ Show current state of all dispatches being optimized.
 ### `/iree-optimizer reset <dispatch_id>`
 Reset state for a dispatch to start over.
 
-## Model Resolution
-
-Given `<model_mlir>` (e.g., `models/mobilenet_f32/mobilenet.mlir`):
-
-1. **model_path**: use the argument directly (relative to AutoIREE root)
-2. **benchmarks_dir**: `<model_mlir_parent>/<model_mlir_stem>/benchmarks/`
-   - Example: `models/mobilenet_f32/mobilenet.mlir` -> `models/mobilenet_f32/mobilenet/benchmarks/`
-3. **platform_toml**: use the argument if provided, otherwise default to `config/AX45_1024.toml`
-4. **Validate** both the mlir file and benchmarks dir exist before proceeding
-
-Use `model_path` for `--model`, `benchmarks_dir` for `--benchmarks-dir`, and
-`platform_toml` for `--platform` in all harness script invocations below.
-
 ## Phase Execution
 
-Read `~/.claude/skills/iree-optimizer/references/state_schema.md` for the full state.json schema.
+Read `references/state_schema.md` for the full state.json schema.
 
 ### Phase 1: GATHER
 
@@ -104,7 +65,7 @@ Run the extract script to analyze the dispatch IR:
 ```bash
 python opt/script/extract_dispatch_info.py \
   --dispatch-id <N> \
-  --benchmarks-dir <benchmarks_dir>
+  --benchmarks-dir benchmarks/
 ```
 
 This produces the `ir_analysis` JSON. Create initial state:
@@ -126,9 +87,9 @@ Run the profile script to establish default performance:
 ```bash
 python opt/script/profile_dispatch.py \
   --dispatch-id <N> \
-  --benchmarks-dir <benchmarks_dir> \
+  --benchmarks-dir benchmarks/ \
   --model <model_path> \
-  --platform <platform_toml>
+  --platform <config.toml>
 ```
 
 Record baseline cycles in state. Advance to "iterate".
@@ -175,11 +136,11 @@ This is where your reasoning drives optimization. Each iteration:
    ```bash
    python opt/script/compile_dispatch.py \
      --dispatch-id <N> \
-     --benchmarks-dir <benchmarks_dir> \
+     --benchmarks-dir benchmarks/ \
      --transform-file opt/dispatch_N/transforms/iter_M.mlir \
      --work-dir /tmp/agentic_compile_N_M \
      --model <model_path> \
-     --platform <platform_toml>
+     --platform <config.toml>
    ```
 
    If compilation fails, record the error in history and proceed to step 7.
@@ -190,7 +151,7 @@ This is where your reasoning drives optimization. Each iteration:
    python opt/script/benchmark_dispatch.py \
      --exe-path <exe_path_from_compile> \
      --model <model_path> \
-     --platform <platform_toml>
+     --platform <config.toml>
    ```
 
 7. **Record and evaluate** - Use state.py to record the iteration:
@@ -216,7 +177,7 @@ Print the final summary: baseline, best, speedup, winning strategy.
 
 ## Strategy Guide
 
-Read `~/.claude/skills/iree-optimizer/references/strategy_guide.md` for detailed CPU codegen strategy
+Read `references/strategy_guide.md` for detailed CPU codegen strategy
 knowledge, but here's the quick version:
 
 ### CPU (RISC-V with RVV) Strategy Space
@@ -260,10 +221,9 @@ Access via: `ls opt/dispatch_*/state.json`
 
 ## Important Notes
 
-- Always run scripts from the AutoIREE root directory.
 - Always use the harness scripts. Never run iree-compile directly.
 - Always save transform scripts before compiling (for reproducibility).
 - Keep strategy descriptions concise but specific in the history.
 - Truncate compiler error messages to 500 chars in state.json.
-- Derive model_path, benchmarks_dir, and platform_toml from command arguments
-  per the Model Resolution section. Pass them to every harness script invocation.
+- The model and platform args are required for scripts that need Context init.
+  Get these from the user or from the working directory structure.
