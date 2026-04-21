@@ -2,7 +2,7 @@ read @save_output_token.md
 read @TDD.md
 
 # Principle
-* When designing a plan, always consider how to reach `Compound Effect` and `Closed-Loop Optimization`
+* When designing a plan, always consider how to reach `Compound Effect`, `Closed-Loop Optimization` and 'flywheel effect' to speedup the plan.
 
 #
 * When writing a SKILL.md, never hardcode anything. Always consider the portability.

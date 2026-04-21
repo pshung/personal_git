@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+################################################################################
+# Run vsim pipeline analysis on a standalone kernel assembly extract.
+#
+# No fast-forward needed — the ELF starts executing the kernel immediately.
+# Compiles a .S file, runs it in AndesCycle, logs pipeline from cycle 0.
+#
+# Usage:
+#   run_vsim_kernel.sh <kern.S> [--log-cycles N]
+#
+# Example:
+#   run_vsim_kernel.sh vsim-bench/kern_maxpool_HWC_s8.S --log-cycles 2000
+#
+# Output:
+#   qemu-validate/work/vsim_<basename>.kanata.log — pipeline log
+################################################################################
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORK_DIR="${SCRIPT_DIR}/work"
+VSIM_DIR="/local/nick/vsim-workspace/vsim"
+
+# Parse args
+LOG_CYCLES=2000
+KERN_SRC=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --log-cycles) LOG_CYCLES="$2"; shift 2 ;;
+        -*)           echo "Unknown option: $1" >&2; exit 1 ;;
+        *)            KERN_SRC="$1"; shift ;;
+    esac
+done
+
+if [ -z "${KERN_SRC}" ]; then
+    echo "Usage: $0 <kern.S> [--log-cycles N]" >&2
+    exit 1
+fi
+
+BASENAME="$(basename "${KERN_SRC}" .S)"
+ELF="${WORK_DIR}/${BASENAME}.elf"
+OBJDUMP_FILE="${WORK_DIR}/${BASENAME}.objdump"
+KANATA_LOG="${WORK_DIR}/vsim_${BASENAME}.kanata.log"
+
+mkdir -p "${WORK_DIR}"
+
+# Compile
+echo "[compile] ${KERN_SRC}"
+riscv64-elf-gcc -march=rv64gcv -mabi=lp64d -nostdlib \
+    -o "${ELF}" "${KERN_SRC}" -Wl,-Ttext=0x10000 || exit 1
+
+riscv64-elf-objdump -d "${ELF}" > "${OBJDUMP_FILE}"
+echo "[objdump] ${OBJDUMP_FILE}"
+
+# Run vsim — no fast-forward, log from cycle 0
+echo "[vsim] Logging ${LOG_CYCLES} cycles from start"
+
+ln -sfn "${VSIM_DIR}/tools" /tmp/vsim
+PYTHONPATH="/tmp:${VSIM_DIR}/tools" python3 - "${ELF}" "${OBJDUMP_FILE}" "${KANATA_LOG}" "${LOG_CYCLES}" <<'PYEOF'
+import sys
+
+elf = sys.argv[1]
+objdump_file = sys.argv[2]
+kanata_log = sys.argv[3]
+log_cycles = int(sys.argv[4])
+
+from vsim import Vsim
+import andes45
+from utils import KanataLogger, parse_objdump_output
+
+# Set up simulator
+simu = Vsim("ax45mpv_premium")
+print(f"AndesCycle: {simu.get_version()}")
+simu.load_elf(elf)
+simu.reset()
+
+# Cycle-by-cycle pipeline logging from the start
+kanata = KanataLogger(open(kanata_log, "w"))
+with open(objdump_file, "r") as fin:
+    kanata.code_map = parse_objdump_output(fin.read())
+
+has_vpu = True  # ax45mpv has VPU
+recorders = [andes45.PipelineModeler(simu.cpu, kanata, has_vpu)]
+
+for cy in range(log_cycles):
+    if simu.get_exits() >= 0:
+        print(f"[vsim] Program exited after {cy} logged cycles")
+        break
+    for rec in recorders:
+        rec.record(cy)
+    simu.run(1)
+    kanata.advance_cycle(1)
+
+kanata.flush_all()
+print(f"[done] Logged {cy+1} cycles")
+PYEOF
+
+RC=$?
+if [ ${RC} -ne 0 ]; then
+    echo "RESULT: VSIM_ERROR (exit ${RC})" >&2
+    exit 1
+fi
+
+echo ""
+echo "--- vsim kernel profile ---"
+echo "  Pipeline log: ${KANATA_LOG}"
+echo "  Objdump:      ${OBJDUMP_FILE}"
+echo "  Log size:     $(wc -l < "${KANATA_LOG}") lines"
+echo "---"

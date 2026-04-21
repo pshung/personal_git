@@ -3,10 +3,10 @@
 # Build and run a single libnn unit test on Andes QEMU (AX45MPV)
 #
 # Usage:
-#   run_qemu_test.sh <test_name> [--strace] [--vlen N] [--timeout N]
+#   run_qemu_test.sh <test_name> [--strace] [--vlen N] [--timeout N] [--config <config.toml>]
 #
 # Examples:
-#   run_qemu_test.sh conv_HWC_s8_s8_s8_asym_bias_any --strace --vlen 1024
+#   run_qemu_test.sh conv_HWC_s8_s8_s8_RGB_sft_bias --strace --config /path/to/config.toml
 #   run_qemu_test.sh relu_s8 --strace --vlen 512
 #
 # Notes:
@@ -19,13 +19,14 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIB_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+LIB_ROOT="${LIBNN_ROOT:-/home/nick/work/agentic_libnn_opt}"
 
 # Defaults
 USE_STRACE=0
 VLEN=1024
 TIMEOUT=120
 TEST_NAME=""
+CONFIG_TOML=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -33,19 +34,33 @@ while [[ $# -gt 0 ]]; do
         --strace)  USE_STRACE=1; shift ;;
         --vlen)    VLEN="$2"; shift 2 ;;
         --timeout) TIMEOUT="$2"; shift 2 ;;
+        --config)  CONFIG_TOML="$2"; shift 2 ;;
         -*)        echo "Unknown option: $1" >&2; exit 1 ;;
         *)         TEST_NAME="$1"; shift ;;
     esac
 done
 
 if [ -z "${TEST_NAME}" ]; then
-    echo "Usage: $0 <test_name> [--strace] [--vlen N] [--timeout N]" >&2
+    echo "Usage: $0 <test_name> [--strace] [--vlen N] [--timeout N] [--config <config.toml>]" >&2
     exit 1
 fi
 
-# Paths
-TOOLCHAIN_BIN="/local/nick/SW_Release_cp/ast530/nds64le-elf-newlib-v5d/bin"
-QEMU_BIN="/local/nick/qemu_andes/build/qemu-system-riscv64"
+# Load config (required)
+if [ -z "${CONFIG_TOML}" ]; then
+    CONFIG_TOML="${SCRIPT_DIR}/../../opt/config.toml"
+fi
+if [ ! -f "${CONFIG_TOML}" ]; then
+    echo "ERROR: config.toml not found: ${CONFIG_TOML}" >&2
+    echo "  Provide --config <path> or ensure opt/config.toml exists." >&2
+    exit 1
+fi
+source "${SCRIPT_DIR}/parse_config.sh" "${CONFIG_TOML}"
+TOOLCHAIN_BIN="${CFG_TOOLCHAIN_BIN}"
+QEMU_BIN_PATH="${CFG_QEMU_BIN}"
+VLEN="${CFG_QEMU_VLEN:-${VLEN}}"
+TIMEOUT="${CFG_QEMU_TIMEOUT:-${TIMEOUT}}"
+
+QEMU_BIN="${QEMU_BIN_PATH}"
 QEMU_CFG="${LIB_ROOT}/project/ax45mpv/qemu_cfg/zve64d/ADP-AE350-AX45MPV-1C_dw0_mw1.cfg"
 UNIT_TEST_DIR="${LIB_ROOT}/Examples/unit_func"
 TEST_SRC="${UNIT_TEST_DIR}/t_${TEST_NAME}.c"
@@ -72,9 +87,9 @@ fi
 # Compile
 CC="riscv64-elf-gcc"
 CFLAGS="-O3 -Wall -Werror -ffunction-sections -fdata-sections -Wl,-gc-sections"
-CFLAGS+=" -mvh -DENA_FS_VS"
+CFLAGS+=" -mvh -mzfh -DENA_FS_VS"
 CFLAGS+=" -mtune=andes-45-series -mext-vector=zve64d -DNDS_VEC_RVV_VERSION=1000"
-CFLAGS+=" -DENA_DUMP_GOLDEN=0 -DENA_MEASURE_PERF=0"
+CFLAGS+=" -DENA_FAST_ALGO -DENA_DUMP_GOLDEN=0 -DENA_MEASURE_PERF=0"
 CFLAGS+=" -DGETENV_TESTDIR=${UNIT_TEST_DIR}"
 INC="-I${LIB_ROOT}/Include -I${UNIT_TEST_DIR}/include"
 ADX="${WORK_DIR}/t_${TEST_NAME}.adx"
@@ -100,9 +115,8 @@ if [ "${USE_STRACE}" -eq 1 ]; then
     timeout "${TIMEOUT}" strace -f -e trace=write -o "${STRACE_LOG}" ${QEMU_CMD} > /dev/null 2>&1
     QEMU_RC=$?
 
-    # Parse strace output for semihosting messages (fd 9)
-    # Extract the string content from write(9, "...", N) calls
-    OUTPUT=$(grep 'write(9,' "${STRACE_LOG}" 2>/dev/null | sed 's/.*write(9, "//; s/\\n".*//; s/".*//') || true
+    # Parse strace output for semihosting messages (fd 9 or fd 1)
+    OUTPUT=$(grep -E 'write\((9|1),' "${STRACE_LOG}" 2>/dev/null | sed 's/.*write([0-9]*, "//; s/\\n".*//; s/".*//') || true
 
     echo ""
     echo "--- semihosting output ---"
@@ -127,7 +141,6 @@ if [ "${USE_STRACE}" -eq 1 ]; then
         exit 1
     else
         echo "RESULT: UNKNOWN (no pass/fail detected, QEMU exit=${QEMU_RC})"
-        # Dump last 20 lines of strace for debugging
         echo "--- strace tail ---"
         tail -20 "${STRACE_LOG}" 2>/dev/null || true
         echo "---"

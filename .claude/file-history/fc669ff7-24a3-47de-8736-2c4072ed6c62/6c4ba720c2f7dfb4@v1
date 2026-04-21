@@ -4,50 +4,62 @@
 # Captures cycle counts from PF_COUNTER output.
 #
 # Usage:
-#   run_fpga_test.sh <test_name> [--timeout N]
+#   run_fpga_test.sh <test_name> [--timeout N] [--config <config.toml>]
 #
 # Examples:
-#   run_fpga_test.sh conv_dw_HWC_s8_s8_s8_sym_bias_any
+#   run_fpga_test.sh conv_HWC_s8_s8_s8_RGB_sft_bias --config /path/to/config.toml
 #   run_fpga_test.sh relu_s8 --timeout 600
-#
-# Environment:
-#   MYPC   — FPGA board host (default: sw-boards.andestech.com)
-#   MYPORT — FPGA board port (default: 1116)
 ################################################################################
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIB_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+LIB_ROOT="${LIBNN_ROOT:-/home/nick/work/agentic_libnn_opt}"
 
 # Defaults
 TIMEOUT=300
 TEST_NAME=""
+CONFIG_TOML=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --timeout) TIMEOUT="$2"; shift 2 ;;
+        --config)  CONFIG_TOML="$2"; shift 2 ;;
         -*)        echo "Unknown option: $1" >&2; exit 1 ;;
         *)         TEST_NAME="$1"; shift ;;
     esac
 done
 
 if [ -z "${TEST_NAME}" ]; then
-    echo "Usage: $0 <test_name> [--timeout N]" >&2
+    echo "Usage: $0 <test_name> [--timeout N] [--config <config.toml>]" >&2
     exit 1
 fi
 
+# Load config (required)
+if [ -z "${CONFIG_TOML}" ]; then
+    CONFIG_TOML="${SCRIPT_DIR}/../../opt/config.toml"
+fi
+if [ ! -f "${CONFIG_TOML}" ]; then
+    echo "ERROR: config.toml not found: ${CONFIG_TOML}" >&2
+    echo "  Provide --config <path> or ensure opt/config.toml exists." >&2
+    exit 1
+fi
+source "${SCRIPT_DIR}/parse_config.sh" "${CONFIG_TOML}"
+TOOLCHAIN_BIN="${CFG_TOOLCHAIN_BIN}"
+FPGA_HOST="${CFG_FPGA_HOST}"
+FPGA_PORT="${CFG_FPGA_PORT}"
+TIMEOUT="${CFG_FPGA_TIMEOUT:-${TIMEOUT}}"
+
 # Paths
-TOOLCHAIN_BIN="/local/nick/SW_Release_cp/ast530/nds64le-elf-newlib-v5d/bin"
 UNIT_TEST_DIR="${LIB_ROOT}/Examples/unit_func"
 TEST_SRC="${UNIT_TEST_DIR}/t_${TEST_NAME}.c"
 WORK_DIR="${SCRIPT_DIR}/work"
 BOARD_DIR="${LIB_ROOT}/project/ax45mpv"
 WRAPPER="${BOARD_DIR}/riscv64-sim-wrapper-on-board"
 
-# FPGA board connection
-export MYPC="${MYPC:-sw-boards.andestech.com}"
-export MYPORT="${MYPORT:-1116}"
+# FPGA board connection (from config.toml)
+export MYPC="${FPGA_HOST}"
+export MYPORT="${FPGA_PORT}"
 
 # Validate
 for f in "${TOOLCHAIN_BIN}/riscv64-elf-gcc" "${TEST_SRC}" "${WRAPPER}"; do
@@ -57,7 +69,17 @@ for f in "${TOOLCHAIN_BIN}/riscv64-elf-gcc" "${TEST_SRC}" "${WRAPPER}"; do
     fi
 done
 
-export PATH="${TOOLCHAIN_BIN}:${LIB_ROOT}:${PATH}"
+# Create gdb-nopython symlink if needed (GDB expect script requires it)
+GDB_REAL="${TOOLCHAIN_BIN}/riscv64-elf-gdb"
+GDB_NOPYTHON="${TOOLCHAIN_BIN}/riscv64-elf-gdb-nopython"
+GDB_EXTRA_PATH=""
+if [ -f "${GDB_REAL}" ] && [ ! -e "${GDB_NOPYTHON}" ]; then
+    GDB_TMPDIR=$(mktemp -d /tmp/fpga_gdb_XXXXXX)
+    ln -sf "${GDB_REAL}" "${GDB_TMPDIR}/riscv64-elf-gdb-nopython"
+    GDB_EXTRA_PATH="${GDB_TMPDIR}:"
+fi
+
+export PATH="${GDB_EXTRA_PATH}${TOOLCHAIN_BIN}:${LIB_ROOT}:${PATH}"
 mkdir -p "${WORK_DIR}"
 
 # Check libnn.a exists
@@ -90,7 +112,7 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# Generate objdump for vsim analysis later
+# Generate objdump for analysis
 riscv64-elf-objdump -d "${ADX}" > "${OBJDUMP_FILE}" 2>/dev/null || true
 
 # Reset board state
