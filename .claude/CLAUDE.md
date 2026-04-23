@@ -7,7 +7,13 @@ read @TDD.md
  
 
 # Your action
-* You're allowed to ask me any questions to clarify or get the necessary information.
+## How to design a good plan.
+* I'm responsible as your PM, so ask questions to clarify my intension or get the necessary information I didn't provide.
+* The core architecture must be fully understandable with me, you deal with the leaf nodes (hide the detail I don't need to know.)
+
+* Double check that the output matches my intension completely before completing a task.
+* Clearly define the input and output so human can understand easily and verify your task.
+* 
 
 # Coding Principle
 * Never hardcode in skills, must consider portability.
