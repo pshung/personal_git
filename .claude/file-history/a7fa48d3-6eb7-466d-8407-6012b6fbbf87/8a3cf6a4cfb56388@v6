@@ -1,0 +1,427 @@
+---
+name: optimize
+description: Fully autonomous RVV optimization loop for libnn functions on AX45MPV (VLEN=1024). Runs a 6-step FSM — select, analyze, implement, verify, measure, learn — then loops back to analyze with new insights. No human intervention required.
+argument-hint: [function_name|status|reset]
+disable-model-invocation: false
+allowed-tools: Read, Grep, Glob, Bash, Edit, Write, Agent
+---
+
+# libnn RVV Optimization Skill
+
+Fully autonomous optimization loop. State persisted in `.claude/opt-state.json`.
+
+## Current State
+
+!`LIB_ROOT=$(git rev-parse --show-toplevel); cat ${LIB_ROOT}/.claude/opt-state.json 2>/dev/null || echo '{"step":"idle","function":"","round":0,"history":[]}'`
+
+## Commands
+
+- `/optimize <function_name>` — Start optimizing a function (loops until flat land).
+- `/optimize status` — Show current state
+- `/optimize reset` — Reset to idle
+
+Arguments received: `$ARGUMENTS`
+
+## Finite State Machine
+
+```
+idle → select → analyze ──→ implement → verify ──→ measure ──→ learn ─┐
+                  ↑ |          ↑          |                             |
+                  | |          └──────────┘                             |
+                  | |       (verify fail → fix → retry)                 |
+                  | └→ idle (no opportunity found)                       |
+                  |                                                      |
+                  └──────────────────────────────────────────────────────┘
+                    (loop with new insights + assembly analysis)
+
+Exit conditions:
+  - analyze finds no optimization opportunity → idle
+  - max 10 rounds per function → idle
+```
+
+The loop is the core mechanic: after `learn`, go back to `analyze` with fresh insights from FPGA measurements, updated assembly, and recomputed metrics. The verify/measure loop provides real feedback.
+
+---
+
+## Build Scripts Reference
+
+All scripts are at `qemu-validate/` (relative to project root). Always use `/usr/bin/bash` to invoke them. In every bash block, define: `LIB_ROOT=$(git rev-parse --show-toplevel)`
+
+| Script | Purpose | Time |
+|--------|---------|------|
+| `build_libnn.sh` | Full rebuild of libnn.a (~400 files). Use ONLY for initial build in `select` step. | ~30s |
+| `rebuild_single.sh <src.c>` | Recompile single .c, update libnn.a + objdump. Use for ALL rebuilds after `implement`. | ~0.6s |
+| `rebuild_single.sh -E <src.c>` | Preprocess only (reuses the same flags). Output: `qemu-validate/work/<basename>.i`. Use in `analyze` to see which `#ifdef` branches survive. | ~0.3s |
+| qemu-runner subagent | QEMU correctness test (handles fd 9 semihosting). Compile test binary first, then dispatch agent. | ~1s |
+| `run_fpga_test.sh <name>` | FPGA cycle count measurement via GDB. | ~30s |
+
+---
+
+## State: `idle`
+
+No optimization in progress.
+
+If a function name is provided, transition → `select`.
+If "status", report idle. If "reset", clear state.
+
+---
+
+## State: `select`
+
+Validate the function and gather baseline context.
+
+1. Find the source file under `Source/` — grep for the function name
+2. Confirm it has `#ifdef ENA_VEC_ISA` (existing RVV to improve)
+3. Find corresponding test in `Examples/unit_func/t_<name>.c`
+4. Query the wiki for prior lessons and applicable techniques:
+   - Read `docs/wiki/index.md` to identify relevant pages
+   - Read the operator page in `docs/wiki/operators/` if it exists (e.g., `conv-hwc-s8-sym-bias-fast.md`)
+   - Read matching `docs/wiki/general/` pages for applicable techniques and known anti-patterns
+5. Full build (first time only):
+   ```bash
+   /usr/bin/bash ${LIB_ROOT}/qemu-validate/build_libnn.sh
+   ```
+6. Run baseline FPGA measurement (**MUST use this exact script — do NOT compile or run FPGA tests manually**):
+   ```bash
+   /usr/bin/bash ${LIB_ROOT}/qemu-validate/run_fpga_test.sh <test_name>
+   ```
+   Parse cycles from the output line: `RESULT: PASS (cycles=NNNN)`
+7. **Identify the active code path.** Primary: preprocess the source with the same build flags and read the surviving `#ifdef` branches:
+   ```bash
+   /usr/bin/bash ${LIB_ROOT}/qemu-validate/rebuild_single.sh -E <source_file>
+   # Output: qemu-validate/work/<basename>.i
+   ```
+   Secondary (for dispatch functions that call sub-kernels): confirm the linked sub-function names from the perf objdump:
+   ```bash
+   grep -A500 '<function_name>:' qemu-validate/work/t_<test>_perf.objdump | \
+     grep -E "(jal|jalr).*<[^+>]+>" | head -20
+   ```
+   Save `active_path_file` (path to `.i`) and `called_functions` in state.
+8. Save state: function, source_file, test_name, cycles_before, instrs_before, active_path_file, called_functions.
+
+**Transition:** → `analyze`
+**Fail:** Function not found or no RVV → stay `select`, report error.
+
+---
+
+## State: `analyze`
+
+Study the current RVV code and assembly to form the next optimization hypothesis.
+
+**CRITICAL — Identify the active code path from preprocessed source, not from raw `#ifdef` guards.**
+
+Many `#ifdef` guards depend on macros defined in internal headers (e.g., `ENA_TILING`, `ENA_FAST_ALGO` are unconditionally defined in `internal/internal_nn_math.h`), NOT just build.sh flags. **Never guess the active path from raw source alone.** Instead:
+
+1. **Primary method — preprocessed source.** Run the file through the preprocessor with the exact build flags:
+   ```bash
+   /usr/bin/bash ${LIB_ROOT}/qemu-validate/rebuild_single.sh -E <source_file.c>
+   # Output: qemu-validate/work/<basename>.i
+   ```
+   The `.i` file contains only the branches that survive preprocessing — it directly answers "which `#ifdef` block is active" without inference. Grep for the function in the `.i` file and read that body. This works even when the active block is fully inline (no sub-function calls), which objdump cannot disambiguate.
+
+2. **Secondary method — objdump cross-check.** For functions that dispatch to sub-kernels, confirm by checking which sub-functions the linked binary actually calls:
+   ```bash
+   grep -E "(jal|jalr).*<[^+>]+>" qemu-validate/work/t_<test>_perf.objdump | grep -v "gdb\|nds\|start\|__" | head -20
+   ```
+   Cross-reference call targets (e.g., `nn_mat_mul_kernel_tiling_q7` vs `nn_mat_mul_kernel_q7_bias_2sft`) with the preprocessed source. This catches cases where LTO/dead-code elimination pruned a branch that `-E` still shows.
+
+3. When mapping the `.i` body back to raw source for editing, target only the `#ifdef` branch whose body matches the `.i`. Modifying any other branch has zero effect.
+
+**Key defines active for AX45MPV** (from build.sh + internal headers):
+- `ENA_VEC_ISA` — from build.sh
+- `NDS_VEC_RVV_VERSION=1000` — from build.sh
+- `ENA_NDS_V5_VEC_DOT_PROD` — from build.sh
+- `ENA_TILING` — from `internal/internal_nn_math.h:2256`
+- `ENA_FAST_ALGO` — from `internal/internal_nn_math.h`
+- `ENA_VEC_INTRINSIC` — **NOT defined** (dead code)
+- `ENA_VEC_ISA_ZVQMAC` — **NOT defined** (unless toolchain provides it implicitly for some files)
+
+### Analysis
+
+**On first round (round=1):**
+1. Identify the active code path from the `.i` file saved in `active_path_file` by `select`. Read the function body there; use the raw source only to map back to line numbers for editing.
+2. Find the function's assembly in `libnn.objdump`:
+   ```bash
+   grep -A 200 '<function_name>:' ${LIB_ROOT}/libnn.objdump | head -300
+   ```
+3. If the function calls sub-functions (GEMM kernels, etc.), also read those sub-functions' assembly and source
+4. Query the wiki: read `docs/wiki/index.md`, relevant `general/` pages for similar patterns, operator page if it exists
+5. Compute key metrics from the assembly and source:
+   - **Arithmetic Intensity** = FLOPs per byte transferred from memory. Count MAC-equivalent ops (e.g., each `vqmacc` contributes `2 * vl` FLOPs for LMUL-dependent `vl`); count bytes loaded/stored per loop iteration (load instructions x element width x vl). AI = FLOPs / bytes.
+   - **Reuse Rate** = FLOPs per byte loaded (exclude stores). Measures how many times each loaded byte contributes to computation before being evicted. High reuse = cache-friendly; low reuse = memory-bound.
+   - Save both as `arith_intensity` and `reuse_rate` in state.
+6. Identify bottleneck using the metrics: low AI -> memory-bound (improve tiling/blocking/reuse); high AI but low IPC -> compute-bound (LMUL, register pressure, loop structure)
+7. Form hypothesis: what to change and expected impact
+
+**On subsequent rounds (round>1):**
+1. Re-run `rebuild_single.sh -E <source_file>` to refresh the `.i`, then re-read the active block (source changed last round, and `#ifdef` resolution may have shifted if macros were touched).
+2. Re-check `libnn.objdump` for the updated assembly of the function.
+3. Recompute arithmetic intensity and reuse rate from the updated assembly. Compare to previous round — did the change improve reuse or reduce memory traffic?
+4. Review FPGA cycle/instruction delta from last round's `measure` step to identify new bottleneck
+5. Query the wiki: read `docs/wiki/index.md` and relevant `general/` pages for the specific bottleneck pattern
+6. Form the next hypothesis based on what the metrics reveal
+
+**Proposer output:** 1–3 ranked ideas, each with what to change, which lines, expected impact rationale, and risk assessment. Include current arithmetic intensity and reuse rate in the summary. Pick the top idea as the hypothesis.
+
+### Output and Transitions
+
+**Output:** Print the analysis summary (including arithmetic intensity, reuse rate, and hypothesis). Do NOT wait for approval — proceed immediately.
+
+**Decision gate:** If no concrete optimization opportunity can be identified (assembly looks clean, metrics are already optimal, LMUL/tiling are already well-tuned):
+- Transition to idle with final summary.
+- Do NOT force an optimization that has no clear rationale.
+
+**Transition:** → `implement` (if opportunity found) or → `idle` (if no opportunity)
+
+---
+
+## State: `implement`
+
+Apply the optimization.
+
+1. Modify ONLY the active code path identified during `analyze`. The active path was determined from the preprocessed `.i` file (with objdump cross-check for dispatch functions). **Do NOT guess from `#ifdef` guards in the raw source** — many macros (e.g., `ENA_TILING`, `ENA_FAST_ALGO`) are defined in internal headers, not build.sh. Map from the `.i` body back to the corresponding raw-source line numbers when editing.
+2. If the function calls sub-functions (e.g., a GEMM kernel), the optimization may need to be applied in the sub-function's source file, not the conv function's source.
+3. Do NOT touch the plain C fallback or dead `#ifdef` blocks
+4. Save a description of what was changed in state (`changes` field)
+5. If this is round>1 and the previous round regressed, revert the regression first, then try the new approach
+
+**CRITICAL — Intrinsic API selection:**
+The active `ENA_VEC_ISA` code path uses **`NDS_VEC_*` macros** (e.g., `NDS_VEC_VSETVLI`, `NDS_VEC_VLE8_V`, `NDS_VEC_VQMACC_VX`, `NDS_VEC_VNCLIP_WX`). These are defined in `internal/internal_vec_isa_v1_0.h`.
+
+**NEVER use `__riscv_*` C intrinsics** (e.g., `__riscv_vle8_v_i8m2`, `__riscv_vqmacc_vx_i32m8`) in `ENA_VEC_ISA` blocks. Those require `ENA_VEC_INTRINSIC` which is **NOT defined** for AX45MPV builds. Using them causes compilation failures.
+
+When writing new RVV code, always:
+- Study an existing working function in the same `#ifdef` block to learn the available `NDS_VEC_*` macro names
+- Use explicit register names (`NDS_VEC_V0`, `NDS_VEC_V8`, `NDS_VEC_V16`, etc.)
+- Match the LMUL register grouping: M8 uses v0/v8/v16/v24, M4 uses v0/v4/v8/.., M2 uses v0/v2/v4/..
+- For loads: `NDS_VEC_VLE8_V` (e8), `NDS_VEC_VLE16_V` (e16), `NDS_VEC_VLE32_V` (e32)
+- For stores: `NDS_VEC_VSE8_V` (e8), `NDS_VEC_VSE16_V` (e16), `NDS_VEC_VSE32_V` (e32)
+
+**Transition:** → `verify`
+
+---
+
+## State: `verify`
+
+Incremental rebuild and QEMU correctness test.
+
+1. Rebuild ONLY the modified source file (fast incremental):
+   ```bash
+   /usr/bin/bash ${LIB_ROOT}/qemu-validate/rebuild_single.sh <source_file>
+   ```
+   Example:
+   ```bash
+   /usr/bin/bash ${LIB_ROOT}/qemu-validate/rebuild_single.sh Source/ConvolutionFunctions/riscv_nn_conv_dw_HWC_s8_s8_s8_sym_bias_any.c
+   ```
+
+2. Compile the test binary (compile-only, no QEMU execution):
+   ```bash
+   TOOLCHAIN_BIN="/local/nick/SW_Release_cp/ast530/nds64le-elf-newlib-v5d/bin"
+   export PATH="${TOOLCHAIN_BIN}:${PATH}"
+   LIB_ROOT=$(git rev-parse --show-toplevel)
+   UNIT_TEST_DIR="${LIB_ROOT}/Examples/unit_func"
+   WORK_DIR="${LIB_ROOT}/qemu-validate/work"
+   mkdir -p "${WORK_DIR}"
+   riscv64-elf-gcc -O3 -Wall -Werror -ffunction-sections -fdata-sections -Wl,-gc-sections \
+     -mvh -mzfh -DENA_FS_VS \
+     -mtune=andes-45-series -mext-vector=zve64d -DNDS_VEC_RVV_VERSION=1000 \
+     -DENA_FAST_ALGO -DENA_DUMP_GOLDEN=0 -DENA_MEASURE_PERF=0 \
+     -DGETENV_TESTDIR=${UNIT_TEST_DIR} \
+     -I${LIB_ROOT}/Include -I${UNIT_TEST_DIR}/include \
+     -o "${WORK_DIR}/t_<test_name>.adx" \
+     "${UNIT_TEST_DIR}/t_<test_name>.c" "${LIB_ROOT}/libnn.a" -lm
+   ```
+
+3. Run the compiled ELF via the **qemu-runner subagent** (handles semihosting fd 9 capture):
+   ```
+   Agent(subagent_type="qemu-runner", prompt="Run ELF: ${LIB_ROOT}/qemu-validate/work/t_<test_name>.adx at VLEN=1024 with flags: --cwd ${LIB_ROOT}/Examples/unit_func")
+   ```
+   Parse the output for "accuracy checking pass" / "accuracy checking fail".
+
+4. Do NOT run full regression in the optimization loop — only run the target function's test. Full regression is too slow for iterative optimization.
+
+**Pass:** → `measure`
+**Compile error:** Launch a subagent to summarize the compilation error (what failed, which macro/function/type is missing, the exact error message). Then launch a NEW subagent with the summary to fix the code. Rebuild and re-verify. Max 3 retries before going back to `analyze` with a different approach.
+**Test fail (compiled but wrong results):** → `implement` (analyze the failure, fix, retry. Max 3 retries before going back to `analyze` with a different approach)
+
+---
+
+## State: `measure`
+
+Run on the AX45MPV FPGA board via GDB for ground-truth cycle counts.
+
+```bash
+/usr/bin/bash ${LIB_ROOT}/qemu-validate/run_fpga_test.sh <test_name>
+```
+
+This script:
+1. Compiles the test with `-DPF_COUNTER -DENA_TEST_PERF -DENA_RUN_TWICE` flags
+2. Uploads binary to FPGA via GDB expect script (`riscv64-sim-wrapper-on-board`)
+3. Runs on AX45MPV board (`sw-boards.andestech.com:1116`)
+4. Prints cycle count: `"The cycle count is NNNN"`
+5. Generates `.adx` and `.objdump` in `qemu-validate/work/`
+
+Parse the output for:
+- `"The cycle count is <N>"` — the FPGA cycle count
+- `"The inst count is <N>"` — the FPGA instruction count
+- `"accuracy checking pass/fail"` — correctness check
+
+Save `cycles_after` and `instrs_after` in state. Compute speedup: `cycles_before / cycles_after`. Compute IPC: `instrs_after / cycles_after`.
+
+**Transition:** → `learn`
+
+---
+
+## State: `learn`
+
+Record the lesson, then loop back.
+
+1. Update the wiki following the wiki-writer skill:
+   - Read `.claude/skills/wiki-writer/SKILL.md`
+   - Input context from state: function, source_file, round, hypothesis, changes, cycles_before, cycles_after, speedup, arith_intensity, reuse_rate, outcome
+   - Execute all 4 operations: operator page, general page (if applicable), index, log
+   - All content must follow the naive expression style defined in wiki-writer
+
+2. Increment the `round` counter in state.
+
+3. **Check exit condition:**
+   - If `round >= 5`, STOP → `idle`. Print final summary of all rounds.
+   - Otherwise, transition → `analyze` for the next optimization round on the same function.
+
+4. When looping back to `analyze`, key inputs for the next round are: FPGA cycle/instruction counts from `measure`, updated arithmetic intensity and reuse rate from this round, updated assembly, and wiki pages. The `analyze` step will decide whether there's still an opportunity. If not, it exits to `idle`.
+
+**Exit → `idle`:** Print a summary table of all rounds (round#, approach, cycles, instrs, IPC, AI, reuse_rate, speedup, insight). Instruction count diagnoses whether gains came from fewer instructions (algorithmic) or better IPC (cache/scheduling).
+**Continue → `analyze`:** Print "Round N+1: continuing. AI=X, reuse_rate=Y, key finding: <insight>"
+
+---
+
+## State File Format
+
+```json
+{
+  "step": "idle|select|analyze|implement|verify|measure|learn",
+  "function": "function_name",
+  "source_file": "Source/.../file.c",
+  "test_name": "test_name_for_qemu",
+  "round": 0,
+  "hypothesis": "what we plan to change and why",
+  "changes": "description of what was implemented",
+  "cycles_before": "",
+  "cycles_after": "",
+  "instrs_before": "",
+  "instrs_after": "",
+  "speedup": "",
+  "arith_intensity": "",
+  "reuse_rate": "",
+  "rounds_without_improvement": 0,
+  "round_history": [
+    {
+      "round": 1,
+      "approach": "...",
+      "cycles": "...",
+      "instrs": "...",
+      "ipc": "...",
+      "arith_intensity": "...",
+      "reuse_rate": "...",
+      "speedup": "...",
+      "outcome": "improved|regressed|neutral",
+      "insight": "..."
+    }
+  ],
+  "history": ["timestamps of state transitions"]
+}
+```
+
+Update state file on every transition:
+```bash
+python3 -c "
+import json
+from datetime import datetime
+import subprocess
+lib_root = subprocess.check_output(['git', 'rev-parse', '--show-toplevel']).decode().strip()
+f = lib_root + '/.claude/opt-state.json'
+state = json.load(open(f))
+prev_step = state['step']
+new_step = '<new_step>'
+now = datetime.now()
+state['step'] = new_step
+state['step_started'] = now.isoformat()
+state['history'].append(f'{now.isoformat()} {new_step}')
+# Calculate time spent in previous step
+if 'step_started' in state and state['history']:
+    prev_start = datetime.fromisoformat(state.get('prev_step_started', now.isoformat()))
+    elapsed = (now - prev_start).total_seconds()
+    state['last_step_duration'] = f'{prev_step}: {elapsed:.1f}s'
+state['prev_step_started'] = state.get('step_started', now.isoformat())
+json.dump(state, open(f, 'w'), indent=2)
+print(json.dumps(state, indent=2))
+"
+```
+
+---
+
+## Subagent Dispatch
+
+The main agent drives the FSM and reports progress to the user between every step. Only steps that require reasoning use subagents. Mechanical steps run commands directly.
+
+| Step | Execution | Why |
+|------|-----------|-----|
+| **select** | Main agent runs commands directly | Just shell commands (grep, build, FPGA) |
+| **analyze** | Subagent (proposer) | Requires reading code + assembly + metrics, forming hypothesis |
+| **implement** | Subagent | Requires code editing with domain knowledge |
+| **verify** | Main agent compiles test. qemu-runner subagent runs ELF. On compile error: subagent summarizes error → new subagent fixes code | Compile is mechanical; QEMU needs fd 9 handling via qemu-runner; error diagnosis and fix need reasoning |
+| **measure** | Main agent runs commands directly | Just `run_fpga_test.sh` |
+| **learn** | Main agent runs commands directly | Wiki page updates + state update |
+
+### Subagent constraints
+
+When dispatching to a subagent, always include these constraints in the prompt:
+
+**For `analyze` subagent (proposer):**
+- Tools allowed: Read, Grep, Glob, Bash (ONLY for `grep` and `rebuild_single.sh -E`)
+- DO NOT edit any files
+- DO NOT run compile/archive builds, test, QEMU, or FPGA commands. `rebuild_single.sh -E` (preprocess-only) IS allowed.
+- **MUST identify the active code path from preprocessed source**, not raw source. Run `rebuild_single.sh -E <src.c>` and read `qemu-validate/work/<basename>.i` — only surviving `#ifdef` branches appear there. Never guess from raw source: `ENA_TILING`, `ENA_FAST_ALGO` etc. are defined in internal headers, not build.sh. For dispatch functions, also cross-check with `qemu-validate/work/t_<test>_perf.objdump` `jal`/`jalr` targets to confirm which sub-kernel was linked.
+- Focus on data flow, algorithm choice, tiling/blocking, loop structure, GEMM strategy, im2col, unrolling, LMUL selection, vector register utilization. Compute arithmetic intensity and reuse rate from the assembly. Must read `docs/wiki/index.md` and relevant wiki pages for what's been tried.
+- Output: analysis summary including arithmetic intensity, reuse rate, active code path (verified from preprocessed `.i`, cross-checked with objdump for dispatch cases), and 1–3 ranked ideas with expected impact rationale, risk assessment, and which lines to modify
+
+**For `verify error-summary` subagent (on compilation failure):**
+- Tools allowed: Read, Grep, Glob
+- DO NOT edit any files or run any commands
+- Input: the full compilation error output
+- Output: concise summary — what failed, which macro/function/type is missing or misused, the exact error messages, and which source file/line caused it. This summary is passed to the fix subagent.
+
+**For `verify error-fix` subagent (after error-summary):**
+- Tools allowed: Read, Grep, Glob, Edit
+- DO NOT run any Bash commands except `grep` for checking macro availability in headers
+- Input: the error summary from the error-summary subagent + the source file path
+- Fix the compilation error based on the summary. Follow the same intrinsic rules as the implement subagent (NDS_VEC_* macros only, no __riscv_* intrinsics).
+- Output: description of exact code change made to fix the error
+
+**For `implement` subagent:**
+- Tools allowed: Read, Grep, Glob, Edit
+- DO NOT run any Bash commands except `grep` for checking macro availability in headers
+- DO NOT run build, test, QEMU, or FPGA commands
+- DO NOT compile anything
+- **CRITICAL: Use `NDS_VEC_*` macros ONLY** (e.g., `NDS_VEC_VSETVLI`, `NDS_VEC_VLE8_V`, `NDS_VEC_VQMACC_VX`). NEVER use `__riscv_*` C intrinsics — they require `ENA_VEC_INTRINSIC` which is NOT defined. Before writing new RVV code, read an existing working function in the same `#ifdef ENA_VEC_ISA` block to learn the correct macro names.
+- Output: description of exact code change made
+
+---
+
+## Rules
+
+1. **Fully autonomous.** Do not wait for user input at any step. Run the entire loop.
+2. **Main agent drives the FSM.** The main agent owns state, runs mechanical steps directly, dispatches reasoning steps to subagents, and reports progress to the user between every step.
+3. **Never skip steps.** Follow FSM transitions strictly.
+4. **Max 5 rounds per function.** After round 5, exit to idle regardless.
+5. **analyze is the gatekeeper.** If it finds no optimization opportunity from code + assembly + metrics, exit to idle. Do not force pointless changes.
+6. **FPGA is ground truth.** QEMU is correctness only.
+7. **Always record lessons.** Wins AND losses. This compounds knowledge across functions.
+8. **Target VLEN=1024.** Never sacrifice VLEN=1024 performance.
+9. **If verify fails 3 times**, go back to `analyze` with a different approach, not the same one.
+10. **If a round regresses**, revert the code before trying the next approach.
+11. **Arithmetic intensity and reuse rate drive the next round.** Recompute them each round from updated assembly to track whether changes improved memory efficiency.
+12. **Use `rebuild_single.sh` for incremental builds** after the initial `build_libnn.sh` in `select`. Never rebuild the full library in the optimization loop.
+13. **Use `run_fpga_test.sh` for FPGA measurement.** It handles compilation with perf flags, GDB upload, and cycle count parsing. **NEVER compile or run FPGA tests manually — always use this script.**
+14. **Only test the target function** during the optimization loop. Full regression is for final validation only.
+15. **Scripts are the single source of truth for builds and tests.** Never construct gcc, QEMU, or GDB commands manually. Always use the scripts in `qemu-validate/`.
