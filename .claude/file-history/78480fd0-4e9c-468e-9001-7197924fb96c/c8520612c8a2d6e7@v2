@@ -1,0 +1,211 @@
+# Roofline Analysis: `conv_HWC_s8_s8_s8_asym_bias_any`
+
+Target: Andes AX45MPV FPGA, VLEN=1024, clock = 60 MHz.
+Baseline run: 1,122,950 cycles, 647,845 instrs, IPC 0.58, accuracy PASS.
+
+---
+
+## 1. What the function does
+
+`riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any` computes a generic 2D convolution in HWC layout with int8 input, int8 weights, int8 output, asymmetric quantization, optional bias, and arbitrary padding/stride (`_any` = no fast-path shape restrictions).
+
+**Operation per output pixel (y, x, oc):**
+```
+acc = bias[oc]
+for ky in 0..ker_H:
+  for kx in 0..ker_W:
+    for ic in 0..in_ch:
+      in_val = in[y*stride+ky - pad_y][x*stride+kx - pad_x][ic] + in_offset
+      w_val  = filt[oc][ky][kx][ic] + filt_offset[oc]
+      acc   += in_val * w_val                          // int32 accumulate
+out[y][x][oc] = clip_s8( requantize(acc, out_scale[oc], out_shift[oc]) + out_offset )
+```
+
+**Active RVV path** (selected branch, verified from `.i`):
+1. **im2col build** — pack a tile of `ker_H*ker_W*in_ch` column vectors per output pixel into a scratch buffer. Uses a 5-region split (top/bottom pad rows + mid-left/center/right) so the dominant pad=0 center region issues bulk `nn_dup_s8(in_ch * ker_W)` row copies instead of per-element copies.
+2. **GEMM** — batch 8 columns at a time, feed them to `nn_mat_mult_kernel_s8_offset_unroll4` (vd4dots M1 kernel, 4 output-row x 4 pixel-col register tile, vectorizes over K).
+3. **Asymmetric correction** — subtract `in_offset * sum(weights_row)` contribution (precomputed into `contri_buf`).
+4. **Requantize + clip + store** — int32 accumulator -> multiply-shift -> add out_offset -> clip to act_min/act_max -> int8 store.
+
+**Test-3 shape (the only shape that runs under `ENA_MEASURE_PERF`):**
+
+| Field | Value |
+|---|---|
+| batch | 2 |
+| in (WxHxC) | 32 x 30 x 64 |
+| out (WxHxC) | 30 x 28 x 16 |
+| ker | 3 x 3 |
+| pad | 0 |
+| stride | 1 |
+
+---
+
+## 2. FPGA peak compute
+
+Clock: **60 MHz**.
+
+Key VPU ops at VLEN=DLEN=1024, LMUL=M1:
+
+| Instruction | Math per instr | Issue rate (cyc/instr) | MAC/cycle | int8 ops/cycle |
+|---|---|---|---|---|
+| `vd4dots` (e32 M1, VL=32 lanes) | 32 lanes x 4 byte-pairs = 128 MAC | ~4 (VW spacing, per uarch ref) | 32 | 64 |
+| `vd4dots` (optimistic, 1/cyc issue) | 128 MAC | 1 | 128 | 256 |
+| `vwmacc` e8->e16 M1 | 64 MAC | 1 | 64 | 128 |
+| `vmacc` e32 M1 | 32 MAC | 1 | 32 | 64 |
+
+Source for the vd4dots VW spacing: `.claude/skills/optimize/references/uarch/andes_45_series.md` (VW sub-stages separated by many cycles for reduction ops) and `docs/wiki/general/ax45mpv-pipeline.md:24-25` ("`vd4dots` M1: VW sub-stages separated by ~4-8 cycles").
+
+**Peak int8 MAC throughput (conservative, 4-cycle vd4dots spacing):**
+
+```
+32 MAC/cycle x 60 MHz = 1.92 GMAC/s = 3.84 G-int8-OPS/s
+```
+
+**Peak int8 MAC throughput (optimistic, 1-cycle vd4dots issue):**
+
+```
+128 MAC/cycle x 60 MHz = 7.68 GMAC/s = 15.36 G-int8-OPS/s
+```
+
+Both are presented because the exact vd4dots throughput on AX45MPV is not explicitly documented in the available references. Confirm via llvm-mca or cycle-accurate sim.
+
+---
+
+## 3. FPGA peak bandwidth
+
+From `.claude/skills/optimize/fpga_config/ax45mpv_v1024_8mb.inc`:
+
+| Path | Width | B/cycle | B/s @ 60 MHz |
+|---|---|---|---|
+| L1D (1 vle8 VL=128 per cycle) | 1024 bit | 128 | 7.68 GB/s |
+| BIU (L1D <-> L2, AXI 512b) | 512 bit | 64 | 3.84 GB/s |
+| L2 <-> external (512b) | 512 bit | 64 | 3.84 GB/s |
+
+L1D capacity: 32 KB, 4-way, 64 B line. L2 capacity: 8 MB, 16-way.
+
+Practical notes:
+- L1D bandwidth assumes 1 vector load per cycle with no bank conflicts. AX45MPV has a single VLSU port, so 1 vle/cycle is the hard ceiling.
+- BIU number is the sustained refill rate on L1 miss; it is the binding roof for anything that spills out of L1.
+- DRAM beyond L2 depends on the board's external memory controller; for this FPGA config the L2 slave port at 512 b is the visible ceiling.
+
+---
+
+## 4. Function compute, memory, arithmetic intensity
+
+### 4.1 Compute count
+
+Per output pixel: `ker_H * ker_W * in_ch = 3*3*64 = 576` MACs per output channel.
+
+```
+Total MACs = batch * out_H * out_W * out_ch * (ker_H * ker_W * in_ch)
+           = 2 * 28 * 30 * 16 * 576
+           = 15,482,880 MACs
+           = 30,965,760 int8 ops   (MAC = 1 mul + 1 add)
+```
+
+Non-GEMM arithmetic (requantize + clip per output element): `2 * 28 * 30 * 16 = 26,880` elements, ~5-10 ops each -> ~0.13-0.27 M ops. Negligible (< 1% of total).
+
+### 4.2 Memory access
+
+**Compulsory traffic (cold, each byte read/written once):**
+
+| Tensor | Bytes |
+|---|---|
+| input (2 x 32 x 30 x 64) | 122,880 |
+| weights (16 x 3 x 3 x 64) | 9,216 |
+| output (2 x 30 x 28 x 16) | 26,880 |
+| bias (16 x 4) | 64 |
+| out_scale / out_shift (16 x 4 x 2) | 128 |
+| **Total compulsory I/O** | **159,168 B (~155 KB)** |
+
+Weights (9 KB) fit in L1 and stay resident. Inputs (120 KB) do not fit in L1 but do fit in L2 (8 MB). Each input byte is read once from DRAM/L2 into L1 on first touch; subsequent re-use during kernel sliding hits L1.
+
+**Instruction-level load traffic (bytes loaded by vle8 in the hot path):**
+
+Per `nn_mat_mult_kernel_s8_offset_unroll4` call with K=576, 4 row-groups, 4 pixel cols:
+- K chunks: `ceil(576/128) = 5`
+- `vle8` per call: `4 row-groups * 5 chunks * 8 loads = 160`
+- Bytes per call: `160 * 128 = 20,480 B`
+
+Calls: 1680 pixels / 4 per call = 420 unroll4 calls.
+Total hot-loop load traffic: `420 * 20,480 = 8,601,600 B (~8.2 MB)`.
+This is almost entirely L1 hits (working set ~12 KB << 32 KB L1D).
+
+**im2col copy traffic:**
+- Per output pixel: `ker_H * ker_W * in_ch = 576 B` written to buffer + read back in GEMM.
+- Total: `1680 * 576 = 967,680 B (~945 KB)` of im2col write + read.
+
+### 4.3 Arithmetic intensity
+
+Two useful definitions:
+
+**Compulsory AI (vs compulsory DRAM/L2 traffic):**
+```
+15,482,880 MAC / 159,168 B ~= 97 MAC/byte
+```
+
+**Instruction-level AI (vs hot-loop load bytes, i.e. L1 traffic):**
+```
+15,482,880 MAC / 8,601,600 B ~= 1.80 MAC/byte
+```
+
+The per-hot-loop-iteration AI is 2.0 MAC/byte (16 vd4dots at 128 MACs each vs 8 vle8 at 128 B each). The 1.80 number above is the full-call amortized view, slightly lower due to additional loads for `contri_buf` and boundary handling.
+
+### 4.4 Roofline placement
+
+Compute peaks -> memory roof knee points (MAC/byte):
+
+| Bandwidth path | Conservative vd4dots knee | Optimistic vd4dots knee |
+|---|---|---|
+| L1D (128 B/cyc) | 32/128 = **0.25** | 128/128 = **1.00** |
+| BIU (64 B/cyc) | 32/64 = **0.50** | 128/64 = **2.00** |
+
+The hot-loop AI (1.80 MAC/byte) vs L1 knees:
+- Well above the conservative L1 knee (0.25) -> **compute-bound** in that model.
+- Just below the optimistic L1 knee (1.00) -> **still compute-bound** but closer to the roof.
+
+The compulsory AI (97 MAC/byte) is enormous vs any knee -> the function is never DRAM-bandwidth-limited on this shape.
+
+### 4.5 Achieved throughput
+
+```
+Achieved MAC/cycle    = 15,482,880 / 1,122,950 = 13.79
+Achieved G-int8-MAC/s = 13.79 * 60 MHz         = 0.827 GMAC/s
+Achieved G-int8-OPS/s = 1.654 GOPS/s
+```
+
+As % of peak:
+
+| Model | Peak (GMAC/s) | % of peak achieved |
+|---|---|---|
+| Conservative vd4dots (4-cyc) | 1.92 | **43.1%** |
+| Optimistic vd4dots (1-cyc) | 7.68 | 10.8% |
+
+**Interpretation:**
+- Under the conservative model (vd4dots takes 4 cycles per issue), the kernel is at ~43% of peak — consistent with a well-tuned GEMM that also pays for im2col, dispatch, bias/requant, and the scalar loop scaffolding.
+- Under the optimistic model (1-cycle vd4dots), the kernel is at ~11% of peak — in which case the remaining ~89% is dominated by the non-GEMM sections (im2col copy, requantize, call/dispatch), because the GEMM itself would only need ~121 K cycles to do all 15.48 M MACs.
+
+Either way, the hot vd4dots loop is NOT bandwidth-bound. The lever for further speedup is one of: (a) reduce non-GEMM cycles (im2col, scaffolding), or (b) shorten the vd4dots VW chain with better pipeline interleaving (speculative; needs llvm-mca or cycle-accurate sim to prove).
+
+---
+
+## 5. Summary
+
+| Metric | Value |
+|---|---|
+| Clock | 60 MHz |
+| Peak int8 MAC/s (conservative) | 1.92 GMAC/s |
+| Peak int8 MAC/s (optimistic) | 7.68 GMAC/s |
+| Peak L1D bandwidth | 7.68 GB/s |
+| Peak BIU bandwidth | 3.84 GB/s |
+| Function total MAC | 15.48 M |
+| Function compulsory I/O | 155 KB |
+| Function compulsory AI | 97 MAC/byte |
+| Function hot-loop AI | 1.80 MAC/byte |
+| Achieved MAC/s | 0.827 GMAC/s |
+| Achieved % of conservative peak | 43% |
+| Cycles | 1,122,950 |
+| IPC | 0.58 |
+| Prior optimization speedup | 4.97x vs original baseline |
+
+**Conclusion:** the function sits in the compute-bound region of the roofline. The 43% of conservative peak (or 11% of optimistic peak) is limited by non-GEMM overhead and vd4dots pipeline spacing, not by L1 or BIU bandwidth. Memory-side optimizations (prefetch, tiling for reuse) are not expected to help.
