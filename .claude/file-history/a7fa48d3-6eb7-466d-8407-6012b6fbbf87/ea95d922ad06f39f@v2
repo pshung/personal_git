@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+################################################################################
+# Incrementally rebuild a single source file and update libnn.a.
+# ~100x faster than full build.sh (1 file vs ~400 files).
+#
+# Usage:
+#   rebuild_single.sh <source_file.c> [--config <config.toml>] [--extra-cflags <flags>]
+#   rebuild_single.sh -E <source_file.c> [--config <config.toml>]
+#
+# The -E mode preprocesses the source (using the SAME CFLAGS as a real build)
+# and writes the result to ${CFG_WORK_DIR}/<basename>.i. Use this in the
+# analyze step to see which #ifdef branches survive.
+#
+# Examples:
+#   rebuild_single.sh Source/ActivationFunctions/riscv_nn_relu_s8.c
+#   rebuild_single.sh -E Source/PoolingFunctions/riscv_nn_maxpool_HWC_s8.c
+#   rebuild_single.sh Source/ConvolutionFunctions/riscv_nn_conv_HWC_s8_s8_s8_RGB_sft_bias.c \
+#       --extra-cflags "-DENA_AGENT_OPT_CONV_HWC_S8_S8_S8_RGB_SFT_BIAS"
+#
+# Prerequisites (compile mode only; -E mode does not need libnn.a):
+#   - libnn.a must already exist (run build_libnn.sh first for initial build)
+#   - lib_objs/ directory must exist from prior build
+################################################################################
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+SRC_FILE=""
+CONFIG_TOML=""
+EXTRA_CFLAGS=""
+PREPROCESS_ONLY=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -E)             PREPROCESS_ONLY=1; shift ;;
+        --config)       CONFIG_TOML="$2"; shift 2 ;;
+        --extra-cflags) EXTRA_CFLAGS="$2"; shift 2 ;;
+        -*)             echo "Unknown option: $1" >&2; exit 1 ;;
+        *)              SRC_FILE="$1"; shift ;;
+    esac
+done
+
+if [ -z "${SRC_FILE}" ]; then
+    echo "Usage: $0 [-E] <source_file.c> [--config <config.toml>] [--extra-cflags <flags>]" >&2
+    exit 1
+fi
+
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/parse_config.sh" ${CONFIG_TOML:+"${CONFIG_TOML}"}
+
+# Resolve source path against libnn_root if relative
+if [[ "${SRC_FILE}" != /* ]]; then
+    SRC_FILE="${CFG_LIBNN_ROOT}/${SRC_FILE}"
+fi
+[ -f "${SRC_FILE}" ] || { echo "ERROR: Source file not found: ${SRC_FILE}" >&2; exit 1; }
+
+export PATH="${CFG_TOOLCHAIN_BIN}:${PATH}"
+
+OBJ_DIR="${CFG_LIBNN_ROOT}/lib_objs"
+LIBNN="${CFG_LIBNN_ROOT}/libnn.a"
+
+# Prerequisites only matter for compile mode; -E mode just needs the toolchain.
+if [ ${PREPROCESS_ONLY} -eq 0 ]; then
+    [ -f "${LIBNN}" ]  || { echo "ERROR: libnn.a not found at ${LIBNN}. Run build_libnn.sh first." >&2; exit 1; }
+    [ -d "${OBJ_DIR}" ] || { echo "ERROR: lib_objs/ not found at ${OBJ_DIR}. Run build_libnn.sh first." >&2; exit 1; }
+fi
+
+CFLAGS="-I${CFG_LIBNN_ROOT}/Include -I${CFG_LIBNN_ROOT}/internal -c ${CFG_CFLAGS_BASE}"
+
+# Detect zfh support (keep - it's a runtime capability check, not a target constant)
+if ${CFG_CC} -mzfh -E -dM ${CFLAGS} - < /dev/null &> /dev/null; then
+    ${CFG_CC} -mzfh -E -dM ${CFLAGS} - < /dev/null 2>/dev/null \
+        | grep -q '__riscv_float_abi_single\|__riscv_float_abi_double' \
+        && CFLAGS+=" -mzfh"
+fi
+
+if [ -n "${EXTRA_CFLAGS}" ]; then
+    CFLAGS+=" ${EXTRA_CFLAGS}"
+fi
+
+# Preprocess-only path: swap -c for -E -P, write to work dir, skip archive.
+if [ ${PREPROCESS_ONLY} -eq 1 ]; then
+    mkdir -p "${CFG_WORK_DIR}"
+    OUT_FILE="${CFG_WORK_DIR}/$(basename "${SRC_FILE}" .c).i"
+    PP_FLAGS="${CFLAGS/-c/-E -P}"
+    echo "[preprocess] ${SRC_FILE##*/} -> ${OUT_FILE##*/}"
+    ${CFG_CC} ${PP_FLAGS} -o "${OUT_FILE}" "${SRC_FILE}"
+    echo "[done] ${OUT_FILE}"
+    exit 0
+fi
+
+OBJ_NAME="$(basename "${SRC_FILE}" .c).o"
+OBJ_FILE="${OBJ_DIR}/${OBJ_NAME}"
+
+echo "[rebuild] ${SRC_FILE##*/}"
+${CFG_CC} ${CFLAGS} -o "${OBJ_FILE}" "${SRC_FILE}"
+
+echo "[archive] updating ${OBJ_NAME} in libnn.a"
+${CFG_AR} rD "${LIBNN}" "${OBJ_FILE}"
+${CFG_RANLIB} -D "${LIBNN}"
+
+echo "[objdump] libnn.objdump"
+${CFG_OBJDUMP} -S "${LIBNN}" > "${CFG_LIBNN_ROOT}/libnn.objdump"
+
+echo "[done] Rebuilt ${OBJ_NAME}"
