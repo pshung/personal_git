@@ -8339,4 +8339,4 @@ if ! (unalias rg 2>/dev/null; command -v rg) >/dev/null 2>&1; then
   fi
 }
 fi
-export PATH=/local/nick/bs3/.venv/bin:/home/nick/.nvm/versions/node/v22.5.1/bin:/home/nick/.pyenv/shims:/home/nick/.pyenv/bin:/home/nick/.nix-profile/bin/:/home/nick/.python_venv/bin/:/home/nick/myusr/bin:/home/nick/myusr/local/bin:/home/nick/mybin/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/bin/vendor_perl:/home/nick/myTool/arcanist/bin:/usr/share:/home/nick/.cargo/bin/:/home/nick/.local/bin:/home/nick/.fzf/bin:/home/nick/.claude/plugins/cache/claude-plugins-official/ralph-loop/1.0.0/bin
+export PATH=/home/nick/.nvm/versions/node/v22.5.1/bin:/home/nick/.pyenv/shims:/home/nick/.pyenv/bin:/home/nick/.nix-profile/bin/:/home/nick/.python_venv/bin/:/home/nick/myusr/bin:/home/nick/myusr/local/bin:/home/nick/mybin/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/bin/vendor_perl:/home/nick/myTool/arcanist/bin:/usr/share:/home/nick/.cargo/bin/:/home/nick/.local/bin:/home/nick/.fzf/bin:/home/nick/.claude/plugins/cache/claude-plugins-official/ralph-loop/1.0.0/bin
