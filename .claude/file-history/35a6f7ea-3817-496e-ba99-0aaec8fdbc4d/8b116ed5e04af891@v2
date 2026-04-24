@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# test_emit_trace.sh - unit tests for emit_trace.sh (Phase 0).
+#
+# Run: /usr/bin/bash test_emit_trace.sh
+# Exit: 0 if all tests pass, 1 on any failure.
+
+set -eo pipefail
+
+_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+emit="${_script_dir}/emit_trace.sh"
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+export TRACE_ROOT="${tmp}/trace_corpus"
+
+pass=0; fail=0
+
+assert() {
+    local desc="$1"; shift
+    if "$@" >/dev/null 2>&1; then
+        echo "  PASS: $desc"
+        pass=$((pass+1))
+    else
+        echo "  FAIL: $desc (cmd: $*)"
+        fail=$((fail+1))
+    fi
+}
+
+section() { echo ""; echo "--- $1 ---"; }
+
+# ------------------------------------------------------------------------------
+section "init"
+
+"$emit" init --fn test_fn --round 0 >/dev/null
+assert "init creates round dir" test -d "${TRACE_ROOT}/test_fn/round_0"
+
+# ------------------------------------------------------------------------------
+section "step (explicit --fn/--round)"
+
+echo "hypothesis body" > "${tmp}/a.md"
+"$emit" step --fn test_fn --round 0 analyze "${tmp}/a.md" >/dev/null
+assert "analyze produces analyze_agent.md" test -s "${TRACE_ROOT}/test_fn/round_0/analyze_agent.md"
+assert "analyze content is copied verbatim" grep -q "hypothesis body" "${TRACE_ROOT}/test_fn/round_0/analyze_agent.md"
+
+echo "diff content" > "${tmp}/i.md"
+"$emit" step --fn test_fn --round 0 implement "${tmp}/i.md" >/dev/null
+assert "implement produces implement_agent.md" test -s "${TRACE_ROOT}/test_fn/round_0/implement_agent.md"
+
+echo '{"result":"PASS","sub_tests":4}' > "${tmp}/v.json"
+"$emit" step --fn test_fn --round 0 verify "${tmp}/v.json" >/dev/null
+assert "verify produces verify_result.json" test -s "${TRACE_ROOT}/test_fn/round_0/verify_result.json"
+assert "verify_result.json parses as JSON" \
+    python3 -c "import json; json.load(open('${TRACE_ROOT}/test_fn/round_0/verify_result.json'))"
+
+echo '{"cycles":12345,"instrs":23456,"ipc":1.9}' > "${tmp}/m.json"
+"$emit" step --fn test_fn --round 0 measure "${tmp}/m.json" >/dev/null
+assert "measure produces measure_result.json" test -s "${TRACE_ROOT}/test_fn/round_0/measure_result.json"
+assert "measure_result.json parses as JSON" \
+    python3 -c "import json; json.load(open('${TRACE_ROOT}/test_fn/round_0/measure_result.json'))"
+
+echo "lessons learned" > "${tmp}/l.md"
+"$emit" step --fn test_fn --round 0 learn "${tmp}/l.md" >/dev/null
+assert "learn produces learn_agent.md" test -s "${TRACE_ROOT}/test_fn/round_0/learn_agent.md"
+
+# ------------------------------------------------------------------------------
+section "timing"
+
+"$emit" timing --fn test_fn --round 0 analyze 3.5 >/dev/null
+"$emit" timing --fn test_fn --round 0 implement 12.1 >/dev/null
+assert "step_timings.json exists" test -s "${TRACE_ROOT}/test_fn/round_0/step_timings.json"
+assert "step_timings.analyze.wall_seconds==3.5" \
+    python3 -c "import json; d=json.load(open('${TRACE_ROOT}/test_fn/round_0/step_timings.json')); assert d['analyze']['wall_seconds']==3.5, d"
+assert "step_timings.implement.wall_seconds==12.1 (timing is appended, not overwritten)" \
+    python3 -c "import json; d=json.load(open('${TRACE_ROOT}/test_fn/round_0/step_timings.json')); assert d['implement']['wall_seconds']==12.1, d"
+
+# ------------------------------------------------------------------------------
+section "fail"
+
+echo "gcc: error: 'foo' undeclared" > "${tmp}/err.txt"
+"$emit" fail --fn test_fn --round 0 compile_error "${tmp}/err.txt" >/dev/null
+assert "fail_reason.md exists after compile_error" test -s "${TRACE_ROOT}/test_fn/round_0/fail_reason.md"
+assert "fail_reason tags compile_error" grep -q "^tag: compile_error" "${TRACE_ROOT}/test_fn/round_0/fail_reason.md"
+assert "fail_reason includes stderr body" grep -q "gcc: error" "${TRACE_ROOT}/test_fn/round_0/fail_reason.md"
+
+"$emit" fail --fn test_fn --round 1 test_fail >/dev/null
+assert "fail_reason.md exists even without message file" test -s "${TRACE_ROOT}/test_fn/round_1/fail_reason.md"
+assert "fail_reason tags test_fail" grep -q "^tag: test_fail" "${TRACE_ROOT}/test_fn/round_1/fail_reason.md"
+
+# ------------------------------------------------------------------------------
+section "auto mode (reads fn/round from state.json via CONFIG_TOML)"
+
+auto_root="${tmp}/auto_root"
+mkdir -p "${auto_root}"
+cat > "${auto_root}/config.toml" <<EOF
+[repo]
+libnn_root = "${auto_root}"
+state_file = "state.json"
+work_dir   = "work"
+[toolchain]
+bin_dir = ""
+prefix  = ""
+[target]
+cpu = "TEST"
+fpga_config   = ""
+uarch_ref     = ""
+intrinsic_api = ""
+[target.cflags_base]
+flags = []
+[target.cflags_perf]
+flags = []
+[target.cflags_verify]
+flags = []
+[target.active_defines]
+defined   = []
+undefined = []
+[qemu]
+binary = ""
+machine = ""
+cpu = ""
+config = ""
+vlen = 1024
+timeout = 300
+[vsim]
+binary = ""
+vlen = 512
+target = ""
+pipeline_modeler = ""
+log_cycles_default = 2000
+[fpga]
+host = ""
+port = 0
+timeout = 300
+linker_script   = ""
+sim_wrapper     = ""
+reset_flag_file = ""
+[limits]
+max_rounds = 5
+validate_cache_hours = 24
+EOF
+cat > "${auto_root}/state.json" <<EOF
+{"step":"analyze","function":"auto_fn","round":2,"history":[]}
+EOF
+echo "auto body" > "${tmp}/auto_a.md"
+CONFIG_TOML="${auto_root}/config.toml" "$emit" step analyze "${tmp}/auto_a.md" >/dev/null
+assert "auto-mode step reads fn+round from state.json" \
+    test -s "${TRACE_ROOT}/auto_fn/round_2/analyze_agent.md"
+
+CONFIG_TOML="${auto_root}/config.toml" "$emit" timing verify 7.25 >/dev/null
+assert "auto-mode timing reads fn+round from state.json" \
+    python3 -c "import json; d=json.load(open('${TRACE_ROOT}/auto_fn/round_2/step_timings.json')); assert d['verify']['wall_seconds']==7.25"
+
+CONFIG_TOML="${auto_root}/config.toml" "$emit" fail compile_error >/dev/null
+assert "auto-mode fail without message still writes tag" \
+    grep -q "^tag: compile_error" "${TRACE_ROOT}/auto_fn/round_2/fail_reason.md"
+
+# ------------------------------------------------------------------------------
+section "error cases"
+
+# Non-existent payload file should fail non-zero
+set +e
+"$emit" step --fn x --round 0 analyze "/nonexistent/payload" >/dev/null 2>&1
+rc=$?
+set -e
+assert "missing payload file -> non-zero exit" test "$rc" -ne 0
+
+# Non-numeric timing seconds should fail
+set +e
+"$emit" timing --fn x --round 0 analyze "not_a_number" >/dev/null 2>&1
+rc=$?
+set -e
+assert "non-numeric timing -> non-zero exit" test "$rc" -ne 0
+
+# ------------------------------------------------------------------------------
+echo ""
+echo "================================================================"
+echo "Results: ${pass} passed, ${fail} failed"
+echo "================================================================"
+[ $fail -eq 0 ]

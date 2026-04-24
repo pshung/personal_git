@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+################################################################################
+# Parse config.toml and export CFG_* variables for use by other scripts.
+#
+# Usage (source with explicit path):
+#   source parse_config.sh /path/to/config.toml
+#
+# Usage (source with env var):
+#   CONFIG_TOML=/path/to/config.toml source parse_config.sh
+#
+# Usage (source with default - resolves to ../config.toml next to this script):
+#   source parse_config.sh
+#
+# Exported variables (all derived from config.toml - no hardcoding):
+#
+#   [repo]
+#     CFG_LIBNN_ROOT        - libnn source root (absolute)
+#     CFG_STATE_FILE        - absolute path to state.json
+#     CFG_WORK_DIR          - absolute path to work directory
+#
+#   [toolchain]
+#     CFG_TOOLCHAIN_BIN     - toolchain bin directory
+#     CFG_TOOLCHAIN_PREFIX  - toolchain prefix (e.g. riscv64-elf-)
+#     CFG_CC                - full path to gcc                 (derived)
+#     CFG_AR, CFG_RANLIB    - full paths to ar, ranlib         (derived)
+#     CFG_OBJDUMP, CFG_GDB  - full paths to objdump, gdb       (derived)
+#
+#   [target]
+#     CFG_CPU               - target CPU name
+#     CFG_FPGA_CONFIG       - absolute path to .inc hardware file
+#     CFG_UARCH_REF         - absolute path to uarch doc
+#     CFG_INTRINSIC_API     - absolute path to intrinsic api doc
+#     CFG_CFLAGS_BASE       - space-joined base CFLAGS
+#     CFG_CFLAGS_PERF       - space-joined extra CFLAGS for perf build
+#     CFG_CFLAGS_VERIFY     - space-joined extra CFLAGS for verify build
+#     CFG_DEFINES_DEFINED   - newline-joined list of defined macros
+#     CFG_DEFINES_UNDEFINED - newline-joined list of undefined macros
+#
+#   [qemu]
+#     CFG_QEMU_BIN          - QEMU binary path
+#     CFG_QEMU_MACHINE      - QEMU machine name (-M argument)
+#     CFG_QEMU_CPU          - QEMU CPU string (-cpu argument)
+#     CFG_QEMU_CONFIG       - absolute path to QEMU device config file
+#     CFG_QEMU_VLEN         - QEMU vector length
+#     CFG_QEMU_TIMEOUT      - QEMU timeout seconds
+#
+#   [vsim]
+#     CFG_VSIM_BIN          - vsim workspace directory
+#     CFG_VSIM_VLEN         - vsim vector length
+#     CFG_VSIM_TARGET       - vsim target name (e.g. ax45mpv_premium)
+#     CFG_VSIM_LOG_CYCLES   - default --log-cycles value
+#
+#   [fpga]
+#     CFG_FPGA_HOST         - FPGA board hostname
+#     CFG_FPGA_PORT         - FPGA board port
+#     CFG_FPGA_TIMEOUT      - FPGA timeout seconds
+#     CFG_FPGA_LD_SCRIPT    - absolute path to FPGA linker script
+#     CFG_FPGA_SIM_WRAPPER  - absolute path to GDB wrapper script
+#     CFG_FPGA_RESET_FLAG   - absolute path to First_Reset_done flag file
+#
+#   [limits]
+#     CFG_MAX_ROUNDS        - max optimization rounds per function
+#     CFG_VALIDATE_CACHE_H  - validate cache TTL in hours
+################################################################################
+
+# Find config file: argument > env var > default (skill-dir/config.toml)
+_pc_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_pc_config_path="${1:-${CONFIG_TOML:-${_pc_script_dir}/../config.toml}}"
+
+if [ ! -f "${_pc_config_path}" ]; then
+    echo "parse_config.sh: config.toml not found at ${_pc_config_path}" >&2
+    return 1 2>/dev/null || exit 1
+fi
+
+eval "$(python3 - "${_pc_config_path}" "${_pc_script_dir}" <<'PYEOF'
+import sys, tomllib, shlex, os
+config_path = sys.argv[1]
+skill_dir   = sys.argv[2]  # directory of parse_config.sh = <skill>/script
+skill_root  = os.path.normpath(os.path.join(skill_dir, ".."))
+
+with open(config_path, "rb") as f:
+    cfg = tomllib.load(f)
+
+repo = cfg.get("repo", {})
+tc   = cfg.get("toolchain", {})
+tg   = cfg.get("target", {})
+qe   = cfg.get("qemu", {})
+vs   = cfg.get("vsim", {})
+fp   = cfg.get("fpga", {})
+lm   = cfg.get("limits", {})
+
+def q(k, v):
+    print(f"{k}={shlex.quote(str(v))}")
+
+def abspath_rel(base, p):
+    """Return absolute path: p as-is if absolute, else joined with base."""
+    if not p:
+        return ""
+    return p if os.path.isabs(p) else os.path.normpath(os.path.join(base, p))
+
+def join_flags(section):
+    """Flatten a [target.cflags_X].flags = [...] list into one string."""
+    if not isinstance(section, dict):
+        return ""
+    flags = section.get("flags", [])
+    if not isinstance(flags, list):
+        return ""
+    return " ".join(str(f) for f in flags)
+
+# repo
+libnn_root = repo.get("libnn_root", "")
+state_rel  = repo.get("state_file", ".claude/skills/optimize/state.json")
+work_rel   = repo.get("work_dir",   ".claude/skills/optimize/work")
+q("CFG_LIBNN_ROOT", libnn_root)
+q("CFG_STATE_FILE", abspath_rel(libnn_root, state_rel))
+q("CFG_WORK_DIR",   abspath_rel(libnn_root, work_rel))
+
+# toolchain
+bin_dir = tc.get("bin_dir", "")
+prefix  = tc.get("prefix", "")
+q("CFG_TOOLCHAIN_BIN",    bin_dir)
+q("CFG_TOOLCHAIN_PREFIX", prefix)
+q("CFG_CC",      os.path.join(bin_dir, f"{prefix}gcc")     if bin_dir else "")
+q("CFG_AR",      os.path.join(bin_dir, f"{prefix}ar")      if bin_dir else "")
+q("CFG_RANLIB",  os.path.join(bin_dir, f"{prefix}ranlib")  if bin_dir else "")
+q("CFG_OBJDUMP", os.path.join(bin_dir, f"{prefix}objdump") if bin_dir else "")
+q("CFG_GDB",     os.path.join(bin_dir, f"{prefix}gdb")     if bin_dir else "")
+
+# target
+q("CFG_CPU",           tg.get("cpu", ""))
+q("CFG_FPGA_CONFIG",   abspath_rel(skill_root, tg.get("fpga_config", "")))
+q("CFG_UARCH_REF",     abspath_rel(skill_root, tg.get("uarch_ref", "")))
+q("CFG_INTRINSIC_API", abspath_rel(skill_root, tg.get("intrinsic_api", "")))
+q("CFG_CFLAGS_BASE",   join_flags(tg.get("cflags_base", {})))
+q("CFG_CFLAGS_PERF",   join_flags(tg.get("cflags_perf", {})))
+q("CFG_CFLAGS_VERIFY", join_flags(tg.get("cflags_verify", {})))
+
+ad = tg.get("active_defines", {})
+q("CFG_DEFINES_DEFINED",   "\n".join(ad.get("defined", [])))
+q("CFG_DEFINES_UNDEFINED", "\n".join(ad.get("undefined", [])))
+
+# qemu
+q("CFG_QEMU_BIN",     qe.get("binary", ""))
+q("CFG_QEMU_MACHINE", qe.get("machine", ""))
+q("CFG_QEMU_CPU",     qe.get("cpu", ""))
+q("CFG_QEMU_CONFIG",  abspath_rel(libnn_root, qe.get("config", "")))
+q("CFG_QEMU_VLEN",    qe.get("vlen", ""))
+q("CFG_QEMU_TIMEOUT", qe.get("timeout", ""))
+
+# vsim
+q("CFG_VSIM_BIN",        vs.get("binary", ""))
+q("CFG_VSIM_VLEN",       vs.get("vlen", ""))
+q("CFG_VSIM_TARGET",     vs.get("target", ""))
+q("CFG_VSIM_MODELER",    vs.get("pipeline_modeler", ""))
+q("CFG_VSIM_LOG_CYCLES", vs.get("log_cycles_default", ""))
+
+# fpga
+q("CFG_FPGA_HOST",        fp.get("host", ""))
+q("CFG_FPGA_PORT",        fp.get("port", ""))
+q("CFG_FPGA_TIMEOUT",     fp.get("timeout", ""))
+q("CFG_FPGA_LD_SCRIPT",   abspath_rel(libnn_root, fp.get("linker_script", "")))
+q("CFG_FPGA_SIM_WRAPPER", abspath_rel(libnn_root, fp.get("sim_wrapper", "")))
+q("CFG_FPGA_RESET_FLAG",  abspath_rel(libnn_root, fp.get("reset_flag_file", "")))
+
+# limits
+q("CFG_MAX_ROUNDS",       lm.get("max_rounds", ""))
+q("CFG_VALIDATE_CACHE_H", lm.get("validate_cache_hours", ""))
+
+# For convenience: record the resolved config path itself
+q("CFG_CONFIG_PATH", config_path)
+PYEOF
+)"
+
+unset _pc_script_dir _pc_config_path

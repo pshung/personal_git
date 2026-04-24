@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+################################################################################
+# emit_trace.sh - structured trace capture for /optimize FSM (Phase 0).
+#
+# Writes per-round artifacts to ${TRACE_ROOT}/<fn>/round_<N>/:
+#
+#   analyze_agent.md     proposer I/O (subagent hypothesis + analysis)
+#   implement_agent.md   implementer diff + reasoning
+#   verify_result.json   PASS/FAIL + stderr from run_qemu_test.sh
+#   measure_result.json  cycles/instrs/IPC from run_fpga_test.sh
+#   learn_agent.md       wiki/lessons written this round
+#   fail_reason.md       tagged failure class (compile_error, test_fail, ...)
+#   step_timings.json    {<step>: {wall_seconds: N}}
+#
+# Environment:
+#   TRACE_ROOT   override trace_corpus location (default: <skill_dir>/trace_corpus)
+#   CONFIG_TOML  override config.toml path (used by auto-mode to find state.json)
+#
+# Usage:
+#   emit_trace.sh init    [--fn X --round N]
+#   emit_trace.sh step    [--fn X --round N] <step_name> <payload_file>
+#   emit_trace.sh timing  [--fn X --round N] <step_name> <seconds>
+#   emit_trace.sh fail    [--fn X --round N] <tag> [<message_file>]
+#
+# Auto mode: when --fn/--round are omitted, both are read from CFG_STATE_FILE
+# (via parse_config.sh, which honors $CONFIG_TOML).
+#
+# Exit: 0 on success, non-zero on error.
+################################################################################
+
+set -eo pipefail
+
+_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_skill_dir="$(cd "${_script_dir}/.." && pwd)"
+TRACE_ROOT="${TRACE_ROOT:-${_skill_dir}/trace_corpus}"
+
+_die() { echo "emit_trace.sh: $*" >&2; exit 1; }
+
+# Populate FN and ROUND (globals) from --fn/--round flags, or fall back to
+# state.json via parse_config.sh.
+_resolve_fn_round() {
+    if [ -n "${_fn}" ] && [ -n "${_round}" ]; then
+        FN="$_fn"; ROUND="$_round"; return 0
+    fi
+    # Auto mode: need parse_config.sh to locate state.json
+    if [ ! -f "${_script_dir}/parse_config.sh" ]; then
+        _die "auto mode requires parse_config.sh next to emit_trace.sh"
+    fi
+    # shellcheck disable=SC1091
+    source "${_script_dir}/parse_config.sh" >/dev/null
+    [ -f "${CFG_STATE_FILE}" ] || \
+        _die "state.json not found at ${CFG_STATE_FILE} (pass --fn/--round explicitly?)"
+    eval "$(python3 - "${CFG_STATE_FILE}" <<'PY'
+import json, sys, shlex
+s = json.load(open(sys.argv[1]))
+print(f"FN={shlex.quote(str(s.get('function','')))}")
+print(f"ROUND={shlex.quote(str(s.get('round', 0)))}")
+PY
+)"
+    [ -n "${FN}" ] || _die "state.json has no 'function' set (pass --fn/--round explicitly?)"
+}
+
+# Split --fn/--round out of "$@". Remaining positional args in POSARGS.
+_parse_flags() {
+    _fn=""; _round=""; POSARGS=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --fn)    _fn="$2";    shift 2 ;;
+            --round) _round="$2"; shift 2 ;;
+            --)      shift; while [ $# -gt 0 ]; do POSARGS+=("$1"); shift; done; break ;;
+            *)       POSARGS+=("$1"); shift ;;
+        esac
+    done
+}
+
+_round_dir() {
+    local dir="${TRACE_ROOT}/${FN}/round_${ROUND}"
+    mkdir -p "$dir"
+    echo "$dir"
+}
+
+# Map step_name -> artifact filename. verify/measure are JSON; everything
+# else is markdown (analyze, implement, learn, select, validate, ...).
+_step_filename() {
+    case "$1" in
+        verify|measure) echo "$1_result.json" ;;
+        *)              echo "$1_agent.md"    ;;
+    esac
+}
+
+################################################################################
+# Main
+################################################################################
+
+subcmd="${1:-}"
+[ -n "$subcmd" ] || _die "usage: emit_trace.sh {init|step|timing|fail} ..."
+shift
+
+_parse_flags "$@"
+set -- "${POSARGS[@]}"
+
+case "$subcmd" in
+
+    init)
+        _resolve_fn_round
+        _round_dir
+        ;;
+
+    step)
+        step_name="${1:-}"
+        payload="${2:-}"
+        [ -n "$step_name" ] && [ -n "$payload" ] || \
+            _die "step: usage: step [--fn X --round N] <step_name> <payload_file>"
+        [ -f "$payload" ] || _die "step: payload file not found: $payload"
+        _resolve_fn_round
+        dir="$(_round_dir)"
+        out="${dir}/$(_step_filename "$step_name")"
+        cp "$payload" "$out"
+        echo "$out"
+        ;;
+
+    timing)
+        step_name="${1:-}"
+        secs="${2:-}"
+        [ -n "$step_name" ] && [ -n "$secs" ] || \
+            _die "timing: usage: timing [--fn X --round N] <step_name> <seconds>"
+        _resolve_fn_round
+        dir="$(_round_dir)"
+        out="${dir}/step_timings.json"
+        python3 - "$out" "$step_name" "$secs" <<'PY'
+import json, os, sys
+path, step, raw = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    secs = float(raw)
+except ValueError:
+    sys.exit(f"emit_trace.sh: timing seconds must be numeric, got: {raw!r}")
+data = {}
+if os.path.exists(path):
+    try:
+        data = json.load(open(path))
+    except Exception:
+        data = {}
+data[step] = {"wall_seconds": secs}
+json.dump(data, open(path, "w"), indent=2)
+PY
+        ;;
+
+    fail)
+        tag="${1:-}"
+        msg="${2:-}"
+        [ -n "$tag" ] || \
+            _die "fail: usage: fail [--fn X --round N] <tag> [<message_file>]"
+        _resolve_fn_round
+        dir="$(_round_dir)"
+        out="${dir}/fail_reason.md"
+        {
+            echo "tag: ${tag}"
+            echo ""
+            if [ -n "$msg" ] && [ -f "$msg" ]; then
+                cat "$msg"
+            fi
+        } > "$out"
+        echo "$out"
+        ;;
+
+    *)
+        _die "unknown subcommand: $subcmd (valid: init, step, timing, fail)"
+        ;;
+esac

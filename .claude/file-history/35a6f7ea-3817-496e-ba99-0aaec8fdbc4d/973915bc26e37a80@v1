@@ -1,0 +1,88 @@
+# Andes 45-series uarch reference
+
+Microarchitecture model used by the `/optimize` skill when `config.toml` points
+`[target].uarch_ref` at this file. Contains facts the FPGA `.inc` file cannot
+express: pipeline stage names, stall taxonomy, dual-issue rules, per-LMUL
+register grouping.
+
+## Pipeline stages
+
+The VPU pipeline is `VQ -> VD -> VC -> VW`, where `VW` has LMUL sub-stages
+(`VW8` down to `VW1`).
+
+- `VQ` (queue): instruction enters vector issue queue
+- `VD` (dispatch): operand read
+- `VC` (complete / compute): functional unit execution
+- `VW` (writeback): retirement; expanded per LMUL group
+
+## Active defines (AX45MPV build)
+
+These defines are ACTIVE on a libnn AX45MPV build. The list comes from
+`build.sh` flags plus unconditional macros in `internal/internal_nn_math.h`.
+
+- `ENA_VEC_ISA` - from build.sh
+- `NDS_VEC_RVV_VERSION=1000` - from build.sh
+- `ENA_NDS_V5_VEC_DOT_PROD` - from build.sh
+- `ENA_TILING` - from `internal/internal_nn_math.h:2256`
+- `ENA_FAST_ALGO` - from `internal/internal_nn_math.h`
+
+These defines are NOT active:
+
+- `ENA_VEC_INTRINSIC` - not defined (dead code in source)
+- `ENA_VEC_ISA_ZVQMAC` - not defined (unless toolchain provides it implicitly for some files)
+
+**Implication for `analyze`**: cross-reference the linked test binary's
+objdump against `#ifdef` blocks before reading source. Modifying dead code has
+zero runtime effect.
+
+## Stall taxonomy
+
+When reading kanata pipeline logs:
+
+- **VQ->VD stall**: instruction waiting for operand from previous VW
+  completion. Interleave scalar/vector work or shorten the RAW chain to reduce.
+- **Too many VW stages**: LMUL too high for the current loop structure. Reduce
+  LMUL, increase tiling.
+- **Poor dual-issue**: scalar and vector streams not overlapping. Reorder
+  instructions so independent scalar work sits between dependent vector ops.
+- **VLSU stall**: memory subsystem cannot feed the vector unit at issue rate.
+  Add prefetch, align data, reduce stride.
+- **Register spills (scalar)**: visible in assembly as stack loads/stores in
+  hot loop. Reduce scratch usage, shrink loop-carried state.
+
+## Loop period and VW spacing
+
+- **Loop period** = cycle gap between successive iterations of the same
+  instruction.
+- **VW spacing** = gap between VW sub-stages (e.g., 18 cycles per VW step
+  indicates per-element latency on a variable-latency op).
+- **VC stall** pattern: instruction X's VC can't start until its operand's VW
+  completes. Long VW tails (e.g., `vdiv`) block dependent `vnsra`.
+
+## Instruction class latencies (indicative)
+
+- `vle8` VW4->VW1: VLSU writeback, ~4 stages for M4.
+- `vwadd` / `vmax` VW8->VW1: VALU writeback, 8 stages for M8.
+- `vdiv` VW spacing >> 1: each VW sub-stage takes many cycles (per-element
+  division).
+
+## LMUL -> register group mapping
+
+When writing RVV on this uarch, respect the register grouping rules:
+
+- M8: v0 / v8 / v16 / v24
+- M4: v0 / v4 / v8 / v12
+- M2: v0 / v2 / v4 / v6 / ...
+- M1: any v-register
+
+Picking a register that doesn't align with the LMUL group is a compile error
+(for intrinsic macros) or a silent wrong-result bug (for hand-written
+assembly).
+
+## vsim VLEN note
+
+vsim runs with a VLEN that may be smaller than the FPGA `.inc` configured
+VLEN (see `[vsim].vlen` in `config.toml`). Pipeline patterns (stalls,
+scheduling, issue behavior) are uarch-invariant with respect to VLEN; only
+the element count per instruction scales. Do not use vsim runs to reason
+about raw throughput - only about pipeline shape.
