@@ -1,0 +1,142 @@
+# Optimization Log
+
+Append-only chronological record of optimization activity. One entry per `learn` step.
+
+---
+
+## 2026-03-21
+
+**riscv_nn_maxpool_HWC_s8** - Round 1
+- Approach: Unroll k_x by 2, interleave vle8/vmax
+- Result: 0.97x (regressed)
+- Lesson: Function is memory-bound; vmax is not the bottleneck. See [[anti-lmul-reduction-memory-bound]].
+
+**riscv_nn_maxpool_HWC_s8** - Round 2
+- Approach: Replace multiply-based addressing with precomputed pointer + stride
+- Result: 1.012x (neutral, ~1.2%)
+- Lesson: Scalar address math is not limiting factor for memory-bound kernel.
+
+---
+
+## 2026-03-23
+
+**riscv_nn_avepool_HWC_s8** - Round 1
+- Approach: Use e16/M4 vwadd accumulation instead of e32/M2 vqmacc
+- Result: 2.79x (149,131 -> 53,535 cycles)
+- Lesson: e16 doubles VL (512 vs 256 at VLEN=1024) when count*127 fits in s16. See [[e16-accumulation]].
+
+**riscv_nn_conv_HWC_s8_s8_s8_sym_bias_fast** - Round 1
+- Approach: Replace ENA_TILING GEMM with im2col + 4x4 vd4dots GEMM
+- Result: 4.35x (2,292,485 -> 527,219 cycles)
+- Lesson: Tiling GEMM vectorizes N=32 (12.5% VL at VLEN=1024); vd4dots vectorizes K=1152 (~100%). See [[tiling-gemm-to-vd4dots]].
+
+**riscv_nn_conv_HWC_s8_s8_s8_sym_fast** - Round 1
+- Approach: Same as sym_bias_fast
+- Result: 4.36x
+
+**riscv_nn_conv_HWC_s8_s8_s8_RGB_sym_bias_fast** - Round 1
+- Approach: Replace ENA_TILING with direct conv (no im2col/GEMM)
+- Result: 2.67x initial; 2.57x final after bug fix
+- Lesson: K=3 too small for vd4dots; direct conv wins. See [[anti-vd4dots-small-k]].
+
+**riscv_nn_maxpool_HWC_s8** - Round 3
+- Approach: M4 2-pixel parallel (separate accumulators v0/v4)
+- Result: 0.99x (neutral)
+- Lesson: IPC improved 0.32->0.57 but instruction count doubled (8192->14584). Memory-bound: more parallelism doesn't help. See [[memory-bound-diagnosis]].
+
+---
+
+## 2026-03-24
+
+**riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any** - Round 1 (GEMM upgrade)
+- Approach: Add vd4dots GEMM kernel (unroll4)
+- Result: 1.03x initial
+- Lesson: GEMM was already reasonable; im2col was the bottleneck.
+
+**riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any** - Round 2 (im2col bulk copy)
+- Approach: 5-region im2col split with bulk row copies for pad=0 center
+- Result: 1.57x (vs 1.03x prior, cumulative ~4.97x from baseline)
+- Lesson: Mid-center region dominates; 3x192B bulk copy beats 9x64B per-element copy. See [[im2col-strategies]].
+
+**riscv_nn_conv_1x1_HWC_s8_s8_s8_asym_bias_fast_any** - Round 1
+- Approach: Replace ENA_TILING with nn_mat_mult_nt_t_s8_v2 direct GEMM
+- Result: 2.60x (1,116,941 -> 428,860 cycles)
+- Lesson: Vectorize K=512 not N=32. See [[vectorize-k-vs-n]].
+
+**riscv_nn_conv_1x1_HWC_s8_s8_s8_asym_bias_fast_any** - Round 2 (runtime dispatch)
+- Approach: VLMAX-threshold dispatch: VD4DOTS for small N, tiling for large N
+- Result: Fixes regression on large-N test cases; keeps 2.60x for small N
+- Lesson: VD4DOTS only wins when N < VLMAX_e8_m4/4. See [[runtime-dispatch]].
+
+**riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any_dilated** - Round 1
+- Approach: groups==1 fast path with unroll4 GEMM (4-pixel batching)
+- Result: 1.05x
+
+**riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any_dilated** - Round 2
+- Approach: pad=0 fast path skipping boundary checks, precomputed dilation strides
+- Result: 1.24x (cumulative 1.30x from baseline: 1,822,840 -> 1,398,877 cycles)
+- Lesson: Boundary check elimination via pad=0 specialization. See [[im2col-strategies]].
+
+---
+
+## 2026-04-17
+
+- **riscv_nn_conv_dw_HWC_u8_u8_u8_asym_bias_any** round 1 | vmulh requantization (single M8 pass, no vwmul split) | 174,549 -> 164,347 cycles (1.06x) | improved | Lesson: vmulh (vector multiply-high, returns upper 32 bits of 32x32 multiply) stays at e32 width, avoiding the e64 widening that forces splitting an M8 accumulator (LMUL=8, using all register groups) into two M4 halves. Saves ~14 vector ops per requantization. See [[vmulh-requantization]].
+
+---
+
+## 2026-04-24
+
+- **riscv_nn_relu_s8** round 1 | 2-iter SW pipeline (prologue load, pipelined body store-prev+load-next+vmax, epilogue store) | 2984 -> 3058 cycles (0.976x), 333 -> 390 instrs | regressed | Lesson: at m8/VLEN=1024 all four register groups (v0/v8/v16/v24) are in use; the next-iter load reuses the group the prev-iter store is still draining, so VLSU does not overlap across iterations. Pure code bloat. See [[anti-sw-pipeline-same-reg-group]], [[relu-s8]]. Baseline is already at ~44 B/cyc against a ~32 B/cyc per-direction L2 ceiling -- memory-bandwidth-bound.
+
+---
+
+## 2026-04-27
+
+**riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any** - Round 1 (post-pipeline-tuning-page)
+- Approach: SW-pipeline double-buffer in nn_mat_mult_kernel_s8_offset_unroll4 inner loop. Unroll-by-2: iter A loads v24-v31 + computes v16-v23, iter B loads v16-v23 + computes v24-v31. Goal: VMAC+VLSU dual-issue per V1024_8MB tuning page.
+- Result: 1.026x (1,122,927 -> 1,095,003 cycles)
+- Lesson: Modest gain. The vsetvli (e8 -> e32) between loads and vd4dots in each unrolled iter still partially serializes the VLSU/VMAC overlap. Inner loop is only ~19% of total cycles, so even a 2x inner-loop speedup caps the net at ~10%. See [[anti-sw-pipeline-same-reg-group]] does NOT apply at M1 (separate reg groups available).
+
+**riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any** - Round 2 (post-pipeline-tuning-page)
+- Approach: Eliminate redundant vsetvli vl=1 before vand v31 in epilogue (vand at vl=128 has same effect for the [0]-only consumer).
+- Result: Neutral. Cycles 1,095,003 -> 1,094,983 (-20 cyc, FPGA noise). Instructions 646,165 -> 642,385 (-3,780). Cumulative from baseline: 1.0255x.
+- Lesson: vsetvli removal saves instructions but not cycles when the eliminated vsetvli was issuing in a free dual-issue slot. IPC = `instrs/cycles` improves from 0.59 to ... still 0.59 (the rounded IPC didn't move). For pipeline-bound kernels, instruction-count optimizations are misleading. Cycle count is ground truth -- see [[ipc-vs-throughput]].
+
+**riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any** - Round 1 (fresh session, post-reset)
+- Approach: Trim im2col `nn_dup_s8` LMUL m8 -> m4 (bulk-row, size=192) and m1 (per-pixel, size=64). Added `nn_dup_s8_m4` and `nn_dup_s8_m1` static-inline helpers in `riscv_nn_support.h`; swapped 6 call sites in conv parent. Predicted 5-7% from V1024_8MB pipeline-tuning page formula `(VLEN/VLSU_MEM_DW)*EMUL = 2*EMUL` cyc/instr.
+- Result: Neutral. Cycles 1,094,953 -> 1,094,981 (+28, FPGA noise). Instructions 642,385 -> 642,385 (identical).
+- Lesson: The `2*EMUL` throughput formula is the **WORST-CASE-VL** bound. For partial-VL transfers (vl=64 < VLMAX_m1=128), actual VLSU throughput is data-movement-limited (one BIU beat at 64 B/cyc per request) and m1 == m4 == m8 in cycles. Identical instr count + objdump confirms LMUL did propagate (vsetvli e8,m1/m4 visible at lines 482/966/1043) but those instructions executed in the same cycle budget. **Only trust EMUL-proportional cost when vl == VLMAX.** New anti-pattern: do not optimize LMUL of small-VL VLSU transfers based on the spec-page formula alone -- consult cycle measurements. See [[ipc-vs-throughput]].
+
+**riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any** - Round 2 (fresh session)
+- Approach: Hoist `vle32(v2, out_shift)` and `vle32(v3, out_scale)` earlier in the requantize tail of `nn_mat_mult_kernel_s8_offset_unroll4` -- placed BEFORE the contri_buf vadds rather than immediately before vrsub/vwmul. Pure instruction reordering inside the requantize tail; v2/v3 dead at hoist site (vredsum already consumed them as sources).
+- Result: 1.0252x. Cycles 1,094,953 -> 1,068,029 (-26,924). Instructions 642,385 -> 642,385 (identical).
+- Lesson: Same instr count, ~25k cycles saved -- pure scheduling win. The original code had a hidden RAW stall: `vrsub v2, v2, 30` waited on `vle32(v2, out_shift)` issued just before it. By moving the load ahead of the contri_buf vadds, the load latency is fully hidden under VALU compute. **For requantize tails on V1024_8MB, hoist constant-array vle32 loads as early as register liveness permits.** The 4-pixel-x-4-channel tile's tail amortizes 25 cyc savings into ~6.4 cyc/cur_row * 4 cur_row * 420 calls = ~26k cyc. Cumulative speedup vs pristine baseline (1,122,927): **1.0514x**. See [[ipc-vs-throughput]] -- this is the dual case to round-2-prior: same instr count, different cycles.
+
+---
+
+## 2026-04-27 (post-compaction-resume)
+
+**riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any** - Round 1 (compaction-resume baseline)
+- Context: Previous session's nn_mat_mult_kernel_s8_offset.c uncommitted hoist + SW-pipe got reverted by botched `git checkout HEAD -- file`. Re-baselined at 1,125,457 cyc (HEAD).
+- Approach: Re-applied prior round-2's vle32(v2, out_shift) + vle32(v3, out_scale) hoist above contri_buf vadds in `nn_mat_mult_kernel_s8_offset_unroll4`.
+- Result: 1.0246x. 1,125,457 -> 1,098,425 cyc (-27,032). Instructions identical 647,845.
+- Lesson: Confirms the hoist is reproducible win. Now protected by `refs/optimize-ckpt/` checkpoints anchored before each implement step (round-0-baseline + round-N-pre per round). See updated optimize SKILL.md rule 10/10a.
+
+**riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any** - Round 2
+- Approach: Hoist all 3 vle32 (V1 contri_buf, V2 out_shift, V3 out_scale) ABOVE the slideup batch in `nn_mat_mult_kernel_s8_offset_unroll4` requantize tail. Required 1 extra vsetvli vl=4 e32 m1 (vredsum vl != load vl). The 12 vslideups + 3 vsetvli (~14 cyc VPERMUT+control) cover D$ latency on V1.
+- Result: 1.0198x (vs round 1), cumulative 1.0449x (vs baseline). 1,098,425 -> 1,077,151 cyc (-21,274). Instrs +1,680 = exactly 1 vsetvli * 4 cur_row * 420 calls. Cost model validated.
+- Lesson: VLSU loads can be hoisted above VPERMUT batches at cost of one vsetvli when SEW/vl differs. Each vslideup is ~1 cyc VPERMUT (not VALU), so they free-issue concurrent with VLSU.
+
+**riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any** - Round 3
+- Approach: Reorder vle32 triplet (V2,V3,V1 -> V1,V2,V3) so V1 (earliest consumer) gets max slideup-batch cover.
+- Result: Neutral (~10 cyc, FPGA noise). 1,077,151 -> 1,077,161.
+- Lesson: V2,V3,V1 order had already provided sufficient cover (~12 cyc + scalar). D$ latency was lower than worst-case 14 cyc estimate, likely L1 hit (out_shift/out_scale arrays are reused across cur_row).
+
+**riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any** - Round 4
+- Approach: Peel first inner iter when col_count >= maxvl_per_loop. Interleave 8 vle8 with 16 vand (zero-init accumulators) inside vsetvli e8 m1. vand at e8 m1 vl=128 still zeros full m1 reg = 32 e32 elements. VLSU and VALU dual-issue.
+- Result: 1.0027x (vs round 3), cumulative 1.0476x. 1,077,161 -> 1,074,295 (-2,866). Instructions 649,525 -> 646,585 (-2,940).
+- Lesson: Predicted ~26k cyc savings, got ~3k. Either (a) hardware was already overlapping vand with following vle8 via OoO retire, or (b) loop-tail of vand chain (which has serial WAW within the same FU) was already hidden by other compute. Take-away: when actual << predicted on a dual-issue prediction, the pessimistic baseline assumption was wrong -- check actual stall, not theoretical.
+
+**Cumulative for the session**: 1,125,457 -> 1,074,295 cyc = 1.0476x. Total cycles saved: 51,162.
+Combined with prior session's pristine baseline (1,122,927): the kernel is now **1.0452x** total (since the cumulative starting point shifted slightly between sessions due to revert).
