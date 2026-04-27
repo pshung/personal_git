@@ -1,13 +1,13 @@
-# Plan: Add AX45MPV CPU Architecture Reference Segment
+# Plan: Rename ax45mpv-vpu-uarch.md -> ax45mpv-vpu-uarch-spec.md
 
 ## Context
 
-The `/optimize` skill uses `docs/wiki/index.md` as its entry point. The existing
-`general/ax45mpv-pipeline.md` is inference-based (observation + reasoning). It has
-one factual gap: it says "two vector instructions cannot dual-issue," but the data
-sheet shows they CAN dual-issue across different functional units. The goal is to
-add a raw-data-sheet reference page so the agent can reason about VRF port
-conflicts, chaining, and latency from authoritative numbers rather than guesswork.
+`docs/wiki/general/ax45mpv-vpu-uarch.md` was created as an authoritative data-sheet
+reference for the AX45MPV VPU. The user wants it renamed to `ax45mpv-vpu-uarch-spec.md`
+to make the "spec" nature explicit and distinguish it from derived/observational pages.
+
+The file is untracked (not yet committed), so this is a `git mv` followed by wikilink
+updates across all referencing files.
 
 Source: `docs/wiki/raw/AndesCore_AX45MPV_DS220_V1.4.pdf`
 - 1.5.2 (pp.51-52): VPU functional units, dispatch rules
@@ -20,14 +20,16 @@ Source: `docs/wiki/raw/AndesCore_AX45MPV_DS220_V1.4.pdf`
 - 23.15.6 (pp.562-563): VFMIS latency/throughput table
 - 23.15.7 (pp.564-573): VLSU latency/throughput (all access types)
 
-## Files to Create/Modify
+## Files to Modify
 
 | File | Action |
 |---|---|
-| `docs/wiki/general/ax45mpv-vpu-uarch.md` | Create (new reference page) |
-| `docs/wiki/index.md` | Add "CPU Architecture Reference" section |
+| `docs/wiki/general/ax45mpv-vpu-uarch.md` | Rename to `ax45mpv-vpu-uarch-spec.md` (mv, not git mv -- file is untracked) |
+| `docs/wiki/index.md` | Replace all `[[ax45mpv-vpu-uarch]]` -> `[[ax45mpv-vpu-uarch-spec]]` |
+| `docs/wiki/general/ipc-vs-throughput.md` | Replace `[[ax45mpv-vpu-uarch]]` -> `[[ax45mpv-vpu-uarch-spec]]` in Related section |
+| `docs/wiki/general/memory-bound-diagnosis.md` | Replace `[[ax45mpv-vpu-uarch]]` -> `[[ax45mpv-vpu-uarch-spec]]` in Related section |
 
-## New Page: `ax45mpv-vpu-uarch.md`
+## New Page: `ax45mpv-vpu-uarch-spec.md`
 
 ### Sections
 
