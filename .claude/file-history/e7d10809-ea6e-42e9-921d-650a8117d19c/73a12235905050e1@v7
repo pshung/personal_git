@@ -1,0 +1,806 @@
+# Why is `conv_HWC_s8_s8_s8_asym_bias_any` 4-5x faster in `~/work/libnn`?
+
+## Test setup
+
+| Item | Value |
+|---|---|
+| Hardware | AX45MPV FPGA, **VLEN = 1024 bits** |
+| Function | `conv_HWC_s8_s8_s8_asym_bias_any` (int8 conv, asymmetric quant, with bias) |
+| Input shape | 30 x 32 x 64 (H x W x C), 2 batches |
+| Kernel | 3 x 3, stride 1, no padding |
+| **Output channels** | **16** (key number — keep it in mind) |
+| Baseline (this repo) | **5,170,095 cycles** (measured) |
+| Optimized (`~/work/libnn`) | ~1.0M cycles (per commit-log claims) |
+
+Both repos take exactly the same algorithmic skeleton: `im2col -> GEMM`. They use the same `vd4dot` SIMD primitive only in a small precompute step. The dominant work, the GEMM, is implemented very differently in the two trees - and that is where the speedup comes from.
+
+---
+
+## TL;DR
+
+Four architectural differences, three with measured speedups on FPGA:
+
+| # | Lever | Speedup | Where |
+|---|---|---|---|
+| 1 | **Vectorization axis** flipped from across-output-channels to along-the-reduction | **2.47x** | new GEMM kernel |
+| 2 | **Register tile widening** (single-pixel -> 4-channel x 4-pixel) | **1.25x** | new GEMM kernel |
+| 3 | **im2col bulk row copies** in the non-padded mid region | **1.57x** | im2col pipeline |
+| 4 | **Fused requantization** (in-register vs. separate post-pass over int32 buffer) | implicit in #1 | new GEMM kernel |
+| | Compounded | **~4.85x** | |
+
+The single largest fix is #1 - and it is a side-effect of the input shape, not a vendor-instruction trick.
+
+---
+
+## Background: how the baseline does the convolution
+
+A 2D convolution can be reshaped into a matrix multiply by a process called **im2col**:
+
+```
+For every output pixel:
+    Gather the 3x3 receptive field for all 64 input channels into a row of length K = 3*3*64 = 576.
+
+Stack all those rows into a [num_pixels x K] matrix A.
+Lay the weights as a [K x OC] matrix B.
+
+Output = A x B  ->  [num_pixels x OC]
+```
+
+So one convolution becomes:
+1. **im2col**: data movement (memcpy-like, no math).
+2. **GEMM** (general matrix multiply): the actual MACs.
+
+The baseline's GEMM is the file `internal/internal_vec_mat_mul_tiling.h`, function `vec_mat_mul_rvv_tiling_vq` (line 709). The hot loop computes `2 x 8` C tile = `(2 rows of A) x (8 vectors of B)`, eight K-elements per inner step.
+
+---
+
+## The Issue: vector lanes were 94% idle
+
+To see the issue, recall what a "vector instruction" actually does on AX45MPV:
+
+> One vector instruction operates on a *vector register*. The register holds a fixed number of *lanes* in parallel. Whatever you do, you do to all lanes at once.
+
+For 32-bit accumulators at LMUL=M8, a vector register holds:
+
+```
+VLMAX = (VLEN x LMUL) / SEW
+      = (1024  x 8) / 32
+      = 256 lanes
+```
+
+So each instruction has **256 lanes ready to compute**.
+
+Now the baseline GEMM uses these lanes to span the **output-channel dimension** (`col2` in the source). Look at the inner loop pattern:
+
+```c
+NDS_VEC_VSETVLI(vl, mulLen, DEF_VTYPEVQ_SEW, NDS_VEC_VTYPE_LMUL_M8);  // line 742
+...
+for (k = kk; k < max_kk_tiling_size; k += 8) {
+    DEF_VLOAD_V(NDS_VEC_V16, B11);    // load 8 vectors of B (output-channel slabs)
+    ...
+    DEF_VMACC_V(NDS_VEC_V0, tmpa11, NDS_VEC_V16);  // tmpa11 is a *scalar* weight; V16 spans OC
+    ...
+}
+```
+
+The `vqmacc.vx` instruction is "broadcast a scalar weight, multiply across the vector, accumulate". The vector axis here is the output-channel dimension.
+
+`mulLen` is the number of output channels left to process in this tile. For our test shape:
+
+```
+mulLen = OC = 16
+vl     = min(16, VLMAX) = min(16, 256) = 16
+```
+
+**The vector unit runs at VL=16 even though it has 256 lanes available.**
+
+```
+Lane utilization = 16 / 256 = 6.25 %
+```
+
+That is a ~16x architectural cap on what the baseline GEMM can ever achieve on this shape, no matter how clever the rest of the code is. The hot loop is correct, well-unrolled, well-prefetched, well-tiled in cache - but it is starved of work.
+
+This is the first and biggest cause of the 3-4x gap.
+
+---
+
+## Fix 1 - Flip the vectorization axis (2.47x alone)
+
+The optimized version (commit `5f37b680` in `~/work/libnn`) abandons "vectorize across OC" for a kernel that **vectorizes along the reduction dimension** (K = 576 here):
+
+```c
+// libnn/Source/NNSupportFunctions/nn_mat_mult_kernel_s8_offset.c
+// in nn_mat_mult_kernel_s8_offset_unroll4
+
+while (col_count >= maxvl_per_loop) {
+    NDS_VEC_VSETVLI(vl, col_count, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M1);
+    NDS_VEC_VLE8_V(NDS_VEC_V16, ptr_a0);    // load weight row, length VL along K
+    NDS_VEC_VLE8_V(NDS_VEC_V20, ptr_b0);    // load pixel column, length VL along K
+    ...
+    NDS_VEC_VSETVLI(vl, vl, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M1);
+    NDS_VEC_VD4DOTS_VV(NDS_VEC_V0, NDS_VEC_V16, NDS_VEC_V20);  // partial dot product
+    ...
+}
+```
+
+Now the lane axis is the K dimension. K = 576 is much bigger than VLMAX, so every instruction runs at full VL. Lane utilization jumps from 6% to 100%. There is a small price - a horizontal `vredsum` is needed at the end of each (channel, pixel) pair to fold the partial sums - but with K = 576 versus a per-instruction VLMAX of 128, the reduction is a tiny tail, easily amortized.
+
+**Measured (commit log): 5,456,391 cycles -> 2,208,698 cycles. 2.47x.**
+
+This is purely an axis change. Same MAC count, same memory traffic, same data. Just different lanes doing the work.
+
+### Why didn't the baseline do this?
+
+It probably came from a generic library template designed to work for **any** matrix shape. When OC is large and K is small, vectorizing across OC is the right call. But conv layers in real CNNs frequently have small OC at the early stage (e.g., MobileNet's first 1x1 expansion has OC = 16 too). The baseline GEMM was never specialized for the small-OC regime, so it kept the inefficient axis.
+
+---
+
+## Fix 2 - Register tile widening (1.25x more)
+
+After Fix 1, every vector instruction uses 100% of lanes. The next bottleneck is **memory traffic per useful op**.
+
+### The compute-to-load ratio - what it measures
+
+A vector kernel spends cycles on two kinds of instructions: vector **loads** (`vle8`), and vector **computes** (`vd4dots`). On the AX45MPV pipeline these go through different functional units, but a load-bound kernel will stall waiting for data even when the ALU is idle.
+
+> compute-to-load ratio = (# compute ops) / (# vector loads), counted over one iteration of the inner loop
+
+If the ratio is 1.0 you do one compute per load - and since loads are typically slower than ALU ops, the kernel is load-bound. If the ratio is 2.0, you have a chance to hide the load latency under two computes - the kernel becomes compute-bound, which is what you want on a vector machine.
+
+### Counting loads and computes for an `R x C` tile
+
+Suppose the inner loop processes a small block of **R output channels x C output pixels** per step. To do one tile step the kernel must:
+
+- Load **R** weight vectors (one per channel row).
+- Load **C** pixel vectors (one per pixel column).
+- Compute **R x C** dot-products (one for every (channel, pixel) pair).
+
+So:
+
+```
+loads    = R + C
+computes = R x C
+ratio    = R x C / (R + C)
+```
+
+The asymmetry is the whole point. Loads grow **additively** with the tile dimensions, computes grow **multiplicatively**. Bigger tiles do more reuse per loaded vector.
+
+### Concrete numbers in libnn's evolution
+
+| Tile (R x C) | Loads (R+C) | Computes (R*C) | Ratio | Where |
+|---:|---:|---:|---:|---|
+| 1 x 1 (naive along-K) | 2 | 1 | **0.5** | hypothetical |
+| 4 x 2 (`v4` kernel, LMUL=M2) | 6 | 8 | **1.33** | commit `5f37b680` |
+| 4 x 4 (`unroll4` kernel, LMUL=M1) | 8 | 16 | **2.0** | commit `f526165b` |
+
+Going from a naive scan to the 4x4 tile is a 4x improvement in compute-to-load ratio, mostly absorbed by the move 1x1 -> 4x2; the final widening to 4x4 is the last 50% on top.
+
+### Where this shows up in the source
+
+The `unroll4` inner loop (`Source/NNSupportFunctions/nn_mat_mult_kernel_s8_offset.c:1800-1841` in `~/work/libnn`):
+
+```c
+// ---- 8 vector loads per inner step ----
+NDS_VEC_VLE8_V(NDS_VEC_V16, ptr_a0);  // weight row, ch0
+NDS_VEC_VLE8_V(NDS_VEC_V17, ptr_a1);  // weight row, ch1
+NDS_VEC_VLE8_V(NDS_VEC_V18, ptr_a2);  // weight row, ch2
+NDS_VEC_VLE8_V(NDS_VEC_V19, ptr_a3);  // weight row, ch3
+NDS_VEC_VLE8_V(NDS_VEC_V20, ptr_b0);  // pixel col, pix0
+NDS_VEC_VLE8_V(NDS_VEC_V21, ptr_b1);  // pixel col, pix1
+NDS_VEC_VLE8_V(NDS_VEC_V22, ptr_b2);  // pixel col, pix2
+NDS_VEC_VLE8_V(NDS_VEC_V23, ptr_b3);  // pixel col, pix3
+
+// ---- 16 vd4dots, one per (channel x pixel) ----
+NDS_VEC_VD4DOTS_VV(NDS_VEC_V0,  NDS_VEC_V16, NDS_VEC_V20);  // ch0 . pix0
+NDS_VEC_VD4DOTS_VV(NDS_VEC_V1,  NDS_VEC_V16, NDS_VEC_V21);  // ch0 . pix1
+NDS_VEC_VD4DOTS_VV(NDS_VEC_V2,  NDS_VEC_V16, NDS_VEC_V22);  // ch0 . pix2
+NDS_VEC_VD4DOTS_VV(NDS_VEC_V3,  NDS_VEC_V16, NDS_VEC_V23);  // ch0 . pix3
+NDS_VEC_VD4DOTS_VV(NDS_VEC_V4,  NDS_VEC_V17, NDS_VEC_V20);  // ch1 . pix0
+... // 11 more, covering every (chN, pixM) pair
+```
+
+Each weight vector V16..V19 is reused 4 times (once per pixel). Each pixel vector V20..V23 is reused 4 times (once per channel). The vector register file is the only piece of memory we read from - the loads are amortized across 4 ops each.
+
+### Why not an even bigger tile (8x8, 16x16)?
+
+The 32-register file is the hard limit. The `unroll4` kernel already uses 24 of them: 16 accumulators (4ch x 4pix), 4 weight buffers, 4 pixel buffers. Going to 8x8 would need 64 accumulator registers. To keep more accumulators live you would have to drop LMUL (smaller register groups), which would shrink VL and put us right back in lane-utilization trouble.
+
+The 4x4/M1 choice is the sweet spot for this hardware: highest reuse possible while keeping VL = VLMAX(M1, E32) = 32 lanes (and 128 lanes for the e8 loads at M1).
+
+### Tile size and register usage of the BASELINE
+
+For a fair contrast, the baseline GEMM (`vec_mat_mul_rvv_tiling_vq` at `internal_vec_mat_mul_tiling.h:760-798`) has a tile too - but framed in **(A-rows x K-positions)** rather than (channels x pixels):
+
+| What | Baseline | unroll4 |
+|---|---|---|
+| Tile shape | 2 A-rows x 8 K-positions | 4 channels x 4 pixels |
+| C accumulators | 2 (V0, V8) | 16 (V0..V15) |
+| Compute per step | 16 vqmacc.vx | 16 vd4dots.vv |
+| Vector loads per step | 8 (B vectors) | 8 (4 weight + 4 pixel) |
+| Compute-to-load ratio | 2.0 | 2.0 |
+
+The ratios match - but only because the baseline uses **scalar broadcast** for A (the `tmpaXX` GPRs), so A doesn't cost a vector load. The two kernels look equally well-tiled at this level.
+
+The damage shows up inside each instruction:
+
+| Per inner-loop instruction | Baseline `vqmacc.vx` | unroll4 `vd4dots.vv` |
+|---|---|---|
+| VL (lanes) | **16** (= OC) | **32** (= VLMAX) |
+| MACs per lane | 1 | 4 |
+| MACs per instruction | **16** | **128** |
+
+So per inner step: baseline does 16 instructions x 16 MAC = **256 MAC**; unroll4 does 16 instructions x 128 MAC = **2048 MAC**. **8x more useful work for the same instruction count and the same load count.**
+
+### Vector register accounting (both saturate the file)
+
+Both kernels use all 32 vector registers. The difference is what each register holds.
+
+**Baseline, with OC = 16:**
+
+| Group | Regs | LMUL / SEW | Capacity (lanes) | Useful lanes |
+|---|---|---|---:|---:|
+| C accumulator, row r | V0..V7 | M8 / E32 | 256 | 16 |
+| C accumulator, row r+1 | V8..V15 | M8 / E32 | 256 | 16 |
+| B vector loads (x8 groups) | V16..V31 | M2 / E8 | 256 each | 16 each |
+| **Accumulator utilization** | | | **512 lane-slots** | **32 useful (6.25 %)** |
+
+**unroll4:**
+
+| Group | Regs | LMUL / SEW | Capacity (lanes) | Useful lanes |
+|---|---|---|---:|---:|
+| 16 accumulators (4ch x 4pix) | V0..V15 | M1 / E32 | 32 each | 32 each |
+| Weight vector loads | V16..V19 | M1 / E8 | 128 each | 128 each |
+| Pixel vector loads | V20..V23 | M1 / E8 | 128 each | 128 each |
+| Reduction-epilogue scratch | V24..V31 | M1 | - | - |
+| **Accumulator utilization** | | | **512 lane-slots** | **512 useful (100 %)** |
+
+Both kernels reserve **the same total accumulator capacity** (512 lane-slots = 16 registers worth at E32). Baseline fills 6.25 % of that capacity with real data; unroll4 fills 100 %. The wasted register budget in the baseline is the architectural cost of choosing the wrong axis - the kernel is paying for 256-lane vector registers and only using 16 of those lanes.
+
+**Measured: 2,208,698 cycles -> 1,767,895 cycles. 1.25x.**
+
+---
+
+## Fix 3 - im2col bulk row copies (1.57x more)
+
+### Background: what im2col actually does
+
+The GEMM kernel expects its inputs in matrix form: a row of length K = ker_h x ker_w x IC for every output pixel. But the **input tensor** is not laid out that way - it is a 3D tensor.
+
+For our shape (input 30 x 32 x 64, kernel 3 x 3, IC = 64), the input layout in this library is **HWC**: H is outermost, then W, then channel innermost. That means **the 64 channels of any single (y, x) position sit in 64 consecutive bytes of memory.**
+
+```
+input memory:
+  [pixel(0,0): ch0..ch63] [pixel(0,1): ch0..ch63] ... [pixel(0,31): ch0..ch63]
+  [pixel(1,0): ch0..ch63] [pixel(1,1): ch0..ch63] ... [pixel(1,31): ch0..ch63]
+  ...
+```
+
+For each output pixel at (out_y, out_x), the GEMM needs all 9 receptive-field positions packed contiguously into one row of length K = 9 x 64 = 576 bytes:
+
+```
+im2col row for one output pixel:
+  [ker(0,0): 64B] [ker(0,1): 64B] [ker(0,2): 64B]
+  [ker(1,0): 64B] [ker(1,1): 64B] [ker(1,2): 64B]
+  [ker(2,0): 64B] [ker(2,1): 64B] [ker(2,2): 64B]
+```
+
+im2col's job is just to copy the 9 small slabs from the input tensor into this contiguous row, padding with `-in_offset` for out-of-bounds positions.
+
+### Why the baseline is slow at this
+
+The baseline's im2col loop does the copy one kernel position at a time:
+
+```c
+for (cur_out_y ...) {
+    for (cur_out_x ...) {
+        for (cur_ker_y ...) {                      // 3 iterations
+            for (cur_ker_x ...) {                  // 3 iterations
+                if (cur_ker_y < 0 || cur_ker_y >= in_tensor_dim_y ||
+                    cur_ker_x < 0 || cur_ker_x >= in_tensor_dim_x) {
+                    nn_set_val_s8(src1_buf, -in_offset, 64);   // pad
+                } else {
+                    nn_dup_s8(in_tensor + offset, src1_buf, 64); // copy 64B
+                }
+                src1_buf += 64;
+            }
+        }
+        ...
+    }
+}
+```
+
+Two costs per output pixel:
+
+**(a) Many small copies.** Nine separate 64-byte calls. Each `nn_dup_s8(64)` carries fixed overhead - call/return, `vsetvli`, pointer setup, possibly a vload+vstore pair, then a tail check. For a 64-byte copy on VLEN=1024 you can in theory load 128 bytes in one `vle8` instruction; the actual transfer is one vector op, but everything around it is per-call overhead. Multiply by 9 per output pixel x 1680 output pixels = **15,120 small copies**.
+
+**(b) Padding check fires every iteration.** Four scalar compares + a branch run on every kernel position - including output pixels deep inside the image where the receptive field is obviously in bounds. For our shape (input 30 x 32, kernel 3 x 3, no padding) this is wasted work on **every** output pixel.
+
+After Fixes 1 and 2 the GEMM cycles dropped roughly 4x. Cycles spent in im2col did not. So im2col went from a small fraction of total time to a meaningful fraction - the next bottleneck.
+
+### The two improvements in commit `92703a32`
+
+**(a) Region split: hoist the padding check out of the hot path.**
+
+Looking at the input geometry, you can compute up front which output pixels can possibly need padding. With pad = 0 in our test, that is *no pixels at all*; with pad = 1 and kernel 3 x 3, only the outer one-pixel ring needs bounds checks. The optimized im2col splits the output into five zones:
+
+```
++----------------------+
+|       top            |   <- y ring touched by padding
++---+--------------+---+
+|   |              |   |
+| L |    middle    | R |   <- L and R are x-rings; middle is fully in-bounds
+|   |              |   |
++---+--------------+---+
+|       bottom         |
++----------------------+
+```
+
+The middle zone runs a stripped loop with no `if` and no bounds compares - just plain copies. The four edge zones keep the original per-position logic, but they cover only a few pixels, so their cost is small.
+
+**(b) Bulk row copy: exploit HWC contiguity.**
+
+Inside the middle zone, the three kernel positions in one kernel row - `(ker_y, ker_x_start)`, `(ker_y, ker_x_start+1)`, `(ker_y, ker_x_start+2)` - lie in three consecutive 64-byte slabs of the input tensor. Because the layout is HWC and there is no gap between adjacent x-positions, **all three slabs are one contiguous 192-byte run of memory**.
+
+So instead of three separate 64-byte copies, the optimized code does one 192-byte copy:
+
+```c
+for (cur_ker_y = ker_y_start; cur_ker_y < ker_y_start + ker_dim_y; cur_ker_y++) {
+    nn_dup_s8(in_tensor + (cur_ker_y * in_tensor_dim_x + ker_x_start) * in_tensor_ch,
+              col_ptr,
+              in_tensor_ch * ker_dim_x);   // 64 * 3 = 192 bytes per kernel row
+    col_ptr += in_tensor_ch * ker_dim_x;
+}
+```
+
+Per output pixel, the kernel-x loop disappears entirely:
+- Before: 9 calls of `nn_dup_s8(64B)`
+- After: 3 calls of `nn_dup_s8(192B)`
+
+Same total bytes copied (576), but the per-call fixed overhead is paid 3x fewer times, and each `nn_dup_s8` runs over a longer stretch where the inner vector loop reaches steady state.
+
+### Why this matters more than it sounds
+
+For a microcopy like 64 bytes, the per-call overhead is on the same order as the actual data move. Tripling the copy length is close to a 3x speedup on the data-movement portion. The padding-check elimination is a smaller but additive win.
+
+Combined effect, measured on the AX45MPV FPGA: **1.57x** over the post-Fix-2 timing.
+
+### A sibling change in the same commit
+
+Commit `92703a32` also adds an "8-pixel double-pump": run im2col for 8 output pixels into a buffer, then call the GEMM kernel twice (pixels 0..3 and 4..7) on the buffered data. The same weight tensor is read by both GEMM calls back-to-back, so weights stay L1-resident across them. The commit notes this is **neutral on its own** - the weight footprint already fit in L1 - but it sets up the structure cleanly and would help on shapes with bigger weights. We mention it for completeness; the 1.57x comes from the region split + bulk copy.
+
+---
+
+## Fix 4 - Fused requantization (in-register vs. round-trip through memory)
+
+This one is not separately measured by a commit - it was already baked into the new GEMM kernel from commit `5f37b680` onward. But it is a **distinct architectural improvement** and worth calling out, because it explains a meaningful chunk of why "fix 1+2" together delivered 3.09x rather than the ~2x you would predict from axis flip + tile widening alone.
+
+### Background: what requantization is
+
+In a quantized int8 conv, the multiply-accumulate is done in int32 (to hold the wide accumulator). But the next layer expects int8 input. So between GEMM and the final store, the kernel must:
+
+1. Add the bias / weight-contribution term.
+2. Multiply by a per-channel scale (int32 multiplier).
+3. Right-shift by a per-channel shift count.
+4. Add the output zero-point (`out_offset`).
+5. Clamp to `[act_min, act_max]`.
+6. Narrow int32 -> int16 -> int8.
+7. Store the int8.
+
+These seven steps are collectively called **requantization**. Some libraries (the baseline here) treat them as a separate post-processing pass after the GEMM finishes. Others (libnn) fold them into the GEMM kernel itself, so int32 accumulators never touch memory.
+
+### Baseline: GEMM and requantization are two separate passes
+
+The baseline's `nn_mat_mul_kernel_tiling_asym_vq.generic` looks like:
+
+```c
+// === Pass 1: GEMM ===
+vec_mat_mul_rvv_tiling_vq(src1, src2, tmp_out, ...);   // writes int32 to tmp_out
+
+// === Pass 2: Requantize ===
+for (...) {
+    DEF_VLOADVQ_V(NDS_VEC_V0, tmp_out);                // load int32 back
+    // ... apply scale, shift, offset, clip, narrow ...
+    NDS_VEC_VSE8_V(NDS_VEC_V0, out);                   // store int8
+    tmp_out += vl;
+}
+```
+
+So every int32 accumulator is **written to a temporary buffer** (`tmp_out`), then **read back** in a second loop. For our shape:
+
+```
+int32 traffic per direction = 1680 pixels x 16 OC x 4 bytes = 107.5 KB
+```
+
+107.5 KB is larger than the AX45MPV L1 cache (~32 KB), so the round-trip almost certainly spills to L2. The kernel pays for ~215 KB of int32 store+reload that exists only because the two passes are decoupled.
+
+### libnn: requantization happens inside the GEMM tile, in registers
+
+The `unroll4` kernel produces 16 int32 accumulators per 4ch x 4pix tile and finishes the entire requantization sequence on those 16 values **before moving to the next tile**. Reading the kernel from line 1889 onward:
+
+```c
+// 16 int32 accumulators v0..v15 are full of partial dot products.
+// Steps below all stay in vector registers - no memory store of int32.
+
+// (1) Reduce 16 partials to 16 scalars (one per channel-pixel pair)
+NDS_VEC_VREDSUM_VS(NDS_VEC_V16, NDS_VEC_V0,  NDS_VEC_V31);  // ch0*pix0
+... 15 more vredsum
+
+// (2) Pack 4 channels of each pixel into a VL=4 vector via vslideup
+NDS_VEC_VSLIDEUP_VI(NDS_VEC_V16, NDS_VEC_V17, 1);  // pack ch1 into pix0 vector
+... etc, building v16=pix0, v20=pix1, v24=pix2, v28=pix3
+
+// (3) Add bias / weight-contribution term
+NDS_VEC_VLE32_V(NDS_VEC_V1, contri_buf);
+NDS_VEC_VADD_VV(NDS_VEC_V16, NDS_VEC_V16, NDS_VEC_V1);
+... three more vadd
+
+// (4) Multiply by scale
+NDS_VEC_VWMUL_VV(NDS_VEC_V4,  NDS_VEC_V16, NDS_VEC_V3);
+... three more vwmul
+
+// (5) Right-shift
+NDS_VEC_VNSRA_WV(NDS_VEC_V4, NDS_VEC_V4, NDS_VEC_V2);
+NDS_VEC_VSSRA_VI(NDS_VEC_V4, NDS_VEC_V4, 1);
+... etc
+
+// (6) Add out_offset
+NDS_VEC_VADD_VX(NDS_VEC_V4, NDS_VEC_V4, out_offset);
+... etc
+
+// (7) Clip
+NDS_VEC_VMAX_VX(NDS_VEC_V4, NDS_VEC_V4, act_min);
+NDS_VEC_VMIN_VX(NDS_VEC_V4, NDS_VEC_V4, act_max);
+... etc
+
+// (8) Narrow int32 -> int16 -> int8
+NDS_VEC_VNSRA_VI(NDS_VEC_V4, NDS_VEC_V4, 0);  // E32 -> E16
+NDS_VEC_VNSRA_VI(NDS_VEC_V4, NDS_VEC_V4, 0);  // E16 -> E8
+
+// (9) Single int8 store
+NDS_VEC_VSE8_V(NDS_VEC_V4, out_0);
+```
+
+The int32 accumulators are produced in v0..v15, transformed in v16..v30, and never written to memory. Only the final int8 result is stored.
+
+### Memory-traffic comparison on the test shape
+
+| Traffic | Baseline | libnn `unroll4` | Saving |
+|---|---:|---:|---:|
+| int32 store (GEMM -> tmp_out) | 107.5 KB | 0 KB | -107.5 KB |
+| int32 load (tmp_out -> requant) | 107.5 KB | 0 KB | -107.5 KB |
+| int8 store (final output) | 26.9 KB | 26.9 KB | (same) |
+| **Total output-side traffic** | **241.9 KB** | **26.9 KB** | **~9x reduction** |
+
+The ~215 KB of avoided int32 traffic is large compared to the L1 working set. On a vector machine where the kernel was already load-bound (compute-to-load ratio = 2.0), removing this pressure has a direct effect on throughput.
+
+### Why this isn't broken out as a separate measurement
+
+The fusion was introduced together with the new GEMM kernel in commit `5f37b680`. There was no version of the optimized kernel that had axis-flip + tile-widening but kept the unfused requant pass - so there is no clean A/B for it. It is part of the "3.09x" headline number, just not on its own line.
+
+If you wanted to estimate it: an unfused variant of the same kernel would have to add ~215 KB of memory traffic back. Given the rest of the kernel is load-bound at ratio 2.0, that is plausibly worth another 1.2-1.5x by itself. Treat that as a back-of-envelope, not a measurement.
+
+### Why the baseline didn't fuse
+
+Same reason as Fix 1: the baseline's GEMM is a generic library routine. Generic GEMM does not know about per-channel scale/shift, output zero-point, or activation clamping - those are convolution-specific. Decoupling GEMM from requant lets the GEMM be reused (e.g., by the symmetric variant or by fully-connected layers). Fusion costs reusability.
+
+The optimized version chose to **specialize the GEMM kernel for convolution**: the kernel is named `nn_mat_mult_kernel_s8_offset_unroll4`, takes per-channel `out_scale` / `out_shift` and the `act_min`/`act_max` as parameters, and is only used by conv code. Specialization unlocks fusion.
+
+---
+
+## Decision tree: when to pick which approach
+
+The optimized libnn keeps the old GEMM around as a fallback. The new fast path is gated on `out_tensor_ch <= 64`. Generalize that to a rule of thumb:
+
+| Shape signal | Recommended GEMM strategy |
+|---|---|
+| **OC small** (<= 64), K large | Vectorize along K (`unroll4`-style, 4ch x 4pix tile) |
+| **OC large** (> 128), K small | Vectorize across OC (baseline `vqmacc.vx`-style) |
+| **OC == K == medium** | Either works; pick the one with fewer leftover lanes after `min(VLMAX, axis)` |
+| **K == 1** (1x1 conv) | Skip im2col; GEMM directly on input layout |
+| **OC == 1** (depthwise) | Don't use GEMM; per-channel direct conv |
+| **K == 3 or 5, large IC** | Try direct conv (no im2col), like commit `4197132c` |
+
+The decisive question is always:
+
+> When I do `vsetvli(vl, axis_size, ...)` with my chosen LMUL,
+> how full is the resulting `vl`?
+
+If `axis_size >= VLMAX`, you are good. If `axis_size << VLMAX`, you are wasting silicon and you should pick a different axis.
+
+For VLEN = 1024 and 32-bit accumulators:
+
+| LMUL | VLMAX (E32) | Threshold for "axis is big enough" |
+|---|---|---|
+| M1 | 32 | OC >= 32 |
+| M2 | 64 | OC >= 64 |
+| M4 | 128 | OC >= 128 |
+| M8 | 256 | OC >= 256 |
+
+The baseline picked M8. Many real CNN layers have OC of 16, 32, 64. They will all suffer the same 4-16x penalty unless the GEMM is shape-aware.
+
+### im2col strategies
+
+| Shape signal | Recommended im2col |
+|---|---|
+| Padding rare (most pixels in middle) | Region-split, bulk row copy |
+| Padding pervasive (small input, large kernel) | Per-position copy is fine; padding checks dominate anyway |
+| K = 1 | No im2col |
+| Large IC, large output | Tiled im2col, fused with GEMM in cache-resident chunks |
+
+---
+
+## What this means for the optimization workflow
+
+1. **Profile lane utilization, not just FLOPs.** A kernel can hit 100% IPC and still be 16x slower than it should be, if 94% of vector lanes are unused.
+
+2. **The vectorization axis matters more than the instruction.** Both repos have access to `vd4dots`, `vqmacc.vx`, `vqmaccsu.vx`, etc. The choice of *which dimension to spread across the lanes* is the dominant decision.
+
+3. **Optimize iteratively, in the right order.** GEMM-axis fix gave 2.47x; tile widening gave another 1.25x; im2col fix gave another 1.57x. Each step exposed the next bottleneck. Doing them out of order would have given misleading speedups - e.g., fixing im2col before fixing the GEMM axis would only have given a small win because the GEMM was the long pole.
+
+4. **Generic templates are a trap when shape varies.** The baseline GEMM is a perfectly serviceable matrix multiply for moderately-sized OC. It just happens to be terrible for the small-OC regime that NN inference actually exhibits. A specialized fast path keyed on a single shape predicate (`out_ch <= 64`) recovered the entire 4-5x.
+
+---
+
+## File pointers
+
+### Baseline (this repo)
+
+- Caller: `Source/ConvolutionFunctions/riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any.c:311-530` (the `ENA_NDS_V5_VEC_DOT_PROD && ENA_TILING` branch)
+- GEMM wrapper: `Source/NNSupportFunctions/nn_mat_mul_kernel_tiling_asym_s8_s8_s8.c`
+- GEMM hot loop: `internal/internal_vec_mat_mul_tiling.h:709-` (`vec_mat_mul_rvv_tiling_vq`)
+- Macro: `internal/internal_vec_i_v1_0.h:873` (`NDS_VEC_VQMACC_VX`)
+
+### Optimized (`~/work/libnn`)
+
+- Caller (out_ch <= 64 fast path): `Source/ConvolutionFunctions/riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any.c:467-772`
+- GEMM kernel: `Source/NNSupportFunctions/nn_mat_mult_kernel_s8_offset.c:1728` (`nn_mat_mult_kernel_s8_offset_unroll4`)
+
+### Commits with measured numbers
+
+- `5f37b680` `[opt/rvv] Add 4x2 tiled GEMM kernel (v4) for conv_HWC_s8 - 3.09x speedup` (axis flip + tile widening)
+- `f526165b` `[opt/rvv] Add 4x4 vd4dots GEMM - 1.03x speedup` (further tile widening)
+- `92703a32` `[opt/rvv] Optimize ... im2col with bulk row copies - 1.57x speedup`
+
+---
+
+## Appendix: Optimized kernel hot path (objdump)
+
+Source: `~/work/libnn/libnn.objdump`, function `nn_mat_mult_kernel_s8_offset_unroll4`. The two regions below are the steady-state inner loop and the requantization-fusion epilogue, extracted from the disassembly.
+
+### Hot inner loop (one K-chunk iteration, ~33 inst)
+
+Each iteration consumes 4 weight rows + 4 pixel rows of bytes (VLMAX_M1_E8 = 128 lanes) and produces 16 partial dot products into V0..V15.
+
+```asm
+# --- Tail-guard: zero pixel registers in case last iter is partial-VL ---
+vsetvli  a5, a5, e8, m1, tu, mu
+vand.vi  v20, v20, 0
+vand.vi  v21, v21, 0
+vand.vi  v22, v22, 0
+vand.vi  v23, v23, 0
+
+# --- 8 byte-vector loads: 4 pixel rows + 4 weight rows ---
+vsetvli  a4, a4, e8, m1, tu, mu
+vle8.v   v20, (t6)         # pixel row 0
+vle8.v   v21, (t5)         # pixel row 1
+vle8.v   v22, (t4)         # pixel row 2
+vle8.v   v23, (t3)         # pixel row 3
+vle8.v   v16, (a0)         # weight row ch0
+vle8.v   v17, (t1)         # weight row ch1
+vle8.v   v18, (a3)         # weight row ch2
+vle8.v   v19, (a2)         # weight row ch3
+
+# --- Pointer/length scalar bookkeeping ---
+addi     a5, a4, 3
+add      a0, a0, a4
+srai     a5, a5, 0x2
+
+# --- 16 vd4dots: every (weight ch) x (pixel) pair ---
+vsetvli  a5, a5, e32, m1, tu, mu
+vd4dots.vv v0,  v16, v20    # ch0*pix0
+vd4dots.vv v1,  v16, v21    # ch0*pix1
+vd4dots.vv v2,  v16, v22    # ch0*pix2
+vd4dots.vv v3,  v16, v23    # ch0*pix3
+vd4dots.vv v4,  v17, v20    # ch1*pix0
+vd4dots.vv v5,  v17, v21    # ch1*pix1
+vd4dots.vv v6,  v17, v22    # ch1*pix2
+vd4dots.vv v7,  v17, v23    # ch1*pix3
+vd4dots.vv v8,  v18, v20    # ch2*pix0
+vd4dots.vv v9,  v18, v21    # ch2*pix1
+vd4dots.vv v10, v18, v22    # ch2*pix2
+vd4dots.vv v11, v18, v23    # ch2*pix3
+vd4dots.vv v12, v19, v20    # ch3*pix0
+vd4dots.vv v13, v19, v21    # ch3*pix1
+vd4dots.vv v14, v19, v22    # ch3*pix2
+vd4dots.vv v15, v19, v23    # ch3*pix3
+```
+
+**Per-iter work:** 16 vd4dots x 32 lanes x 4 MACs/lane = **2048 MACs**.
+**Cycle floor (vd4dots @ 1/cycle, no stalls):** 16 cycles -> **128 MACs/cycle**.
+
+### Requantization-fusion epilogue (one 16-output tile, ~78 inst)
+
+Runs once per tile of 4ch x 4pix = 16 outputs. After Stage 1, the 16 wide accumulators collapse to 16 int32 scalars; all subsequent work is at VL=4 (4 lanes carrying 4 channels per pixel).
+
+```asm
+# === Stage 1: 16 vredsum -- collapse each acc vector to a scalar in lane[0] ===
+vsetvli  a5, s0, e32, m1
+vredsum.vs v16, v0,  v31     # ch0*pix0
+vredsum.vs v17, v4,  v31     # ch1*pix0
+vredsum.vs v18, v8,  v31     # ch2*pix0
+vredsum.vs v19, v12, v31     # ch3*pix0
+vredsum.vs v20, v1,  v31     # ch0*pix1
+vredsum.vs v21, v5,  v31     # ch1*pix1
+vredsum.vs v22, v9,  v31     # ch2*pix1
+vredsum.vs v23, v13, v31     # ch3*pix1
+vredsum.vs v24, v2,  v31     # ch0*pix2
+vredsum.vs v25, v6,  v31     # ch1*pix2
+vredsum.vs v26, v10, v31     # ch2*pix2
+vredsum.vs v27, v14, v31     # ch3*pix2
+vredsum.vs v28, v3,  v31     # ch0*pix3
+vredsum.vs v29, v7,  v31     # ch1*pix3
+vredsum.vs v30, v11, v31     # ch2*pix3
+vredsum.vs v0,  v15, v31     # ch3*pix3   (reuses v0)
+
+# === Stage 2: pack 4 scalars per pixel into v16/v20/v24/v28 (final VL=4) ===
+vsetvli  a5, 2, e32, m1                # VL=2
+vslideup.vi v16, v17, 1
+vslideup.vi v20, v21, 1
+vslideup.vi v24, v25, 1
+vslideup.vi v28, v29, 1
+vsetvli  a5, 3, e32, m1                # VL=3
+vslideup.vi v16, v18, 2
+vslideup.vi v20, v22, 2
+vslideup.vi v24, v26, 2
+vslideup.vi v28, v30, 2
+vsetvli  a5, s4, e32, m1               # VL=4 (s4 = 4)
+vslideup.vi v16, v19, 3
+vslideup.vi v20, v23, 3
+vslideup.vi v24, v27, 3
+vslideup.vi v28, v0,  3
+
+# === Stage 3: add per-channel int32 contribution (input_offset * weight pre-sum) ===
+vle32.v  v1, (s3)                      # contri_buf
+add      s3, s3, a5                    # contri_buf += vl
+vadd.vv  v16, v16, v1
+vadd.vv  v20, v20, v1
+vadd.vv  v24, v24, v1
+vadd.vv  v28, v28, v1
+
+# === Stage 4: load per-channel scale and shift ===
+vle32.v  v2, (s5)                      # out_shift
+vle32.v  v3, (s6)                      # out_scale
+li       a5, 30
+vrsub.vx v2, v2, a5                    # v2 = 30 - shift
+
+# === Stage 5: requantize -- vwmul (xscale, M1->M2 widen) ===
+vwmul.vv v4,  v16, v3                  # M2 = v4..v5
+vwmul.vv v6,  v20, v3                  # M2 = v6..v7
+vwmul.vv v8,  v24, v3                  # M2 = v8..v9
+vwmul.vv v10, v28, v3                  # M2 = v10..v11
+
+# === Stage 6: arithmetic shift right (narrow M2->M1) ===
+vnsra.wv v4,  v4,  v2
+vnsra.wv v6,  v6,  v2
+vnsra.wv v8,  v8,  v2
+vnsra.wv v10, v10, v2
+
+# === Stage 7: rounding shift by 1 ===
+vssra.vi v4,  v4,  1
+vssra.vi v6,  v6,  1
+vssra.vi v8,  v8,  1
+vssra.vi v10, v10, 1
+
+# === Stage 8: add output offset ===
+vadd.vx  v4,  v4,  a6                  # a6 = out_offset
+vadd.vx  v6,  v6,  a6
+vadd.vx  v8,  v8,  a6
+vadd.vx  v10, v10, a6
+
+# === Stage 9: clamp to [act_min, act_max] ===
+vmax.vx  v4,  v4,  a7
+vmin.vx  v4,  v4,  s1
+vmax.vx  v6,  v6,  a7
+vmin.vx  v6,  v6,  s1
+vmax.vx  v8,  v8,  a7
+vmin.vx  v8,  v8,  s1
+vmax.vx  v10, v10, a7
+vmin.vx  v10, v10, s1
+
+# === Stage 10: narrow int32 -> int16 -> int8 ===
+vsetvli  a5, s4, e16, m1
+vnsra.wi v4,  v4,  0
+vnsra.wi v6,  v6,  0
+vnsra.wi v8,  v8,  0
+vnsra.wi v10, v10, 0
+vsetvli  a5, s4, e8, m1
+vnsra.wi v4,  v4,  0
+vnsra.wi v6,  v6,  0
+vnsra.wi v8,  v8,  0
+vnsra.wi v10, v10, 0
+
+# === Stage 11: store 4 int8 vectors of length 4 ===
+vse8.v   v4,  (s7)                     # pix0
+vse8.v   v6,  (s8)                     # pix1
+vse8.v   v8,  (s2)                     # pix2
+vse8.v   v10, (s9)                     # pix3
+```
+
+### Per-tile cycle accounting (estimate, no timeline data)
+
+For the bench shape (K = 64 x 3 x 3 = 576), each output tile has 5 K-chunks. Cycle floors below assume single-issue at 1 IPC and no FU stalls.
+
+| Region | Inst | Cycle floor | Notes |
+|---|---|---|---|
+| Inner GEMM (5 K-chunks) | 5 x 33 = 165 | ~80 (vd4dots-bound) | 16 vd4dots @ 1/cyc per chunk |
+| Stage 1 vredsum | 16 | 16-64 | reduction FU latency unknown |
+| Stage 2 vslideup pack | 12 + 3 vsetvli | ~15 | 3-deep WAW chain x 4 streams |
+| Stages 3-9 requant | ~30 | ~30 | 4 streams, mostly independent |
+| Stage 10 narrow chain | 8 + 2 vsetvli | ~10 | E32 -> E16 -> E8 |
+| Stage 11 stores | 4 | ~4 | |
+| **Per-tile total** | **~240** | **~155-200** | epilogue is **~40-60%** of total |
+
+---
+
+## Optimization tuning candidates (timeline-view-driven)
+
+The transformations below are candidates whose expected payoff and feasibility depend on uarch parameters that only a cycle-accurate timeline view exposes. Listed in approximate descending order of expected gain on the bench shape.
+
+### T1. Restructure or eliminate the 16-vredsum chain
+- **What to measure:** vredsum issue rate, latency, whether it pipelines, whether it shares a port with vmacc/vd4dots.
+- **What to try:**
+  - Verify the 4 independent pixel streams (pix0/pix1/pix2/pix3 in vredsum source order) actually overlap on the FU.
+  - Replace vredsum-per-acc with a transposed accumulator layout (K in lane axis, outputs in row axis) so the inner product produces per-output scalars directly with no reduction.
+  - Tree-style reduction with vslideup + vadd, if redsum FU is single-pipe and slow.
+- **Expected payoff:** 10-20% of total tile cycles.
+- **Risk:** layout changes ripple through the whole kernel.
+
+### T2. Hide vredsum behind the next tile's GEMM (double-buffered tiles)
+- **What to measure:** whether the redsum FU is idle during the GEMM steady state.
+- **What to try:** issue tile N's vredsums concurrently with tile N+1's first vd4dots block. Requires splitting accumulators V0..V15 into two halves and rotating.
+- **Expected payoff:** 5-15%, conditional on redsum and d4dots being on different units.
+
+### T3. Software-pipeline the inner loop (load[N+1] || compute[N])
+- **What to measure:** whether the first 4 vd4dots stall waiting on vle8 results.
+- **What to try:** issue iter N+1's loads inside iter N's vd4dots block. There's room: 16 vd4dots vs 8 loads.
+- **Expected payoff:** 0-5%. Likely small if the uarch already has enough rename/reorder window.
+
+### T4. Drop tail-guard vand.vi from the steady-state body
+- **What to measure:** whether the 4 vand.vi to V20..V23 are emitted every iter or only on the partial-VL tail.
+- **What to try:** peel the last iteration; remove the 4 vand.vi from the steady-state body.
+- **Expected payoff:** ~3% of GEMM cycles (4 inst out of 33).
+- **Risk:** structural-only change, low.
+
+### T5. Collapse vsetvli switches in the epilogue
+- **What to measure:** vsetvli flush penalty on Andes uarch (does SEW/LMUL change stall the front-end?).
+- **What to try:**
+  - Stage 2 pack: do the 12 slideups all at VL=4 instead of ramping VL=2 -> 3 -> 4 (the unused lanes are don't-care).
+  - Stage 10 narrow: keep one vsetvli config and chain narrowing without re-setting.
+- **Expected payoff:** 2-8% if vsetvli is heavy on this uarch; near zero if free.
+
+### T6. Replace vslideup chain with vrgather
+- **What to measure:** vrgather latency vs slideup latency, vrgather throughput.
+- **What to try:** precompute an index vector mapping the 4 source scalars to lanes [0..3]; use one vrgather per pixel instead of 3 slideups.
+- **Expected payoff:** 3-8% if vrgather wins per output stream.
+- **Risk:** vrgather is often slower than expected; needs measurement.
+
+### T7. Tile reshape 4x4 -> 4x8 (or 8x4)
+- **What to measure:** whether the register file has headroom (today 24/32 used).
+- **What to try:** double the pixel count per tile to amortize the fixed epilogue across 32 outputs instead of 16. Requires either dropping K-chunk LMUL or accepting fewer K-positions per chunk.
+- **Expected payoff:** 5-15%. Largest gain on small-K shapes where the epilogue dominates.
+- **Risk:** moderate - changes register allocation throughout the kernel.
+
+### T8. Verify vd4dots is actually the throughput floor
+- **What to measure:** vd4dots issue rate during the steady-state inner loop. If saturating at 1/cycle, GEMM is bound and only T1-T2 help. If less, find the stall (load latency, scoreboard hazard, vsetvli flush).
+- **Expected payoff:** opens or closes whole categories of optimization.
+
+### Suggested workflow once timeline view is available
+
+1. Capture baseline timeline + critical-path annotation on the bench shape.
+2. Verify T8 first - is GEMM compute-bound?
+3. If yes: focus on T1, T2 (epilogue and overlap).
+4. If no: investigate stall reasons in the inner loop, then T3, T4.
+5. T5, T6, T7 are incremental cleanups after the structural changes.
+6. After each change, re-capture timeline and verify the predicted cycle delta.
+
+Realistic ceiling on the bench shape: **20-40%** improvement. On small-K shapes where the epilogue exceeds 70% of cycles, headroom approaches **2x**.
