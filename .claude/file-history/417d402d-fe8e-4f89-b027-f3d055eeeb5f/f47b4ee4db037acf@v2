@@ -1,0 +1,149 @@
+# Plan: Add AX45MPV CPU Architecture Reference Segment
+
+## Context
+
+The `/optimize` skill uses `docs/wiki/index.md` as its entry point. The existing
+`general/ax45mpv-pipeline.md` is inference-based (observation + reasoning). It has
+one factual gap: it says "two vector instructions cannot dual-issue," but the data
+sheet shows they CAN dual-issue across different functional units. The goal is to
+add a raw-data-sheet reference page so the agent can reason about VRF port
+conflicts, chaining, and latency from authoritative numbers rather than guesswork.
+
+Source: `docs/wiki/raw/AndesCore_AX45MPV_DS220_V1.4.pdf`
+- 1.5.2 (pp.51-52): VPU functional units, dispatch rules
+- 2.4.8 (pp.69-70): VLEN/DLEN config table
+- 23.15.1 (p.550): dual-issue restrictions for vector instructions
+- 23.15.2 (p.551-552): VRF read/write port assignments
+- 23.15.3 (p.553): vector chaining with pipeline diagram
+- 23.15.4 (pp.554-556): VALU latency/throughput table
+- 23.15.5 (pp.557-561): VMAC integer + FP latency/throughput tables
+- 23.15.6 (pp.562-563): VFMIS latency/throughput table
+- 23.15.7 (pp.564-573): VLSU latency/throughput (all access types)
+
+## Files to Create/Modify
+
+| File | Action |
+|---|---|
+| `docs/wiki/general/ax45mpv-vpu-uarch.md` | Create (new reference page) |
+| `docs/wiki/index.md` | Add "CPU Architecture Reference" section |
+
+## New Page: `ax45mpv-vpu-uarch.md`
+
+### Sections
+
+**1. VPU Functional Units** (from 1.5.2)
+- List all 11 FUs: VALU, VMAC, VMAC2 (opt), VFMIS, VPERMUT, VDIV, VFDIV, VMASK,
+  VACE (opt), VLSU, VSP (opt)
+- Key rules: different FUs = parallel + OOO; same FU = in-order
+- VSCB: dependency tracking + VRF port arbitration
+- VDIS: 2 dispatches/cycle from VIQ to different FUs
+
+**2. AX45MPV Target Config (VLEN=1024, DLEN=512)**
+- Table 5: VLEN=1024 -> DLEN options: 512 or 1024; our board uses 512
+- VLEN/DLEN = 2 (the throughput scaling factor for all instruction formulas)
+- BIU_DATA_WIDTH = 512 -> VLSU_MEM_DW = 512 for both cache and HVM regions
+
+**3. Dual-Issue Restrictions** (23.15.1)
+List all 8 restrictions. Key ones for NN kernels:
+- VLSU as first instruction + any vector as second: BLOCKED
+- Load/Store (scalar) as first + vector as second: BLOCKED
+- Implication: VLSU must always be the second slot; pair it with a scalar or have
+  a non-VLSU vector as the first slot
+
+**4. VRF Port Conflicts** (23.15.2)
+Read port assignments (11 read ports, 0-10):
+- Ports 0-2: VALU (vs1,vs2,vs3) AND VMAC (vs1,vs2,vs3) AND VMAC2 (vs1,vs2,vs3)
+  -- all three share the same ports -> VALU+VMAC dual-issue causes read port conflict
+- Ports 3-5: VFMIS (vs3@3, vs1@4, vs2@5) AND VLSU (vs2@4, vs3@5)
+  -- VFMIS+VLSU share ports 4,5
+- Ports 6-8: VMASK (vs1@6, vs2@7, vs3@8); VSP (vs3@6)
+- Ports 8-10: VACE (vs1@8, vs2@9, vs3@10)
+- Ports 9-10: VPERMUT, VDIV, VFDIV all share ports 9,10
+
+Write port assignments (6 write ports, 0-5):
+- Port 0: VALU (vd) AND VLSU (vd) -- shared
+- Port 1: VMASK (vd) AND VSP (vd1)
+- Port 2: VACE (vd) AND VSP (vd2)
+- Port 3: VMAC (vd) AND VPERMUT (vd) -- shared
+- Port 4: VMAC2 (vd) AND VDIV (vd) -- shared
+- Port 5: VFMIS (vd) AND VFDIV (vd) -- shared
+
+Conflict rule: dual-issuing two instructions that share a read or write port
+causes extra bubble cycles (VSCB inserts stalls).
+
+Best dual-issue pairs (no port conflict):
+- Scalar ALU/load + any vector (most effective, no VRF ports at all for scalar)
+- VALU + VFMIS (read ports 0-2 vs 3-5, write ports 0 vs 5: no overlap)
+- VFMIS + VMAC (read ports 3-5 vs 0-2: no overlap, write ports 5 vs 3: no overlap)
+
+Worst pair (always port conflict):
+- VALU + VMAC (share read ports 0-2 AND write port... VALU=0, VMAC=3 so write OK)
+  -> read port conflict on all 3 ports
+
+**5. Vector Chaining** (23.15.3)
+- Forward first chunk of result before instruction fully completes
+- Works between different FUs only
+- "Result latency" = cycles before first chunk forwarded to consumer
+- Enables VALU and VMAC to pipeline if they're chained (consumer starts at cycle 4
+  after VMAC first chunk available)
+
+**6. Concrete Numbers at VLEN=1024, DLEN=512** (VLEN/DLEN=2)
+
+VALU (vadd, vsub, vand, vor, vmv, vsll, vsra, vmin/max, etc.):
+- Throughput = 2*LMUL cycles; Latency = 2 cycles
+
+Narrowing ops (vnclip/vnsrl/vnsra, LMUL>=1):
+- Throughput = 4*LMUL; Latency = 3
+
+Reduction (vredsum): throughput = 2*LMUL + LOG2(512/64)*2 + LOG2(64/SEW)
+  = 2*LMUL + 6 + LOG2(64/SEW)
+
+VMAC integer (vmul/vmulh/vmulhu/vmacc/vnmsac/vsmul, and Andes vd4dots_vv):
+- Throughput = 2*LMUL; Latency = 4
+
+Widening VMAC (vwmul/vwmacc, LMUL>=1):
+- Throughput = 4*LMUL; Latency = 4
+
+Quad-widening (vqmacc, LMUL>=1):
+- Throughput = 8*LMUL; Latency = 4
+
+Unit-stride vector load (unmasked, aligned to 64B boundary):
+- Throughput = 2*EMUL cycles  (VLEN/BIU * EMUL = 2*EMUL)
+- Latency (HVM region): 4 + 3 = 7 cycles
+- Latency (cacheable, L2 hit): 4 + 12 = 16 cycles
+- Latency (cacheable, L2 cold/miss): 4 + 14 = 18 cycles
+- Unaligned penalty: +2 cycles latency, +1 cycle throughput
+
+Strided/indexed load (per active element):
+- Throughput = vector_length cycles; Latency = 4 + VLSU_MEM_LATENCY + (DLEN/EEW)
+
+**7. Pipeline Stall Recipes** (derived, not verbatim from DS)
+- To hide 16-cycle cache load latency with VMAC M1 (throughput=2): need 8 back-to-
+  back loads before first consumer = 8*2=16 cycles of load issue = just enough
+- Chain VALU->VMAC: VALU latency=2, start VMAC 2 cycles after VALU first chunk
+- RAW in 64B region: VLSU stalls until prior write transaction completes
+
+## index.md Changes
+
+Add new section between "Anti-Patterns" and "Operator Profiles":
+
+```markdown
+---
+
+## CPU Architecture Reference
+
+- [[ax45mpv-vpu-uarch]] -- AX45MPV VPU functional units, VRF port assignments,
+  dual-issue rules, vector chaining, and instruction latency/throughput tables
+  from the data sheet. Read when reasoning about pipeline stalls.
+```
+
+Also update the `ax45mpv-pipeline` entry under "Pipeline and Throughput" to note:
+`(observational; for authoritative numbers see [[ax45mpv-vpu-uarch]])`
+
+## Verification
+
+1. Confirm `ax45mpv-vpu-uarch.md` has valid wiki frontmatter (type: pipeline-insight)
+2. Confirm all wikilinks in index.md resolve to actual .md files
+3. Read the new page and verify the VMAC vd4dots throughput formula matches DS
+   Table 224 (should be `(VLEN/DLEN)*LMUL = 2*LMUL`)
+4. Verify the VRF port table conflicts match the read/write port tables in 23.15.2

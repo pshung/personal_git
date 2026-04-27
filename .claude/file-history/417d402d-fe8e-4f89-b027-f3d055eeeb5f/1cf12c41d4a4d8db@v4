@@ -1,0 +1,256 @@
+---
+type: pipeline-insight
+tags: [ax45mpv, vpu, uarch, latency, throughput, dual-issue, vrf, chaining]
+source: AndesCore_AX45MPV_DS220_V1.4.pdf sections 1.5.2, 23.15
+---
+
+# AX45MPV VPU Micro-Architecture Reference
+
+Authoritative numbers from the data sheet. Primary reference for pipeline stall reasoning.
+Formulas use `VLEN`, `DLEN`, `VLSU_MEM_DW` as parameters -- substitute the actual
+FPGA configuration values when computing concrete cycle counts.
+
+---
+
+## VPU Functional Units (DS 1.5.2)
+
+```
+VALU   VMAC   VMAC2   VFMIS   VPERMUT   VDIV   VFDIV
+VMASK  VACE   VSP     VLSU
+```
+
+- VDIS dispatches 2 instructions/cycle from VIQ to two **different** FUs.
+- Instructions in **different** FUs: execute in parallel, out-of-order.
+- Instructions in the **same** FU: execute in-order.
+- VSCB: tracks register dependencies, arbitrates VRF read/write ports.
+- VCMT: commits instructions in program order.
+- VMAC2, VACE, VSP are optional; present on production AX45MPV.
+
+---
+
+## Dual-Issue Rules for Vector Instructions (DS 23.15.1)
+
+AX45MPV can dual-issue a vector instruction with another instruction **unless**
+any of these restrictions applies:
+
+1. First instruction is a scalar Load/Store, second is a vector instruction.
+2. First instruction is Branch/Jump, second is a vector instruction.
+3. First instruction is **VLSU**, second is any vector instruction.
+4. First instruction is VSP, second is VLSU.
+5. First instruction reads more than 2 integer registers.
+6. First instruction writes 2 integer registers.
+7. First reads 3 FP registers AND second reads 1 FP register.
+8. Second instruction reads more than 2 integer registers.
+
+**Key implications:**
+- VLSU **must be the second slot** in any dual-issue pair involving another vector op.
+- `scalar ALU + vector` is the safest dual-issue (no VRF port involvement for scalar).
+- Two vector ops from different FUs (e.g., VALU + VFMIS) can dual-issue if none of
+  the above restrictions fire.
+
+---
+
+## VRF Port Assignments (DS 23.15.2)
+
+VRF port conflicts between dual-issued instructions cause extra bubble cycles.
+VSCB detects and inserts the stalls automatically; the programmer cannot suppress
+them, only avoid them by choosing conflict-free instruction pairs.
+
+### Read Ports (11 total, numbered 0-10)
+
+| Port | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| VALU | vs1 | vs2 | vs3 | | | | | | | | |
+| VMAC | vs1 | vs2 | vs3 | | | | | | | | |
+| VMAC2 | vs1 | vs2 | vs3 | | | | | | | | |
+| VFMIS | | | | vs3 | vs1 | vs2 | | | | | |
+| VLSU | | | | | vs2 | vs3 | | | | | |
+| VMASK | | | | | | | vs1 | vs2 | vs3 | | |
+| VSP | | | | | | | vs3 | | | | |
+| VACE | | | | | | | | | vs1 | vs2 | vs3 |
+| VPERMUT | | | | | | | | | | vs1 | vs2 |
+| VDIV | | | | | | | | | | vs1 | vs2 |
+| VFDIV | | | | | | | | | | vs1 | vs2 |
+
+### Write Ports (6 total, numbered 0-5)
+
+| Port | 0 | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|---|
+| VALU | vd | | | | | |
+| VLSU | vd | | | | | |
+| VMASK | | vd | | | | |
+| VSP | | vd1 | vd2 | | | |
+| VACE | | | vd | | | |
+| VMAC | | | | vd | | |
+| VPERMUT | | | | vd | | |
+| VMAC2 | | | | | vd | |
+| VDIV | | | | | vd | |
+| VFMIS | | | | | | vd |
+| VFDIV | | | | | | vd |
+
+### Conflict Summary
+
+**Highest-conflict pairs (avoid for dual-issue):**
+- VALU + VMAC: share read ports 0, 1, 2 on all three operands -> 3 read conflicts
+- VALU + VMAC2: same as above
+- VFMIS + VLSU: share read ports 4 (VFMIS-vs1, VLSU-vs2) and 5 (VFMIS-vs2, VLSU-vs3)
+- VALU + VLSU: share write port 0
+
+**Low-conflict pairs (prefer for dual-issue):**
+- Scalar + any vector: scalar uses no VRF ports -> zero conflict
+- VALU + VFMIS: read ports 0-2 vs 3-5 (no overlap); write 0 vs 5 (no overlap) -> clean
+- VFMIS + VMAC: read ports 3-5 vs 0-2 (no overlap); write 5 vs 3 (no overlap) -> clean
+- VMAC + VLSU: read ports 0-2 vs 4-5 (no overlap); write 3 vs 0 (no overlap) -> clean
+  (VLSU as second satisfies restriction 3 from 23.15.1)
+
+---
+
+## Vector Chaining (DS 23.15.3)
+
+AX45MPV chains two instructions in **different FUs**:
+- The consumer can start as soon as the **first chunk** of the producer's result
+  is forwarded -- it does not need to wait for the full instruction to complete.
+- "Result latency" in the tables below = cycles until first chunk is available
+  for forwarding.
+
+**Example (LMUL=4, VALU->VFMIS chain):**
+```
+Cycle  VALU-VS  VALU  VALU-VD  VFMIS-VS  VFMIS  VFMIS-VD
+  0    v0[0]
+  1    v0[1]    v0+a4
+  2    v0[2]    v0+a4           v0[0]
+  3    v0[3]    v0+a4           v0[1]     vfcvt[0]
+  4             v0+a4           v0[2]     vfcvt[1]  vfcvt[0]
+  ...
+```
+VALU result latency = 2: VFMIS starts processing first chunk after 2 cycles.
+Total wall time is much less than sequential execution.
+
+**Chaining reduces effective latency** -- the number that matters for scheduling
+is `result_latency`, not throughput. If two ops fully chain, the throughput of the
+slower FU dominates; there is no wait between them beyond result_latency.
+
+---
+
+## Instruction Throughput and Latency (DS 23.15)
+
+Throughput = cycles the FU is occupied (next independent instruction of the same
+type must wait this many cycles). Latency = cycles until first result chunk is
+available for chaining.
+
+Variables: `VLEN` and `DLEN` are the configured register and datapath widths.
+`VLSU_MEM_DW` = DLEN for HVM region; = BIU_DATA_WIDTH for cache/non-cacheable.
+
+### VALU Instructions
+
+| Instruction | Throughput | Latency |
+|---|---|---|
+| vadd, vsub, vrsub | (VLEN/DLEN)*LMUL | 2 |
+| vand, vor, vxor, vmv, vmerge | (VLEN/DLEN)*LMUL | 2 |
+| vmin/vmax, vminu/vmaxu | (VLEN/DLEN)*LMUL | 2 |
+| vsadd, vssub, vsaddu, vssubu | (VLEN/DLEN)*LMUL | 2 |
+| vsll, vsrl, vsra, vssrl, vssra | (VLEN/DLEN)*LMUL | 2 |
+| vaaddu, vaadd, vasubu, vasub | (VLEN/DLEN)*LMUL | 2 |
+| vadc, vsbc | (VLEN/DLEN)*LMUL | 2 |
+| vwadd/vwsub/vwaddu/vwsubu (LMUL>=1) | (VLEN/DLEN)*LMUL*2 | 2 |
+| vnclip/vnsrl/vnsra (LMUL>=1) | (VLEN/DLEN)*LMUL*2 | 3 |
+| vmseq/vmsne/vmslt/vmsltu/vmsle/vmsgtu | (VLEN/DLEN)*LMUL + (VLEN!=DLEN) | (VLEN/DLEN)*LMUL + 2 |
+| vredsum/vredand/vredor/vredxor/vredmin/vredmax | (VLEN/DLEN)*LMUL + LOG2(DLEN/64)*2 + LOG2(64/SEW) | same + 1 |
+
+Notes:
+- Widening/narrowing ops (LMUL<1): throughput = 4 if VLEN!=DLEN, else 1 or 2.
+- Fractional LMUL: substitute LMUL=1 in throughput formula.
+
+### VMAC Integer Instructions
+
+| Instruction | Throughput | Latency |
+|---|---|---|
+| vmul, vmulh, vmulhu, vmulhsu | (VLEN/DLEN)*LMUL | 4 |
+| vmacc, vnmsac, vmadd, vnmsub | (VLEN/DLEN)*LMUL | 4 |
+| vsmul | (VLEN/DLEN)*LMUL | 4 |
+| vwmul/vwmulu/vwmulsu (LMUL>=1) | (VLEN/DLEN)*LMUL*2 | 4 |
+| vwmaccu/vwmacc/vwmaccsu/vwmaccus (LMUL>=1) | (VLEN/DLEN)*LMUL*2 | 4 |
+| **vd4dots_vv / vd4dotu_vv / vd4dotsu_vv** | **(VLEN/DLEN)*LMUL** | **4** |
+| vqmacc/vqmaccu/vqmaccsu (LMUL>=1) | (VLEN/DLEN)*LMUL*4 | 4 |
+
+Notes:
+- vd4dots has the **same throughput formula as vmac** but does 4x the arithmetic
+  (one 4-way s8 dot product per element vs one s8 multiply). Always prefer vd4dots
+  for int8 inner products.
+- vqmacc throughput is 4x that of vd4dots at the same LMUL.
+- Widening/quad-widening with LMUL<1: throughput = 4 (widen) or 8 (quad), latency = 4.
+
+### VFMIS Instructions
+
+| Instruction | Throughput | Latency |
+|---|---|---|
+| vfmin/vfmax, vfsgnj*, vfmerge, vfmv, vfclass | (VLEN/DLEN)*LMUL | 2 |
+| vfcvt.x*.v, vfcvt.f*.v | (VLEN/DLEN)*LMUL | 3 |
+| vfwcvt (LMUL>=1) | (VLEN/DLEN)*LMUL*2 | 3 |
+| vfncvt (LMUL>=1) | (VLEN/DLEN)*LMUL*2 | 4 |
+
+### VLSU Instructions
+
+`VLSU_MEM_LATENCY` reference values (DS Tables 228-229, L2 configured, 2 banks):
+
+| Access Region | D-Cache state | L2-Cache state | Latency (cycles) |
+|---|---|---|---|
+| HVM | - | - | 3 |
+| Cacheable, non-shareable | Invalid | Clean/Dirty | 12-13 |
+| Cacheable, L2 cold miss | Invalid | Invalid | 14 |
+| Non-cacheable memory | - | - | 7 |
+
+**Unit-stride load (unmasked or fully-masked, aligned):**
+- Throughput = `(VLEN/VLSU_MEM_DW)*EMUL`
+- Latency = `4 + VLSU_MEM_LATENCY`
+- Unaligned penalty: +2 latency, +1 throughput.
+- Partial mask (not all-ones): throughput = vector_length (one request/element).
+
+**Unit-stride store (unmasked or fully-masked, aligned):**
+- Throughput = `(VLEN/VLSU_MEM_DW)*EMUL`
+
+**Strided load:**
+- Throughput = vector_length; Latency = `4 + VLSU_MEM_LATENCY + (DLEN/EEW)`
+
+**Indexed load:**
+- Throughput = vector_length + vs2_EMUL - 1; Latency = `5 + VLSU_MEM_LATENCY + (DLEN/EEW)`
+
+**VLSU resource limits:**
+- Configurable number of in-flight VLSU requests (max concurrent memory requests).
+- Configurable VLSU data buffer depth; each entry = VLEN bits.
+- If either resource is exhausted, VLSU stops issuing new requests.
+- RAW/WAW/WAR stall: any access to the same 64-byte region as an in-flight
+  transaction is held until that transaction completes.
+
+---
+
+## Derived Optimization Rules
+
+General principles derived from the DS numbers above.
+
+**Hiding load latency:**
+- Loads needed to hide latency L with compute throughput T cycles/inst: `ceil(L / T)`.
+- Unit-stride EMUL=1 throughput = `VLEN/VLSU_MEM_DW`. Latency >> throughput for
+  any cache path -> prefetch or software-pipeline multiple loads before the consumer.
+
+**Chaining VMAC -> VALU:**
+- VMAC result latency = 4. VALU can start on the first chunk after 4 cycles.
+- VMAC write port = 3, VALU read ports = 0-2: no port conflict. Chaining is clean.
+
+**Chaining VALU -> VMAC:**
+- VALU result latency = 2. VMAC can start 2 cycles after VALU's first chunk.
+- VALU write port = 0, VMAC read port 0 = vs1: **write/read port 0 overlap** ->
+  VSCB may insert a 1-cycle bubble per chunk. Chain still occurs but not perfectly clean.
+
+**vd4dots vs vmulh:**
+- Both: throughput = `(VLEN/DLEN)*LMUL`, latency = 4.
+- vmulh computes 1 signed multiply per element; vd4dots computes a 4-way s8 dot product.
+- Same FU occupancy, 4x more arithmetic -> vd4dots always wins for int8 kernels.
+
+---
+
+## Related
+
+- [[ipc-vs-throughput]] -- why low IPC can still mean high throughput
+- [[lmul-selection]] -- LMUL/SEW selection table and principles
+- [[tiling-gemm-to-vd4dots]] -- applying vd4dots to GEMM kernels

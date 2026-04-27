@@ -1,0 +1,77 @@
+---
+type: technique
+tags: [memory-bound, maxpool, diagnosis, ipc, vlsu]
+applies_to: [maxpool_HWC_s8, any memory-bound function]
+---
+
+# Memory-Bound Diagnosis
+
+## Symptoms
+
+A function is memory-bound when:
+1. IPC is low (~0.30) and does NOT improve when you reduce the number of instructions
+2. Increasing LMUL to process more elements per instruction does not reduce cycles proportionally
+3. Unrolling to expose more compute does not help
+4. The inner loop consists primarily of loads followed by a single simple operation (vmax, vadd)
+
+**Confirmed example:** `riscv_nn_maxpool_HWC_s8`
+- 3x3 max pool over in_tensor_ch channels
+- Inner loop: `vle8` load + `vmax` each iteration
+- IPC: ~0.32 (baseline M8 config)
+- Attempts to improve: all neutral or regressed
+
+## Diagnostic Procedure
+
+### 1. Check IPC from FPGA measurement
+
+```
+cycles = <from run_fpga_test.sh>
+instrs = <from run_fpga_test.sh>
+ipc = instrs / cycles
+```
+
+IPC < 0.40 for a simple loop with 2 instructions/iteration suggests VLSU stall.
+
+### 2. Try a compute-neutral change and observe IPC
+
+If adding a 2-pixel unroll (doubles instructions, doubles loads, no extra compute) keeps cycles the same: memory-bound. Proof from maxpool:
+
+| Approach | Cycles | Instructions | IPC |
+|---|---|---|---|
+| M8 baseline | 25,667 | 8,192 | 0.32 |
+| M4 2-pixel parallel | 25,805 | 14,584 | 0.57 |
+| Unroll k_x by 2 | 26,365 | 8,192 | 0.31 |
+
+Cycles stayed flat despite IPC increasing (M4 case). The wall is VLSU bandwidth.
+
+### 3. Check vsim pipeline for VLSU stalls
+
+In the kanata log, look for vector load instructions (`vle8`) with large gaps between VW sub-stages, or long delays between `VC` and `VW1`. This indicates the load is stalling on memory bandwidth.
+
+## What Does NOT Help for Memory-Bound Functions
+
+- Increasing LMUL (reduces instruction count but same bytes transferred)
+- Unrolling (exposes more loads simultaneously but same bandwidth)
+- Interleaving loads with compute (hides some latency but doesn't increase bandwidth)
+- Software pipelining (same issue)
+
+## What Could Help (Theoretical)
+
+- Reducing working set to fit in L1 cache (if data fits)
+- Prefetching to overlap L2/L3 latency (adds complexity, marginal gains)
+- Data layout changes to improve cache line utilization
+
+For libnn's typical conv/pool test cases, the input tensor is much larger than L1 (32x30x64 = ~60KB vs 32KB L1). Memory-bound functions near this level are near the hardware bandwidth limit.
+
+## Decision: When to Stop Optimizing
+
+If a function shows all 3 signs of memory-bound behavior and multiple approaches confirm it:
+1. Record the diagnosis in the operator page
+2. Exit the optimization loop (no more algorithm opportunities)
+3. Do not attempt micro-arch optimization -- the bottleneck is bandwidth, not pipeline scheduling
+
+## Related
+
+- [[anti-lmul-reduction-memory-bound]] -- specific anti-pattern
+- [[ax45mpv-vpu-uarch]] -- VLSU latency/throughput numbers and stall rules
+- [[maxpool-hwc-s8]] -- operator page where this was diagnosed
