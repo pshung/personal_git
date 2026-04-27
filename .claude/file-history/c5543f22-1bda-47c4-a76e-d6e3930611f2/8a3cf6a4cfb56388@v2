@@ -1,0 +1,638 @@
+---
+name: optimize
+description: Fully autonomous RVV optimization loop for libnn functions. Target VPU, toolchain, build flags, FPGA board, and hardware profile all come from config.toml — no hardcoded paths or CPU names. Runs a 7-step FSM — validate, select, analyze, implement, verify, measure, learn — then loops back to analyze with new insights. No human intervention required.
+argument-hint: [validate|function_name|status|reset]
+disable-model-invocation: false
+allowed-tools: Read, Grep, Glob, Bash, Edit, Write, Agent
+---
+
+# libnn RVV Optimization Skill
+
+Fully autonomous optimization loop. Target (VPU, toolchain, FPGA, CFLAGS) is configured in `.claude/skills/optimize/config.toml`. State persisted in the `state_file` path set there (default: `.claude/skills/optimize/state.json`).
+
+## Current State
+
+!`LIB_ROOT=$(git rev-parse --show-toplevel); SKILL_DIR="${LIB_ROOT}/.claude/skills/optimize"; source "${SKILL_DIR}/script/parse_config.sh" 2>/dev/null; cat "${CFG_STATE_FILE:-${SKILL_DIR}/state.json}" 2>/dev/null || echo '{"step":"idle","function":"","round":0,"history":[]}'`
+
+## Commands
+
+- `/optimize validate` — Run config.toml validation (Step 0) only
+- `/optimize <function_name>` — Start optimizing a function (validates first, then loops until flat land)
+- `/optimize status` — Show current state
+- `/optimize reset` — Reset to idle
+
+Arguments received: `$ARGUMENTS`
+
+## Finite State Machine
+
+```
+idle → validate → select → analyze ──→ implement → verify ──→ measure ──→ learn ─┐
+          |         ↑  |         ↑          |  |                                  |
+          |         |  |         └──────────┘  |                                  |
+          |         |  |      (test fail → fix)|                                  |
+          |         |  |                       └→ analyze                         |
+          |         |  |                (3 retries exhausted)                     |
+          |         |  └→ idle (no opportunity found)                             |
+          |         |                                                             |
+          |         └─────────────────────────────────────────────────────────────┘
+          |           (loop with new insights + assembly analysis)
+          └→ idle (config validation failed)
+
+Exit conditions:
+  - validate fails → idle (fix config.toml, retry)
+  - analyze finds no optimization opportunity → idle
+  - max [limits].max_rounds per function → idle (5 by default; see config.toml)
+```
+
+The loop is the core mechanic: after `learn`, go back to `analyze` with fresh insights from FPGA measurements, updated assembly, and recomputed metrics. The verify/measure loop provides real feedback.
+
+---
+
+## Build Scripts Reference
+
+All scripts live under the skill itself at `.claude/skills/optimize/script/`. They each source `parse_config.sh` to pull toolchain paths, CFLAGS, QEMU/FPGA targets, and work dir from `config.toml` — no hardcoded values. Always invoke with `/usr/bin/bash`.
+
+**Shell-variable convention for every bash block in this skill:**
+```bash
+LIB_ROOT=$(git rev-parse --show-toplevel)
+SCRIPT_DIR="${LIB_ROOT}/.claude/skills/optimize/script"
+```
+When you need config values (work dir, toolchain, etc.) inside a bash block, `source "${SCRIPT_DIR}/parse_config.sh"` and use the exported `CFG_*` variables (e.g. `${CFG_WORK_DIR}`, `${CFG_CC}`, `${CFG_CPU}`).
+
+| Script | Purpose | Time |
+|--------|---------|------|
+| `validate_config.py` | 7-step fail-fast config validation (toolchain, QEMU, FPGA .inc parse, FPGA TCP, GDB run). Used by `validate` state. | ~10s |
+| `build_libnn.sh` | Full rebuild of libnn.a (~400 files) using `${CFG_CPU}`. Use ONLY for initial build in `select` step. | ~30s |
+| `rebuild_single.sh <src.c>` | Recompile single .c with `${CFG_CFLAGS_BASE}`, update libnn.a + objdump. Use for ALL rebuilds after `implement`. | ~0.6s |
+| `rebuild_single.sh -E <src.c>` | Preprocess only (same CFLAGS). Output: `${CFG_WORK_DIR}/<basename>.i`. Use in `analyze` to see which `#ifdef` branches survive. | ~0.3s |
+| `run_qemu_test.sh <name>` | Build test binary + run on QEMU with fd-9 strace capture + parse pass/fail. Uses `${CFG_QEMU_*}`. Use in `verify`. | ~2s |
+| `run_fpga_test.sh <name>` | FPGA cycle count measurement via GDB. Uses `${CFG_FPGA_*}`. Use in `select` baseline + `measure`. | ~30s |
+| `emit_trace.sh <sub>`    | Structured trace capture (Phase 0 meta-harness). Subcommands: `init`, `step`, `timing`, `fail`. Writes artifacts under `trace_corpus/<fn>/round_<N>/`. Auto-reads fn/round from state.json. | <1s |
+
+---
+
+## Trace Emission (Phase 0 meta-harness)
+
+After each reasoning step produces output, the main agent writes a structured
+trace artifact to `trace_corpus/<fn>/round_<N>/` via `${SCRIPT_DIR}/emit_trace.sh`.
+These artifacts are the input to the outer meta-loop's harness-critic (future phase).
+Trace emission does NOT change FSM behavior.
+
+**Per-step artifacts:**
+
+| Step | Artifact | Contents |
+|------|----------|----------|
+| analyze   | `analyze_agent.md`    | Subagent hypothesis, ranked ideas, AI/reuse metrics |
+| implement | `implement_agent.md`  | Subagent's description of the exact code change |
+| verify    | `verify_result.json`  | `{"result": "PASS\|FAIL\|COMPILE_ERROR\|TIMEOUT\|UNKNOWN", "sub_tests": N, "stderr": "..."}` |
+| measure   | `measure_result.json` | `{"cycles": N, "instrs": M, "ipc": X, "speedup": Y}` |
+| learn     | `learn_agent.md`      | Lessons written to wiki this round (summary) |
+| (any)     | `fail_reason.md`      | Tagged failure class: `compile_error`, `test_fail`, `regression`, `timeout`, `unknown` |
+
+Timing (wall-clock per step) is appended to `step_timings.json` automatically by
+the state-transition block — no explicit call needed.
+
+**Emission pattern** (auto-mode reads fn/round from state.json; no flags needed):
+
+```bash
+LIB_ROOT=$(git rev-parse --show-toplevel)
+SCRIPT_DIR="${LIB_ROOT}/.claude/skills/optimize/script"
+# Write payload to a temp file, then emit:
+cat > /tmp/trace_payload <<'EOF'
+<content>
+EOF
+/usr/bin/bash ${SCRIPT_DIR}/emit_trace.sh step <step_name> /tmp/trace_payload
+# Or on failure:
+/usr/bin/bash ${SCRIPT_DIR}/emit_trace.sh fail <tag> /tmp/error_stderr
+```
+
+No trace is emitted from `validate` or `select` — trace lifecycle begins at
+`analyze` (which runs in a round context).
+
+---
+
+## State: `idle`
+
+No optimization in progress.
+
+Routing:
+- `/optimize validate` → `validate` (run 7-step check, then return to `idle`)
+- `/optimize <function_name>` → `validate` first (cache-aware); on PASS, continue to `select`; on FAIL, stay `idle`
+- `/optimize status` → report current state, stay `idle`
+- `/optimize reset` → clear state, stay `idle`
+
+---
+
+## State: `validate`
+
+Check that `config.toml` points at a working toolchain, reachable QEMU, parseable FPGA .inc, and live FPGA board BEFORE any optimization work starts. Failing fast here saves a lot of pain later.
+
+1. Cache check (skip re-validation if nothing has changed):
+   ```bash
+   LIB_ROOT=$(git rev-parse --show-toplevel)
+   SCRIPT_DIR="${LIB_ROOT}/.claude/skills/optimize/script"
+   source "${SCRIPT_DIR}/parse_config.sh"
+   # Skip if last validated within [limits].validate_cache_hours AND
+   # config.toml + .inc mtimes are not newer than state.validated_at
+   ```
+   If cached validation is still fresh, skip to step 4.
+
+2. Run the 7-step validator:
+   ```bash
+   python3 "${SCRIPT_DIR}/validate_config.py"
+   ```
+   The script prints `[OK]` / `[FAIL]` per step and exits non-zero on the first failure. The 7 steps are:
+   1. Load `config.toml` — all required sections/keys present
+   2. Toolchain — `${CFG_TOOLCHAIN_BIN}` exists, `${CFG_CC}` accepts Andes flags
+   3. Compile hello world — produces valid RISC-V ELF
+   4. QEMU — `${CFG_QEMU_BIN}` runs hello.adx (strace-captured semihosting)
+   5. FPGA .inc parse — `${CFG_FPGA_CONFIG}` parses (VLEN, caches, ISA features)
+   6. FPGA TCP — connect to `${CFG_FPGA_HOST}:${CFG_FPGA_PORT}` (5s timeout)
+   7. FPGA GDB run — compile hello_fpga and run it on the board
+
+3. On `[FAIL]`:
+   - Report which step failed and what needs fixing in `config.toml` (or auxiliary files like the .inc path).
+   - Steps 6 / 7 may fail if the FPGA board is unreachable from the current network. When that happens and the user only needs QEMU-only work, they can skip by setting `[limits].validate_cache_hours` high after a prior success, or by running `/optimize validate` from a network with FPGA access.
+   - Transition → `idle`. Do NOT proceed to `select`.
+
+4. On `[OK]` (or cache hit): update state:
+   ```json
+   {"validated_at": "<ISO timestamp>", "config_toml_mtime": <stat mtime>}
+   ```
+   If `/optimize validate` was called directly → transition → `idle` with a success summary.
+   If `/optimize <function>` triggered validation → transition → `select`.
+
+**Transition:** → `select` (when invoked via function-name path) or → `idle`.
+
+---
+
+## State: `select`
+
+Validate the function and gather baseline context.
+
+1. Find the source file under `Source/` — grep for the function name
+2. Confirm it has `#ifdef ENA_VEC_ISA` (existing RVV to improve)
+3. Find corresponding test in `Examples/unit_func/t_<name>.c`
+4. Query the wiki for prior lessons and applicable techniques:
+   - Read `docs/wiki/index.md` to identify relevant pages
+   - Read the operator page in `docs/wiki/operators/` if it exists (e.g., `conv-hwc-s8-sym-bias-fast.md`)
+   - Read matching `docs/wiki/general/` pages for applicable techniques and known anti-patterns
+5. Full build (first time only):
+   ```bash
+   /usr/bin/bash ${SCRIPT_DIR}/build_libnn.sh
+   ```
+6. Run baseline FPGA measurement (**MUST use this exact script — do NOT compile or run FPGA tests manually**):
+   ```bash
+   /usr/bin/bash ${SCRIPT_DIR}/run_fpga_test.sh <test_name>
+   ```
+   Parse both counts from the output lines (same format as `measure` state):
+   - `"The cycle count is <N>"` → `cycles_before`
+   - `"The inst count is <N>"` → `instrs_before`
+   (The `RESULT: PASS (cycles=N)` summary line also carries cycles but not instrs, so use the raw lines for both.)
+7. **Identify the active code path.** Primary: preprocess the source with the same build flags and read the surviving `#ifdef` branches:
+   ```bash
+   /usr/bin/bash ${SCRIPT_DIR}/rebuild_single.sh -E <source_file>
+   # Output: ${CFG_WORK_DIR}/<basename>.i
+   ```
+   Secondary (for dispatch functions that call sub-kernels): confirm the linked sub-function names from the perf objdump:
+   ```bash
+   grep -A500 '<function_name>:' ${CFG_WORK_DIR}/t_<test>_perf.objdump | \
+     grep -E "(jal|jalr).*<[^+>]+>" | head -20
+   ```
+   Save `active_path_file` (path to `.i`) and `called_functions` in state.
+8. Save state: function, source_file, test_name, cycles_before, instrs_before, active_path_file, called_functions.
+9. **Capture round-0 baseline checkpoint.** Snapshot the current working tree (with any prior-session uncommitted edits) so any future round can restore to this clean baseline:
+   ```bash
+   LIB_ROOT=$(git rev-parse --show-toplevel)
+   FN=<function_name>
+   REF="refs/optimize-ckpt/${FN}/round-0-baseline"
+   SHA=$(cd "${LIB_ROOT}" && git stash create "optimize ${FN} round-0 baseline")
+   if [ -n "${SHA}" ]; then
+     git -C "${LIB_ROOT}" update-ref "${REF}" "${SHA}"
+   else
+     git -C "${LIB_ROOT}" update-ref "${REF}" HEAD
+   fi
+   # Persist in state for diagnostics
+   python3 - "${CFG_STATE_FILE}" "${REF}" <<'PYEOF'
+   import json,sys
+   f, ref = sys.argv[1], sys.argv[2]
+   s = json.load(open(f))
+   s['baseline_ref'] = ref
+   json.dump(s, open(f,'w'), indent=2)
+   PYEOF
+   ```
+   These refs live under `refs/optimize-ckpt/<fn>/...` — invisible to `git branch` / `git tag`, won't pollute history, but are inspectable via `git for-each-ref refs/optimize-ckpt/`.
+
+**Transition:** → `analyze`
+**Fail:** Function not found or no RVV → stay `select`, report error.
+
+---
+
+## State: `analyze`
+
+Study the current RVV code and assembly to form the next optimization hypothesis.
+
+**CRITICAL — Identify the active code path from preprocessed source, not from raw `#ifdef` guards.**
+
+Many `#ifdef` guards depend on macros defined in internal headers (e.g., `ENA_TILING`, `ENA_FAST_ALGO` are unconditionally defined in `internal/internal_nn_math.h`), NOT just build.sh flags. **Never guess the active path from raw source alone.** Instead:
+
+1. **Primary method — preprocessed source.** Run the file through the preprocessor with the exact build flags:
+   ```bash
+   /usr/bin/bash ${SCRIPT_DIR}/rebuild_single.sh -E <source_file.c>
+   # Output: ${CFG_WORK_DIR}/<basename>.i
+   ```
+   The `.i` file contains only the branches that survive preprocessing — it directly answers "which `#ifdef` block is active" without inference. Grep for the function in the `.i` file and read that body. This works even when the active block is fully inline (no sub-function calls), which objdump cannot disambiguate.
+
+2. **Secondary method — objdump cross-check.** For functions that dispatch to sub-kernels, confirm by checking which sub-functions the linked binary actually calls:
+   ```bash
+   grep -E "(jal|jalr).*<[^+>]+>" ${CFG_WORK_DIR}/t_<test>_perf.objdump | grep -v "gdb\|nds\|start\|__" | head -20
+   ```
+   Cross-reference call targets (e.g., `nn_mat_mul_kernel_tiling_q7` vs `nn_mat_mul_kernel_q7_bias_2sft`) with the preprocessed source. This catches cases where LTO/dead-code elimination pruned a branch that `-E` still shows.
+
+3. When mapping the `.i` body back to raw source for editing, target only the `#ifdef` branch whose body matches the `.i`. Modifying any other branch has zero effect.
+
+**Active-defines hint.** For a quick list of which macros `config.toml` declares defined vs undefined, source `parse_config.sh` and inspect `${CFG_DEFINES_DEFINED}` and `${CFG_DEFINES_UNDEFINED}` (from `[target.active_defines]`). These are a hint only — the `.i` file is always authoritative, because internal headers can redefine things without any config.toml knowledge.
+
+### Analysis
+
+**On first round (round=1):**
+1. Identify the active code path from the `.i` file saved in `active_path_file` by `select`. Read the function body there to understand what will actually execute.
+2. Find the function's assembly in `libnn.objdump` (regenerated by `rebuild_single.sh` after every compile; located at `${CFG_LIBNN_ROOT}/libnn.objdump`):
+   ```bash
+   grep -A 200 '<function_name>:' ${CFG_LIBNN_ROOT}/libnn.objdump | head -300
+   ```
+3. If the function calls sub-functions (GEMM kernels, etc.), run `${SCRIPT_DIR}/rebuild_single.sh -E` on each sub-function's source file too, and read its assembly from `libnn.objdump`. Sub-functions have their own `#ifdef` branches.
+4. Query the wiki: read `docs/wiki/index.md`, relevant `general/` pages for similar patterns, operator page if it exists
+5. Compute key metrics from the assembly and source:
+   - **Arithmetic Intensity** = FLOPs per byte transferred from memory. Count MAC-equivalent ops (e.g., each `vqmacc` contributes `2 * vl` FLOPs for LMUL-dependent `vl`); count bytes loaded/stored per loop iteration (load instructions x element width x vl). AI = FLOPs / bytes.
+   - **Reuse Rate** = FLOPs per byte loaded (exclude stores). Measures how many times each loaded byte contributes to computation before being evicted. High reuse = cache-friendly; low reuse = memory-bound.
+   - Save both as `arith_intensity` and `reuse_rate` in state.
+6. Identify bottleneck using the metrics: low AI -> memory-bound (improve tiling/blocking/reuse); high AI but low IPC -> compute-bound (LMUL, register pressure, loop structure)
+7. Form hypothesis: what to change and expected impact
+
+**On subsequent rounds (round>1):**
+1. Re-run `${SCRIPT_DIR}/rebuild_single.sh -E <source_file>` to refresh the `.i` (the previous round's `implement` modified the source, and if any macros were touched the `#ifdef` resolution may have shifted). Re-read the active block.
+2. Re-check `${CFG_LIBNN_ROOT}/libnn.objdump` for the updated assembly of the function.
+3. Recompute arithmetic intensity and reuse rate from the updated assembly. Compare to previous round — did the change improve reuse or reduce memory traffic?
+4. Review FPGA cycle/instruction delta from last round's `measure` step to identify new bottleneck
+5. Query the wiki: read `docs/wiki/index.md` and relevant `general/` pages for the specific bottleneck pattern
+6. Form the next hypothesis based on what the metrics reveal
+
+**Proposer output:** 1–3 ranked ideas, each with what to change, which lines, expected impact rationale, and risk assessment. Include current arithmetic intensity and reuse rate in the summary. Pick the top idea as the hypothesis.
+
+### Output and Transitions
+
+**Output:** Print the analysis summary (including arithmetic intensity, reuse rate, and hypothesis). Do NOT wait for approval — proceed immediately.
+
+**Trace emit:** Write the subagent's full analysis (hypothesis, AI, reuse rate, ranked ideas, risk) to a tmp file, then:
+```bash
+/usr/bin/bash ${SCRIPT_DIR}/emit_trace.sh step analyze /tmp/analyze_trace.md
+```
+
+**Decision gate:** If no concrete optimization opportunity can be identified (assembly looks clean, metrics are already optimal, LMUL/tiling are already well-tuned):
+- Transition to idle with final summary.
+- Do NOT force an optimization that has no clear rationale.
+
+**Transition:** → `implement` (if opportunity found) or → `idle` (if no opportunity)
+
+---
+
+## State: `implement`
+
+Apply the optimization.
+
+**Step 0 — capture a checkpoint of the working tree BEFORE any edit.** This is the rollback point if the round regresses. Uses `git stash create` (snapshot blob; does NOT modify the working tree, index, or branch state) plus `git update-ref` (anchors the blob so git GC won't collect it). One ref per round per function.
+
+```bash
+LIB_ROOT=$(git rev-parse --show-toplevel)
+SCRIPT_DIR="${LIB_ROOT}/.claude/skills/optimize/script"
+source "${SCRIPT_DIR}/parse_config.sh"
+FN=$(python3 -c "import json;print(json.load(open('${CFG_STATE_FILE}'))['function'])")
+ROUND=$(python3 -c "import json;print(json.load(open('${CFG_STATE_FILE}'))['round'])")
+REF="refs/optimize-ckpt/${FN}/round-${ROUND}-pre"
+SHA=$(cd "${LIB_ROOT}" && git stash create "optimize ${FN} round-${ROUND} pre-implement")
+if [ -n "${SHA}" ]; then
+  git -C "${LIB_ROOT}" update-ref "${REF}" "${SHA}"
+else
+  # No tracked-file changes vs HEAD: anchor HEAD itself so revert works
+  git -C "${LIB_ROOT}" update-ref "${REF}" HEAD
+fi
+# Persist the ref name in state for the measure step's auto-revert
+python3 - "${CFG_STATE_FILE}" "${REF}" <<'PYEOF'
+import json,sys
+f, ref = sys.argv[1], sys.argv[2]
+s = json.load(open(f))
+s['checkpoint_ref'] = ref
+json.dump(s, open(f,'w'), indent=2)
+PYEOF
+```
+
+Then perform the edit:
+
+1. Modify ONLY the active code path identified during `analyze`. The active path was determined from the preprocessed `.i` file (with objdump cross-check for dispatch functions). **Do NOT guess from `#ifdef` guards in the raw source** — many macros (e.g., `ENA_TILING`, `ENA_FAST_ALGO`) are defined in internal headers, not build.sh. Map from the `.i` body back to the corresponding raw-source line numbers when editing.
+2. If the function calls sub-functions (e.g., a GEMM kernel), the optimization may need to be applied in the sub-function's source file, not the conv function's source.
+3. Do NOT touch the plain C fallback or dead `#ifdef` blocks
+4. Save a description of what was changed in state (`changes` field), AND list the modified files in state under `changed_files: [...]` so `measure` knows what to revert on regression.
+5. If this is round>1 and the previous round regressed, the prior round's `measure` step has ALREADY auto-reverted via the checkpoint; the working tree is back to the pre-regression state. Just proceed with the new approach.
+
+**CRITICAL — Intrinsic API selection:**
+The active `ENA_VEC_ISA` code path uses **`NDS_VEC_*` macros** (e.g., `NDS_VEC_VSETVLI`, `NDS_VEC_VLE8_V`, `NDS_VEC_VQMACC_VX`, `NDS_VEC_VNCLIP_WX`). These are defined in `internal/internal_vec_isa_v*.h` (version chosen by `NDS_VEC_RVV_VERSION` in `[target.cflags_base]`).
+
+**NEVER use `__riscv_*` C intrinsics** (e.g., `__riscv_vle8_v_i8m2`, `__riscv_vqmacc_vx_i32m8`) in `ENA_VEC_ISA` blocks. Those require `ENA_VEC_INTRINSIC`, which is listed under `[target.active_defines].undefined` in `config.toml` for this target. Using them causes compilation failures.
+
+The canonical reference for legal macros is `${CFG_INTRINSIC_API}` (path from `[target].intrinsic_api`). Read that file before writing new RVV code. In addition:
+- Study an existing working function in the same `#ifdef` block to see live usage patterns
+- Use explicit register names (`NDS_VEC_V0`, `NDS_VEC_V8`, `NDS_VEC_V16`, etc.)
+- Match the LMUL register grouping: M8 uses v0/v8/v16/v24, M4 uses v0/v4/v8/.., M2 uses v0/v2/v4/..
+- For loads: `NDS_VEC_VLE8_V` (e8), `NDS_VEC_VLE16_V` (e16), `NDS_VEC_VLE32_V` (e32)
+- For stores: `NDS_VEC_VSE8_V` (e8), `NDS_VEC_VSE16_V` (e16), `NDS_VEC_VSE32_V` (e32)
+
+**Trace emit:** After the implement subagent returns, write its description of the exact change (which file, which lines, what replaced what, reasoning) to a tmp file, then:
+```bash
+/usr/bin/bash ${SCRIPT_DIR}/emit_trace.sh step implement /tmp/implement_trace.md
+```
+
+**Transition:** → `verify`
+
+---
+
+## State: `verify`
+
+Incremental rebuild and QEMU correctness test — all via scripts.
+
+1. Rebuild ONLY the modified libnn source (fast incremental):
+   ```bash
+   /usr/bin/bash ${SCRIPT_DIR}/rebuild_single.sh <source_file>
+   ```
+
+2. Build the test binary AND run it on QEMU with fd-9 semihosting capture in one script call:
+   ```bash
+   /usr/bin/bash ${SCRIPT_DIR}/run_qemu_test.sh <test_name>
+   ```
+   The script reads `${CFG_QEMU_*}` + `${CFG_CFLAGS_BASE}` + `${CFG_CFLAGS_VERIFY}` from `config.toml`, compiles `Examples/unit_func/t_<test_name>.c` against `libnn.a`, runs under `strace -e trace=write` to capture fd-9 semihosting, and emits one of:
+   - `RESULT: PASS (N sub-tests passed)` — correctness verified
+   - `RESULT: FAIL (N failures detected)` — compiled but wrong results
+   - `RESULT: COMPILE_ERROR` — gcc failed; full error is on stderr
+   - `RESULT: TIMEOUT (Ns)` — QEMU hang
+   - `RESULT: UNKNOWN (...)` — no pass/fail marker in output
+
+3. Do NOT run full regression in the optimization loop — only the target function's test.
+
+**Trace emit:** After `run_qemu_test.sh` returns, capture the result to a JSON payload (one-shot, regardless of pass/fail):
+```bash
+cat > /tmp/verify_trace.json <<EOF
+{"result": "PASS|FAIL|COMPILE_ERROR|TIMEOUT|UNKNOWN", "sub_tests": <N>, "stderr": "<first few lines if any>"}
+EOF
+/usr/bin/bash ${SCRIPT_DIR}/emit_trace.sh step verify /tmp/verify_trace.json
+```
+On non-PASS also emit a failure tag (writes `fail_reason.md`). Tag mapping:
+- `COMPILE_ERROR` → `compile_error` (pass gcc stderr as message file)
+- `FAIL` → `test_fail`
+- `TIMEOUT` → `timeout`
+- `UNKNOWN` → `unknown`
+```bash
+/usr/bin/bash ${SCRIPT_DIR}/emit_trace.sh fail <tag> /tmp/qemu_stderr.txt
+```
+
+**Pass:** → `measure`
+**`COMPILE_ERROR`:** Launch ONE `error-fix` subagent with the full stderr + source file path. It reads the error and edits the source. Re-run step 1+2. Max 3 compile-fix retries before going back to `analyze`.
+**`FAIL` (wrong results):** → `implement` (diagnose + fix). Max 3 test-fix retries before going back to `analyze`.
+**`TIMEOUT` / `UNKNOWN`:** Treat as FAIL, same retry policy.
+
+---
+
+## State: `measure`
+
+Run on the FPGA board via GDB for ground-truth cycle counts.
+
+```bash
+/usr/bin/bash ${SCRIPT_DIR}/run_fpga_test.sh <test_name>
+```
+
+This script reads `[target].cpu`, `[target.cflags_base]`, `[target.cflags_perf]`, `[fpga].*` from `config.toml` and:
+1. Compiles the test with `${CFG_CFLAGS_BASE} ${CFG_CFLAGS_PERF}` (includes `-DPF_COUNTER -DENA_TEST_PERF -DENA_RUN_TWICE` on the perf list)
+2. Uploads binary to FPGA via the GDB expect script at `${CFG_FPGA_SIM_WRAPPER}`
+3. Runs on the board at `${CFG_FPGA_HOST}:${CFG_FPGA_PORT}`
+4. Generates `.adx` and `.objdump` in `${CFG_WORK_DIR}/`
+
+Parse the output for:
+- `"The cycle count is <N>"` — FPGA cycle count
+- `"The inst count is <N>"` — FPGA instruction count
+- `"accuracy checking pass/fail"` — correctness check
+
+Save `cycles_after` and `instrs_after` in state. Compute speedup: `cycles_before / cycles_after`. Compute IPC: `instrs_after / cycles_after`.
+
+**Trace emit:** After parsing, write a JSON payload and emit:
+```bash
+cat > /tmp/measure_trace.json <<EOF
+{"cycles": <cycles_after>, "instrs": <instrs_after>, "ipc": <ipc>, "speedup": <speedup>, "cycles_before": <cycles_before>}
+EOF
+/usr/bin/bash ${SCRIPT_DIR}/emit_trace.sh step measure /tmp/measure_trace.json
+```
+If speedup < 1.0 (regression), also emit a failure tag AND **auto-restore the working tree from the pre-implement checkpoint captured in `implement` step 0**:
+```bash
+echo "cycles regressed: ${cycles_before} -> ${cycles_after} (speedup ${speedup})" > /tmp/regression.txt
+/usr/bin/bash ${SCRIPT_DIR}/emit_trace.sh fail regression /tmp/regression.txt
+
+# AUTO-REVERT from checkpoint
+LIB_ROOT=$(git rev-parse --show-toplevel)
+source "${SCRIPT_DIR}/parse_config.sh"
+REF=$(python3 -c "import json;print(json.load(open('${CFG_STATE_FILE}'))['checkpoint_ref'])")
+FILES=$(python3 -c "import json;print(' '.join(json.load(open('${CFG_STATE_FILE}')).get('changed_files',[])))")
+if [ -n "${REF}" ] && [ -n "${FILES}" ]; then
+  git -C "${LIB_ROOT}" checkout "${REF}" -- ${FILES}
+  /usr/bin/bash "${SCRIPT_DIR}/rebuild_single.sh" ${FILES}  # rebuild from restored source
+  echo "Auto-reverted ${FILES} from ${REF}; libnn.a is back to pre-round-${ROUND} state."
+else
+  echo "WARN: no checkpoint_ref or changed_files in state — manual revert needed."
+fi
+```
+
+**Transition:** → `learn`
+
+---
+
+## State: `learn`
+
+Record the lesson, then loop back.
+
+1. Update the wiki following the wiki-writer skill:
+   - Read `.claude/skills/wiki-writer/SKILL.md`
+   - Input context from state: function, source_file, round, hypothesis, changes, cycles_before, cycles_after, speedup, arith_intensity, reuse_rate, outcome
+   - Execute all 4 operations: operator page, general page (if applicable), index, log
+   - All content must follow the naive expression style defined in wiki-writer
+
+2. **Trace emit** (before the round counter bumps, so attribution stays on this round):
+   ```bash
+   cat > /tmp/learn_trace.md <<EOF
+   <1-3 sentence summary of lessons recorded this round; cite which wiki pages updated>
+   EOF
+   /usr/bin/bash ${SCRIPT_DIR}/emit_trace.sh step learn /tmp/learn_trace.md
+   ```
+
+3. Increment the `round` counter in state.
+
+4. **Check exit condition:**
+   - If `round >= ${CFG_MAX_ROUNDS}` (from `[limits].max_rounds` in config.toml, default 5), STOP → `idle`. Print final summary of all rounds.
+   - Otherwise, transition → `analyze` for the next optimization round on the same function.
+
+5. When looping back to `analyze`, key inputs for the next round are: FPGA cycle/instruction counts from `measure`, updated arithmetic intensity and reuse rate from this round, updated assembly, and wiki pages. The `analyze` step will decide whether there's still an opportunity. If not, it exits to `idle`.
+
+**Exit → `idle`:** Print a summary table of all rounds (round#, approach, cycles, instrs, IPC, AI, reuse_rate, speedup, insight). Instruction count diagnoses whether gains came from fewer instructions (algorithmic) or better IPC (cache/scheduling).
+**Continue → `analyze`:** Print "Round N+1: continuing. AI=X, reuse_rate=Y, key finding: <insight>"
+
+---
+
+## State File Format
+
+State lives at `${CFG_STATE_FILE}` (from `[repo].state_file` in config.toml — default `.claude/skills/optimize/state.json`).
+
+```json
+{
+  "step": "idle|validate|select|analyze|implement|verify|measure|learn",
+  "function": "function_name",
+  "source_file": "Source/.../file.c",
+  "test_name": "test_name_for_qemu",
+  "round": 0,
+  "hypothesis": "what we plan to change and why",
+  "changes": "description of what was implemented",
+  "cycles_before": "",
+  "cycles_after": "",
+  "instrs_before": "",
+  "instrs_after": "",
+  "speedup": "",
+  "arith_intensity": "",
+  "reuse_rate": "",
+  "active_path_file": "",
+  "called_functions": [],
+  "validated_at": "",
+  "config_toml_mtime": 0,
+  "trace_dir": "trace_corpus/<fn>/round_<N>/ (derivable from function+round; populated lazily)",
+  "current_trace_round": "mirrors round; bookkeeping for the meta-harness outer loop",
+  "round_history": [
+    {
+      "round": 1,
+      "approach": "...",
+      "cycles": "...",
+      "instrs": "...",
+      "ipc": "...",
+      "arith_intensity": "...",
+      "reuse_rate": "...",
+      "speedup": "...",
+      "outcome": "improved|regressed|neutral",
+      "insight": "..."
+    }
+  ],
+  "history": ["timestamps of state transitions"]
+}
+```
+
+Update state file on every transition (uses `CFG_STATE_FILE` from parse_config.sh — no hardcoded path). The block also auto-emits `step_timings.json` entries via `emit_trace.sh timing` for the step that just finished, so individual states do not need explicit timing calls:
+```bash
+LIB_ROOT=$(git rev-parse --show-toplevel)
+SCRIPT_DIR="${LIB_ROOT}/.claude/skills/optimize/script"
+source "${SCRIPT_DIR}/parse_config.sh"
+python3 - "${CFG_STATE_FILE}" "<new_step>" "${SCRIPT_DIR}" <<'PYEOF'
+import json, os, sys, subprocess
+from datetime import datetime
+f, new_step = sys.argv[1], sys.argv[2]
+script_dir = sys.argv[3] if len(sys.argv) > 3 else ""
+os.makedirs(os.path.dirname(f), exist_ok=True)
+state = json.load(open(f)) if os.path.exists(f) else {"step": "idle", "history": []}
+prev_step = state.get("step", "idle")
+now = datetime.now()
+prev_start = datetime.fromisoformat(state.get("prev_step_started", now.isoformat()))
+elapsed = (now - prev_start).total_seconds()
+state["last_step_duration"] = f"{prev_step}: {elapsed:.1f}s"
+# Auto-emit trace timing for traced FSM steps. `learn` bumps the round before
+# this block runs, so attribute learn's timing to round-1.
+traced = ("analyze", "implement", "verify", "measure", "learn")
+fn_for_trace = state.get("function", "")
+rnd_for_trace = state.get("round", 0)
+if prev_step == "learn" and isinstance(rnd_for_trace, int) and rnd_for_trace > 0:
+    rnd_for_trace -= 1
+if script_dir and fn_for_trace and prev_step in traced:
+    emit = os.path.join(script_dir, "emit_trace.sh")
+    if os.path.isfile(emit):
+        subprocess.run(
+            [emit, "timing", "--fn", str(fn_for_trace),
+             "--round", str(rnd_for_trace), prev_step, f"{elapsed:.3f}"],
+            check=False,
+        )
+state["step"] = new_step
+state["step_started"] = now.isoformat()
+state["history"] = state.get("history", []) + [f"{now.isoformat()} {new_step}"]
+state["prev_step_started"] = state["step_started"]
+json.dump(state, open(f, "w"), indent=2)
+print(json.dumps(state, indent=2))
+PYEOF
+```
+
+---
+
+## Subagent Dispatch
+
+The main agent drives the FSM and reports progress to the user between every step. Only steps that require reasoning use subagents. Mechanical steps run commands directly.
+
+| Step | Execution | Why |
+|------|-----------|-----|
+| **validate** | Main agent runs `python3 ${SCRIPT_DIR}/validate_config.py` | Mechanical check; no reasoning |
+| **select** | Main agent runs commands directly | Just shell commands (grep, build, FPGA baseline, `-E` preprocess) |
+| **analyze** | Subagent (proposer) | Requires reading code + assembly + metrics, forming hypothesis |
+| **implement** | Subagent | Requires code editing with domain knowledge |
+| **verify** | Main agent runs `rebuild_single.sh` + `run_qemu_test.sh`. On `COMPILE_ERROR`: single `error-fix` subagent reads error and edits source | Build + QEMU are fully scripted; only error diagnosis needs reasoning |
+| **measure** | Main agent runs commands directly | Just `run_fpga_test.sh` |
+| **learn** | Main agent runs commands directly | Wiki page updates + state update |
+
+### Subagent constraints
+
+When dispatching to a subagent, always include these constraints in the prompt:
+
+**For `analyze` subagent (proposer):**
+- Dispatch: `Agent(model="opus", ...)`. Prepend the prompt with `[effort: xhigh]` so the subagent reasons at extended-thinking depth (this is the reasoning-heaviest step).
+- Tools allowed: Read, Grep, Glob, Bash (ONLY for `grep` and `${SCRIPT_DIR}/rebuild_single.sh -E`)
+- DO NOT edit any files
+- DO NOT run compile/archive builds, test, QEMU, or FPGA commands. `rebuild_single.sh -E` (preprocess-only) IS allowed.
+- **MUST identify the active code path from preprocessed source**, not raw source. Run `${SCRIPT_DIR}/rebuild_single.sh -E <src.c>` and read `${CFG_WORK_DIR}/<basename>.i` — only surviving `#ifdef` branches appear there. Never guess from raw source: `ENA_TILING`, `ENA_FAST_ALGO` etc. are defined in internal headers, not build.sh. For dispatch functions, also cross-check with `${CFG_WORK_DIR}/t_<test>_perf.objdump` `jal`/`jalr` targets to confirm which sub-kernel was linked.
+- Focus on data flow, algorithm choice, tiling/blocking, loop structure, GEMM strategy, im2col, unrolling, LMUL selection, vector register utilization. Compute arithmetic intensity and reuse rate from the assembly. Must read `docs/wiki/index.md` and relevant wiki pages for what's been tried. Read `${CFG_UARCH_REF}` for pipeline/stall reasoning.
+- Output: analysis summary including arithmetic intensity, reuse rate, active code path (verified from preprocessed `.i`, cross-checked with objdump for dispatch cases), and 1–3 ranked ideas with expected impact rationale, risk assessment, and which lines to modify
+
+**For `error-fix` subagent (on `RESULT: COMPILE_ERROR`):**
+- Dispatch: `Agent(model="sonnet", ...)`. Prepend the prompt with `[effort: high]`.
+- Tools allowed: Read, Grep, Glob, Edit
+- DO NOT run any Bash commands except `grep` for checking macro availability in headers
+- Input: the full gcc stderr output + the source file path of the file being optimized
+- Read the error, identify which macro/function/type is missing or misused (often `__riscv_*` intrinsics used where config.toml marks `ENA_VEC_INTRINSIC` undefined), and edit the source to fix it. Same intrinsic rules as `implement`. Reference: `${CFG_INTRINSIC_API}`.
+- Output: description of exact code change made to fix the error
+
+**For `implement` subagent:**
+- Dispatch: `Agent(model="sonnet", ...)`. Prepend the prompt with `[effort: high]`.
+- Tools allowed: Read, Grep, Glob, Edit
+- DO NOT run any Bash commands except `grep` for checking macro availability in headers
+- DO NOT run build, test, QEMU, or FPGA commands
+- DO NOT compile anything
+- **CRITICAL: Use `NDS_VEC_*` macros ONLY** (e.g., `NDS_VEC_VSETVLI`, `NDS_VEC_VLE8_V`, `NDS_VEC_VQMACC_VX`). NEVER use `__riscv_*` C intrinsics — they require `ENA_VEC_INTRINSIC` which is undefined for this target (see `[target.active_defines].undefined` in config.toml). Read `${CFG_INTRINSIC_API}` first; then study an existing working function in the same `#ifdef ENA_VEC_ISA` block for live usage.
+- Output: description of exact code change made
+
+---
+
+## Rules
+
+1. **Fully autonomous.** Do not wait for user input at any step. Run the entire loop.
+2. **Main agent drives the FSM.** The main agent owns state, runs mechanical steps directly, dispatches reasoning steps to subagents, and reports progress to the user between every step.
+3. **Never skip steps.** Follow FSM transitions strictly. `validate` runs before the first `select` of every session (cache-aware).
+4. **Max `[limits].max_rounds` rounds per function** (5 by default). After that, exit to idle regardless.
+5. **analyze is the gatekeeper.** If it finds no optimization opportunity from code + assembly + metrics, exit to idle. Do not force pointless changes.
+6. **FPGA is ground truth.** QEMU is correctness only.
+7. **Always record lessons.** Wins AND losses. This compounds knowledge across functions.
+8. **Target VLEN = `[qemu].vlen` = `${CFG_QEMU_VLEN}`.** Never sacrifice primary-VLEN performance when tuning for secondary VLENs.
+9. **If verify fails 3 times**, go back to `analyze` with a different approach, not the same one.
+10. **If a round regresses, the auto-revert in `measure` already restored the working tree from the pre-implement checkpoint** (`refs/optimize-ckpt/<fn>/round-N-pre`). Do NOT manually `git checkout HEAD --` -- that would discard prior-session uncommitted gains. The next round starts from the LAST GOOD state automatically.
+10a. **Checkpoint discipline.** `select` snapshots round-0 baseline as `refs/optimize-ckpt/<fn>/round-0-baseline`. `implement` step 0 snapshots the pre-implement state as `refs/optimize-ckpt/<fn>/round-N-pre` and records `checkpoint_ref` + `changed_files` in state.json. `measure` consults these on regression to revert atomically. Use `git for-each-ref refs/optimize-ckpt/` to inspect all checkpoints; `git diff <ref> -- <file>` to compare any round to current. NEVER use `git checkout HEAD -- <file>` or `git stash drop` inside the loop.
+11. **Arithmetic intensity and reuse rate drive the next round.** Recompute them each round from updated assembly to track whether changes improved memory efficiency.
+12. **Use `${SCRIPT_DIR}/rebuild_single.sh` for incremental builds** after the initial `build_libnn.sh` in `select`. Never rebuild the full library in the optimization loop.
+13. **Use `${SCRIPT_DIR}/run_fpga_test.sh` for FPGA measurement.** It handles compilation with perf flags, GDB upload, and cycle count parsing. **NEVER compile or run FPGA tests manually — always use this script.**
+14. **Only test the target function** during the optimization loop. Full regression is for final validation only.
+15. **Scripts are the single source of truth for builds and tests.** Never construct gcc, QEMU, or GDB commands manually. Always use the scripts in `.claude/skills/optimize/script/`.
+16. **No hardcoded target values.** Target CPU, toolchain, VLEN, CFLAGS, FPGA host, and active-defines all live in `config.toml`. SKILL.md and scripts never embed them literally.
+17. **Emit a trace every reasoning step.** After `analyze`, `implement`, `verify`, `measure`, and `learn`, call `${SCRIPT_DIR}/emit_trace.sh step <step_name> <payload>` (see Trace Emission section). On any verify/measure failure path, also call `emit_trace.sh fail <tag> <stderr>`. Timing is automatic via the state-transition block; do not emit timing by hand. Trace emission is additive and MUST NOT alter FSM transitions.

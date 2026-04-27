@@ -1,0 +1,48 @@
+# Round 1 Analyze (post-reset, infinite-trial session)
+
+## Cycle-share decomposition (of 1,094,953 baseline cycles)
+
+| Phase | Cycles | % |
+|---|---|---|
+| vredsum chain (16 reds * 10 cyc * 4 cur_row * 420 calls) | ~268,800 | 24.5% |
+| im2col bulk-row `nn_dup_s8` | ~161,280 | 14.7% |
+| Inner SW-piped vd4dots+vle8 | ~107,520 | 9.8% |
+| Requantize tail | ~84,000 | 7.7% |
+| Inner K tail | ~26,880 | 2.5% |
+| Function call save/restore | ~10,500 | 1.0% |
+| Residual (chain stalls, cold L2, vand zero, ptr arith) | ~432,000 | 39.4% |
+
+**Test shape:** batch=2, in=32x30x64, ker=3x3 pad=0 stride=1, out=30x28x16. Active branch `out_tensor_ch <= 64` (4-pixel tile, FLUSH every 8 pixels via 2 unroll4 calls). K=576, 420 unroll4 calls total.
+
+## AI / Reuse
+- Total MACs: 15.483 M
+- VLSU bytes: ~5.8 MB
+- AI = 3.20 MAC/byte. L2 budget 70 MB (64 B/cyc * 1.094 M cyc); only 8% used.
+- **Compute-bound.**
+
+## Ranked ideas
+
+### Idea 1 (TOP): Trim im2col `nn_dup_s8` LMUL m8 -> m4 for 192-byte bulk-row
+- File: `Include/riscv_nn_support.h:105-133`
+- Site: `Source/ConvolutionFunctions/riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any.c:584-585` (bulk row); also 542,570,605,631 (per-pixel ch=64, m1 best)
+- Why: 192 B at m8 throughput = 16 cyc/instr (wastes 50% FU); m4 throughput = 8 cyc matches data
+- Impact: 16 cyc * 3 dups/pixel * 1680 pixels = ~80,640 cyc = ~7.4% conservative; floor ~5%
+- Risk: low; clone helper, easy rollback
+
+### Idea 2: Hide next-iter weight loads behind vredsum (VPERMUT slideup window)
+- File: `Source/NNSupportFunctions/nn_mat_mult_kernel_s8_offset.c:2010-2122`
+- Why: VLSU+VPERMUT is a clean dual-issue pair; park 8 vle8 during slideup chain
+- Impact: ~5,040 cyc (~0.5%) partial overlap; up to ~13,440 (~1.2%)
+- Risk: medium; register liveness rewrite
+
+### Idea 3: Inline 2 unroll4 calls + elide redundant weight reload
+- File: parent `riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any.c:489-517`
+- Why: 2 consecutive calls re-load same weights (D$ hit but FU still busy)
+- Impact: ~5-7% if VLSU FU is gate
+- Risk: high; large API change
+
+## TOP hypothesis
+Idea 1: m4 nn_dup_s8 for bulk-row im2col path. Targets under-explored 14.7% region with clean architectural reason (m4 throughput matches 192 B transfer; m8 wastes 50% of VLSU FU).
+
+## Decision gate
+`proceed-implement` -- Idea 1.
