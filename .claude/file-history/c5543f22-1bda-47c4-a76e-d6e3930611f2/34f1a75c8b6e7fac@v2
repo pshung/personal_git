@@ -1,0 +1,197 @@
+---
+type: pipeline-insight
+tags: [ax45mpv, v1024, 8mb, pipeline, tuning, lmul, vlsu, dual-issue, dlen]
+source: .claude/skills/optimize/fpga_config/ax45mpv_v1024_8mb.inc
+ground_truth: [[ax45mpv-vpu-uarch-spec]], AndesCore_AX45MPV_DS220_V1.4.pdf
+---
+
+# AX45MPV V1024_8MB Pipeline Tuning Reference
+
+Reference summary for the AX45MPV silicon configured as V1024_8MB (the FPGA target the optimize loop tunes against). Every number on this page is the spec formula from [[ax45mpv-vpu-uarch-spec]] resolved with the `NDS_*` defines in `.claude/skills/optimize/fpga_config/ax45mpv_v1024_8mb.inc`. **Ground truth is the spec page and the AndesCore_AX45MPV_DS220 PDF.** If a number here disagrees with the PDF, the PDF wins -- file the discrepancy and update this page.
+
+The spec page's worked example uses `VLEN=1024 / DLEN=512`. The V1024_8MB silicon has `DLEN=1024`, which collapses the `(VLEN/DLEN)*LMUL` term to `LMUL`. Many spec formulas resolve to materially smaller cycle counts here than the example column suggests.
+
+---
+
+## Resolved Configuration
+
+| Parameter | Value | Notes |
+|---|---|---|
+| `NDS_VLEN` | 1024 | vector register width |
+| `NDS_DLEN` | 1024 | datapath width = VLEN -> `(VLEN/DLEN) = 1` |
+| `NDS_VPERMUT_DLEN` | 1024 | permutes share the full datapath, no slowdown vs VALU |
+| `NDS_ELEN` | 64 | max SEW per element |
+| `NDS_VRF_MUX` | 2 | VRF read mux factor |
+| `NDS_VSCB_DEPTH` | 16 | scoreboard tracks 16 in-flight vector ops |
+| `NDS_VLSU_MSHR_DEPTH` | 16 | max in-flight VLSU memory requests |
+| `NDS_VLSU_BUF_DEPTH` | 16 | data-buffer entries; each entry = VLEN bits = 128 B -> **2 KB in-flight load data cap** |
+| `NDS_VMAC2_TYPE` | 3 | VMAC2 FU present |
+| `NDS_QMAC_SUPPORT` | yes | vqmacc family available |
+| `NDS_VECTOR_VDOT_SUPPORT` | yes | vd4dots family available |
+| `NDS_INT4_VECTOR_LOAD_SUPPORT` | yes | int4 vector loads available |
+| `NDS_BFLOAT16_SUPPORT`, `ZVFBFMIN`, `ZVFBFWMA` | yes | bf16 scalar + vector + widening MAC |
+| `NDS_HVM_SIZE_KB` | 0 | **no HVM region** -- the 3-cycle HVM load latency in the spec is not reachable on this silicon |
+| `NDS_BIU_DATA_WIDTH` | 512 | for cacheable / non-cacheable: `VLSU_MEM_DW = 512` |
+| `NDS_L2_DATA_WIDTH`, `NDS_L2C_DATA_RAM_DW` | 512 | L2 peak = 64 B/cyc |
+| `NDS_L2C_CACHE_SIZE_KB` | 8192 | 8 MB L2 |
+| `NDS_L2C_WAY` | 16 | |
+| `NDS_L2C_BANKS` | 2 | |
+| `NDS_L2C_TAG_RAM_SETUP_CYCLE` / `DATA_RAM_SETUP_CYCLE` / `DATA_RAM_OUTPUT_CYCLE` | 1 / 2 / 2 | matches spec's "reference latency" L2 config |
+| `NDS_DCACHE_SIZE_KB` / `WAY` / `DATA_RAM_DW` | 32 / 4 / 64 | D$ 32 KB, 4-way |
+| `NDS_ICACHE_SIZE_KB` / `WAY` | 32 / 2 | |
+| `NDS_CACHE_LINE_SIZE` | 64 B | governs the VLSU same-region stall window |
+| `NDS_LSU_MSHR_DEPTH` | 32 | scalar LSU; separate from VLSU |
+| `NDS_DSP_SUPPORT`, `NDS_ACE_SUPPORT` | no | P-extension and ACE not available -- do not propose DSP intrinsics |
+
+---
+
+## Throughput / Latency Resolved at This Config
+
+`Throughput` here follows the spec convention: cycles the FU is occupied per instruction (i.e. reciprocal-throughput). `Latency` = cycles until the first chunk is available for chaining.
+
+### VALU
+
+| Instruction | Spec formula | V1024_8MB cycles (LMUL=k) | Latency |
+|---|---|---|---|
+| vadd / vsub / vand / vor / vxor / vmv / vmerge / vmin / vmax / vsadd / vssub / vsll / vsrl / vsra / vssrl / vssra / vaadd / vasub / vadc / vsbc | `(VLEN/DLEN)*LMUL` | **k** | 2 |
+| vwadd / vwsub (LMUL>=1) | `(VLEN/DLEN)*LMUL*2` | **2k** | 2 |
+| vnclip / vnsrl / vnsra (LMUL>=1) | `(VLEN/DLEN)*LMUL*2` | **2k** | 3 |
+| vmseq / vmsne / vmslt / vmsle / vmsgtu | `(VLEN/DLEN)*LMUL + (VLEN!=DLEN)` | **k** (VLEN==DLEN drops the +1) | k + 2 |
+| vredsum-e8 / vredmin / vredmax | `LMUL + LOG2(DLEN/64)*2 + LOG2(64/SEW)` | **k + 11** at e8 (k+10 at e16, k+9 at e32, k+8 at e64) | (k + 11) + 1 = k + 12 at e8 |
+
+### VMAC integer
+
+| Instruction | Spec formula | V1024_8MB cycles (LMUL=k) | Latency |
+|---|---|---|---|
+| vmul / vmulh / vmulhu / vmulhsu | `(VLEN/DLEN)*LMUL` | **k** | 4 |
+| vmacc / vnmsac / vmadd / vnmsub / vsmul | `(VLEN/DLEN)*LMUL` | **k** | 4 |
+| vwmul / vwmacc (LMUL>=1) | `(VLEN/DLEN)*LMUL*2` | **2k** | 4 |
+| **vd4dots_vv / vd4dotu_vv / vd4dotsu_vv** | `(VLEN/DLEN)*LMUL` | **k** | 4 |
+| vqmacc / vqmaccu / vqmaccsu (LMUL>=1) | `(VLEN/DLEN)*LMUL*4` | **4k** | 4 |
+
+Implication: at this silicon, **vd4dots m1 occupies VMAC for 1 cycle** while doing 4 int8 multiply-adds per element x VL elements. vqmacc m1 occupies VMAC for 4 cycles for the same work. vd4dots is dominant whenever K >= 4.
+
+### VFMIS
+
+| Instruction | Spec formula | V1024_8MB cycles (LMUL=k) | Latency |
+|---|---|---|---|
+| vfmin / vfmax / vfsgnj / vfmerge / vfmv / vfclass | `(VLEN/DLEN)*LMUL` | **k** | 2 |
+| vfcvt | `(VLEN/DLEN)*LMUL` | **k** | 3 |
+| vfwcvt (LMUL>=1) | `(VLEN/DLEN)*LMUL*2` | **2k** | 3 |
+| vfncvt (LMUL>=1) | `(VLEN/DLEN)*LMUL*2` | **2k** | 4 |
+| vmfeq / vmflt / vmfle | `(VLEN/DLEN)*LMUL + (VLEN!=DLEN)` | **k** | k + 2 |
+
+### VLSU
+
+`VLSU_MEM_DW = 512` (BIU width, since HVM is absent). Unit-stride throughput = `(VLEN/VLSU_MEM_DW)*EMUL = 2*EMUL`.
+
+| Access | Region / state | Resolved latency (cyc) |
+|---|---|---|
+| Unit-stride load (aligned, full mask), D$ hit | -- | `4 + 0` from L2 perspective; D$ hit answers in a few cycles |
+| Unit-stride load, cacheable D$-Invalid, L2 Clean/Dirty | normal hit at L2 | **4 + 12..13 = 16..17** |
+| Unit-stride load, cacheable, L2-Invalid (DRAM fill) | -- | **4 + 14 = 18** + DRAM time |
+| Unit-stride load, shareable Exclusive | -- | **4 + 22 = 26** |
+| Unit-stride load, shareable Modified | -- | **4 + 25 = 29** |
+| Unit-stride load, non-cacheable | -- | **4 + 7 = 11** |
+| HVM | (size = 0) | **not available** on this silicon |
+| Unaligned penalty | -- | +2 latency, +1 throughput |
+| Partial mask (not all-ones) | -- | throughput becomes `vector_length` (one request per element) |
+| Strided load, e8 | -- | **`4 + L + 128`** where `DLEN/EEW = 1024/8 = 128`. At L2-hit L=12 -> ~144 cyc; throughput = `vector_length` |
+| Indexed load, e8 | -- | **`5 + L + 128`** + `vs2_EMUL - 1` cyc throughput penalty |
+| Unit-stride store (aligned, full mask) | -- | throughput = `2*EMUL` |
+
+Resource limits: 16 in-flight requests, 16 buffer entries (each VLEN bits). RAW/WAW/WAR stall when a new access targets the same 64-B region as an in-flight transaction (cacheable + non-cacheable; HVM is the only exception, but HVM is absent here, so the rule is universal on V1024_8MB).
+
+---
+
+## VLSU Budget
+
+Concrete numbers that bound any prefetch / SW-pipeline plan:
+
+- **In-flight load data cap** = 16 entries x 128 B = **2 KB**.
+- **L2 peak bandwidth** = 512 bit/cyc = **64 B/cyc**.
+- **In-flight latency budget** = 2 KB / 64 B/cyc = **32 cycles**.
+- **One L2-hit miss** consumes ~16-18 cycles of that budget. Two stacked L2 misses already saturate it.
+- **No HVM**: every load takes at least the cacheable-hit latency (16 cyc round trip from issue). The 3-cycle HVM path in the spec is not reachable.
+
+Rule of thumb: if a kernel needs more than ~32 cycles of latency hiding past one issued load, **add explicit cache prefetch** (touch the next line via scalar `prefetch.r`). Adding more vector loads to the in-flight queue does not help once the buffer is full.
+
+---
+
+## LMUL Selection at DLEN = VLEN
+
+Because `(VLEN/DLEN) = 1`, every step up in LMUL costs exactly that many extra issue cycles on VALU/VMAC class instructions (1 cyc per LMUL step). There is no "free" LMUL doubling on this silicon -- the trade is purely against register-blocking and load-instruction count.
+
+| LMUL | e8 VL | Reg groups occupied | Use when |
+|---|---|---|---|
+| m1 | 128 | 1 (32 free as accumulators) | **default** for vd4dots inner-product kernels; lets you tile a [4 x 8] output block with 32 free accumulator regs |
+| m2 | 256 | 2 (16 free) | int8 vector ops where K is moderate and you still need spare regs for SW pipelining |
+| m4 | 512 | 4 (8 free) | load-heavy unit-stride loops -- EMUL=4 cuts load instruction count 4x; throughput per load scales the same way |
+| m8 | 1024 | 8 (only 4 groups exist: v0/v8/v16/v24, all consumed) | only when VL = VLEN_max is required AND no SW pipelining is needed -- see [[anti-sw-pipeline-same-reg-group]] |
+
+For widening MACs (`vwmacc`, `vqmacc`): the destination is wider than the sources, so EMUL_dst > EMUL_src. The reg-group budget is set by EMUL_dst.
+
+---
+
+## Dual-Issue Quick Picks for V1024_8MB
+
+The VRF port table and 8 dual-issue restrictions live in [[ax45mpv-vpu-uarch-spec]]. Distilled rules for this config:
+
+- **Best, always-safe**: `scalar + vector`. Scalar uses no VRF ports. Mix `addi` / `vsetvli` / loop counters between vector ops.
+- **Clean vector + vector pairs** (no read- or write-port number overlap):
+  - `VALU + VFMIS`
+  - `VFMIS + VMAC`
+  - `VMAC + VLSU` -- and **VLSU must be the second slot** (restriction 3).
+- **Avoid**:
+  - `VALU + VMAC` / `VALU + VMAC2` -- share read ports 0,1,2 on every operand.
+  - `VFMIS + VLSU` -- share read ports 4,5.
+  - `VALU + VLSU` -- share write port 0.
+  - `VMAC + VPERMUT` -- share write port 3.
+  - **VLSU as the first slot** with any vector instruction -- hard rule violation regardless of port state.
+
+Practical loop shape that stays inside the safe pairs:
+
+```
+loop:
+    vle8.v v0, (a0)        ; VLSU (paired with prior scalar)
+    addi   a0, a0, ...     ; scalar (pairs with next vector)
+    vd4dots.vv v8, v0, v16 ; VMAC
+    vse8.v v8, (a1)        ; VLSU (after VMAC -- legal: VLSU as 2nd, no port conflict)
+    addi   a1, a1, ...
+    bne    a0, a2, loop
+```
+
+---
+
+## Memory-Bound Ceiling
+
+L2 peak = `NDS_L2_DATA_WIDTH = 512` bit/cyc = **64 B/cyc**. By the wiki convention in [[memory-bound-diagnosis]], a kernel sustaining bytes/cycle within ~15% of that ceiling (i.e. >= ~54 B/cyc) is at the memory wall and further LMUL / unroll changes will not help. At that point the next moves are: cache prefetch, traffic reduction, or accept the wall.
+
+---
+
+## Cache and Line-Hazard Notes
+
+- Cache line = 64 B. The VLSU same-region rule applies per 64-B chunk.
+- D$: 32 KB, 4-way, 64-B line, 64-bit data RAM per bank. A working set under 32 KB that fits in 4 ways stays D$-resident.
+- L2: 8 MB, 16-way, 2 banks, 512-bit data path. Two banks allow concurrent L2 fills to different banks.
+- I$: 32 KB, 2-way -- code-bloat from over-aggressive unrolling can evict the hot loop. Keep inner loops compact.
+- In-place quantization (read e32, write e8 to the same buffer) creates a RAW hazard on the same 64-B line and stalls until the store commits. Either separate the buffers by >= 64 B or order the kernel so all stores to a region complete before any reload.
+
+---
+
+## What This Page Is Not
+
+- Not a replacement for [[ax45mpv-vpu-uarch-spec]] or the AndesCore_AX45MPV_DS220 PDF. It is a derived numeric summary specific to one silicon config.
+- Not authoritative when the .inc changes. If `ax45mpv_v1024_8mb.inc` is updated, re-resolve the formulas and update this page.
+- Not a place to hide algorithmic guidance. Algorithm-level rules (vectorize-K vs vectorize-N, im2col strategies, vd4dots tiling) live in their own pages and are linked below.
+
+---
+
+## Related
+
+- [[ax45mpv-vpu-uarch-spec]] -- ground-truth parametric formulas, full VRF port table, full dual-issue rules.
+- [[ipc-vs-throughput]] -- why low IPC + dense instructions still wins.
+- [[lmul-selection]] -- general LMUL / SEW selection principles.
+- [[memory-bound-diagnosis]] -- when to declare a kernel done at the L2 wall.
+- [[anti-sw-pipeline-same-reg-group]] -- why m8 at VLEN=1024 leaves no register group for SW pipelining.
+- [[tiling-gemm-to-vd4dots]] -- the canonical vd4dots GEMM tiling on this silicon.
