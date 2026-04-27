@@ -1,0 +1,317 @@
+# Why is `conv_HWC_s8_s8_s8_asym_bias_any` 4-5x faster in `~/work/libnn`?
+
+## Test setup
+
+| Item | Value |
+|---|---|
+| Hardware | AX45MPV FPGA, **VLEN = 1024 bits** |
+| Function | `conv_HWC_s8_s8_s8_asym_bias_any` (int8 conv, asymmetric quant, with bias) |
+| Input shape | 30 x 32 x 64 (H x W x C), 2 batches |
+| Kernel | 3 x 3, stride 1, no padding |
+| **Output channels** | **16** (key number — keep it in mind) |
+| Baseline (this repo) | **5,170,095 cycles** (measured) |
+| Optimized (`~/work/libnn`) | ~1.0M cycles (per commit-log claims) |
+
+Both repos take exactly the same algorithmic skeleton: `im2col -> GEMM`. They use the same `vd4dot` SIMD primitive only in a small precompute step. The dominant work, the GEMM, is implemented very differently in the two trees - and that is where the speedup comes from.
+
+---
+
+## TL;DR
+
+Three independent optimizations, each measured on the FPGA:
+
+| # | Lever | Speedup | Where |
+|---|---|---|---|
+| 1 | **Vectorization axis** flipped from across-output-channels to along-the-reduction | **2.47x** | new GEMM kernel |
+| 2 | **Register tile widening** (single-pixel -> 4-channel x 4-pixel) | **1.25x** | new GEMM kernel |
+| 3 | **im2col bulk row copies** in the non-padded mid region | **1.57x** | im2col pipeline |
+| | Compounded | **~4.85x** | |
+
+The single largest fix is #1 - and it is a side-effect of the input shape, not a vendor-instruction trick.
+
+---
+
+## Background: how the baseline does the convolution
+
+A 2D convolution can be reshaped into a matrix multiply by a process called **im2col**:
+
+```
+For every output pixel:
+    Gather the 3x3 receptive field for all 64 input channels into a row of length K = 3*3*64 = 576.
+
+Stack all those rows into a [num_pixels x K] matrix A.
+Lay the weights as a [K x OC] matrix B.
+
+Output = A x B  ->  [num_pixels x OC]
+```
+
+So one convolution becomes:
+1. **im2col**: data movement (memcpy-like, no math).
+2. **GEMM** (general matrix multiply): the actual MACs.
+
+The baseline's GEMM is the file `internal/internal_vec_mat_mul_tiling.h`, function `vec_mat_mul_rvv_tiling_vq` (line 709). The hot loop computes `2 x 8` C tile = `(2 rows of A) x (8 vectors of B)`, eight K-elements per inner step.
+
+---
+
+## The Issue: vector lanes were 94% idle
+
+To see the issue, recall what a "vector instruction" actually does on AX45MPV:
+
+> One vector instruction operates on a *vector register*. The register holds a fixed number of *lanes* in parallel. Whatever you do, you do to all lanes at once.
+
+For 32-bit accumulators at LMUL=M8, a vector register holds:
+
+```
+VLMAX = (VLEN x LMUL) / SEW
+      = (1024  x 8) / 32
+      = 256 lanes
+```
+
+So each instruction has **256 lanes ready to compute**.
+
+Now the baseline GEMM uses these lanes to span the **output-channel dimension** (`col2` in the source). Look at the inner loop pattern:
+
+```c
+NDS_VEC_VSETVLI(vl, mulLen, DEF_VTYPEVQ_SEW, NDS_VEC_VTYPE_LMUL_M8);  // line 742
+...
+for (k = kk; k < max_kk_tiling_size; k += 8) {
+    DEF_VLOAD_V(NDS_VEC_V16, B11);    // load 8 vectors of B (output-channel slabs)
+    ...
+    DEF_VMACC_V(NDS_VEC_V0, tmpa11, NDS_VEC_V16);  // tmpa11 is a *scalar* weight; V16 spans OC
+    ...
+}
+```
+
+The `vqmacc.vx` instruction is "broadcast a scalar weight, multiply across the vector, accumulate". The vector axis here is the output-channel dimension.
+
+`mulLen` is the number of output channels left to process in this tile. For our test shape:
+
+```
+mulLen = OC = 16
+vl     = min(16, VLMAX) = min(16, 256) = 16
+```
+
+**The vector unit runs at VL=16 even though it has 256 lanes available.**
+
+```
+Lane utilization = 16 / 256 = 6.25 %
+```
+
+That is a ~16x architectural cap on what the baseline GEMM can ever achieve on this shape, no matter how clever the rest of the code is. The hot loop is correct, well-unrolled, well-prefetched, well-tiled in cache - but it is starved of work.
+
+This is the first and biggest cause of the 3-4x gap.
+
+---
+
+## Fix 1 - Flip the vectorization axis (2.47x alone)
+
+The optimized version (commit `5f37b680` in `~/work/libnn`) abandons "vectorize across OC" for a kernel that **vectorizes along the reduction dimension** (K = 576 here):
+
+```c
+// libnn/Source/NNSupportFunctions/nn_mat_mult_kernel_s8_offset.c
+// in nn_mat_mult_kernel_s8_offset_unroll4
+
+while (col_count >= maxvl_per_loop) {
+    NDS_VEC_VSETVLI(vl, col_count, NDS_VEC_VTYPE_SEW_E8, NDS_VEC_VTYPE_LMUL_M1);
+    NDS_VEC_VLE8_V(NDS_VEC_V16, ptr_a0);    // load weight row, length VL along K
+    NDS_VEC_VLE8_V(NDS_VEC_V20, ptr_b0);    // load pixel column, length VL along K
+    ...
+    NDS_VEC_VSETVLI(vl, vl, NDS_VEC_VTYPE_SEW_E32, NDS_VEC_VTYPE_LMUL_M1);
+    NDS_VEC_VD4DOTS_VV(NDS_VEC_V0, NDS_VEC_V16, NDS_VEC_V20);  // partial dot product
+    ...
+}
+```
+
+Now the lane axis is the K dimension. K = 576 is much bigger than VLMAX, so every instruction runs at full VL. Lane utilization jumps from 6% to 100%. There is a small price - a horizontal `vredsum` is needed at the end of each (channel, pixel) pair to fold the partial sums - but with K = 576 versus a per-instruction VLMAX of 128, the reduction is a tiny tail, easily amortized.
+
+**Measured (commit log): 5,456,391 cycles -> 2,208,698 cycles. 2.47x.**
+
+This is purely an axis change. Same MAC count, same memory traffic, same data. Just different lanes doing the work.
+
+### Why didn't the baseline do this?
+
+It probably came from a generic library template designed to work for **any** matrix shape. When OC is large and K is small, vectorizing across OC is the right call. But conv layers in real CNNs frequently have small OC at the early stage (e.g., MobileNet's first 1x1 expansion has OC = 16 too). The baseline GEMM was never specialized for the small-OC regime, so it kept the inefficient axis.
+
+---
+
+## Fix 2 - Register tile widening (1.25x more)
+
+After Fix 1, every vector instruction uses 100% of lanes. The next bottleneck is **memory traffic per useful op**.
+
+A naive "vectorize along K" still has a problem: for each (output channel, output pixel) pair, the kernel must walk through all of K, doing one vload per chunk and one `vd4dots` per chunk. The compute-to-load ratio is 1:1.
+
+Standard solution from BLAS literature: process a small block of (channels x pixels) per inner step, so the loaded vectors get reused.
+
+**libnn's `unroll4` kernel processes a 4 x 4 tile (4 output channels x 4 output pixels):**
+
+```c
+// 8 vector loads per inner step:
+NDS_VEC_VLE8_V(NDS_VEC_V16, ptr_a0);  // weight row for ch0
+NDS_VEC_VLE8_V(NDS_VEC_V17, ptr_a1);  // weight row for ch1
+NDS_VEC_VLE8_V(NDS_VEC_V18, ptr_a2);  // weight row for ch2
+NDS_VEC_VLE8_V(NDS_VEC_V19, ptr_a3);  // weight row for ch3
+NDS_VEC_VLE8_V(NDS_VEC_V20, ptr_b0);  // pixel col 0
+NDS_VEC_VLE8_V(NDS_VEC_V21, ptr_b1);  // pixel col 1
+NDS_VEC_VLE8_V(NDS_VEC_V22, ptr_b2);  // pixel col 2
+NDS_VEC_VLE8_V(NDS_VEC_V23, ptr_b3);  // pixel col 3
+
+// 16 vd4dots, one per (channel, pixel) pair:
+NDS_VEC_VD4DOTS_VV(NDS_VEC_V0,  NDS_VEC_V16, NDS_VEC_V20);  // ch0 . pix0
+NDS_VEC_VD4DOTS_VV(NDS_VEC_V1,  NDS_VEC_V16, NDS_VEC_V21);  // ch0 . pix1
+NDS_VEC_VD4DOTS_VV(NDS_VEC_V2,  NDS_VEC_V16, NDS_VEC_V22);  // ch0 . pix2
+NDS_VEC_VD4DOTS_VV(NDS_VEC_V3,  NDS_VEC_V16, NDS_VEC_V23);  // ch0 . pix3
+NDS_VEC_VD4DOTS_VV(NDS_VEC_V4,  NDS_VEC_V17, NDS_VEC_V20);  // ch1 . pix0
+... 12 more vd4dots
+```
+
+Compute-to-load ratio: **16 / 8 = 2.0**.
+
+(The intermediate v2 kernel did 4ch x 2pix with ratio 1.33; the v4 kernel did 4ch x 2pix at LMUL=M2 with ratio 1.33; the final unroll4 hit 2.0.)
+
+Why is this huge? Because at this level of optimization, most cycles on a vector chip are spent waiting for loads, not waiting for the ALU. Doubling the compute per load directly speeds up the whole kernel.
+
+**Measured (commit `5f37b680` extension): 2,208,698 cycles -> 1,767,895 cycles. 1.25x.**
+
+---
+
+## Fix 3 - im2col bulk row copies (1.57x more)
+
+After Fixes 1 and 2, the GEMM is well-vectorized, so cycles spent in the GEMM go down. But cycles spent in **im2col** (just data movement, no math) stay the same. They become a larger share.
+
+Look at the baseline's im2col loop (`riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any.c:467-485`):
+
+```c
+for (cur_out_y ...) {
+    for (cur_out_x ...) {
+        for (cur_ker_y = ...; cur_ker_y < ...; cur_ker_y++) {
+            for (cur_ker_x = ...; cur_ker_x < ...; cur_ker_x++) {
+                if (out_of_bounds) {
+                    nn_set_val_s8(src1_buf, -in_offset, in_tensor_ch);  // 64 bytes
+                } else {
+                    nn_dup_s8(in_tensor + offset, src1_buf, in_tensor_ch);  // 64 bytes
+                }
+                src1_buf += in_tensor_ch;
+            }
+        }
+        ...
+    }
+}
+```
+
+For each output pixel, this copies **9 separate 64-byte chunks** (one per kernel position), each going through its own vload + vstore. And each iteration runs the in-bounds check (4 compares) on every kernel position - even for output pixels that are nowhere near the image edge.
+
+libnn's commit `92703a32` makes two changes:
+
+### 3a. Region split: separate the padding zones from the bulk
+
+The output is divided into 5 regions:
+
+```
++---------------------+
+|    top  (padded)    |
++---+-------------+---+
+|   |             |   |
+| L |  middle     | R |   <- middle has NO padding,
+|   |  (bulk)     |   |      padding checks not needed
+|   |             |   |
++---+-------------+---+
+|   bottom (padded)   |
++---------------------+
+```
+
+The four padded regions (top, bottom, left, right) keep the per-position copy + bounds-check loop. The middle region drops all padding checks - the receptive field is always fully inside the image.
+
+### 3b. Bulk row copy in the middle
+
+For every output pixel in the middle region:
+
+```c
+for (cur_ker_y = ...; cur_ker_y < ...; cur_ker_y++) {
+    nn_dup_s8(in_tensor + offset,
+              col_ptr,
+              in_tensor_ch * ker_dim_x);  // 64 * 3 = 192 bytes per row
+    col_ptr += in_tensor_ch * ker_dim_x;
+}
+```
+
+Three `nn_dup_s8(192 bytes)` calls replace nine `nn_dup_s8(64 bytes)` calls. ~3x fewer vload/vstore pairs, and the underlying memcpy primitive amortizes its setup cost over a longer copy.
+
+**Measured: 1.57x speedup over the post-Fix-2 baseline.**
+
+(There is also an "8-pixel double-pump" in the same commit - im2col 8 pixels then call the GEMM kernel twice. The commit notes it is neutral on its own; it exists to keep weights L1-hot between the two calls.)
+
+---
+
+## Decision tree: when to pick which approach
+
+The optimized libnn keeps the old GEMM around as a fallback. The new fast path is gated on `out_tensor_ch <= 64`. Generalize that to a rule of thumb:
+
+| Shape signal | Recommended GEMM strategy |
+|---|---|
+| **OC small** (<= 64), K large | Vectorize along K (`unroll4`-style, 4ch x 4pix tile) |
+| **OC large** (> 128), K small | Vectorize across OC (baseline `vqmacc.vx`-style) |
+| **OC == K == medium** | Either works; pick the one with fewer leftover lanes after `min(VLMAX, axis)` |
+| **K == 1** (1x1 conv) | Skip im2col; GEMM directly on input layout |
+| **OC == 1** (depthwise) | Don't use GEMM; per-channel direct conv |
+| **K == 3 or 5, large IC** | Try direct conv (no im2col), like commit `4197132c` |
+
+The decisive question is always:
+
+> When I do `vsetvli(vl, axis_size, ...)` with my chosen LMUL,
+> how full is the resulting `vl`?
+
+If `axis_size >= VLMAX`, you are good. If `axis_size << VLMAX`, you are wasting silicon and you should pick a different axis.
+
+For VLEN = 1024 and 32-bit accumulators:
+
+| LMUL | VLMAX (E32) | Threshold for "axis is big enough" |
+|---|---|---|
+| M1 | 32 | OC >= 32 |
+| M2 | 64 | OC >= 64 |
+| M4 | 128 | OC >= 128 |
+| M8 | 256 | OC >= 256 |
+
+The baseline picked M8. Many real CNN layers have OC of 16, 32, 64. They will all suffer the same 4-16x penalty unless the GEMM is shape-aware.
+
+### im2col strategies
+
+| Shape signal | Recommended im2col |
+|---|---|
+| Padding rare (most pixels in middle) | Region-split, bulk row copy |
+| Padding pervasive (small input, large kernel) | Per-position copy is fine; padding checks dominate anyway |
+| K = 1 | No im2col |
+| Large IC, large output | Tiled im2col, fused with GEMM in cache-resident chunks |
+
+---
+
+## What this means for the optimization workflow
+
+1. **Profile lane utilization, not just FLOPs.** A kernel can hit 100% IPC and still be 16x slower than it should be, if 94% of vector lanes are unused.
+
+2. **The vectorization axis matters more than the instruction.** Both repos have access to `vd4dots`, `vqmacc.vx`, `vqmaccsu.vx`, etc. The choice of *which dimension to spread across the lanes* is the dominant decision.
+
+3. **Optimize iteratively, in the right order.** GEMM-axis fix gave 2.47x; tile widening gave another 1.25x; im2col fix gave another 1.57x. Each step exposed the next bottleneck. Doing them out of order would have given misleading speedups - e.g., fixing im2col before fixing the GEMM axis would only have given a small win because the GEMM was the long pole.
+
+4. **Generic templates are a trap when shape varies.** The baseline GEMM is a perfectly serviceable matrix multiply for moderately-sized OC. It just happens to be terrible for the small-OC regime that NN inference actually exhibits. A specialized fast path keyed on a single shape predicate (`out_ch <= 64`) recovered the entire 4-5x.
+
+---
+
+## File pointers
+
+### Baseline (this repo)
+
+- Caller: `Source/ConvolutionFunctions/riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any.c:311-530` (the `ENA_NDS_V5_VEC_DOT_PROD && ENA_TILING` branch)
+- GEMM wrapper: `Source/NNSupportFunctions/nn_mat_mul_kernel_tiling_asym_s8_s8_s8.c`
+- GEMM hot loop: `internal/internal_vec_mat_mul_tiling.h:709-` (`vec_mat_mul_rvv_tiling_vq`)
+- Macro: `internal/internal_vec_i_v1_0.h:873` (`NDS_VEC_VQMACC_VX`)
+
+### Optimized (`~/work/libnn`)
+
+- Caller (out_ch <= 64 fast path): `Source/ConvolutionFunctions/riscv_nn_conv_HWC_s8_s8_s8_asym_bias_any.c:467-772`
+- GEMM kernel: `Source/NNSupportFunctions/nn_mat_mult_kernel_s8_offset.c:1728` (`nn_mat_mult_kernel_s8_offset_unroll4`)
+
+### Commits with measured numbers
+
+- `5f37b680` `[opt/rvv] Add 4x2 tiled GEMM kernel (v4) for conv_HWC_s8 - 3.09x speedup` (axis flip + tile widening)
+- `f526165b` `[opt/rvv] Add 4x4 vd4dots GEMM - 1.03x speedup` (further tile widening)
+- `92703a32` `[opt/rvv] Optimize ... im2col with bulk row copies - 1.57x speedup`
