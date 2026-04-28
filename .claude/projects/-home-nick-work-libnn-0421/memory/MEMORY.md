@@ -7,3 +7,4 @@
 - [Clamp chains: batch vmax then vmin](feedback_clamp_chain_batching.md) — In requantize tails, batch all vmax then all vmin (not alternating) to hide VALU latency; measured +0.64% in unroll4 round 6.
 - [llvm-mca for AX45MPV](reference_llvm_mca_ax45v.md) — Invocation flags for nx45v + Andes vdot/vqmac; what the model gets right vs wrong vs FPGA ground truth.
 - [SW-pipeline amortization threshold](feedback_swpipe_amortization_threshold.md) — 4x4 vd4dots SW-pipeline pattern only nets positive when inner-loop iters >= ~4-5 per call; check `K/VLMAX` before porting from s8 sibling.
+- [vmadd.vx fuses vmul+vadd(NN_ROUND)](feedback_vmadd_fusion_requantize.md) — In requantize tails reuse bias-load reg as NN_ROUND broadcast; vmadd.vx collapses 3-stage vsra->vmul->vadd RAW chain to 2 stages.
