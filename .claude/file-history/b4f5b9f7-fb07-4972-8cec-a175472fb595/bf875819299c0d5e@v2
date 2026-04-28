@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+################################################################################
+# Build a libnn unit test (if needed) and run it on QEMU with the hotblocks
+# TCG plugin enabled. Captures (pc, tcount, icount, ecount) per translation
+# block to a plugin log file.
+#
+# Why this matters: the hotblocks plugin gives ground-truth execution
+# frequency for every translation block QEMU sees. The hottest block by
+# `ecount` is the innermost loop body of whatever was running -- which is
+# exactly what we want to extract for a microbenchmark.
+#
+# Usage:
+#   run_hotblocks.sh <test_name> [--config <config.toml>] [--timeout N]
+#
+# Output:
+#   ${CFG_HIK_WORK_DIR}/<test_name>.plugin.log    -- raw plugin output
+#   ${CFG_HIK_WORK_DIR}/<test_name>.qemu.log      -- QEMU stderr (if any)
+################################################################################
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+TEST_NAME=""
+TIMEOUT_OVERRIDE=""
+CONFIG_TOML=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --timeout) TIMEOUT_OVERRIDE="$2"; shift 2 ;;
+        --config)  CONFIG_TOML="$2"; shift 2 ;;
+        -*)        echo "Unknown option: $1" >&2; exit 1 ;;
+        *)         TEST_NAME="$1"; shift ;;
+    esac
+done
+
+if [ -z "${TEST_NAME}" ]; then
+    echo "Usage: $0 <test_name> [--timeout N] [--config <config.toml>]" >&2
+    exit 1
+fi
+
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/parse_config.sh" ${CONFIG_TOML:+"${CONFIG_TOML}"}
+
+TIMEOUT="${TIMEOUT_OVERRIDE:-${CFG_QEMU_TIMEOUT}}"
+UNIT_TEST_DIR="${CFG_LIBNN_ROOT}/Examples/unit_func"
+TEST_SRC="${UNIT_TEST_DIR}/t_${TEST_NAME}.c"
+LIBNN="${CFG_LIBNN_ROOT}/libnn.a"
+ADX="${CFG_HIK_WORK_DIR}/t_${TEST_NAME}.adx"
+PLUGIN_LOG="${CFG_HIK_WORK_DIR}/${TEST_NAME}.plugin.log"
+QEMU_LOG="${CFG_HIK_WORK_DIR}/${TEST_NAME}.qemu.log"
+
+for f in "${CFG_CC}" "${CFG_QEMU_BIN}" "${CFG_QEMU_CONFIG}" "${TEST_SRC}" "${LIBNN}" "${CFG_HIK_QEMU_PLUGIN}"; do
+    [ -f "$f" ] || { echo "ERROR: Not found: $f" >&2; exit 1; }
+done
+
+export PATH="${CFG_TOOLCHAIN_BIN}:${PATH}"
+
+# (Re)compile only if missing or stale wrt libnn.a.
+if [ ! -f "${ADX}" ] || [ "${LIBNN}" -nt "${ADX}" ] || [ "${TEST_SRC}" -nt "${ADX}" ]; then
+    echo "[compile] ${TEST_NAME}"
+    INC="-I${CFG_LIBNN_ROOT}/Include -I${UNIT_TEST_DIR}/include"
+    CFLAGS_LINK="-Wl,-gc-sections -DGETENV_TESTDIR=${UNIT_TEST_DIR}"
+    CFLAGS_ALL="${CFG_CFLAGS_BASE} ${CFG_CFLAGS_VERIFY} ${CFLAGS_LINK}"
+    ${CFG_CC} ${CFLAGS_ALL} ${INC} -o "${ADX}" "${TEST_SRC}" "${LIBNN}" -lm 2>&1
+    if [ $? -ne 0 ]; then
+        echo "RESULT: COMPILE_ERROR" >&2
+        exit 1
+    fi
+else
+    echo "[compile] ${TEST_NAME} -- up to date, skipping"
+fi
+
+cd "${UNIT_TEST_DIR}"
+
+# `-d plugin -D <log>` redirects qemu_plugin_outs() output to <log>.
+# `inline=true` makes hotblocks increment counters via TCG-inlined ops (faster).
+QEMU_CMD=(
+    "${CFG_QEMU_BIN}"
+    -plugin "file=${CFG_HIK_QEMU_PLUGIN},inline=true"
+    -d plugin -D "${PLUGIN_LOG}"
+    -readconfig "${CFG_QEMU_CONFIG}"
+    -M "${CFG_QEMU_MACHINE}"
+    -cpu "${CFG_QEMU_CPU}"
+    -nographic -semihosting -bios "${ADX}"
+)
+
+echo "[run] QEMU + hotblocks (timeout=${TIMEOUT}s)"
+# Andes QEMU semihosting goes to fd 9; ignore that here -- we only need plugin
+# output. Backgrounding + pkill matches the pattern of run_qemu_test.sh.
+timeout "${TIMEOUT}" "${QEMU_CMD[@]}" > "${QEMU_LOG}" 2>&1 &
+QEMU_PID=$!
+# Wait for either QEMU to finish or for the plugin log to appear with content.
+# Some workloads exit cleanly via semihosting; others run forever -- in either
+# case the plugin log is only flushed on plugin_exit which happens at QEMU
+# termination. So we just wait for `timeout` to do its job, then kill if alive.
+wait "${QEMU_PID}" 2>/dev/null
+QEMU_RC=$?
+
+if [ ! -s "${PLUGIN_LOG}" ]; then
+    echo "ERROR: plugin log is empty: ${PLUGIN_LOG}" >&2
+    echo "--- QEMU stderr tail ---" >&2
+    tail -20 "${QEMU_LOG}" >&2 2>/dev/null || true
+    exit 1
+fi
+
+echo "[ok] plugin log: ${PLUGIN_LOG} ($(wc -l < "${PLUGIN_LOG}") lines)"
+echo "[ok] QEMU exit: ${QEMU_RC}"

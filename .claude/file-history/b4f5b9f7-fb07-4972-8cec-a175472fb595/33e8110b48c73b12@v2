@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""
+Identify the hot inner loop body and its prologue from a libnn objdump,
+guided by hotblocks plugin output.
+
+Inputs:
+  --plugin-log   : QEMU hotblocks plugin output (pc, tcount, icount, ecount)
+  --objdump      : disassembly file (e.g. t_<test>_perf.objdump)
+  --function     : entry function name (the libnn function the user is profiling).
+                   The hottest block returned must lie inside this function or
+                   one of its callees.
+  --top-k        : how many candidate hot blocks to consider (default 5)
+
+Output (JSON to stdout):
+  {
+    "hot_block_pc": "0x12fe0",
+    "hot_block_ecount": 5984,
+    "containing_fn": "nn_mat_mult_kernel_s8_offset_unroll4",
+    "containing_fn_start": "0x128d4",
+    "loop_start_pc": "0x12fa4",       # branch target of innermost backward branch
+    "loop_end_pc":   "0x12fec",       # PC of the backward branch itself
+    "loop_body_lines": [...]          # raw objdump lines for the loop body
+    "prologue_lines":  [...]          # objdump lines from fn entry up to loop_start_pc
+    "live_in_regs":  {                # registers the loop body reads before writing
+        "scalar": ["a0", "a1", "a2", ...],
+        "vector": ["v0", "v8", ...]
+    },
+    "live_in_producers": [...]        # prologue lines that write to live-ins
+                                      # (subset of prologue_lines, transitively
+                                      #  closed)
+  }
+
+The output drives the harness emitter. We deliberately emit BOTH the full
+prologue (entry..loop) and the live-in producer subset so the user can pick:
+the full prologue is conservative-correct (literally what the function does
+before the loop); the producer subset is a tighter approximation.
+"""
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+
+# ----------------------------------------------------------------------------
+# objdump parsing
+# ----------------------------------------------------------------------------
+
+# Function header: "0000000000010b30 <name>:"
+FN_HDR_RE = re.compile(r"^([0-9a-f]+)\s+<([^>]+)>:\s*$")
+
+# Instruction line: "   12fe0:\t<hex>\t<mnemonic>[\t<operands>]"
+# Hex column may have multiple bytes; we only need the address.
+INSN_RE = re.compile(r"^\s*([0-9a-f]+):\s+([0-9a-f]+)\s+(\S+)(?:\s+(.*))?$")
+
+# Branch operand parsing: "0x12fec <fn_name+0xN>" or just "0x12fec"
+BRANCH_TGT_RE = re.compile(r"(0x[0-9a-f]+)")
+
+
+def parse_objdump(path: Path):
+    """
+    Return (functions, insns) where:
+      functions = list of (start_pc, end_pc, name) sorted by start_pc
+      insns     = dict pc -> {"line": raw_line, "mnemonic": str, "operands": str,
+                              "fn": name}
+    end_pc is exclusive (= next fn's start_pc, or address-after-last-insn).
+    """
+    functions = []
+    insns = {}
+
+    current_fn = None
+    fn_start_pc = None
+
+    with path.open() as f:
+        lines = f.readlines()
+
+    # First pass: collect (fn, start_pc) and per-pc insn data.
+    for raw in lines:
+        m = FN_HDR_RE.match(raw)
+        if m:
+            current_fn = m.group(2)
+            fn_start_pc = int(m.group(1), 16)
+            functions.append([fn_start_pc, None, current_fn])  # end filled later
+            continue
+        m = INSN_RE.match(raw)
+        if m and current_fn is not None:
+            pc = int(m.group(1), 16)
+            mnemonic = m.group(3)
+            operands = (m.group(4) or "").strip()
+            insns[pc] = {
+                "line":     raw.rstrip("\n"),
+                "mnemonic": mnemonic,
+                "operands": operands,
+                "fn":       current_fn,
+            }
+
+    # Second pass: fill in end_pc per function (exclusive upper bound).
+    functions.sort(key=lambda x: x[0])
+    for i, fn in enumerate(functions):
+        if i + 1 < len(functions):
+            fn[1] = functions[i + 1][0]
+        else:
+            # Last function: use max insn pc + something reasonable.
+            max_pc = max(insns.keys()) if insns else fn[0]
+            fn[1] = max_pc + 4
+
+    return functions, insns
+
+
+def find_fn(functions, name):
+    """Return (start_pc, end_pc) for fn `name`, or None."""
+    for s, e, n in functions:
+        if n == name:
+            return (s, e)
+    return None
+
+
+def fn_at(functions, pc):
+    """Return function tuple containing `pc`, or None."""
+    for s, e, n in functions:
+        if s <= pc < e:
+            return (s, e, n)
+    return None
+
+
+# objdump emits call targets as either "<name>" or "<name+0xN>". We want the
+# bare name so we can match against function headers.
+CALL_TGT_RE = re.compile(r"<([^+>]+)(?:\+0x[0-9a-f]+)?>")
+
+
+def reachable_functions(insns, functions, root_name):
+    """
+    Compute the set of function names reachable via `jal`/`jalr` from `root_name`.
+    BFS over the static call graph extracted from objdump.
+
+    Why this matters: hotblocks reports the hottest TBs over the WHOLE program,
+    including the test harness's fread/memcmp loops. Without filtering, the
+    "hottest" block is almost always I/O. By restricting to functions reachable
+    from the libnn entry, we focus on actual kernel work.
+
+    Note: this is a SOUND over-approximation -- we add anything called via a
+    direct `jal <symbol>`. Indirect `jalr` calls are skipped (objdump shows
+    them as register-only operands). For libnn this is fine since dispatch
+    is via direct calls.
+    """
+    fn_names = {n for _, _, n in functions}
+    if root_name not in fn_names:
+        return set()
+    fn_ranges = {n: (s, e) for s, e, n in functions}
+
+    reachable = {root_name}
+    worklist = [root_name]
+    while worklist:
+        cur = worklist.pop()
+        s, e = fn_ranges[cur]
+        for pc, ins in insns.items():
+            if not (s <= pc < e):
+                continue
+            if ins["mnemonic"] not in ("jal", "c.jal"):
+                continue
+            m = CALL_TGT_RE.search(ins["operands"])
+            if not m:
+                continue
+            target = m.group(1)
+            if target in fn_names and target not in reachable:
+                reachable.add(target)
+                worklist.append(target)
+    return reachable
+
+
+# ----------------------------------------------------------------------------
+# hotblocks plugin parsing
+# ----------------------------------------------------------------------------
+
+# "0x000000000001297c, 1, 17, 2008"
+HB_RE = re.compile(r"^(0x[0-9a-f]+),\s*\d+,\s*(\d+),\s*(\d+)\s*$")
+
+
+def parse_hotblocks(path: Path):
+    """Return list of dicts: [{pc, icount, ecount}, ...] sorted by ecount desc."""
+    blocks = []
+    with path.open() as f:
+        for line in f:
+            m = HB_RE.match(line.strip())
+            if m:
+                blocks.append({
+                    "pc":     int(m.group(1), 16),
+                    "icount": int(m.group(2)),
+                    "ecount": int(m.group(3)),
+                })
+    blocks.sort(key=lambda b: -b["ecount"])
+    return blocks
+
+
+# ----------------------------------------------------------------------------
+# Loop boundary detection from objdump
+# ----------------------------------------------------------------------------
+
+# RISC-V conditional branches and jumps (we treat unconditional `j`/`c.j` too).
+BRANCHES = {
+    "beq", "bne", "blt", "bltu", "bge", "bgeu",
+    "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
+    "c.beqz", "c.bnez",
+    "j", "jal", "c.j", "c.jal",
+    "bge", "ble",
+    # pseudo-mnemonics objdump may emit:
+    "ble", "bgt", "bleu", "bgtu",
+}
+
+
+def insn_is_branch(insn):
+    return insn["mnemonic"] in BRANCHES
+
+
+def branch_target(insn):
+    """Extract numeric branch target PC from objdump operands, or None."""
+    m = BRANCH_TGT_RE.search(insn["operands"])
+    return int(m.group(1), 16) if m else None
+
+
+def find_innermost_loop(insns, fn_start, fn_end, hot_pc):
+    """
+    Walk forward from hot_pc within [fn_start, fn_end) to find the next
+    backward branch whose target lies <= hot_pc and >= fn_start. That branch
+    closes the smallest loop containing the hot block.
+
+    Returns (loop_start_pc, loop_end_pc) or None.
+    loop_start_pc = branch target (loop header).
+    loop_end_pc   = PC of the backward branch itself.
+    """
+    sorted_pcs = sorted(p for p in insns.keys() if fn_start <= p < fn_end)
+    candidates = []
+    for pc in sorted_pcs:
+        if pc < hot_pc:
+            continue
+        ins = insns[pc]
+        if not insn_is_branch(ins):
+            continue
+        tgt = branch_target(ins)
+        if tgt is None:
+            continue
+        # Must be backward (tgt < pc) AND containing hot_pc.
+        if tgt <= hot_pc <= pc and tgt >= fn_start:
+            candidates.append((pc, tgt))
+
+    if not candidates:
+        return None
+    # The "innermost" is the one with the smallest (pc - tgt) span among those
+    # containing hot_pc. (A nested smaller loop would have an even smaller span,
+    # but if hot_pc is inside it, this candidate wins.)
+    candidates.sort(key=lambda x: x[0] - x[1])
+    end_pc, start_pc = candidates[0]
+    return (start_pc, end_pc)
+
+
+# ----------------------------------------------------------------------------
+# Live-in analysis
+# ----------------------------------------------------------------------------
+
+# Regex to peel register names from operand strings. We match the union of:
+#   - x-style scalar names: x0..x31
+#   - ABI scalar names: zero, ra, sp, gp, tp, t0..t6, s0..s11, a0..a7, fp
+#   - Compressed C* aliases that objdump rarely uses (it usually emits ABI)
+#   - Vector regs: v0..v31
+#
+# Memory operands like "152(sp)" -> we take "sp" as a read, no separate offset.
+SCALAR_REGS = {
+    "zero", "ra", "sp", "gp", "tp", "fp",
+    *(f"t{i}" for i in range(7)),
+    *(f"s{i}" for i in range(12)),
+    *(f"a{i}" for i in range(8)),
+    *(f"x{i}" for i in range(32)),
+}
+VECTOR_REGS = {f"v{i}" for i in range(32)}
+
+REG_TOKEN_RE = re.compile(r"\b([vstxa]\d+|fp|ra|sp|gp|tp|zero)\b")
+
+
+def extract_regs(operands):
+    """Return ordered list of (kind, name) registers found in operands string.
+    kind is 'v' for vector, 's' for scalar."""
+    out = []
+    for tok in REG_TOKEN_RE.findall(operands):
+        if tok in VECTOR_REGS:
+            out.append(("v", tok))
+        elif tok in SCALAR_REGS:
+            out.append(("s", tok))
+    return out
+
+
+# Mnemonic -> (num_dst_operands_at_start, has_dst)
+# Most RISC-V instructions follow `op rd, rs1, rs2[, ...]` where rd is the
+# first operand. Branches/stores have NO destination register written.
+# Vector loads `vle*.v vd, (rs1)` and stores `vse*.v vs3, (rs1)` -- the first
+# vector reg in vse is a SOURCE not a dest.
+# We classify by mnemonic prefix.
+
+NO_DST_PREFIXES = (
+    "b",      # branches: beq, bne, ...
+    "c.b",    # compressed branches
+    "j", "c.j",  # jumps
+    "vse",    # vector stores: vse8.v, vse16.v, vse32.v
+    "sb", "sh", "sw", "sd",   # scalar stores
+    "c.sw", "c.sd", "c.sh", "c.sb",
+    "c.swsp", "c.sdsp",
+    "fsd", "fsw",
+    "ret",
+    "fence", "ecall", "ebreak", "wfi",
+)
+# vector ops that accumulate INTO their destination (read-modify-write):
+# vd is both read AND written.
+RMW_VECTOR_PREFIXES = (
+    "vd4dots",  # Andes custom vd4dots.vv: v0 += v_{rs1} dotprod v_{rs2}
+    "vmacc",    # vmacc.vv vd, vs1, vs2 -- vd += vs1 * vs2
+    "vnmacc",
+    "vmadd",
+    "vnmadd",
+    "vqmacc",
+    "vredsum",  # vredsum.vs vd, vs2, vs1 -- partial reductions touch vd
+    "vredmax", "vredmin", "vredor", "vredand", "vredxor",
+    "vfmacc", "vfnmacc", "vfmadd", "vfnmadd",
+    "vfredusum", "vfredosum", "vfredmax", "vfredmin",
+)
+
+# vsetvli: `vsetvli rd, rs1, ...` writes rd (gets vl) and updates vtype/vl CSR.
+# Treat rd as written. rs1 as read.
+# vsetvli with x0 dest (`vsetvli x0, x0, ...`) writes nothing scalar, just CSR.
+
+# Compressed instructions: c.li/c.mv/c.add etc. -- rd is first operand and
+# it's both read and written for c.add/c.addi (rd = rd + ...). For c.mv/c.li,
+# rd is only written.
+
+C_RMW_SCALAR = {
+    "c.add", "c.addi", "c.addiw", "c.addw",
+    "c.sub", "c.subw",
+    "c.and", "c.andi", "c.or", "c.xor",
+    "c.slli", "c.srli", "c.srai",
+}
+
+
+def classify_rw(insn):
+    """
+    Return (writes, reads) sets of registers (kind, name) tuples.
+    `writes` = registers definitely written by this instruction.
+    `reads`  = registers read.
+    """
+    mnem = insn["mnemonic"]
+    # Andes vendor extensions appear as `nds.<base>` (e.g. nds.vd4dots.vv,
+    # nds.lea.h, nds.bfos). For r/w classification we want to match against
+    # the base mnemonic. Strip the vendor namespace -- semantics of all the
+    # nds.* ops in libnn follow the standard "rd is first operand" rule with
+    # one exception (nds.vd4dots), which we keep in RMW_VECTOR_PREFIXES below.
+    if mnem.startswith("nds."):
+        mnem = mnem[4:]
+    operands = insn["operands"]
+    regs = extract_regs(operands)
+
+    # Anything matching a no-dst prefix: all regs are reads.
+    for p in NO_DST_PREFIXES:
+        if mnem.startswith(p):
+            return set(), set(regs)
+
+    # vsetvli rd, rs1, e8, m8, tu, mu  -- rd written, rs1 read.
+    if mnem.startswith("vsetvli") or mnem.startswith("vsetivli"):
+        if not regs:
+            return set(), set()
+        # First reg is rd (often `zero`/`x0` -> still treat as written-to-x0
+        # which we can ignore at the live-in stage).
+        rd = regs[0]
+        rest = regs[1:]
+        return {rd}, set(rest)
+
+    # Compressed RMW scalar.
+    if mnem in C_RMW_SCALAR:
+        if not regs:
+            return set(), set()
+        rd = regs[0]
+        rest = regs[1:]
+        return {rd}, set(regs)  # rd is both read AND written
+
+    # Vector RMW (accumulators).
+    for p in RMW_VECTOR_PREFIXES:
+        if mnem.startswith(p):
+            if not regs:
+                return set(), set()
+            rd = regs[0]
+            return {rd}, set(regs)
+
+    # Default: first reg is dst, rest are sources.
+    # Covers: add, addi, mv, li, ld, lw, lh, lb, c.ld, c.lw, c.li, c.mv, ...,
+    # vle*.v vd, (rs1), vmv.v.x, vmv.v.i, vand.vi vd, vs2, imm, etc.
+    # Loads: vle*.v vd, (rs1) -- rd is vd (vector), rs1 is scalar in operands.
+    if not regs:
+        return set(), set()
+    rd = regs[0]
+    rest = regs[1:]
+    return {rd}, set(rest)
+
+
+def compute_live_ins(loop_lines):
+    """
+    Walk the loop body in order. For each instr:
+      - reads of regs not yet written  -> add to live-in set
+      - writes  -> add to written-set
+    Returns set of (kind, name).
+    """
+    written = set()
+    live_ins = set()
+    for ins in loop_lines:
+        w, r = classify_rw(ins)
+        for reg in r:
+            if reg not in written:
+                live_ins.add(reg)
+        written |= w
+    return live_ins
+
+
+def collect_producers(prologue, live_ins):
+    """
+    Walk prologue backward, keep instrs that write a live-in. Their reads
+    transitively become live-ins for the producer subset.
+    Returns ordered list of producer instrs (program order).
+    """
+    needed = set(live_ins)
+    keep_pcs = set()
+    # iterate in reverse program order
+    for ins in reversed(prologue):
+        w, r = classify_rw(ins)
+        if w & needed:
+            keep_pcs.add(ins["pc"])
+            needed = (needed - w) | r
+    # return in program order
+    return [ins for ins in prologue if ins["pc"] in keep_pcs]
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--plugin-log", required=True, type=Path)
+    ap.add_argument("--objdump",    required=True, type=Path)
+    ap.add_argument("--function",   required=True,
+                    help="entry function name; hottest block must lie in this fn or its callees")
+    ap.add_argument("--top-k",      type=int, default=5,
+                    help="how many top-ecount blocks to consider")
+    args = ap.parse_args()
+
+    functions, insns = parse_objdump(args.objdump)
+    if not functions:
+        print(f"ERROR: no functions parsed from {args.objdump}", file=sys.stderr)
+        sys.exit(1)
+
+    blocks = parse_hotblocks(args.plugin_log)
+    if not blocks:
+        print(f"ERROR: no hotblocks parsed from {args.plugin_log}", file=sys.stderr)
+        sys.exit(1)
+
+    # Restrict candidate hot blocks to functions reachable from --function.
+    # Without this filter, the test harness's fread loop dominates ecount.
+    in_scope = reachable_functions(insns, functions, args.function)
+    if args.function not in in_scope:
+        print(f"ERROR: function <{args.function}> not found in objdump",
+              file=sys.stderr)
+        sys.exit(1)
+
+    chosen = None
+    for blk in blocks:
+        fn = fn_at(functions, blk["pc"])
+        if fn is None or fn[2] not in in_scope:
+            continue
+        chosen = (blk, fn)
+        break
+
+    if chosen is None:
+        print(f"ERROR: no hot block lands inside <{args.function}> or its callees",
+              file=sys.stderr)
+        sys.exit(1)
+
+    blk, (fn_s, fn_e, fn_name) = chosen
+
+    # Find loop boundaries.
+    loop = find_innermost_loop(insns, fn_s, fn_e, blk["pc"])
+    if loop is None:
+        print(f"ERROR: no backward branch closing a loop around 0x{blk['pc']:x} "
+              f"in fn <{fn_name}>", file=sys.stderr)
+        sys.exit(1)
+    loop_start, loop_end = loop
+
+    # Collect loop body (start..end inclusive).
+    pcs_sorted = sorted(p for p in insns if loop_start <= p <= loop_end)
+    loop_lines = []
+    for pc in pcs_sorted:
+        d = insns[pc]
+        loop_lines.append({
+            "pc": pc, "line": d["line"],
+            "mnemonic": d["mnemonic"], "operands": d["operands"],
+        })
+
+    # Collect prologue (fn entry..loop_start, exclusive).
+    pcs_pro = sorted(p for p in insns if fn_s <= p < loop_start)
+    prologue_lines = []
+    for pc in pcs_pro:
+        d = insns[pc]
+        prologue_lines.append({
+            "pc": pc, "line": d["line"],
+            "mnemonic": d["mnemonic"], "operands": d["operands"],
+        })
+
+    # Live-in analysis.
+    live_ins = compute_live_ins(loop_lines)
+    producers = collect_producers(prologue_lines, live_ins)
+
+    # Format output.
+    def fmt_regs(li):
+        scalar = sorted({n for k, n in li if k == "s"})
+        vector = sorted({n for k, n in li if k == "v"},
+                        key=lambda v: int(v[1:]))
+        return {"scalar": scalar, "vector": vector}
+
+    out = {
+        "hot_block_pc":     f"0x{blk['pc']:x}",
+        "hot_block_ecount": blk["ecount"],
+        "containing_fn":    fn_name,
+        "containing_fn_start": f"0x{fn_s:x}",
+        "loop_start_pc":    f"0x{loop_start:x}",
+        "loop_end_pc":      f"0x{loop_end:x}",
+        "loop_body_lines":  [l["line"] for l in loop_lines],
+        "loop_body_count":  len(loop_lines),
+        "prologue_lines":   [l["line"] for l in prologue_lines],
+        "prologue_count":   len(prologue_lines),
+        "live_in_regs":     fmt_regs(live_ins),
+        "live_in_producers": [l["line"] for l in producers],
+        "live_in_producers_count": len(producers),
+        "top_hotblocks": [
+            {
+                "pc": f"0x{b['pc']:x}",
+                "ecount": b["ecount"],
+                "icount": b["icount"],
+                "fn": (fn_at(functions, b["pc"]) or (0, 0, "<unknown>"))[2],
+            }
+            for b in blocks[: args.top_k]
+        ],
+    }
+    json.dump(out, sys.stdout, indent=2)
+    print()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""
+Emit a self-contained .S harness that runs the extracted hot inner loop body
+N times under mcycle measurement.
+
+Inputs:
+  --analysis    : JSON from find_hot_loop.py
+  --output      : path to write the .S file
+  --warmup      : warm-up iterations (unmeasured, settle pipeline) [default 5]
+  --iters       : measured iteration count [default 100]
+  --buf-size    : input/weight scratch buffer size in bytes [default 65536]
+
+Output:
+  A complete RISC-V assembly source file with:
+    .data    -- scratch buffers for vector loads
+    .text    -- _start that:
+                  1. allocates a small stack
+                  2. initializes scalar live-ins to point at scratch buffers /
+                     reasonable counts, vector live-ins via vle from scratch
+                  3. runs <warmup> iterations of the loop body
+                  4. wraps <iters> iterations in csrr mcycle / csrr mcycle
+                  5. exits via a `_exit:` label users can hook in their TB
+
+Design notes:
+  - The captured loop body is inlined verbatim, EXCEPT:
+      * the backward branch at loop_end_pc is stripped (we wrap with our own
+        outer counter)
+      * any other branches (mid-loop early-exit) are kept; the user is
+        expected to set up live-in counts so those branches don't fire
+  - Each measured iteration RESETS scalar pointer/count live-ins so the body
+    walks the same buffer every time. Without reset, pointers would walk off
+    the buffer and counts would go negative within a few iters.
+  - Vector live-ins are initialized ONCE (in setup) and the loop body is
+    expected to leave them in a consistent state. For software-pipelined
+    bodies that consume v_lo and produce v_hi (or vice versa), this works
+    because the body's writes restore the inputs the next iter expects.
+
+The harness is written in standalone format -- no semihosting calls in the
+critical region. Cycle deltas are stashed in known memory locations so a
+Verilator testbench can scrape them by address, or a smoke-test on QEMU can
+print them via post-region semihosting.
+"""
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+
+# Regex to peel "ADDR: HEX MNEMONIC OPERANDS" out of an objdump line.
+INSN_RE = re.compile(r"^\s*([0-9a-f]+):\s+([0-9a-f]+)\s+(\S+)(?:\s+(.*))?$")
+
+
+def parse_insn_line(line):
+    """Return dict {addr, mnemonic, operands, raw} or None."""
+    m = INSN_RE.match(line)
+    if not m:
+        return None
+    return {
+        "addr":     int(m.group(1), 16),
+        "mnemonic": m.group(3),
+        "operands": (m.group(4) or "").strip(),
+        "raw":      line,
+    }
+
+
+# ----------------------------------------------------------------------------
+# Live-in initialization
+# ----------------------------------------------------------------------------
+# Default policy: scalar pointer-like names (a0..a7, t0..t6, s0..s11) get
+# pointed at scratch_in / scratch_wt / scratch_out depending on a heuristic
+# based on the order they appear in the loop body's first vle8.v ops.
+
+# We don't try to reason about WHICH scalar is which buffer -- that's an
+# overconstrained problem and the user knows their kernel best. Instead we
+# emit ALL live-in scalars pointing at scratch_in by default, and add a
+# comment block recommending the user override per their buffer layout.
+
+# Vector live-ins: load from scratch_in for v8..v23 (consumer half), zero v0
+# (accumulator pattern). Adjust per kernel.
+
+SCALAR_PTR_HINT = {
+    # If you see these names pointing at output, edit the harness:
+    "a1": "out",  # AAPCS: first arg is dst-ish; for libnn unroll4 a1 is dst
+    "a2": "in",
+    "a0": "in",
+}
+
+
+def emit_live_in_init(live_ins, label_in="scratch_in", label_wt="scratch_wt",
+                      label_out="scratch_out"):
+    """
+    Emit asm lines that establish each live-in scalar/vector to a known value.
+    Buffer assignment is HEURISTIC -- the user is expected to read the
+    generated comments and adjust.
+    """
+    out = []
+    out.append("    # ---- live-in initialization ----")
+    out.append("    # NOTE: scalar pointer assignments are heuristic. Read")
+    out.append("    # the loop body and adjust labels (scratch_in/_wt/_out)")
+    out.append("    # if a register actually points at a different buffer.")
+
+    # Scalar live-ins.
+    for name in live_ins["scalar"]:
+        if name in ("zero", "x0"):
+            continue
+        if name == "sp":
+            # We allocate sp ourselves below.
+            continue
+        if name in ("ra", "tp", "gp"):
+            out.append(f"    li {name}, 0   # neutral init")
+            continue
+        # Loop-bound-like names get a small positive constant.
+        # Stride-like names get the reset constant on each measured iter.
+        # Default: point at scratch_in. User edits as needed.
+        if name in ("s1", "a3", "a4", "a5", "t6"):
+            out.append(f"    li {name}, 0x100   # heuristic count; edit if loop bound")
+        else:
+            buf = "scratch_out" if SCALAR_PTR_HINT.get(name) == "out" else \
+                  "scratch_wt"  if SCALAR_PTR_HINT.get(name) == "wt"  else \
+                  "scratch_in"
+            out.append(f"    la {name}, {buf}   # heuristic pointer init")
+
+    # Vector live-ins.
+    if live_ins["vector"]:
+        out.append("    # vector live-ins: zero accumulators (v0..v15 if RMW), load v16+ from scratch_in")
+        out.append("    vsetvli t0, x0, e8, m8, tu, mu   # max VL for fill")
+        # Group v0..v7 and v8..v15 are typically accumulators -- zero them.
+        # v16..v23, v24..v31 are typically activations/weights -- load.
+        for vname in live_ins["vector"]:
+            n = int(vname[1:])
+            if n < 16:
+                out.append(f"    vand.vi {vname}, {vname}, 0   # zero accumulator")
+            else:
+                out.append(f"    vle8.v {vname}, (a0)   # load from scratch_in (heuristic)")
+        # Re-set vtype to whatever the loop body expects on entry.
+        out.append("    vsetvli x0, x0, e8, m1, tu, mu   # match loop entry vtype (override if different)")
+
+    return out
+
+
+def emit_live_in_reset(live_ins):
+    """
+    Emit asm to reset SCALAR live-ins each measured iteration. We don't reset
+    vector regs each iter -- they're either accumulators (we want the running
+    sum) or pipeline-carried (the body's writes restore them). Resetting vector
+    regs would defeat the SW-pipeline behavior we're trying to measure.
+    """
+    out = []
+    out.append("    # reset scalar live-ins each iter (so pointers don't walk off buffer)")
+    for name in live_ins["scalar"]:
+        if name in ("zero", "x0", "sp", "ra", "tp", "gp"):
+            continue
+        if name in ("s1", "a3", "a4", "a5", "t6"):
+            out.append(f"    li {name}, 0x100")
+        else:
+            buf = "scratch_out" if SCALAR_PTR_HINT.get(name) == "out" else \
+                  "scratch_wt"  if SCALAR_PTR_HINT.get(name) == "wt"  else \
+                  "scratch_in"
+            out.append(f"    la {name}, {buf}")
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Loop body emission
+# ----------------------------------------------------------------------------
+
+BRANCH_MNEMONICS = {
+    "beq", "bne", "blt", "bltu", "bge", "bgeu",
+    "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
+    "ble", "bgt", "bleu", "bgtu",
+    "c.beqz", "c.bnez",
+    "j", "c.j", "jal", "c.jal",
+}
+
+# Match the leading "0x..." numeric target and any trailing "<sym+offset>".
+BRANCH_OPERAND_RE = re.compile(
+    r"^(.*?)(0x[0-9a-f]+)(\s*<[^>]+>)?\s*$"
+)
+
+
+def label_for(addr):
+    return f"_kpc_{addr:x}"
+
+
+def emit_loop_body(loop_lines, loop_start_pc, loop_end_pc):
+    """
+    Convert objdump lines back to assembleable instructions:
+      1. Strip the backward branch at loop_end_pc (our outer counter replaces it).
+      2. For every other branch:
+         - Strip the "<sym+offset>" operand annotation (the harness has no
+           sym to resolve against).
+         - If the target is INSIDE the loop body, rewrite the absolute hex
+           address to a local label `_kpc_<hex>` and emit the label at the
+           target location. This preserves intra-body control flow.
+         - If the target is OUTSIDE the loop body (forward escape, e.g. a
+           tail-handling early exit), rewrite to `_oob_exit`. This label
+           lives outside the measurement window in the surrounding harness;
+           if it ever fires, the harness exits cleanly instead of jumping
+           into garbage memory.
+      3. Pass everything else through verbatim (operands like vector regs,
+         memory operands, immediates -- all assembler-legal as objdump emits).
+    """
+    # First pass: collect all branch target addrs that point inside the body.
+    body_pcs = set()
+    targets_inside = set()
+    for raw in loop_lines:
+        ins = parse_insn_line(raw)
+        if ins is None:
+            continue
+        body_pcs.add(ins["addr"])
+
+    for raw in loop_lines:
+        ins = parse_insn_line(raw)
+        if ins is None:
+            continue
+        if ins["mnemonic"] not in BRANCH_MNEMONICS:
+            continue
+        if ins["addr"] == loop_end_pc:
+            continue  # the closing backward branch will be stripped
+        m = BRANCH_OPERAND_RE.match(ins["operands"])
+        if not m:
+            continue
+        tgt = int(m.group(2), 16)
+        if loop_start_pc <= tgt <= loop_end_pc:
+            targets_inside.add(tgt)
+
+    # Second pass: emit, with labels prepended at any addr in targets_inside.
+    out = []
+    for raw in loop_lines:
+        ins = parse_insn_line(raw)
+        if ins is None:
+            continue
+        # Insert label before the instruction if anyone branches to this addr.
+        if ins["addr"] in targets_inside:
+            out.append(f"{label_for(ins['addr'])}:")
+
+        if ins["addr"] == loop_end_pc:
+            out.append(
+                f"    # (stripped backward branch: "
+                f"{ins['mnemonic']} {ins['operands']})"
+            )
+            continue
+
+        if ins["mnemonic"] in BRANCH_MNEMONICS:
+            m = BRANCH_OPERAND_RE.match(ins["operands"])
+            if m:
+                pre = m.group(1)         # everything before the numeric target
+                tgt = int(m.group(2), 16)
+                if loop_start_pc <= tgt <= loop_end_pc:
+                    new_tgt = label_for(tgt)
+                else:
+                    new_tgt = "_oob_exit"
+                out.append(f"    {ins['mnemonic']} {pre}{new_tgt}")
+                continue
+
+        out.append(f"    {ins['mnemonic']} {ins['operands']}".rstrip())
+
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Whole-file emission
+# ----------------------------------------------------------------------------
+
+HEADER = """\
+###############################################################################
+# Hot-inner-kernel harness
+#
+# Auto-generated by hot-inner-kernel-extractor. Do NOT edit the generated body
+# directly; re-run the extractor with adjusted args instead.
+#
+# Function : {fn}
+# Hot block: {hot_pc}  (ecount={ecount})
+# Loop     : {loop_start} .. {loop_end}  ({body_count} insns)
+# Live-ins : {n_scalar} scalar, {n_vector} vector
+###############################################################################
+
+    .section .data
+    .align 6
+scratch_in:
+    .skip {bufsize}
+    .align 6
+scratch_wt:
+    .skip {bufsize}
+    .align 6
+scratch_out:
+    .skip {bufsize}
+
+    .align 3
+cycle_total:    .dword 0   # measured cycles for {iters} iterations
+cycle_warmup:   .dword 0   # cycles for warmup (informational)
+
+    .section .text
+    .globl _start
+_start:
+    # Use a fresh small stack -- the harness has no caller.
+    la sp, _stack_top
+"""
+
+WARMUP = """\
+
+    # ---- warmup: settle pipeline state, do NOT measure ----
+    li t0, {warmup}
+warmup_loop:
+{reset}
+{body}
+    addi t0, t0, -1
+    bnez t0, warmup_loop
+"""
+
+MEASURE = """\
+
+    # ---- measurement window ----
+    csrr s10, mcycle
+    li t0, {iters}
+measure_loop:
+{reset}
+{body}
+    addi t0, t0, -1
+    bnez t0, measure_loop
+    csrr s11, mcycle
+    sub  s11, s11, s10
+    la   t1, cycle_total
+    sd   s11, 0(t1)
+"""
+
+EXIT = """\
+
+    # ---- exit ----
+    # Verilator testbenches: scrape `cycle_total` from memory.
+    # QEMU smoke-test: emit semihosting EXIT_EXTENDED with code 0.
+_exit:
+1:  j 1b   # spin; testbench observes cycle_total at this PC
+
+    # Out-of-body branch fallback. The original loop has forward branches
+    # that exit to other parts of the function epilogue. In a correct
+    # microbench, those branches must NOT fire -- live-in init keeps the
+    # branch conditions false. If init is wrong, control lands here so the
+    # harness fails LOUDLY (cycles=0 or implausible) instead of executing
+    # garbage. Treat this as a tripwire.
+_oob_exit:
+    la t0, cycle_total
+    li t1, -1
+    sd t1, 0(t0)   # poison value: tells the testbench "init was wrong"
+    j _exit
+
+    .section .bss
+    .align 4
+    .skip 4096
+_stack_top:
+"""
+
+
+def emit_harness(analysis, warmup, iters, bufsize):
+    live_ins = analysis["live_in_regs"]
+    loop_start_pc = int(analysis["loop_start_pc"], 16)
+    loop_end_pc = int(analysis["loop_end_pc"], 16)
+
+    init_lines = emit_live_in_init(live_ins)
+    reset_lines = emit_live_in_reset(live_ins)
+    body_lines = emit_loop_body(analysis["loop_body_lines"],
+                                loop_start_pc, loop_end_pc)
+
+    indent = lambda lines: "\n".join(lines)
+    header = HEADER.format(
+        fn=analysis["containing_fn"],
+        hot_pc=analysis["hot_block_pc"],
+        ecount=analysis["hot_block_ecount"],
+        loop_start=analysis["loop_start_pc"],
+        loop_end=analysis["loop_end_pc"],
+        body_count=analysis["loop_body_count"],
+        n_scalar=len(live_ins["scalar"]),
+        n_vector=len(live_ins["vector"]),
+        bufsize=bufsize,
+        iters=iters,
+    )
+    body_text   = indent(body_lines)
+    reset_text  = indent(reset_lines)
+
+    parts = [
+        header,
+        indent(init_lines),
+        WARMUP.format(warmup=warmup, reset=reset_text, body=body_text),
+        MEASURE.format(iters=iters, reset=reset_text, body=body_text),
+        EXIT,
+    ]
+    return "\n".join(parts)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--analysis", required=True, type=Path)
+    ap.add_argument("--output",   required=True, type=Path)
+    ap.add_argument("--warmup",   type=int, default=5)
+    ap.add_argument("--iters",    type=int, default=100)
+    ap.add_argument("--buf-size", type=int, default=65536)
+    args = ap.parse_args()
+
+    analysis = json.loads(args.analysis.read_text())
+    text = emit_harness(analysis, args.warmup, args.iters, args.buf_size)
+    args.output.write_text(text)
+    print(f"[ok] harness written to {args.output} "
+          f"({args.iters} measured iters, {args.warmup} warmup, "
+          f"buf={args.buf_size}B)")
+
+
+if __name__ == "__main__":
+    main()

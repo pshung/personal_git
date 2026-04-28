@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+################################################################################
+# End-to-end orchestrator: given a libnn function, produce
+#   1. work/<fn>/analysis.json     -- find_hot_loop.py output
+#   2. work/<fn>/analysis.md       -- human-readable report
+#   3. work/<fn>/harness.S         -- compilable harness
+#
+# Steps:
+#   1. resolve <fn> to its source file and unit test name
+#   2. (re)build libnn.a + perf objdump if needed
+#   3. run QEMU + hotblocks plugin against the unit test
+#   4. analyze hot block + loop boundaries + live-ins
+#   5. emit harness .S
+#   6. write a markdown report
+#
+# Usage:
+#   extract_kernel.sh <function_name> [--iters N] [--warmup N] [--buf-size N]
+################################################################################
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OPT_SCRIPT_DIR="$(cd "${SCRIPT_DIR}/../../optimize/script" && pwd)"
+
+FN=""
+ITERS=100
+WARMUP=5
+BUFSIZE=65536
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --iters)    ITERS="$2"; shift 2 ;;
+        --warmup)   WARMUP="$2"; shift 2 ;;
+        --buf-size) BUFSIZE="$2"; shift 2 ;;
+        -*)         echo "Unknown option: $1" >&2; exit 1 ;;
+        *)          FN="$1"; shift ;;
+    esac
+done
+
+if [ -z "${FN}" ]; then
+    echo "Usage: $0 <function_name> [--iters N] [--warmup N] [--buf-size N]" >&2
+    exit 1
+fi
+
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/parse_config.sh"
+
+OUT_DIR="${CFG_HIK_WORK_DIR}/${FN}"
+mkdir -p "${OUT_DIR}"
+
+echo "============================================================"
+echo "  hot-inner-kernel-extractor  --  ${FN}"
+echo "============================================================"
+
+# ---- Step 1: resolve test name ---------------------------------------------
+# Convention: t_<short>.c where <short> is the function with riscv_nn_ stripped.
+SHORT="${FN#riscv_nn_}"
+TEST_SRC="${CFG_LIBNN_ROOT}/Examples/unit_func/t_${SHORT}.c"
+if [ ! -f "${TEST_SRC}" ]; then
+    # Some tests use the bare function name without the prefix strip.
+    TEST_SRC_ALT="${CFG_LIBNN_ROOT}/Examples/unit_func/t_${FN}.c"
+    if [ -f "${TEST_SRC_ALT}" ]; then
+        SHORT="${FN}"
+        TEST_SRC="${TEST_SRC_ALT}"
+    else
+        echo "ERROR: no unit test found for ${FN} -- looked at:" >&2
+        echo "  ${TEST_SRC}" >&2
+        echo "  ${TEST_SRC_ALT}" >&2
+        exit 1
+    fi
+fi
+echo "[step 1] test name: ${SHORT}  src: ${TEST_SRC}"
+
+# ---- Step 2: ensure libnn.a + perf objdump are fresh -----------------------
+LIBNN="${CFG_LIBNN_ROOT}/libnn.a"
+PERF_OBJDUMP="${CFG_WORK_DIR}/t_${SHORT}_perf.objdump"
+
+if [ ! -f "${LIBNN}" ]; then
+    echo "[step 2] libnn.a missing -- running optimize/build_libnn.sh"
+    /usr/bin/bash "${OPT_SCRIPT_DIR}/build_libnn.sh"
+fi
+
+if [ ! -f "${PERF_OBJDUMP}" ]; then
+    echo "[step 2] perf objdump missing -- running run_fpga_test.sh to generate it"
+    echo "         (this also produces .adx for QEMU; if the FPGA is unreachable"
+    echo "          you can stub this by manually running the perf compile step)"
+    /usr/bin/bash "${OPT_SCRIPT_DIR}/run_fpga_test.sh" "${SHORT}" || {
+        echo "WARN: run_fpga_test.sh failed; falling back to perf-objdump-only build" >&2
+        # Try a minimal compile that produces the perf objdump without uploading.
+        # This path is best-effort -- the user should have run the optimize loop
+        # at least once before using this skill.
+        if [ ! -f "${PERF_OBJDUMP}" ]; then
+            echo "ERROR: cannot produce ${PERF_OBJDUMP} without FPGA access." >&2
+            echo "       Run the /optimize skill on this function once, then retry." >&2
+            exit 1
+        fi
+    }
+fi
+echo "[step 2] objdump: ${PERF_OBJDUMP}"
+
+# ---- Step 3: run QEMU + hotblocks ------------------------------------------
+echo "[step 3] running hotblocks profile"
+/usr/bin/bash "${SCRIPT_DIR}/run_hotblocks.sh" "${SHORT}"
+PLUGIN_LOG="${CFG_HIK_WORK_DIR}/${SHORT}.plugin.log"
+
+# ---- Step 4: analyze --------------------------------------------------------
+echo "[step 4] analyzing hot loop + live-ins"
+ANALYSIS_JSON="${OUT_DIR}/analysis.json"
+python3 "${SCRIPT_DIR}/find_hot_loop.py" \
+    --plugin-log "${PLUGIN_LOG}" \
+    --objdump    "${PERF_OBJDUMP}" \
+    --function   "${FN}" \
+    > "${ANALYSIS_JSON}"
+
+# ---- Step 5: emit harness ---------------------------------------------------
+# Use lowercase .s so the toolchain skips the C preprocessor. The harness uses
+# `#` line comments and many of them happen to spell preprocessor-directive
+# lookalikes (e.g. "# if a register..."). Lowercase .s = pure GAS, no cpp.
+echo "[step 5] emitting harness"
+HARNESS_S="${OUT_DIR}/harness.s"
+python3 "${SCRIPT_DIR}/emit_harness.py" \
+    --analysis "${ANALYSIS_JSON}" \
+    --output   "${HARNESS_S}" \
+    --iters    "${ITERS}" \
+    --warmup   "${WARMUP}" \
+    --buf-size "${BUFSIZE}"
+
+# ---- Step 6: write markdown report -----------------------------------------
+ANALYSIS_MD="${OUT_DIR}/analysis.md"
+python3 "${SCRIPT_DIR}/write_report.py" \
+    --analysis "${ANALYSIS_JSON}" \
+    --harness  "${HARNESS_S}" \
+    --output   "${ANALYSIS_MD}"
+
+echo
+echo "============================================================"
+echo "  DONE"
+echo "============================================================"
+echo "  analysis.json : ${ANALYSIS_JSON}"
+echo "  analysis.md   : ${ANALYSIS_MD}"
+echo "  harness.S     : ${HARNESS_S}"
+echo
+echo "  Next: assemble harness.s with"
+echo "    \${CFG_CC} \${CFG_CFLAGS_BASE} -c ${HARNESS_S} -o harness.o"
+echo "  then link with your testbench's linker script (or use the toolchain's"
+echo "  default for a quick smoke test)."
+echo "  then run on Verilator / QEMU and read \`cycle_total\` from memory."
+echo "============================================================"

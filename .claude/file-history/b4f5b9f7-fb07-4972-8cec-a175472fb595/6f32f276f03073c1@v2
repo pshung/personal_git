@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""
+Render a human-readable Markdown report from analysis.json + harness.S.
+
+The report is the primary user-facing artifact. It explains WHAT was found
+(hot block, loop boundary, live-ins) and WHY each piece was selected, so the
+user can spot-check the extraction before trusting the harness.
+"""
+
+import argparse
+import json
+from pathlib import Path
+
+
+REPORT_TEMPLATE = """\
+# Hot inner kernel: `{fn}`
+
+## Summary
+- Hot block PC: `{hot_pc}` (executed **{ecount}** times)
+- Containing function: `{fn}` (starts at `{fn_start}`)
+- Inner loop: `{loop_start}` .. `{loop_end}` ({body_count} instructions)
+- Prologue captured: {prologue_count} instructions before loop entry
+- Live-in regs: {n_scalar} scalar, {n_vector} vector
+- Producer subset: {producer_count} instructions (the prologue insns that
+  transitively produce live-in values)
+
+## Why this block
+
+The `hotblocks` TCG plugin recorded translation-block exec counts during a
+QEMU run of the unit test. After filtering to the call graph reachable from
+`{fn}` (i.e. excluding the test harness's I/O loops), the hottest block by
+exec count is `{hot_pc}`. The smallest backward branch enclosing this block
+defines the inner loop boundary.
+
+### Top hot blocks (after call-graph filter)
+| PC | exec_count | inst_count | function |
+|---|---:|---:|---|
+{top_table}
+
+## Live-in registers
+
+These are the registers the loop body **reads before writing**. They MUST be
+established by the harness prologue before the measurement window starts.
+
+- **Scalar:** {scalar_list}
+- **Vector:** {vector_list}
+
+The `vd4dots`-style accumulator pattern means vector accumulator regs (e.g.
+v0..v15) are read-modify-written each iteration -- they're live-ins because
+the loop expects an initial accumulator value (typically zero).
+
+For SW-pipelined kernels, two distinct vector register groups appear as
+live-ins (e.g. v16..v23 AND v24..v31): one group is consumed in the first
+half of the body and produced in the second, the other group vice versa. The
+running iteration depends on values produced by the previous iteration -- so
+warm-up iterations are essential.
+
+## Loop body
+
+```asm
+{loop_body}
+```
+
+## Prologue (verbatim, from function entry)
+
+If you prefer a conservative-correct harness that replays the actual function
+prologue, copy this verbatim. The auto-emitted harness uses a leaner
+hand-built init instead. You may want to splice values from this prologue
+into the harness when the heuristic init is wrong.
+
+<details><summary>Show {prologue_count} prologue instructions</summary>
+
+```asm
+{prologue_lines}
+```
+</details>
+
+## Live-in producers (pruned prologue)
+
+These are the prologue instructions that transitively write at least one
+live-in register. This is a sound subset of the verbatim prologue -- enough
+to establish all loop entry state, with dead code dropped.
+
+<details><summary>Show {producer_count} producer instructions</summary>
+
+```asm
+{producer_lines}
+```
+</details>
+
+## Generated harness
+
+Path: `{harness_path}`
+
+The harness:
+1. Allocates scratch buffers in `.data`
+2. Initializes all live-in registers (heuristic -- see warning below)
+3. Runs **warmup** iterations (unmeasured) to settle the pipeline
+4. Wraps **N_ITERS** iterations in `csrr mcycle` reads
+5. Stores the cycle delta to `cycle_total` in memory and spins at `_exit:`
+
+### Warning: heuristic init
+
+The harness defaults all live-in scalar pointers to `scratch_in`, all
+"counter-like" scalars to `0x100`, all low-numbered vector regs (v0..v15) to
+zero, and all high-numbered vector regs (v16..v31) loaded from `scratch_in`.
+
+This works for many GEMM-shaped inner loops, but you should READ the loop
+body and adjust if:
+- A scalar reg actually points at the *output* buffer (would corrupt its
+  iteration if pointed at `scratch_in`).
+- A scalar reg is a *count* whose initial value drives a forward early-exit
+  branch in the loop body.
+- A vector reg is read with non-zero semantics (e.g. a broadcast constant).
+
+Look for the comment `# heuristic` lines in the harness and edit them.
+
+### Building & running
+
+```bash
+# Assemble (use the same toolchain + base CFLAGS as libnn)
+${{CFG_CC}} ${{CFG_CFLAGS_BASE}} -nostdlib -static \\
+    -T <your_linker_script.ld> \\
+    {harness_path} -o harness.elf
+
+# Verilator: run elf, scrape `cycle_total` symbol from elf, read its
+# value from simulated memory at sim end.
+# QEMU sanity check (no cycle accuracy):
+${{CFG_QEMU_BIN}} -M ${{CFG_QEMU_MACHINE}} -cpu ${{CFG_QEMU_CPU}} \\
+    -nographic -semihosting -bios harness.elf
+```
+
+### Tuning the iter count
+
+Pipeline steady state is usually reached in 3-5 iters on a 5-stage in-order
+machine like AX45MPV. Compare cycles/iter at N=10 vs N=100; if they match
+within 1-2% you've confirmed steady state and N=100 is plenty.
+"""
+
+
+def fmt_top_table(top_blocks):
+    rows = []
+    for b in top_blocks:
+        rows.append(f"| `{b['pc']}` | {b['ecount']} | {b['icount']} | `{b['fn']}` |")
+    return "\n".join(rows)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--analysis", required=True, type=Path)
+    ap.add_argument("--harness",  required=True, type=Path)
+    ap.add_argument("--output",   required=True, type=Path)
+    args = ap.parse_args()
+
+    a = json.loads(args.analysis.read_text())
+    li = a["live_in_regs"]
+
+    text = REPORT_TEMPLATE.format(
+        fn=a["containing_fn"],
+        hot_pc=a["hot_block_pc"],
+        ecount=a["hot_block_ecount"],
+        fn_start=a["containing_fn_start"],
+        loop_start=a["loop_start_pc"],
+        loop_end=a["loop_end_pc"],
+        body_count=a["loop_body_count"],
+        prologue_count=a["prologue_count"],
+        producer_count=a["live_in_producers_count"],
+        n_scalar=len(li["scalar"]),
+        n_vector=len(li["vector"]),
+        top_table=fmt_top_table(a["top_hotblocks"]),
+        scalar_list=", ".join(f"`{r}`" for r in li["scalar"]) or "(none)",
+        vector_list=", ".join(f"`{r}`" for r in li["vector"]) or "(none)",
+        loop_body="\n".join(a["loop_body_lines"]),
+        prologue_lines="\n".join(a["prologue_lines"]),
+        producer_lines="\n".join(a["live_in_producers"]),
+        harness_path=str(args.harness),
+    )
+    args.output.write_text(text)
+    print(f"[ok] report written to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
