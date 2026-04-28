@@ -1,0 +1,222 @@
+---
+name: hot-inner-kernel-extractor
+description: Extract a libnn function's hot inner-most loop into a standalone, mcycle-wrapped RISC-V assembly harness so it can be measured on a cycle-accurate Verilator simulator (or any cycle counter) without running the whole function. Use this skill whenever the user wants to study pipeline behavior of a libnn kernel, profile inner-loop cycles, build a microbenchmark from an existing function, prepare a Verilator workload, isolate a hot loop body, or asks about "extracting", "isolating", "harnessing", "microbenchmark", "Verilator timeview", "pipeline timeview", "steady state", or "inner kernel" of any libnn / RVV function. The skill identifies the hottest translation block via QEMU's hotblocks plugin, walks objdump to find the innermost backward branch, computes live-in registers, and emits a compilable .S harness that runs the body N times under csrr mcycle.
+allowed-tools: Read, Grep, Glob, Bash, Edit, Write, Agent
+---
+
+# hot-inner-kernel-extractor
+
+Produces a self-contained, cycle-measurable assembly harness from a libnn
+function's hot inner loop. Designed for cases where running the full function
+on a cycle-accurate simulator (Verilator at ~9 kHz, RTL emulators, etc.) is
+too slow to reach steady state -- by extracting just the inner kernel and
+wrapping it in a counted measurement loop, you get pipeline-level cycle data
+in seconds instead of hours.
+
+## When to use
+
+- User wants to profile pipeline behavior of an existing libnn kernel on
+  Verilator and the full function is too slow to simulate.
+- User wants a microbenchmark of a specific GEMM/conv/elementwise inner loop
+  for cycle-accurate analysis or RTL bring-up.
+- User asks "what's the inner kernel of `<fn>`" or "where does `<fn>` spend
+  its cycles" -- the skill answers both, with a runnable artifact.
+
+## When NOT to use
+
+- For the FPGA cycle ground truth used by the `/optimize` loop -- that's
+  whole-function measurement and is already automated by `/optimize`.
+- For correctness debugging -- this skill produces a harness that exercises
+  only the hot loop in isolation and does NOT verify outputs against golden.
+
+## Quick start
+
+```bash
+# All-in-one: profile, find loop, emit harness + report
+LIB_ROOT=$(git rev-parse --show-toplevel)
+SCRIPT_DIR="${LIB_ROOT}/.claude/skills/hot-inner-kernel-extractor/script"
+/usr/bin/bash "${SCRIPT_DIR}/extract_kernel.sh" <function_name>
+```
+
+Outputs land under `<skill>/work/<function_name>/`:
+- `analysis.json` -- machine-readable: hot block PC, loop boundaries,
+  live-ins, prologue, top hotblocks, etc.
+- `analysis.md`   -- human-readable report with the loop body, live-in
+  list, prologue, and a heuristic-init harness explainer
+- `harness.s`     -- standalone Verilator/QEMU harness (bare-metal `_start`,
+  internal `csrr mcycle` reads, `cycle_total` symbol for memory scrape)
+- `kernel.s` + `kernel.c` -- FPGA-mode harness: `kernel.s` defines a
+  callable `extracted_kernel()`; `kernel.c` is a tiny main that uses
+  libnn's `nds_pfcounter.h` macros (`_startPFM`/`_stopPFM`/`readResult`)
+  to bracket a second call (the first call serves as warmup, matching
+  libnn's `ENA_RUN_TWICE` convention). Output format matches every other
+  libnn perf test verbatim (`The cycle count is N` / `The inst count is N`),
+  so existing grep pipelines parse it unchanged. Run via
+  `script/run_kernel_fpga.sh <fn>`.
+
+## Pipeline (FSM-style, but executed straight through)
+
+```
+resolve_fn -> ensure_libnn_built -> profile_qemu_hotblocks
+    -> analyze_objdump_loop -> emit_harness -> write_report
+```
+
+The skill is one-shot: each invocation produces a fresh artifact set. No
+state persists across calls (unlike the `/optimize` skill, which has an FSM
+across rounds).
+
+### Step 1: resolve function
+
+Given `<function_name>`, resolve to:
+- The unit test name (strip `riscv_nn_` prefix if present)
+- The unit test source under `Examples/unit_func/t_<name>.c`
+
+Implementation: `extract_kernel.sh` does the lookup. If the test doesn't
+exist, the skill exits early with a clear error.
+
+### Step 2: ensure libnn build artifacts
+
+The skill needs:
+- `${CFG_LIBNN_ROOT}/libnn.a`
+- `${CFG_WORK_DIR}/t_<name>_perf.objdump` (from optimize/run_fpga_test.sh)
+
+If either is missing, the skill calls into `optimize/script/build_libnn.sh`
+and `optimize/script/run_fpga_test.sh` to produce them. This means the
+skill REUSES the `/optimize` build infrastructure -- there's no parallel
+build path to maintain.
+
+### Step 3: profile via QEMU hotblocks
+
+`run_hotblocks.sh <test>` compiles the unit test (or reuses a cached .adx),
+runs it under QEMU with `-plugin libhotblocks.so,inline=true`, and dumps
+`(pc, tcount, icount, ecount)` per translation block to a plugin log.
+
+The hotblocks plugin counts every basic block QEMU sees, ranked by exec
+count. The hottest block is the body of the innermost loop, regardless of
+whether that loop is in the user's function or in a callee (e.g. a GEMM
+sub-kernel). This matters for libnn because most conv functions dispatch
+to `nn_mat_mult_kernel_*` -- the inner kernel is in the callee, not the
+top-level conv.
+
+### Step 4: analyze (find_hot_loop.py)
+
+Inputs: hotblocks log + objdump + user's function name.
+
+Algorithm:
+1. Parse objdump into (functions, instructions). Each function has a PC
+   range; each instruction is keyed by PC.
+2. Compute the call graph reachable from the user's function (BFS over
+   `jal`/`c.jal` targets that resolve to known symbols). This filters out
+   the test harness's I/O loops, which would otherwise dominate ecount.
+3. Pick the highest-ecount block whose containing function is in the
+   reachable set.
+4. From the hot PC, walk forward to find the innermost backward branch
+   that closes a loop containing it. The branch's target is the loop
+   header; the branch itself is the loop tail.
+5. Live-in analysis: for each instruction in the loop body, classify its
+   read/write registers. A register is a live-in if it is read before
+   being written within the loop. RMW vector instructions (vd4dots,
+   vmacc, vredsum, etc.) count their first operand as both read and
+   written -- so accumulators show up as live-ins (they expect an initial
+   value).
+6. Walk the prologue (function entry .. loop header) backwards, keeping
+   only instructions that produce live-in values (or values transitively
+   consumed by such producers). This is the "producer subset" -- a
+   pruned prologue.
+
+Andes vendor extensions (`nds.vd4dots.vv`, `nds.lea.h`, etc.) are handled
+by stripping the `nds.` prefix before classification.
+
+### Step 5: emit harness (emit_harness.py)
+
+Produces a `.S` file with:
+- `.data` scratch buffers: `scratch_in`, `scratch_wt`, `scratch_out`
+- `_start:`
+  - small stack init
+  - **live-in initialization** (heuristic): scalar pointer-like names
+    point at `scratch_in`, scalar count-like names get `0x100`, vector
+    accumulators (v0..v15) zeroed, vector activations (v16..v31) loaded
+    from `scratch_in`
+  - **warmup loop** (default 5 iters, unmeasured)
+  - **measurement loop** (default 100 iters) wrapped in
+    `csrr mcycle ... csrr mcycle`
+  - cycle delta stored to a known symbol `cycle_total` for testbench
+    scraping
+  - `_exit:` spin label
+
+Each measured iteration RESETS scalar live-ins (so pointers don't walk
+off the buffer). Vector live-ins are NOT reset -- this is deliberate:
+software-pipelined kernels that consume v_lo/produce v_hi (or vice
+versa) need the body's writes to restore the inputs the next iter
+expects.
+
+The captured loop body is emitted **verbatim** from objdump, except the
+backward branch at `loop_end_pc` is stripped (replaced by our outer
+counter's `bnez`).
+
+### Step 6: write report (write_report.py)
+
+Renders `analysis.md` -- the user-facing artifact. Explains what was
+found, why each piece was chosen, and how to assemble + run the harness.
+Includes the loop body, live-in list, top hotblocks table, and prologue
+fold-outs.
+
+## Heuristic init -- read this before trusting the harness
+
+The harness's live-in initialization is a heuristic. It works for the
+common GEMM/conv inner loop pattern but can be wrong if:
+
+- A scalar reg points at the *output* buffer (heuristic assumes input)
+- A scalar reg is a *count* whose value drives a forward early-exit
+  branch in the loop body (e.g. `blt rd, rs1, exit` -- if rd starts low
+  the branch fires and the loop exits before we measure)
+- A vector reg holds a *broadcast constant* (e.g. NN_ROUND, in_offset)
+  rather than tile data
+
+Always inspect the comment-flagged `# heuristic` lines in the generated
+harness. The `analysis.md` report includes the verbatim prologue from
+the function entry, which you can splice into the harness if heuristic
+init produces wrong cycle counts.
+
+## What the skill does NOT do
+
+- Cycle-accurate simulation: that's Verilator's job. The skill produces
+  the workload; you run it.
+- Memory model fidelity: scratch buffers are flat arrays in `.data`. If
+  your TB models DRAM/L2 latency, the cycle count includes those. If
+  your TB uses TCM/single-cycle BRAM, you're measuring pipeline only --
+  which is the intended use case for pipeline tuning.
+- Correctness verification: the harness does not check outputs. Use
+  `/optimize`'s verify step or a manual QEMU run for that.
+
+## Files
+
+```
+hot-inner-kernel-extractor/
+├── SKILL.md             -- this file
+├── config.toml          -- symlink to ../optimize/config.toml
+├── script/
+│   ├── parse_config.sh  -- thin wrapper around optimize/parse_config.sh
+│   ├── run_hotblocks.sh -- QEMU + hotblocks plugin runner
+│   ├── find_hot_loop.py -- core analysis: hot block, loop, live-ins
+│   ├── emit_harness.py  -- .S file emitter
+│   ├── write_report.py  -- analysis.md renderer
+│   └── extract_kernel.sh -- orchestrator
+└── work/                -- per-function output dirs (gitignored)
+```
+
+## Rules
+
+1. **Reuse `/optimize`'s build pipeline.** Never duplicate `build_libnn.sh`
+   or `run_fpga_test.sh` -- delegate to them.
+2. **Filter hotblocks by call graph.** Without filtering, the test harness's
+   fread/memcmp loops dominate ecount and the wrong block is picked.
+3. **Strip ONLY the backward branch from the loop body.** Mid-loop forward
+   branches are kept but rewritten: targets inside the body get local
+   labels `_kpc_<hex>:`; targets that escape get redirected to `_oob_exit`,
+   a tripwire that poisons `cycle_total` to `-1` so the testbench can
+   detect "init was wrong" instead of executing garbage.
+4. **Reset scalar live-ins each measured iter, not vector live-ins.** The
+   reason: SW-pipeline kernels need vector regs carried iter-to-iter.
+5. **Heuristic init is a starting point.** Always remind the user (in the
+   report) which lines need spot-checking.

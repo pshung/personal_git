@@ -198,6 +198,7 @@ function less() {
 
 alias ls='eza --icons --group-directories-first'
 alias ll='eza -lh --icons --git'
+alias lg='lazygit'
 
 # define an associative key-value array
 typeset -A disabledCMD=(

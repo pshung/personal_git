@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+################################################################################
+# Compile the FPGA-mode harness (kernel.s + wrapper.c), upload it to the
+# Andes board via the GDB sim wrapper, and parse cycle/inst counts from the
+# nds_pfcounter readResult() output -- the same format every libnn perf test
+# emits, so the existing grep pipeline works unchanged.
+#
+# Usage:
+#   run_kernel_fpga.sh <function_name>
+#
+# Inputs (auto-discovered under work/<fn>/):
+#   kernel.s    -- emitted by emit_harness.py --mode fpga
+#   wrapper.c   -- emitted by emit_harness.py --mode fpga
+#
+# Output:
+#   work/<fn>/kernel.adx       -- linked ELF
+#   work/<fn>/kernel.objdump   -- disassembly
+#   work/<fn>/fpga_kernel.log  -- raw GDB log
+#   parsed cycle/inst counts printed to stdout
+################################################################################
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+FN=""
+TIMEOUT_OVERRIDE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --timeout) TIMEOUT_OVERRIDE="$2"; shift 2 ;;
+        -*)        echo "Unknown option: $1" >&2; exit 1 ;;
+        *)         FN="$1"; shift ;;
+    esac
+done
+
+[ -n "${FN}" ] || { echo "Usage: $0 <function_name>" >&2; exit 1; }
+
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/parse_config.sh"
+
+OUT_DIR="${CFG_HIK_WORK_DIR}/${FN}"
+KERNEL_S="${OUT_DIR}/kernel.s"
+# emit_harness.py defaults the wrapper to <kernel.s stem>.c == kernel.c
+WRAPPER_C="${OUT_DIR}/kernel.c"
+ELF="${OUT_DIR}/kernel.adx"
+OBJDUMP_FILE="${OUT_DIR}/kernel.objdump"
+LOG="${OUT_DIR}/fpga_kernel.log"
+TIMEOUT="${TIMEOUT_OVERRIDE:-${CFG_FPGA_TIMEOUT}}"
+
+for f in "${KERNEL_S}" "${WRAPPER_C}"; do
+    [ -f "$f" ] || {
+        echo "ERROR: Not found: $f" >&2
+        echo "       Run extract_kernel.sh --fpga ${FN} first." >&2
+        exit 1
+    }
+done
+for f in "${CFG_CC}" "${CFG_FPGA_SIM_WRAPPER}" "${CFG_FPGA_LD_SCRIPT}"; do
+    [ -f "$f" ] || { echo "ERROR: Not found: $f" >&2; exit 1; }
+done
+
+# GDB-nopython alias trick (same as run_fpga_test.sh).
+GDB_NOPY="${CFG_TOOLCHAIN_BIN}/${CFG_TOOLCHAIN_PREFIX}gdb-nopython"
+GDB_EXTRA_PATH=""
+if [ -f "${CFG_GDB}" ] && [ ! -e "${GDB_NOPY}" ]; then
+    GDB_TMPDIR=$(mktemp -d /tmp/hik_fpga_gdb_XXXXXX)
+    ln -sf "${CFG_GDB}" "${GDB_TMPDIR}/${CFG_TOOLCHAIN_PREFIX}gdb-nopython"
+    GDB_EXTRA_PATH="${GDB_TMPDIR}:"
+fi
+
+export PATH="${GDB_EXTRA_PATH}${CFG_TOOLCHAIN_BIN}:${CFG_LIBNN_ROOT}:${PATH}"
+export MYPC="${CFG_FPGA_HOST}"
+export MYPORT="${CFG_FPGA_PORT}"
+
+# Same INC + flags as run_fpga_test.sh -- needed so nds_pfcounter.h, intrinsics,
+# and the linker script all resolve consistently with libnn's other perf tests.
+UNIT_TEST_INC="${CFG_LIBNN_ROOT}/Examples/unit_func/include"
+INC="-I${CFG_LIBNN_ROOT}/Include -I${UNIT_TEST_INC} -I${CFG_TOOLCHAIN_BIN}/../riscv64-elf/include"
+CFLAGS_LINK="-Wl,-gc-sections"
+CFLAGS_ALL="${CFG_CFLAGS_BASE} ${CFG_CFLAGS_PERF} ${CFLAGS_LINK}"
+
+echo "[compile] ${FN} (FPGA mode: kernel.s + wrapper.c)"
+${CFG_CC} ${CFLAGS_ALL} ${INC} -o "${ELF}" "${WRAPPER_C}" "${KERNEL_S}" -lm 2>&1
+${CFG_OBJDUMP} -d "${ELF}" > "${OBJDUMP_FILE}" 2>/dev/null || true
+
+# Reset board state (same as run_fpga_test.sh).
+[ -z "${CFG_FPGA_RESET_FLAG}" ] || rm -f "${CFG_FPGA_RESET_FLAG}"
+
+echo "[run] FPGA board ${MYPC}:${MYPORT} (timeout=${TIMEOUT}s)"
+timeout "${TIMEOUT}" "${CFG_FPGA_SIM_WRAPPER}" "${ELF}" 2>&1 | tee "${LOG}"
+FPGA_RC=${PIPESTATUS[0]}
+
+echo
+if [ "${FPGA_RC}" -eq 124 ]; then
+    echo "RESULT: TIMEOUT (${TIMEOUT}s)"
+    exit 1
+fi
+
+CYCLE_COUNT=$(grep -o "The cycle count is [0-9]*" "${LOG}" | tail -1 | grep -o "[0-9]*" || echo "")
+INST_COUNT=$( grep -o "The inst count is [0-9]*"  "${LOG}" | tail -1 | grep -o "[0-9]*" || echo "")
+ITERS_HINT=$( grep -o "Inner-loop iterations per call: [0-9]*" "${LOG}" | tail -1 | grep -o "[0-9]*$" || echo "")
+
+if [ -n "${CYCLE_COUNT}" ]; then
+    echo "--- FPGA Kernel Results ---"
+    echo "  Cycles (one measured call): ${CYCLE_COUNT}"
+    echo "  Instructions:               ${INST_COUNT:-?}"
+    if [ -n "${INST_COUNT}" ] && [ "${CYCLE_COUNT}" -gt 0 ]; then
+        IPC=$(python3 -c "print(f'{${INST_COUNT}/${CYCLE_COUNT}:.2f}')" 2>/dev/null || echo "?")
+        echo "  IPC:                        ${IPC}"
+    fi
+    if [ -n "${ITERS_HINT}" ] && [ "${ITERS_HINT}" -gt 0 ]; then
+        CPI=$(python3 -c "print(f'{${CYCLE_COUNT}/${ITERS_HINT}:.2f}')")
+        echo "  Cycles per inner-loop iter: ${CPI}  (over ${ITERS_HINT} iters)"
+    fi
+    echo "  ELF:                        ${ELF}"
+    echo "  Objdump:                    ${OBJDUMP_FILE}"
+    echo "---"
+    echo "RESULT: PASS (cycles=${CYCLE_COUNT})"
+    exit 0
+else
+    echo "RESULT: UNKNOWN (no cycle count parsed)"
+    echo "--- log tail ---"
+    tail -30 "${LOG}" 2>/dev/null || true
+    exit 1
+fi
