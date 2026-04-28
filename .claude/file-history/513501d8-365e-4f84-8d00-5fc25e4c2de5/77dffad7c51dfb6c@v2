@@ -21,15 +21,3 @@ In `Source/NNSupportFunctions/nn_mat_mul_kernel_q7_bias_2sft.c`, the unroll4 act
    - Reordering 4 VADDs sharing V30 read source (VRF read-port serialization is the bottleneck, not order).
 
 **Other functions that link this kernel:** rows 4, 9, 13, 19 in ROADMAP.md (`s8_s8_s8_sym_bias_fast`, `s8_s8_s8_sym_fast`, `s8_s8_s8_sym_bias_fast_any`, `s8_s8_s8_sym_fast_any`). Once the kernel is optimized, those rows inherit the fix automatically -- their roadmap rows just need re-baselining, not new edits.
-
-**Tail copies in this file (post-r3 of conv_HWC_s8_s8_s8_sym_bias_fast):**
-- 12-slideup main tails (4-row + fast-path 4-acc, V0/V4/V8/V12) at ~lines 475 and 1093 -- byte-identical, port replace_all together
-- 4-slideup tail (out_tensor_ch & 0x2 path, V0/V4/V8/V12 single-layer) at ~line 1233 -- structurally similar, separate edit
-- 4-slideup tail with V16/V18/V20/V22 (different acc registers) at ~line 605 -- NOT touched by r1-r3, still at pre-fusion baseline (separate VMUL+VADD pattern). Apply r1+r2+r3 here separately if pursuing this kernel further.
-
-**Port-aware tier (post-chaining), confirmed on s8/s8/s8 baseline 524,971 -> 524,851 (1.00023x):**
-1. **r-uarch1 hoist VLW into slideup chain (-118 cyc, 1.00022x):** Move `VLW_V(V30, bias)` from above the VADD bias-add to right after the FIRST `vslideup`. VPERMUT+VLSU is clean dual-issue (VPERMUT read 9-10/write 3 vs VLSU read 4-5/write 0; VLSU as 2nd slot satisfies DS 23.15.1 restriction 3). Hides cacheable bias load latency (12-13 cyc) under the 12-deep slideup chain. Caveat: bias hot in L1 after a few iterations, so observed gain << theoretical.
-2. **r-uarch2 hoist VMV into slideup chain (-4 cyc, neutral):** Switch NN_ROUND broadcast register from V30 (shared with bias) to V29 (free in this file -- grep'd zero uses); place `VMV_V_X(V29, NN_ROUND)` mid-slideup-chain (e.g., after slideup #4) so it dual-issues with a slideup. VPERMUT+VALU is clean (read 9-10 vs 0-2, write 3 vs 0). Gain in noise -- VMV was already amortized via chaining in the prior r2.
-3. **r-uarch3 scalar pointer increments interleaved with VSB (REVERTED, +4 cyc noise):** Theory says VNCLIP V12 -> VSB V0 is BAD-WRITE (both write port 0). Tried inserting `rowCnt--` and `out += vl` etc. between VNCLIP and stores. Did not measure. **Hypothesis:** VLSU+VLSU consecutive runs in-order anyway (restriction 3 prohibits VLSU+vector dual-issue), so inserting scalars between VSBs doesn't speed up the VSB chain. Only the single VNCLIP V12 -> VSB V0 boundary is a real BAD-WRITE pair, and the 1-bubble savings doesn't outweigh measurement noise.
-
-**Lesson:** Once the inner loop chain is well-scheduled (chaining-style r1-r3), port-aware reorderings of the requantize tail yield 0.0X% per round at best -- the tail is a small fraction of total cycles in this kernel. Don't expect uarch-spec-driven rework to repeat the chaining-tier wins. To get more, attack the GEMM inner loop (vd4dots) or accept this as the floor.
