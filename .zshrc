@@ -266,6 +266,7 @@ alias t="\tig"
 alias f="\fd"
 alias v="\$DEFAULT_EDITOR"
 # bat
+alias cat="\bat"
 alias r="\bat"
 # less
 alias l="\less"
