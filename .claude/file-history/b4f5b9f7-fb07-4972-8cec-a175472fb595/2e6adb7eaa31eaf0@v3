@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+################################################################################
+# Compile the vsim-mode harness (kernel.s + kernel.c + vsim_runtime/) and run
+# it on the cycle-accurate Verilator simulator. Output format matches FPGA
+# mode verbatim ("The cycle count is N", "The inst count is N"), so the same
+# parser is used.
+#
+# Usage:
+#   run_kernel_vsim.sh <function_name>
+#
+# Inputs (auto-discovered under work/<fn>/):
+#   kernel.s    -- emitted by emit_harness.py --mode vsim
+#   kernel.c    -- emitted by emit_harness.py --mode vsim
+#
+# Inputs (vendored under skill dir, configured in [vsim] of config.toml):
+#   vsim_runtime/crt0.S, libgloss.c, handler.c, trap.S
+#
+# Output:
+#   work/<fn>/kernel_vsim.adx       -- linked ELF
+#   work/<fn>/kernel_vsim.objdump   -- disassembly
+#   work/<fn>/vsim_kernel.log       -- raw simulator log
+#   parsed cycle/inst counts printed to stdout
+#
+# Why a separate ELF artifact (not kernel.adx): the FPGA build links against
+# AE350 platform code via libnn's perf-test machinery, while the vsim build
+# is bare-metal with vsim's HTIF-based libgloss. Same kernel.s, different
+# everything else. Keep both products around so we can A/B FPGA vs vsim
+# without rebuilding.
+################################################################################
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+FN=""
+TIMEOUT_OVERRIDE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --timeout) TIMEOUT_OVERRIDE="$2"; shift 2 ;;
+        -*)        echo "Unknown option: $1" >&2; exit 1 ;;
+        *)         FN="$1"; shift ;;
+    esac
+done
+
+[ -n "${FN}" ] || { echo "Usage: $0 <function_name>" >&2; exit 1; }
+
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/parse_config.sh"
+
+OUT_DIR="${CFG_HIK_WORK_DIR}/${FN}"
+KERNEL_S="${OUT_DIR}/kernel.s"
+WRAPPER_C="${OUT_DIR}/kernel.c"
+ELF="${OUT_DIR}/kernel_vsim.adx"
+OBJDUMP_FILE="${OUT_DIR}/kernel_vsim.objdump"
+LOG="${OUT_DIR}/vsim_kernel.log"
+TIMEOUT="${TIMEOUT_OVERRIDE:-${CFG_VSIM_TIMEOUT}}"
+
+# Sanity-check inputs.
+for f in "${KERNEL_S}" "${WRAPPER_C}"; do
+    [ -f "$f" ] || {
+        echo "ERROR: Not found: $f" >&2
+        echo "       Run: emit_harness.py --mode vsim ... first." >&2
+        echo "       Or:  extract_kernel.sh --target vsim ${FN}" >&2
+        exit 1
+    }
+done
+[ -n "${CFG_VSIM_BIN}" ] || { echo "ERROR: [vsim].binary unset in config.toml" >&2; exit 1; }
+[ -x "${CFG_VSIM_BIN}" ] || { echo "ERROR: vsim binary not executable: ${CFG_VSIM_BIN}" >&2; exit 1; }
+[ -d "${CFG_VSIM_RUNTIME_DIR}" ] || { echo "ERROR: runtime dir not found: ${CFG_VSIM_RUNTIME_DIR}" >&2; exit 1; }
+[ -x "${CFG_CC}" ] || { echo "ERROR: compiler not found: ${CFG_CC}" >&2; exit 1; }
+
+# Build runtime file list (absolute paths, pulled from vsim_runtime/).
+RUNTIME_OBJS=()
+for f in ${CFG_VSIM_RUNTIME_FILES}; do
+    full="${CFG_VSIM_RUNTIME_DIR}/${f}"
+    [ -f "${full}" ] || { echo "ERROR: missing runtime file: ${full}" >&2; exit 1; }
+    RUNTIME_OBJS+=("${full}")
+done
+
+echo "[compile] ${FN} (vsim mode: kernel.s + kernel.c + ${#RUNTIME_OBJS[@]} runtime files)"
+echo "  CC:       ${CFG_CC}"
+echo "  CFLAGS:   ${CFG_VSIM_CFLAGS}"
+echo "  LDFLAGS:  ${CFG_VSIM_LDFLAGS}"
+echo "  RUNTIME:  ${CFG_VSIM_RUNTIME_DIR}"
+
+# Mirror the demo Makefile recipe order:
+#   $(CC) main.c -o $@ $(VSIM_FILES) $(CFLAGS) $(VSIM_FLAGS) $(VSIM_OPTIMIZE)
+# That puts runtime sources between the user .c and CFLAGS. We do the same so
+# any link-order quirks in libgloss/crt0/trap match the reference build.
+${CFG_CC} \
+    "${WRAPPER_C}" "${KERNEL_S}" \
+    -o "${ELF}" \
+    "${RUNTIME_OBJS[@]}" \
+    ${CFG_VSIM_CFLAGS} ${CFG_VSIM_LDFLAGS} ${CFG_VSIM_STARTFILES}
+
+${CFG_OBJDUMP} -d "${ELF}" > "${OBJDUMP_FILE}" 2>/dev/null || true
+
+echo "[run] vsim ${CFG_VSIM_BIN} (timeout=${TIMEOUT}s)"
+# vsim writes printf output to stdout via HTIF.
+timeout "${TIMEOUT}" "${CFG_VSIM_BIN}" "${ELF}" 2>&1 | tee "${LOG}"
+VSIM_RC=${PIPESTATUS[0]}
+
+echo
+if [ "${VSIM_RC}" -eq 124 ]; then
+    echo "RESULT: TIMEOUT (${TIMEOUT}s)"
+    echo "  vsim is ~9 kHz; if N=1000 doesn't finish in ${TIMEOUT}s, try"
+    echo "  re-emitting with smaller --iters and re-run."
+    exit 1
+fi
+
+# Parse same lines as run_kernel_fpga.sh.
+CYCLE_COUNT=$(grep -o "The cycle count is [0-9]*" "${LOG}" | tail -1 | grep -o "[0-9]*" || echo "")
+INST_COUNT=$( grep -o "The inst count is [0-9]*"  "${LOG}" | tail -1 | grep -o "[0-9]*" || echo "")
+ITERS_HINT=$( grep -o "Inner-loop iterations per call: [0-9]*" "${LOG}" | tail -1 | grep -o "[0-9]*$" || echo "")
+BODY_INSNS=$( grep -o "Inner-loop body instructions: *[0-9]*" "${LOG}" | tail -1 | grep -o "[0-9]*$" || echo "")
+
+if [ -n "${CYCLE_COUNT}" ]; then
+    echo "--- VSIM Kernel Results ---"
+    echo "  Cycles (one measured call): ${CYCLE_COUNT}"
+    echo "  Instructions:               ${INST_COUNT:-?}"
+    if [ -n "${INST_COUNT}" ] && [ "${CYCLE_COUNT}" -gt 0 ]; then
+        IPC=$(python3 -c "print(f'{${INST_COUNT}/${CYCLE_COUNT}:.2f}')" 2>/dev/null || echo "?")
+        echo "  IPC:                        ${IPC}"
+    fi
+    if [ -n "${ITERS_HINT}" ] && [ "${ITERS_HINT}" -gt 0 ]; then
+        CPI=$(python3 -c "print(f'{${CYCLE_COUNT}/${ITERS_HINT}:.2f}')")
+        echo "  Cycles per inner-loop iter: ${CPI}  (over ${ITERS_HINT} iters)"
+    fi
+    echo "  ELF:                        ${ELF}"
+    echo "  Objdump:                    ${OBJDUMP_FILE}"
+    # Sanity check: if the average iter executed << body_insn / 4 instructions,
+    # the live-in init heuristic likely tripped a bounds-check branch in the
+    # loop body and exited via _oob_exit instead of running the body. Surface
+    # this loudly -- otherwise users measure microbenchmark of nothing.
+    if [ -n "${INST_COUNT}" ] && [ -n "${ITERS_HINT}" ] && [ -n "${BODY_INSNS}" ] \
+       && [ "${ITERS_HINT}" -gt 0 ] && [ "${BODY_INSNS}" -gt 0 ]; then
+        AVG_INSN_PER_ITER=$((INST_COUNT / ITERS_HINT))
+        QUARTER_BODY=$((BODY_INSNS / 4))
+        if [ "${AVG_INSN_PER_ITER}" -lt "${QUARTER_BODY}" ]; then
+            echo
+            echo "WARNING: avg ${AVG_INSN_PER_ITER} insn/iter is << body size ${BODY_INSNS}."
+            echo "         The live-in init heuristic probably tripped a bounds-check"
+            echo "         branch and the loop body exited via _oob_exit on iter 1."
+            echo "         Inspect kernel.s for early bge/beq/nds.bbs comparisons and"
+            echo "         hand-edit the live-in init block. The verbatim prologue is"
+            echo "         in analysis.md ('Prologue (verbatim, from function entry)')."
+        fi
+    fi
+    echo "---"
+    echo "RESULT: PASS (cycles=${CYCLE_COUNT})"
+    exit 0
+else
+    echo "RESULT: UNKNOWN (no cycle count parsed)"
+    echo "--- log tail ---"
+    tail -30 "${LOG}" 2>/dev/null || true
+    exit 1
+fi

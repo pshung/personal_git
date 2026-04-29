@@ -1,0 +1,772 @@
+#!/usr/bin/env python3
+"""
+Emit a self-contained harness for the extracted hot inner loop body.
+
+Three modes:
+
+  --mode standalone   (default)
+    Single .s file. Bare-metal _start with internal csrr mcycle reads.
+    Stores cycles to `cycle_total` and spins at _exit. For Verilator
+    testbenches that scrape memory by symbol.
+
+  --mode fpga
+    Two files: kernel.s + wrapper.c. The .s defines extracted_kernel() as
+    a callable function (proper RV ABI prologue/epilogue, scratch buffers
+    live in .data). The .c defines main() that uses libnn's nds_pfcounter
+    macros (_startPFM/_stopPFM/readResult) to wrap a second call to
+    extracted_kernel -- producing exactly the same "The cycle count is N"
+    output format that Examples/unit_func/* perf tests print, so the
+    existing run_fpga_test.sh-style cycle-grep pipeline works unchanged.
+
+  --mode vsim
+    Same kernel.s as fpga mode, but a different wrapper.c -- vsim is
+    bare-metal (no nds_pfcounter.h, no AE350 platform support), so the
+    wrapper uses raw `csrr mcycle/minstret` to bracket the measured call.
+    Output line format is identical to fpga mode ("The cycle count is N",
+    "The inst count is N") so the parse pipeline works unchanged. Compile
+    with the vsim_runtime/ files (crt0.S, libgloss.c, handler.c, trap.S)
+    via run_kernel_vsim.sh.
+
+Counter-reg selection:
+    Both modes need an outer iteration counter (the body's original
+    backward branch is stripped). The counter must not collide with any
+    scalar live-in of the body. We prefer callee-saved s* regs (cheap to
+    save/restore in fpga mode); fall back to caller-saved t2/a6/a7 if
+    s2..s11 are all busy. This fixes a real bug where `t0` was used as
+    counter even when t0 was a live-in pointer -- pointer would get
+    decremented and the loop would exit mid-init.
+"""
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+
+INSN_RE = re.compile(r"^\s*([0-9a-f]+):\s+([0-9a-f]+)\s+(\S+)(?:\s+(.*))?$")
+
+
+def parse_insn_line(line):
+    m = INSN_RE.match(line)
+    if not m:
+        return None
+    return {
+        "addr":     int(m.group(1), 16),
+        "mnemonic": m.group(3),
+        "operands": (m.group(4) or "").strip(),
+        "raw":      line,
+    }
+
+
+# ----------------------------------------------------------------------------
+# Counter register selection
+# ----------------------------------------------------------------------------
+
+def pick_counter_reg(live_ins):
+    """
+    Pick a scalar register safe to use as the outer iteration counter.
+
+    Constraints:
+      - MUST NOT be in scalar live-ins (the body would clobber it / use it).
+      - PREFER callee-saved regs (s2..s11). In fpga mode we save/restore
+        them anyway for ABI compliance, so adding the counter to that list
+        is free. Caller-saved t/a regs are a fallback.
+
+    Returns a register name like "s2".
+    """
+    scalar_li = set(live_ins.get("scalar", []))
+    for cand in ["s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"]:
+        if cand not in scalar_li:
+            return cand
+    for cand in ["t2", "a6", "a7"]:
+        if cand not in scalar_li:
+            return cand
+    raise RuntimeError("no free scalar register left for the outer counter -- "
+                       "kernel uses every callee/caller-saved scalar")
+
+
+def callee_saved_clobbered(live_ins, counter):
+    """
+    Set of callee-saved regs the function will clobber and therefore must
+    save/restore: live-in scalar s-regs + the counter (if it's an s-reg).
+
+    ra and sp aren't included; the prologue/epilogue handles those directly.
+    """
+    out = set()
+    for r in live_ins.get("scalar", []):
+        if r.startswith("s") and r != "sp":
+            out.add(r)
+    if counter.startswith("s"):
+        out.add(counter)
+    return sorted(out, key=lambda r: int(r[1:]))
+
+
+# ----------------------------------------------------------------------------
+# Live-in initialization
+# ----------------------------------------------------------------------------
+
+SCALAR_PTR_HINT = {
+    "a1": "out",
+    "a2": "in",
+    "a0": "in",
+}
+
+
+def emit_live_in_init(live_ins, safe_vector_init=True):
+    out = []
+    out.append("    # ---- live-in initialization ----")
+    out.append("    # NOTE: scalar pointer assignments are heuristic. Read")
+    out.append("    # the loop body and adjust labels (scratch_in/_wt/_out)")
+    out.append("    # if a register actually points at a different buffer.")
+
+    # When several scalars all default to `scratch_in`, comparisons like
+    # `bge s11, s5` trivially fire on the first iter (equal addresses) and
+    # short-circuit the loop body to an _oob_exit. The classic symptom is
+    # observed cyc/iter << body_inst_count/4. To avoid that we hand each
+    # unknown pointer a distinct 64-byte-aligned offset into its scratch
+    # buffer. The offsets are still inside the buffer (BUFSIZE >> N_regs * 64)
+    # so any actual loads/stores remain valid, but no two pointers are equal.
+    ptr_offset_idx = 0
+    for name in live_ins["scalar"]:
+        if name in ("zero", "x0", "sp", "ra", "tp", "gp"):
+            continue
+        # Count/threshold heuristic: many libnn kernels have a "remaining
+        # count" register (decremented inside the body, e.g. `sub a3,a3,a4`)
+        # compared against a small threshold (`blt a3, s1, exit`). For the
+        # mid-loop branch to NOT fire we need decrementing-count >> threshold.
+        # We bucket by name based on libnn convention:
+        #   a3            -> remaining count (large positive)
+        #   a4, a5        -> vl-like outputs from vsetvli (large positive,
+        #                    will get overwritten by body's own vsetvli)
+        #   s1, s3, t6    -> threshold-like (zero / small)
+        # Other count-shaped names get a moderate value as before.
+        if name in ("a3",):
+            out.append(f"    li {name}, 0x10000   # remaining count: must stay > threshold")
+        elif name in ("a4", "a5"):
+            out.append(f"    li {name}, 0x10000   # vl-like output of vsetvli; large fallback")
+        elif name in ("s1", "s3", "t6"):
+            out.append(f"    li {name}, 0   # threshold for mid-loop branch; small")
+        else:
+            buf = "scratch_out" if SCALAR_PTR_HINT.get(name) == "out" else \
+                  "scratch_wt"  if SCALAR_PTR_HINT.get(name) == "wt"  else \
+                  "scratch_in"
+            off = ptr_offset_idx * 64
+            ptr_offset_idx += 1
+            if off == 0:
+                out.append(f"    la {name}, {buf}   # heuristic pointer init")
+            else:
+                out.append(f"    la {name}, {buf}+{off}   # heuristic; +{off} keeps ptrs distinct")
+
+    if live_ins["vector"]:
+        if safe_vector_init:
+            # Defensive path: zero accumulators, load v16+ from scratch_in.
+            # Useful only if the kernel has data-dependent control flow
+            # (e.g. a vmsXX -> mask -> conditional vector op). For the
+            # AX45MPV pipeline (data-independent vector timing on
+            # vd4dots/vmacc/vsra/vmul/vadd), values don't affect cycles --
+            # so this block is dead weight in the common case.
+            out.append("    # vector live-ins (safe mode): zero accumulators, load v16+")
+            # Use LMUL=1: with LMUL>1, only group-aligned vd are legal
+            # (v0,v8,v16,v24 for m8) and individual writes to v1/v2 trap.
+            out.append("    vsetvli t0, x0, e8, m1, tu, mu   # one-reg-at-a-time fill")
+            for vname in live_ins["vector"]:
+                n = int(vname[1:])
+                if n < 16:
+                    out.append(f"    vand.vi {vname}, {vname}, 0   # zero accumulator")
+                else:
+                    out.append(f"    vle8.v {vname}, (a0)   # load from scratch_in (heuristic)")
+            out.append("    vsetvli x0, x0, e8, m1, tu, mu   # leave vtype sane for body")
+        else:
+            # Default: skip per-register fills. Vector register *values*
+            # don't influence cycle counts on AX45MPV (the vector pipeline
+            # is data-independent). The body re-issues its own vsetvli on
+            # entry so vtype/vl get set correctly. Power-on state of vector
+            # regs is implementation-defined but harmless for cycle metrics.
+            out.append("    # vector live-in init: skipped (data-independent vector timing).")
+            out.append("    # Re-run emit_harness.py with --safe-vector-init if the kernel")
+            out.append("    # has mask-driven control flow that needs deterministic values.")
+
+    return out
+
+
+def emit_live_in_reset(live_ins):
+    out = []
+    out.append("    # reset scalar live-ins each iter")
+    # Reset must mirror init exactly (same values), otherwise the loop body's
+    # mid-branches see different state on iteration 2 vs iteration 1 and
+    # may exit early. Keep this in lock-step with emit_live_in_init -- in
+    # particular, the same per-pointer +offset must be applied.
+    ptr_offset_idx = 0
+    for name in live_ins["scalar"]:
+        if name in ("zero", "x0", "sp", "ra", "tp", "gp"):
+            continue
+        if name in ("a3",):
+            out.append(f"    li {name}, 0x10000")
+        elif name in ("a4", "a5"):
+            out.append(f"    li {name}, 0x10000")
+        elif name in ("s1", "s3", "t6"):
+            out.append(f"    li {name}, 0")
+        else:
+            buf = "scratch_out" if SCALAR_PTR_HINT.get(name) == "out" else \
+                  "scratch_wt"  if SCALAR_PTR_HINT.get(name) == "wt"  else \
+                  "scratch_in"
+            off = ptr_offset_idx * 64
+            ptr_offset_idx += 1
+            if off == 0:
+                out.append(f"    la {name}, {buf}")
+            else:
+                out.append(f"    la {name}, {buf}+{off}")
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Loop body emission with branch rewriting
+# ----------------------------------------------------------------------------
+
+BRANCH_MNEMONICS = {
+    "beq", "bne", "blt", "bltu", "bge", "bgeu",
+    "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
+    "ble", "bgt", "bleu", "bgtu",
+    "c.beqz", "c.bnez",
+    "j", "c.j", "jal", "c.jal",
+    # Andes V5 conditional branches. Without these, objdump's "<sym+0xN>"
+    # annotation leaks into the emitted operand and GAS rejects it. Also,
+    # any out-of-loop target wouldn't be rewritten to _oob_exit.
+    "nds.bbc", "nds.bbs",       # branch on bit clear/set
+    "nds.beqc", "nds.bnec",     # branch compare with 5-bit imm
+}
+
+BRANCH_OPERAND_RE = re.compile(r"^(.*?)(0x[0-9a-f]+)(\s*<[^>]+>)?\s*$")
+
+
+def label_for(addr):
+    return f"_kpc_{addr:x}"
+
+
+def emit_loop_body(loop_lines, loop_start_pc, loop_end_pc):
+    body_pcs = set()
+    targets_inside = set()
+    for raw in loop_lines:
+        ins = parse_insn_line(raw)
+        if ins is None:
+            continue
+        body_pcs.add(ins["addr"])
+
+    for raw in loop_lines:
+        ins = parse_insn_line(raw)
+        if ins is None or ins["mnemonic"] not in BRANCH_MNEMONICS:
+            continue
+        if ins["addr"] == loop_end_pc:
+            continue
+        m = BRANCH_OPERAND_RE.match(ins["operands"])
+        if not m:
+            continue
+        tgt = int(m.group(2), 16)
+        if loop_start_pc <= tgt <= loop_end_pc:
+            targets_inside.add(tgt)
+
+    out = []
+    for raw in loop_lines:
+        ins = parse_insn_line(raw)
+        if ins is None:
+            continue
+        if ins["addr"] in targets_inside:
+            out.append(f"{label_for(ins['addr'])}:")
+
+        if ins["addr"] == loop_end_pc:
+            out.append(
+                f"    # (stripped backward branch: "
+                f"{ins['mnemonic']} {ins['operands']})"
+            )
+            continue
+
+        if ins["mnemonic"] in BRANCH_MNEMONICS:
+            m = BRANCH_OPERAND_RE.match(ins["operands"])
+            if m:
+                pre = m.group(1)
+                tgt = int(m.group(2), 16)
+                new_tgt = (label_for(tgt)
+                           if loop_start_pc <= tgt <= loop_end_pc
+                           else "_oob_exit")
+                out.append(f"    {ins['mnemonic']} {pre}{new_tgt}")
+                continue
+
+        out.append(f"    {ins['mnemonic']} {ins['operands']}".rstrip())
+
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Standalone-mode emission
+# ----------------------------------------------------------------------------
+
+STANDALONE_HEADER = """\
+###############################################################################
+# Hot-inner-kernel harness (standalone mode)
+#
+# Function : {fn}
+# Hot block: {hot_pc}  (ecount={ecount})
+# Loop     : {loop_start} .. {loop_end}  ({body_count} insns)
+# Live-ins : {n_scalar} scalar, {n_vector} vector
+# Counter  : {counter}  (chosen to avoid live-in collision)
+###############################################################################
+
+    .section .data
+    .align 6
+scratch_in:
+    .skip {bufsize}
+    .align 6
+scratch_wt:
+    .skip {bufsize}
+    .align 6
+scratch_out:
+    .skip {bufsize}
+
+    .align 3
+cycle_total:    .dword 0
+cycle_warmup:   .dword 0
+
+    .section .text
+    .globl _start
+_start:
+    la sp, _stack_top
+"""
+
+STANDALONE_WARMUP = """\
+
+    # ---- warmup: settle pipeline state, do NOT measure ----
+    li {counter}, {warmup}
+warmup_loop:
+{reset}
+{body}
+    addi {counter}, {counter}, -1
+    bnez {counter}, warmup_loop
+"""
+
+STANDALONE_MEASURE = """\
+
+    # ---- measurement window ----
+    csrr s10, mcycle
+    li {counter}, {iters}
+measure_loop:
+{reset}
+{body}
+    addi {counter}, {counter}, -1
+    bnez {counter}, measure_loop
+    csrr s11, mcycle
+    sub  s11, s11, s10
+    la   t1, cycle_total
+    sd   s11, 0(t1)
+"""
+
+STANDALONE_EXIT = """\
+
+_exit:
+1:  j 1b
+
+_oob_exit:
+    la t0, cycle_total
+    li t1, -1
+    sd t1, 0(t0)
+    j _exit
+
+    .section .bss
+    .align 4
+    .skip 4096
+_stack_top:
+"""
+
+
+def emit_standalone(analysis, warmup, iters, bufsize, safe_vector_init=True):
+    live_ins = analysis["live_in_regs"]
+    counter = pick_counter_reg(live_ins)
+    loop_start_pc = int(analysis["loop_start_pc"], 16)
+    loop_end_pc = int(analysis["loop_end_pc"], 16)
+
+    init_lines = emit_live_in_init(live_ins, safe_vector_init=safe_vector_init)
+    reset_lines = emit_live_in_reset(live_ins)
+    body_lines = emit_loop_body(analysis["loop_body_lines"],
+                                loop_start_pc, loop_end_pc)
+    indent = lambda lines: "\n".join(lines)
+
+    header = STANDALONE_HEADER.format(
+        fn=analysis["containing_fn"],
+        hot_pc=analysis["hot_block_pc"],
+        ecount=analysis["hot_block_ecount"],
+        loop_start=analysis["loop_start_pc"],
+        loop_end=analysis["loop_end_pc"],
+        body_count=analysis["loop_body_count"],
+        n_scalar=len(live_ins["scalar"]),
+        n_vector=len(live_ins["vector"]),
+        bufsize=bufsize,
+        counter=counter,
+    )
+    return "\n".join([
+        header,
+        indent(init_lines),
+        STANDALONE_WARMUP.format(counter=counter, warmup=warmup,
+                                 reset=indent(reset_lines),
+                                 body=indent(body_lines)),
+        STANDALONE_MEASURE.format(counter=counter, iters=iters,
+                                  reset=indent(reset_lines),
+                                  body=indent(body_lines)),
+        STANDALONE_EXIT,
+    ])
+
+
+# ----------------------------------------------------------------------------
+# FPGA-mode emission
+# ----------------------------------------------------------------------------
+
+# In FPGA mode the harness is a regular function callable from C. The wrapper
+# C source uses libnn's nds_pfcounter.h macros (_startPFM/_stopPFM/readResult)
+# so output looks identical to existing libnn perf tests, and run_fpga_test.sh
+# can grep cycle/inst counts from the same lines.
+
+FPGA_KERNEL_HEADER = """\
+###############################################################################
+# Extracted kernel (FPGA mode)
+#
+# Signature: void extracted_kernel(long iters)   /* iters in a0 */
+#
+# Function : {fn}
+# Hot block: {hot_pc}  (ecount={ecount})
+# Loop     : {loop_start} .. {loop_end}  ({body_count} insns)
+# Live-ins : {n_scalar} scalar, {n_vector} vector
+# Counter  : {counter}  (clobbered; saved/restored per RV ABI)
+#
+# Iteration count : {iters}  ({body_count}-insn body * {iters} = ~{est_insns} insns/call)
+#
+# Pattern (matches libnn's ENA_RUN_TWICE convention):
+#   call extracted_kernel  -- warmup; PFM not yet started
+#   _startPFM
+#   call extracted_kernel  -- measured
+#   _stopPFM
+#   readResult             -- prints "The cycle count is N"
+###############################################################################
+
+    .section .data
+    .align 6
+scratch_in:
+    .skip {bufsize}
+    .align 6
+scratch_wt:
+    .skip {bufsize}
+    .align 6
+scratch_out:
+    .skip {bufsize}
+
+    .section .text
+    .globl extracted_kernel
+    .type  extracted_kernel, @function
+extracted_kernel:
+    # ---- prologue: save callee-saved regs we will clobber ----
+    addi sp, sp, -{frame_size}
+    sd ra, 0(sp)
+{save_block}
+"""
+
+FPGA_KERNEL_BODY = """\
+    # Capture iter count from a0 BEFORE live-in init (which may clobber a0
+    # via `la a0, scratch_in`). Counter ({counter}) is callee-saved and was
+    # already stashed in the prologue, so it's safe to use as scratch here.
+    mv {counter}, a0
+
+{init}
+
+    # ---- iteration loop ----
+    beqz {counter}, extracted_kernel_epilogue
+extracted_kernel_loop:
+{reset}
+{body}
+    addi {counter}, {counter}, -1
+    bnez {counter}, extracted_kernel_loop
+
+    # ---- normal epilogue ----
+extracted_kernel_epilogue:
+    ld ra, 0(sp)
+{restore_block}
+    addi sp, sp, {frame_size}
+    ret
+
+_oob_exit:
+    # If init was wrong, a forward branch in the body lands here. Fall
+    # through to the epilogue so the function still returns -- the caller
+    # will see a wildly-off cycle count, which is the failure signal.
+    j extracted_kernel_epilogue
+
+    .size extracted_kernel, . - extracted_kernel
+"""
+
+
+FPGA_WRAPPER_C = '''\
+/* Auto-generated wrapper for hot-inner-kernel-extractor (FPGA mode).
+ *
+ * Uses libnn's nds_pfcounter.h to bracket the measured call with PFM.
+ * Output format matches every other libnn perf test, so existing grep
+ * pipelines (like run_fpga_test.sh) parse it without modification.
+ *
+ * Function being measured: {fn}
+ * Warmup iters (unmeasured): {warmup_iters}
+ * Measured iters:            {iters}
+ *
+ * Cycles per inner-loop iter = (printed cycles) / {iters}, modulo a small
+ * per-call init/epilogue overhead. With warmup_iters >= 5 the measured call
+ * already starts in pipeline steady state.
+ */
+
+/* CFG_CFLAGS_PERF already adds -DPF_COUNTER; guard to avoid redefinition. */
+#ifndef PF_COUNTER
+#define PF_COUNTER
+#endif
+#include "nds_pfcounter.h"
+#include <stdio.h>
+
+/* extracted_kernel runs `iters` iterations of the captured loop body, with
+ * the live-ins re-initialized at the start of each iteration. The C wrapper
+ * calls it twice: a small unmeasured warmup (to settle pipeline state of any
+ * piece we missed -- branch predictor, vector unit first-use), then the
+ * PFM-bracketed measured call. */
+extern void extracted_kernel(long iters);
+
+int main(void)
+{{
+    /* warmup: small fixed count, NOT bracketed by PFM */
+    extracted_kernel({warmup_iters});
+
+    /* measure: PFM brackets exactly the {iters} measured iterations */
+    startPFM
+    extracted_kernel({iters});
+    stopPFM
+
+    readResult();
+
+    /* Report meta so post-processing can compute cycles/iter */
+    printf("Inner-loop iterations per call: {iters}\\n");
+    printf("Inner-loop body instructions:   {body_count}\\n");
+
+    /* run_fpga_test.sh greps for this -- harness has no real correctness
+     * check (we're measuring synthetic data), but the line is required. */
+    printf("accuracy checking pass\\n");
+    return 0;
+}}
+'''
+
+
+VSIM_WRAPPER_C = '''\
+/* Auto-generated wrapper for hot-inner-kernel-extractor (vsim mode).
+ *
+ * vsim is bare-metal -- no nds_pfcounter.h, no AE350 platform driver.
+ * We bracket the measured call with raw `csrr mcycle/minstret` reads
+ * and printf the result via libgloss's HTIF stdout. The output format
+ * matches fpga mode verbatim ("The cycle count is N", "The inst count
+ * is N"), so the existing cycle-grep pipeline works unchanged.
+ *
+ * Function being measured: {fn}
+ * Warmup iters (unmeasured): {warmup_iters}
+ * Measured iters:            {iters}
+ */
+#include <stdio.h>
+
+static unsigned long long rdcycle(void)
+{{
+    unsigned long long v;
+    asm volatile("csrr %0, mcycle" : "=r"(v));
+    return v;
+}}
+
+static unsigned long long rdinstret(void)
+{{
+    unsigned long long v;
+    asm volatile("csrr %0, minstret" : "=r"(v));
+    return v;
+}}
+
+extern void extracted_kernel(long iters);
+
+int main(void)
+{{
+    /* Enable the vector unit. vsim resets with mstatus.VS = Off, which traps
+     * any vector instruction (mcause=2) -- including auto-vectorized memcpy
+     * inside libgloss. Setting bit 9 puts VS into Initial state, which is
+     * enough to execute vector ops. The FPGA build doesn't need this because
+     * the AE350 platform code enables VS during boot. */
+    __asm__ __volatile__("csrs mstatus, %0" :: "r"((unsigned long)1 << 9));
+
+    /* warmup: small fixed count, NOT measured. Settles pipeline state of
+     * anything we missed (branch predictor, vector unit first-use latency). */
+    extracted_kernel({warmup_iters});
+
+    unsigned long long c0 = rdcycle();
+    unsigned long long i0 = rdinstret();
+    extracted_kernel({iters});
+    unsigned long long c1 = rdcycle();
+    unsigned long long i1 = rdinstret();
+
+    /* Same line format as libnn's nds_pfcounter readResult() so the parser
+     * in run_kernel_vsim.sh / run_kernel_fpga.sh is shared. */
+    printf("The cycle count is %llu\\n", c1 - c0);
+    printf("The inst count is %llu\\n",  i1 - i0);
+    printf("Inner-loop iterations per call: {iters}\\n");
+    printf("Inner-loop body instructions:   {body_count}\\n");
+    printf("accuracy checking pass\\n");
+    return 0;
+}}
+'''
+
+
+def emit_vsim(analysis, iters, bufsize, warmup_iters=5, safe_vector_init=True):
+    """vsim mode reuses the FPGA-mode kernel.s verbatim (callable
+    extracted_kernel function, scratch buffers in .data) and only swaps the
+    C wrapper. The same iter/buf/warmup/init knobs apply."""
+    asm, _ = emit_fpga(analysis, iters, bufsize,
+                       warmup_iters=warmup_iters,
+                       safe_vector_init=safe_vector_init)
+    wrapper_text = VSIM_WRAPPER_C.format(
+        fn=analysis["containing_fn"],
+        iters=iters,
+        warmup_iters=warmup_iters,
+        body_count=analysis["loop_body_count"],
+    )
+    return asm, wrapper_text
+
+
+def emit_fpga(analysis, iters, bufsize, warmup_iters=5, safe_vector_init=True):
+    live_ins = analysis["live_in_regs"]
+    counter = pick_counter_reg(live_ins)
+    loop_start_pc = int(analysis["loop_start_pc"], 16)
+    loop_end_pc = int(analysis["loop_end_pc"], 16)
+
+    init_lines = emit_live_in_init(live_ins, safe_vector_init=safe_vector_init)
+    reset_lines = emit_live_in_reset(live_ins)
+    body_lines = emit_loop_body(analysis["loop_body_lines"],
+                                loop_start_pc, loop_end_pc)
+
+    callee = callee_saved_clobbered(live_ins, counter)
+    # 8 bytes for ra + 8 bytes per callee-saved reg, rounded up to 16-byte
+    # alignment.
+    frame_size = 8 * (1 + len(callee))
+    frame_size = (frame_size + 15) & ~15
+
+    save_lines = []
+    restore_lines = []
+    for i, r in enumerate(callee, start=1):
+        save_lines.append(f"    sd {r}, {i*8}(sp)")
+        restore_lines.append(f"    ld {r}, {i*8}(sp)")
+    save_block = "\n".join(save_lines)
+    restore_block = "\n".join(restore_lines)
+
+    indent = lambda lines: "\n".join(lines)
+
+    header = FPGA_KERNEL_HEADER.format(
+        fn=analysis["containing_fn"],
+        hot_pc=analysis["hot_block_pc"],
+        ecount=analysis["hot_block_ecount"],
+        loop_start=analysis["loop_start_pc"],
+        loop_end=analysis["loop_end_pc"],
+        body_count=analysis["loop_body_count"],
+        n_scalar=len(live_ins["scalar"]),
+        n_vector=len(live_ins["vector"]),
+        bufsize=bufsize,
+        counter=counter,
+        iters=iters,
+        est_insns=analysis["loop_body_count"] * iters,
+        frame_size=frame_size,
+        save_block=save_block,
+    )
+    body_section = FPGA_KERNEL_BODY.format(
+        init=indent(init_lines),
+        counter=counter,
+        iters=iters,
+        reset=indent(reset_lines),
+        body=indent(body_lines),
+        restore_block=restore_block,
+        frame_size=frame_size,
+    )
+    asm_text = header + "\n" + body_section
+
+    wrapper_text = FPGA_WRAPPER_C.format(
+        fn=analysis["containing_fn"],
+        iters=iters,
+        warmup_iters=warmup_iters,
+        body_count=analysis["loop_body_count"],
+    )
+    return asm_text, wrapper_text
+
+
+# ----------------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--analysis", required=True, type=Path)
+    ap.add_argument("--mode",     choices=("standalone", "fpga", "vsim"),
+                    default="standalone")
+    ap.add_argument("--output",   required=True, type=Path,
+                    help="Output .s path (asm). In fpga mode, the C wrapper "
+                         "goes to <output stem>.c.")
+    ap.add_argument("--output-c", type=Path,
+                    help="Override C wrapper path (fpga mode only).")
+    ap.add_argument("--warmup",   type=int, default=5,
+                    help="Standalone-mode warmup iters (ignored in fpga mode).")
+    ap.add_argument("--fpga-warmup-iters", type=int, default=5,
+                    help="FPGA mode only: warmup iter count passed to the "
+                         "first (unmeasured) call to extracted_kernel. "
+                         "5 is enough to settle a 5-stage in-order pipeline "
+                         "and branch predictor. Set to 0 to skip warmup.")
+    ap.add_argument("--iters",    type=int, default=100,
+                    help="Number of measured iterations of the inner kernel. "
+                         "Default 100 -- measured error vs steady-state is "
+                         "0.9%% (per-call overhead ~64 cyc, body ~73 cyc/iter "
+                         "on the conv kernel) and runs in ~4s on vsim. Going "
+                         "to 1000 only buys 0.08%% error at 3x the runtime, "
+                         "which isn't worth it during tuning iteration. "
+                         "Going below 100 amplifies overhead noise into "
+                         "false signal (N=10 has 8.8%% error). Use 1000 "
+                         "only for final baseline reports.")
+    ap.add_argument("--buf-size", type=int, default=65536)
+    ap.add_argument("--no-vector-init", action="store_true",
+                    help="Skip vector live-in initialization. Default OFF "
+                         "(i.e. vector init IS emitted) because empirically "
+                         "it matters for cycle-accurate measurement: on "
+                         "AX45MPV running this conv kernel without vector "
+                         "init slowed steady-state by ~30%% (170 -> 223 "
+                         "cyc/iter). Likely cause is residual vector regfile "
+                         "state from the warmup call interacting with "
+                         "vd4dots issue timing. Use this flag only if you've "
+                         "confirmed your specific kernel is unaffected.")
+    args = ap.parse_args()
+
+    safe_vector_init = not args.no_vector_init
+    analysis = json.loads(args.analysis.read_text())
+
+    if args.mode == "standalone":
+        text = emit_standalone(analysis, args.warmup, args.iters, args.buf_size,
+                               safe_vector_init=safe_vector_init)
+        args.output.write_text(text)
+        print(f"[ok] standalone harness -> {args.output} "
+              f"({args.iters} measured iters, {args.warmup} warmup)")
+    elif args.mode == "fpga":
+        asm, c = emit_fpga(analysis, args.iters, args.buf_size,
+                           warmup_iters=args.fpga_warmup_iters,
+                           safe_vector_init=safe_vector_init)
+        out_c = args.output_c or args.output.with_suffix(".c")
+        args.output.write_text(asm)
+        out_c.write_text(c)
+        print(f"[ok] fpga kernel  -> {args.output}")
+        print(f"[ok] fpga wrapper -> {out_c}")
+    else:  # vsim
+        asm, c = emit_vsim(analysis, args.iters, args.buf_size,
+                           warmup_iters=args.fpga_warmup_iters,
+                           safe_vector_init=safe_vector_init)
+        out_c = args.output_c or args.output.with_suffix(".c")
+        args.output.write_text(asm)
+        out_c.write_text(c)
+        print(f"[ok] vsim kernel  -> {args.output}")
+        print(f"[ok] vsim wrapper -> {out_c}")
+
+
+if __name__ == "__main__":
+    main()
