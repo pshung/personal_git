@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+################################################################################
+# Thin wrapper that delegates to the optimize skill's parse_config.sh.
+#
+# Why delegate: this skill shares toolchain/QEMU/CFLAGS/work-dir with the
+# /optimize FSM. Maintaining one config source eliminates drift -- if the user
+# updates a flag in optimize/config.toml, this skill picks it up automatically.
+#
+# The wrapper also exports a few CFG_HIK_* variables specific to this skill:
+#   CFG_HIK_SKILL_DIR     - this skill's root directory
+#   CFG_HIK_WORK_DIR      - per-skill work dir (kernel artifacts, harness, etc.)
+#   CFG_HIK_QEMU_PLUGIN   - absolute path to libhotblocks.so
+################################################################################
+set -uo pipefail
+
+_hik_self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_hik_skill_dir="$(cd "${_hik_self_dir}/.." && pwd)"
+
+# config.toml lives at <skill>/config.toml (symlinked to optimize/config.toml).
+# The optimize parser resolves [target.uarch_ref] etc. relative to the SKILL
+# directory of whatever owns the config -- since we symlink, we want those
+# paths to resolve against the optimize skill (where fpga_config/ etc. live),
+# not this skill. Easiest fix: point CONFIG_TOML at the *real* file.
+_hik_config_toml="$(readlink -f "${_hik_skill_dir}/config.toml")"
+
+# Source the optimize parser explicitly so its skill_root computation lands in
+# the optimize directory (sibling resolution for fpga_config/, references/).
+_hik_optimize_parse="$(cd "${_hik_skill_dir}/../optimize/script" && pwd)/parse_config.sh"
+if [ ! -f "${_hik_optimize_parse}" ]; then
+    echo "parse_config.sh: cannot find optimize parser at ${_hik_optimize_parse}" >&2
+    return 1 2>/dev/null || exit 1
+fi
+
+# shellcheck disable=SC1090
+source "${_hik_optimize_parse}" "${_hik_config_toml}"
+
+# Skill-specific exports
+export CFG_HIK_SKILL_DIR="${_hik_skill_dir}"
+export CFG_HIK_WORK_DIR="${_hik_skill_dir}/work"
+
+# QEMU plugin path: derive from QEMU binary location (bin/../contrib/plugins).
+# This works for upstream and Andes QEMU builds; users override by setting
+# CFG_HIK_QEMU_PLUGIN before sourcing.
+if [ -z "${CFG_HIK_QEMU_PLUGIN:-}" ]; then
+    # The build tree lays out plugins as <build>/contrib/plugins/lib*.so where
+    # <build> is the same directory as the qemu binary itself. Don't walk up
+    # to the source tree.
+    _hik_qemu_build="$(cd "$(dirname "${CFG_QEMU_BIN}")" && pwd)"
+    CFG_HIK_QEMU_PLUGIN="${_hik_qemu_build}/contrib/plugins/libhotblocks.so"
+fi
+export CFG_HIK_QEMU_PLUGIN
+
+# Resolve vsim runtime path against THIS skill's directory (vsim_runtime/ is
+# vendored here, not under optimize/). Concatenated lists go through xargs to
+# stay tolerant of trailing whitespace from the python printer.
+if [ -n "${CFG_VSIM_RUNTIME_DIR_REL:-}" ]; then
+    export CFG_VSIM_RUNTIME_DIR="${CFG_HIK_SKILL_DIR}/${CFG_VSIM_RUNTIME_DIR_REL}"
+else
+    export CFG_VSIM_RUNTIME_DIR=""
+fi
+
+mkdir -p "${CFG_HIK_WORK_DIR}"
+
+unset _hik_self_dir _hik_skill_dir _hik_config_toml _hik_optimize_parse _hik_qemu_build 2>/dev/null || true
