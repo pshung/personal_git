@@ -1,0 +1,176 @@
+#pragma once
+
+#include "kanata_cpu_configs.hpp"
+#include "kanata_pipeline.hpp"
+#include "ooo_pipeline.hpp"
+#include "pipeline_viewer.hpp"
+
+#include <spdlog/spdlog.h>
+
+#include <filesystem>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace pipeview {
+
+/// In-order Kanata pipeline viewer — writes Konata-compatible pipeline logs.
+template<typename CPU>
+class KanataViewer : public PipelineViewer<CPU>
+{
+public:
+  KanataViewer(CPU& cpu,
+               std::unique_ptr<kanata::KanataLogger> logger,
+               kanata::PipelineConfig config)
+      : logger_(std::move(logger))
+  {
+    auto vpu_config = config.vpu;
+    modeler_ = std::make_unique<kanata::PipelineModeler<CPU>>(
+      cpu, *logger_, std::move(config));
+
+    if (vpu_config) {
+      vpu_modeler_ = std::make_unique<kanata::VpuPipelineModeler<CPU>>(
+        cpu, *logger_, *modeler_, *vpu_config);
+      modeler_->set_vpu(vpu_modeler_.get());
+    }
+  }
+
+  void on_cycle() override
+  {
+    modeler_->record();
+    logger_->advance_cycle(1);
+  }
+
+  void close() override { logger_->flush_all(); }
+
+private:
+  std::unique_ptr<kanata::KanataLogger> logger_;
+  std::unique_ptr<kanata::PipelineModeler<CPU>> modeler_;
+  std::unique_ptr<kanata::VpuPipelineModeler<CPU>> vpu_modeler_;
+};
+
+/// OoO Kanata pipeline viewer — age-based tracking for AX66 (single core).
+template<typename CPU>
+class OoOKanataViewer : public PipelineViewer<CPU>
+{
+public:
+  OoOKanataViewer(CPU& cpu,
+                  std::unique_ptr<kanata::KanataLogger> logger,
+                  OoOPipelineConfig config)
+      : logger_(std::move(logger))
+      , modeler_(cpu, *logger_, std::move(config))
+  {}
+
+  void on_cycle() override
+  {
+    modeler_.record();
+    logger_->advance_cycle(1);
+  }
+
+  void close() override
+  {
+    modeler_.finalize();
+    logger_->flush_all();
+  }
+
+private:
+  std::unique_ptr<kanata::KanataLogger> logger_;
+  OoOPipelineModeler<CPU> modeler_;
+};
+
+/// Multi-core OoO Kanata viewer — wraps N independent OoOKanataViewers.
+template<typename CPU>
+class MultiCoreOoOKanataViewer : public PipelineViewer<CPU>
+{
+public:
+  void add(std::unique_ptr<OoOKanataViewer<CPU>> viewer)
+  {
+    viewers_.push_back(std::move(viewer));
+  }
+
+  void on_cycle() override
+  {
+    for (auto& v : viewers_)
+      v->on_cycle();
+  }
+
+  void close() override
+  {
+    for (auto& v : viewers_)
+      v->close();
+  }
+
+private:
+  std::vector<std::unique_ptr<OoOKanataViewer<CPU>>> viewers_;
+};
+
+/// Factory: create a pipeline viewer (in-order or OoO) if the CPU is
+/// supported. Returns nullptr if no pipeline config matches the CPU.
+///
+/// For multi-core OoO (AX66 with NDS_NHART > 1), splits the output into
+/// per-core files: "output.kanata" -> "output_core0.kanata",
+/// "output_core1.kanata".
+template<typename CPU>
+std::unique_ptr<PipelineViewer<CPU>> make_kanata_viewer(
+  CPU& cpu, const std::string& filename,
+  const std::string& objdump_file = "")
+{
+  // Try OoO path first (AX66)
+  if (kanata::is_ooo_cpu(cpu.modelName())) {
+    int num_cores = kanata::ax66_ooo_num_cores(cpu);
+    spdlog::info("Kanata: detected AX66 OoO pipeline ({} core{})",
+                 num_cores, num_cores > 1 ? "s" : "");
+
+    if (num_cores == 1) {
+      // Single-core: one file, unchanged behavior
+      auto logger = std::make_unique<kanata::KanataLogger>(filename);
+      if (!logger->is_open())
+        return nullptr;
+      if (!objdump_file.empty())
+        logger->load_objdump(objdump_file);
+      auto config = kanata::make_ax66_ooo_config(cpu, 0);
+      return std::make_unique<OoOKanataViewer<CPU>>(
+        cpu, std::move(logger), std::move(config));
+    }
+
+    // Multi-core: split into per-core files
+    namespace fs = std::filesystem;
+    auto path = fs::path(filename);
+    auto stem = path.stem().string();
+    auto ext = path.extension().string();
+    auto parent = path.parent_path();
+
+    auto multi = std::make_unique<MultiCoreOoOKanataViewer<CPU>>();
+    for (int core = 0; core < num_cores; ++core) {
+      auto core_file =
+        (parent / fmt::format("{}_core{}{}", stem, core, ext)).string();
+      spdlog::info("Kanata: core {} -> {}", core, core_file);
+      auto logger = std::make_unique<kanata::KanataLogger>(core_file);
+      if (!logger->is_open())
+        return nullptr;
+      if (!objdump_file.empty())
+        logger->load_objdump(objdump_file);
+      auto config = kanata::make_ax66_ooo_config(cpu, core);
+      multi->add(std::make_unique<OoOKanataViewer<CPU>>(
+        cpu, std::move(logger), std::move(config)));
+    }
+    return multi;
+  }
+
+  // In-order path
+  auto config = kanata::detect_config(cpu.modelName());
+  if (!config)
+    return nullptr;
+
+  auto logger = std::make_unique<kanata::KanataLogger>(filename);
+  if (!logger->is_open())
+    return nullptr;
+
+  if (!objdump_file.empty())
+    logger->load_objdump(objdump_file);
+
+  return std::make_unique<KanataViewer<CPU>>(cpu, std::move(logger),
+                                             std::move(*config));
+}
+
+} // namespace pipeview

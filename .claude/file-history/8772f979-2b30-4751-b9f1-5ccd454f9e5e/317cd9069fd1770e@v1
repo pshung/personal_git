@@ -1,0 +1,169 @@
+#pragma once
+
+#include "clarity_cpu_configs.hpp"
+#include "kanata_cpu_configs.hpp"
+#include "kanata_logger.hpp"
+#include "kanata_to_clarity.hpp"
+#include "kanata_viewer.hpp"
+#include "pipeline_viewer.hpp"
+
+#include <spdlog/spdlog.h>
+
+#include <filesystem>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace pipeview {
+
+/// Clarity pipeline viewer — wraps a KanataViewer writing to an in-memory
+/// stringstream, then converts to Clarity DB on close().
+template<typename CPU>
+class ClarityViewer : public PipelineViewer<CPU>
+{
+public:
+  ClarityViewer(std::string db_path,
+                std::unique_ptr<PipelineViewer<CPU>> inner,
+                std::unique_ptr<std::stringstream> kanata_buf,
+                std::string toml_config)
+      : db_path_(std::move(db_path))
+      , inner_(std::move(inner))
+      , kanata_buf_(std::move(kanata_buf))
+      , toml_config_(std::move(toml_config))
+  {}
+
+  void on_cycle() override { inner_->on_cycle(); }
+
+  void close() override
+  {
+    inner_->close();
+
+    std::istringstream input(kanata_buf_->str());
+    clarity::KanataToClarity converter;
+    converter.convert(toml_config_, input, db_path_);
+  }
+
+private:
+  std::string db_path_;
+  std::unique_ptr<PipelineViewer<CPU>> inner_;
+  std::unique_ptr<std::stringstream> kanata_buf_;
+  std::string toml_config_;
+};
+
+/// Multi-core Clarity viewer — wraps N independent ClarityViewers.
+template<typename CPU>
+class MultiCoreClarityViewer : public PipelineViewer<CPU>
+{
+public:
+  void add(std::unique_ptr<ClarityViewer<CPU>> viewer)
+  {
+    viewers_.push_back(std::move(viewer));
+  }
+
+  void on_cycle() override
+  {
+    for (auto& v: viewers_)
+      v->on_cycle();
+  }
+
+  void close() override
+  {
+    for (auto& v: viewers_)
+      v->close();
+  }
+
+private:
+  std::vector<std::unique_ptr<ClarityViewer<CPU>>> viewers_;
+};
+
+/// Helper: create a single-core ClarityViewer (OoO or in-order).
+template<typename CPU>
+std::unique_ptr<ClarityViewer<CPU>>
+make_single_clarity_viewer(CPU& cpu, const std::string& db_path,
+                           const std::string& objdump_file,
+                           const std::string& toml,
+                           int core_id = 0)
+{
+  auto ss = std::make_unique<std::stringstream>();
+  auto logger = std::make_unique<kanata::KanataLogger>(*ss);
+  if (!objdump_file.empty())
+    logger->load_objdump(objdump_file);
+
+  if (kanata::is_ooo_cpu(cpu.modelName())) {
+    auto config = kanata::make_ax66_ooo_config(cpu, core_id);
+    auto inner = std::make_unique<OoOKanataViewer<CPU>>(
+      cpu, std::move(logger), std::move(config));
+    return std::make_unique<ClarityViewer<CPU>>(
+      db_path, std::move(inner), std::move(ss), toml);
+  }
+
+  auto config = kanata::detect_config(cpu.modelName());
+  if (!config)
+    return nullptr;
+
+  auto inner = std::make_unique<KanataViewer<CPU>>(
+    cpu, std::move(logger), std::move(*config));
+  return std::make_unique<ClarityViewer<CPU>>(
+    db_path, std::move(inner), std::move(ss), toml);
+}
+
+/// Factory: create a ClarityViewer wrapping the appropriate kanata viewer.
+/// For multi-core OoO, splits output into per-core DBs.
+template<typename CPU>
+std::unique_ptr<PipelineViewer<CPU>>
+make_clarity_viewer(CPU& cpu, const std::string& db_path,
+                    const std::string& objdump_file = "")
+{
+  // OoO path (AX66)
+  if (kanata::is_ooo_cpu(cpu.modelName())) {
+    int num_cores = kanata::ax66_ooo_num_cores(cpu);
+    spdlog::info("Clarity: detected AX66 OoO pipeline ({} core{})",
+                 num_cores, num_cores > 1 ? "s" : "");
+
+    auto toml = clarity::make_ax66_ooo_clarity_config();
+
+    if (num_cores == 1) {
+      spdlog::info("Writing Clarity DB to {}", db_path);
+      return make_single_clarity_viewer(cpu, db_path, objdump_file, toml,
+                                        0);
+    }
+
+    // Multi-core: split into per-core DBs
+    namespace fs = std::filesystem;
+    auto path = fs::path(db_path);
+    auto stem = path.stem().string();
+    auto ext = path.extension().string();
+    auto parent = path.parent_path();
+
+    auto multi = std::make_unique<MultiCoreClarityViewer<CPU>>();
+    for (int core = 0; core < num_cores; ++core) {
+      auto core_file =
+        (parent / fmt::format("{}_core{}{}", stem, core, ext)).string();
+      spdlog::info("Clarity: core {} -> {}", core, core_file);
+      auto viewer =
+        make_single_clarity_viewer(cpu, core_file, objdump_file, toml,
+                                   core);
+      if (!viewer)
+        return nullptr;
+      multi->add(std::move(viewer));
+    }
+    return multi;
+  }
+
+  // In-order path
+  auto config = kanata::detect_config(cpu.modelName());
+  if (!config)
+    return nullptr;
+
+  std::string toml;
+  if (config->stage_names.size() <= 2)
+    toml = clarity::make_inorder_2stage_clarity_config();
+  else
+    toml = clarity::make_inorder_5stage_clarity_config();
+
+  spdlog::info("Writing Clarity DB to {}", db_path);
+  return make_single_clarity_viewer(cpu, db_path, objdump_file, toml);
+}
+
+} // namespace pipeview

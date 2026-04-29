@@ -1,0 +1,199 @@
+#pragma once
+
+#include <fmt/core.h>
+#include <spdlog/spdlog.h>
+
+#include <cstdint>
+
+#include <fstream>
+#include <regex>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace kanata {
+
+/// Maps arbitrary keys to sequential uint64_t IDs.
+/// Port of Python SequentialIndexMap from tools/utils.py.
+class SequentialIndexMap
+{
+public:
+  explicit SequentialIndexMap(uint64_t start_idx = 0)
+      : idx_(start_idx)
+  {}
+
+  uint64_t update(uint64_t key)
+  {
+    auto tmp = idx_;
+    key2id_[key] = idx_++;
+    return tmp;
+  }
+
+  uint64_t get(uint64_t key) const { return key2id_.at(key); }
+
+  uint64_t pop(uint64_t key)
+  {
+    auto it = key2id_.find(key);
+    auto val = it->second;
+    key2id_.erase(it);
+    return val;
+  }
+
+  bool contains(uint64_t key) const { return key2id_.count(key) != 0; }
+
+private:
+  std::unordered_map<uint64_t, uint64_t> key2id_;
+  uint64_t idx_;
+};
+
+/// Writes Kanata pipeline visualization format.
+/// Port of Python KanataLogger from tools/utils.py.
+///
+/// Format reference:
+/// https://github.com/shioyadan/Konata/blob/master/docs/kanata-log-format.md
+class KanataLogger
+{
+public:
+  /// File-based output (existing behavior).
+  explicit KanataLogger(const std::string& filename)
+  {
+    owned_file_.open(filename);
+    if (!owned_file_.is_open()) {
+      spdlog::critical("Failed to open kanata log file: {}", filename);
+      return;
+    }
+    output_ = &owned_file_;
+    *output_ << "Kanata\t0004\n";
+    *output_ << "C=\t0\n";
+    spdlog::info("Writing kanata pipeline log to {}", filename);
+  }
+
+  /// Stream-based output (caller owns the ostream lifetime).
+  explicit KanataLogger(std::ostream& os)
+      : output_(&os)
+  {
+    *output_ << "Kanata\t0004\n";
+    *output_ << "C=\t0\n";
+  }
+
+  ~KanataLogger() { flush_all(); }
+
+  KanataLogger(const KanataLogger&) = delete;
+  KanataLogger& operator=(const KanataLogger&) = delete;
+
+  void advance_cycle(int cycles) { *output_ << "C\t" << cycles << '\n'; }
+
+  void start_insn(uint64_t pc, uint64_t id)
+  {
+    inflight_.insert(id);
+    *output_ << fmt::format("I\t{}\t{}\t0\n", id, id);
+    auto it = code_map_.find(pc);
+    auto code = (it != code_map_.end()) ? it->second : std::string{};
+    *output_ << fmt::format("L\t{}\t0\t{:#x}: {}\n", id, pc, code);
+  }
+
+  /// Start instruction without PC (OoO: PC unknown at issue time).
+  /// Use label_insn() later to back-fill the PC at commit.
+  void start_insn_deferred(uint64_t id)
+  {
+    inflight_.insert(id);
+    *output_ << fmt::format("I\t{}\t{}\t0\n", id, id);
+  }
+
+  /// Back-fill label for a deferred instruction (OoO commit).
+  void label_insn(uint64_t id, uint64_t pc,
+                  std::string_view suffix = "")
+  {
+    if (!is_inflight(id))
+      return;
+    auto it = code_map_.find(pc);
+    auto code = (it != code_map_.end()) ? it->second : std::string{};
+    if (suffix.empty())
+      *output_ << fmt::format("L\t{}\t0\t{:#x}: {}\n", id, pc, code);
+    else
+      *output_ << fmt::format("L\t{}\t0\t{:#x}: {} [{}]\n", id, pc, code,
+                              suffix);
+  }
+
+  void retire_insn(uint64_t id)
+  {
+    if (remove_inflight(id))
+      *output_ << fmt::format("R\t{}\t{}\t0\n", id, id);
+  }
+
+  void flush_insn(uint64_t id)
+  {
+    if (remove_inflight(id))
+      *output_ << fmt::format("R\t{}\t0\t1\n", id);
+  }
+
+  void stage_insn(uint64_t id, std::string_view stage_name, int lane_id = 0)
+  {
+    if (is_inflight(id))
+      *output_ << fmt::format("S\t{}\t{}\t{}\n", id, lane_id, stage_name);
+  }
+
+  void end_stage_insn(uint64_t id, std::string_view stage_name)
+  {
+    if (is_inflight(id))
+      *output_ << fmt::format("E\t{}\t0\t{}\n", id, stage_name);
+  }
+
+  void comment_insn(uint64_t id, std::string_view msg)
+  {
+    if (is_inflight(id))
+      *output_ << fmt::format("L\t{}\t1\t{}\n", id, msg);
+  }
+
+  void flush_all()
+  {
+    for (auto id: inflight_)
+      *output_ << fmt::format("R\t{}\t0\t1\n", id);
+    inflight_.clear();
+    output_->flush();
+  }
+
+  /// Load objdump -d output to populate PC→assembly map.
+  void load_objdump(const std::string& filename)
+  {
+    std::ifstream fin(filename);
+    if (!fin.is_open()) {
+      spdlog::warn("Failed to open objdump file: {}", filename);
+      return;
+    }
+    std::regex code_regex(R"(^\s*([0-9a-f]+):\t([0-9a-f ]+)\t(.+)$)");
+    std::string line;
+    while (std::getline(fin, line)) {
+      std::smatch match;
+      if (std::regex_match(line, match, code_regex)) {
+        auto pc = std::stoull(match[1].str(), nullptr, 16);
+        auto asm_code = match[3].str();
+        // Replace tabs with double spaces (same as Python)
+        for (auto pos = asm_code.find('\t'); pos != std::string::npos;
+             pos = asm_code.find('\t', pos))
+        {
+          asm_code.replace(pos, 1, "  ");
+          pos += 2;
+        }
+        code_map_[pc] = std::move(asm_code);
+      }
+    }
+    spdlog::info("Loaded {} disassembly entries from {}", code_map_.size(),
+                 filename);
+  }
+
+  bool is_open() const { return output_ != nullptr; }
+
+private:
+  bool is_inflight(uint64_t id) const { return inflight_.count(id) != 0; }
+
+  bool remove_inflight(uint64_t id) { return inflight_.erase(id) > 0; }
+
+  std::ostream* output_ = nullptr;
+  std::ofstream owned_file_;
+  std::unordered_map<uint64_t, std::string> code_map_;
+  std::unordered_set<uint64_t> inflight_;
+};
+
+} // namespace kanata
