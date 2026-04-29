@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+################################################################################
+# Run a libnn unit test on QEMU with the cstate TCG plugin to capture CPU state
+# at the first hit of a given guest virtual address (loop_start_pc).
+#
+# Why a separate script: hotblocks runs in step 3 of extract_kernel.sh to find
+# the hot loop. cstate runs in step 4.5 (after find_hot_loop.py decides the
+# loop_start_pc) so the capture point is loop-specific, not test-specific.
+# Splitting keeps the two passes independent.
+#
+# Output blob format: see plugin/cstate.c header comment. emit_harness.py
+# reads it and emits an `.incbin` block + register loaders.
+#
+# Usage:
+#   run_cstate.sh <test_name> --capture-pc 0xNNNN --out <path.bin>
+#                 [--frame-bytes N] [--timeout N]
+################################################################################
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+TEST_NAME=""
+CAPTURE_PC=""
+OUT_BIN=""
+FRAME_BYTES=4096
+TIMEOUT_OVERRIDE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --capture-pc)   CAPTURE_PC="$2"; shift 2 ;;
+        --out)          OUT_BIN="$2"; shift 2 ;;
+        --frame-bytes)  FRAME_BYTES="$2"; shift 2 ;;
+        --timeout)      TIMEOUT_OVERRIDE="$2"; shift 2 ;;
+        -*)             echo "Unknown option: $1" >&2; exit 1 ;;
+        *)              TEST_NAME="$1"; shift ;;
+    esac
+done
+
+if [ -z "${TEST_NAME}" ] || [ -z "${CAPTURE_PC}" ] || [ -z "${OUT_BIN}" ]; then
+    echo "Usage: $0 <test_name> --capture-pc 0xNNNN --out <path.bin> [--frame-bytes N] [--timeout N]" >&2
+    exit 1
+fi
+
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/parse_config.sh"
+
+TIMEOUT="${TIMEOUT_OVERRIDE:-${CFG_QEMU_TIMEOUT}}"
+UNIT_TEST_DIR="${CFG_LIBNN_ROOT}/Examples/unit_func"
+ADX="${CFG_HIK_WORK_DIR}/t_${TEST_NAME}.adx"
+QEMU_LOG="${OUT_BIN%.bin}.qemu.log"
+
+# cstate plugin path: vendored under this skill (NOT QEMU's contrib/plugins).
+CSTATE_PLUGIN="${CFG_HIK_SKILL_DIR}/plugin/libcstate.so"
+
+if [ ! -f "${CSTATE_PLUGIN}" ]; then
+    echo "ERROR: cstate plugin not built: ${CSTATE_PLUGIN}" >&2
+    echo "       Run: make -C ${CFG_HIK_SKILL_DIR}/plugin" >&2
+    exit 1
+fi
+
+for f in "${CFG_QEMU_BIN}" "${CFG_QEMU_CONFIG}" "${ADX}"; do
+    [ -f "$f" ] || { echo "ERROR: Not found: $f" >&2; exit 1; }
+done
+
+# Ensure capture_pc is interpreted as hex by the plugin (g_ascii_strtoull
+# auto-detects 0x prefix; our analysis.json carries "0xNNNN" strings).
+QEMU_CMD=(
+    "${CFG_QEMU_BIN}"
+    -plugin "file=${CSTATE_PLUGIN},capture_pc=${CAPTURE_PC},out=${OUT_BIN},frame_bytes=${FRAME_BYTES}"
+    -readconfig "${CFG_QEMU_CONFIG}"
+    -M "${CFG_QEMU_MACHINE}"
+    -cpu "${CFG_QEMU_CPU}"
+    -nographic -semihosting -bios "${ADX}"
+)
+
+cd "${UNIT_TEST_DIR}"
+echo "[run] cstate capture pc=${CAPTURE_PC} -> ${OUT_BIN} (timeout=${TIMEOUT}s)"
+rm -f "${OUT_BIN}"
+timeout "${TIMEOUT}" "${QEMU_CMD[@]}" > "${QEMU_LOG}" 2>&1 &
+QEMU_PID=$!
+wait "${QEMU_PID}" 2>/dev/null
+QEMU_RC=$?
+
+if [ ! -s "${OUT_BIN}" ]; then
+    echo "ERROR: cstate produced no blob -- capture_pc=${CAPTURE_PC} likely not reached." >&2
+    echo "       Check that the test actually executes the function." >&2
+    echo "--- QEMU log tail ---" >&2
+    tail -20 "${QEMU_LOG}" >&2 2>/dev/null || true
+    exit 1
+fi
+
+# Sanity check the blob: magic "CSTA" at offset 0.
+MAGIC=$(head -c 4 "${OUT_BIN}")
+if [ "${MAGIC}" != "CSTA" ]; then
+    echo "ERROR: bad magic in ${OUT_BIN} (got '${MAGIC}', want 'CSTA')" >&2
+    exit 1
+fi
+
+echo "[ok] blob: ${OUT_BIN} ($(stat -c %s "${OUT_BIN}") bytes)"
+echo "[ok] QEMU exit: ${QEMU_RC}"
