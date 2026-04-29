@@ -1,0 +1,187 @@
+#pragma once
+
+#include "pipeview/clarity_viewer.hpp"
+#include "pipeview/kanata_viewer.hpp"
+
+#include <fmt/core.h>
+#include <spdlog/spdlog.h>
+#include <systemc>
+
+#ifdef VSIMDEBUG
+#include <verilated_fst_sc.h>
+#include <verilated_vcd_sc.h>
+#if defined(TRACEFST)
+#define VERILATORTRACER VerilatedFstSc
+#else
+#define VERILATORTRACER VerilatedVcdSc
+#endif
+#endif
+
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+
+#include <fstream>
+#include <limits>
+#include <memory>
+#include <string>
+
+template<typename CPU>
+class TraceController
+{
+public:
+  void enable_waveform(CPU& cpu, const std::string& waveform_filename)
+  {
+    (void) cpu;
+    waveform_filename_ = waveform_filename;
+
+#ifdef VSIMDEBUG
+    if (waveform_file_) {
+      spdlog::info("Tracing is already enabled.");
+      return;
+    }
+    if constexpr (requires { cpu.trace(waveform_file_.get(), 0); }) {
+      waveform_file_ = std::make_unique<VERILATORTRACER>();
+      cpu.contextp()->traceEverOn(true);
+      cpu.trace(waveform_file_.get(), 0);
+      waveform_file_->open(waveform_filename_.c_str());
+      spdlog::info("Writing traces to {}", waveform_filename_);
+      return;
+    }
+#endif
+
+    spdlog::critical("Waveform is not supported.");
+    std::exit(EXIT_FAILURE);
+  }
+
+  void enable_pc_trace(const std::string& filename)
+  {
+    if (pc_trace_enabled_) {
+      spdlog::warn("PC tracing is already enabled.");
+      return;
+    }
+
+    pc_trace_file_.open(filename);
+    if (!pc_trace_file_.is_open()) {
+      spdlog::critical("Failed to open PC trace file: {}", filename);
+      std::exit(EXIT_FAILURE);
+    }
+
+    pc_trace_file_ << "cycle,core,pc\n";
+    pc_trace_enabled_ = true;
+    cycle_count_ = 0;
+    spdlog::info("Writing PC trace to {}", filename);
+  }
+
+  void enable_kanata(CPU& cpu,
+                     const std::string& filename,
+                     const std::string& objdump_file = "",
+                     std::optional<kanata::LoopGate> gate = std::nullopt)
+  {
+    if (pipeline_viewer_) {
+      spdlog::warn("Pipeline viewer is already enabled.");
+      return;
+    }
+
+    pipeline_viewer_ =
+      pipeview::make_kanata_viewer(cpu, filename, objdump_file, gate);
+    if (!pipeline_viewer_)
+      spdlog::warn("Kanata pipeline viewer not available for this CPU.");
+  }
+
+  void enable_clarity(CPU& cpu, const std::string& filename,
+                      const std::string& objdump_file = "",
+                      std::optional<kanata::LoopGate> gate = std::nullopt)
+  {
+    if (pipeline_viewer_) {
+      spdlog::warn("Pipeline viewer is already enabled.");
+      return;
+    }
+
+    pipeline_viewer_ =
+      pipeview::make_clarity_viewer(cpu, filename, objdump_file, gate);
+    if (!pipeline_viewer_)
+      spdlog::warn("Clarity pipeline viewer not available for this CPU.");
+  }
+
+  void on_cycle(CPU& cpu)
+  {
+    if (pipeline_viewer_)
+      pipeline_viewer_->on_cycle();
+    if (pc_trace_enabled_)
+      dump_cycle_pcs(cpu);
+    ++cycle_count_;
+  }
+
+  void dump_cycle_pcs(CPU& cpu)
+  {
+    if constexpr (requires { cpu.get_committed_pc(); }) {
+      auto committed_pcs = cpu.get_committed_pc();
+      for (size_t core = 0; core < committed_pcs.size(); ++core) {
+        for (auto pc: committed_pcs[core]) {
+          pc_trace_file_ << cycle_count_ << "," << core << "," << std::hex
+                         << "0x" << pc << std::dec << "\n";
+        }
+      }
+    }
+  }
+
+  void close()
+  {
+#ifdef VSIMDEBUG
+    if (waveform_file_)
+      waveform_file_->close();
+#endif
+    disable_pc_trace();
+    disable_pipeview();
+  }
+
+  void disable_pc_trace()
+  {
+    if (pc_trace_enabled_) {
+      pc_trace_file_.close();
+      pc_trace_enabled_ = false;
+      spdlog::info("PC trace closed");
+    }
+  }
+
+  void disable_pipeview()
+  {
+    if (pipeline_viewer_) {
+      pipeline_viewer_->close();
+      pipeline_viewer_.reset();
+      spdlog::info("Pipeline viewer closed");
+    }
+  }
+
+  auto get_cycles(const sc_core::sc_clock& clk) const -> std::uint64_t
+  {
+    const auto time_resolution = sc_core::sc_get_time_resolution();
+    const auto divider = clk.period().value() / time_resolution.value();
+    return sc_core::sc_time_stamp().value() / divider;
+  }
+
+  void log_committed_pcs(CPU& cpu)
+  {
+    if constexpr (requires { cpu.get_last_committed_pc(); }) {
+      auto pcs = cpu.get_last_committed_pc();
+      for (size_t core = 0; core < pcs.size(); ++core) {
+        std::string pc_list;
+        for (const auto& pc: pcs[core])
+          pc_list += fmt::format("0x{:x} ", pc);
+        spdlog::info("Core {} last PCs: {}", core, pc_list);
+      }
+    }
+  }
+
+private:
+  std::unique_ptr<pipeview::PipelineViewer<CPU>> pipeline_viewer_;
+  std::ofstream pc_trace_file_;
+  bool pc_trace_enabled_ = false;
+  std::uint64_t cycle_count_ = 0;
+  std::string waveform_filename_;
+
+#ifdef VSIMDEBUG
+  std::unique_ptr<VERILATORTRACER> waveform_file_{};
+#endif
+};
