@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# Hot inner-loop detector wrapper.
+#
+# Runs an ELF under user-mode QEMU with the hotloops plugin and prints
+# a sorted table of detected backward branches:
+#
+#   iters | start_pc -> end_pc | function:offset
+#
+# Usage:
+#   scripts/hotloops.sh [opts] <elf> [--] [prog args...]
+#
+# Options:
+#   --arch <riscv32|riscv64|auto>   Target arch (default: auto)
+#   --qemu <path>                   Override qemu binary
+#   --plugin <path>                 Override plugin .so
+#   --limit <N>                     Top-N loops to print (default 50)
+#   --min-iters <N>                 Hot-loop threshold; drop loops with
+#                                   fewer than N iterations (default 1)
+#   --objdump <path>                Override objdump (resolves symbols)
+#   --addr2line <path>              Override addr2line (resolves source lines)
+#   --no-source                     Disable source file:line resolution
+#   --raw                           Print raw plugin output, no formatting
+#   -h | --help                     Show help
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+QEMU_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
+ARCH="auto"
+QEMU=""
+PLUGIN=""
+LIMIT=50
+MIN_ITERS=1
+OBJDUMP=""
+ADDR2LINE=""
+NO_SOURCE=0
+RAW=0
+
+usage() { sed -n '2,20p' "$0"; exit 0; }
+
+# --- arg parsing ---
+ELF=""
+PROG_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --arch)    ARCH="$2"; shift 2 ;;
+        --qemu)    QEMU="$2"; shift 2 ;;
+        --plugin)  PLUGIN="$2"; shift 2 ;;
+        --limit)   LIMIT="$2"; shift 2 ;;
+        --min-iters) MIN_ITERS="$2"; shift 2 ;;
+        --objdump) OBJDUMP="$2"; shift 2 ;;
+        --addr2line) ADDR2LINE="$2"; shift 2 ;;
+        --no-source) NO_SOURCE=1; shift ;;
+        --raw)     RAW=1; shift ;;
+        -h|--help) usage ;;
+        --) shift; PROG_ARGS+=("$@"); break ;;
+        -*) echo "unknown option: $1" >&2; exit 2 ;;
+        *)
+            if [[ -z "$ELF" ]]; then ELF="$1"; else PROG_ARGS+=("$1"); fi
+            shift ;;
+    esac
+done
+
+[[ -n "$ELF" ]] || { echo "error: ELF path required" >&2; exit 2; }
+[[ -f "$ELF" ]] || { echo "error: not found: $ELF" >&2; exit 2; }
+
+# --- arch detection ---
+if [[ "$ARCH" == "auto" ]]; then
+    file_out="$(file -L -- "$ELF" 2>/dev/null || true)"
+    case "$file_out" in
+        *"ELF 64-bit"*"RISC-V"*)  ARCH=riscv64 ;;
+        *"ELF 32-bit"*"RISC-V"*)  ARCH=riscv32 ;;
+        *) echo "error: cannot auto-detect arch (not RISC-V?), pass --arch" >&2; exit 2 ;;
+    esac
+fi
+
+# --- locate qemu + plugin ---
+if [[ -z "$QEMU" ]]; then
+    QEMU="${QEMU_ROOT}/build/qemu-${ARCH}"
+fi
+[[ -x "$QEMU" ]] || { echo "error: qemu not found/executable: $QEMU" >&2; exit 2; }
+
+if [[ -z "$PLUGIN" ]]; then
+    PLUGIN="${QEMU_ROOT}/build/contrib/plugins/libhotloops.so"
+fi
+[[ -f "$PLUGIN" ]] || { echo "error: plugin not built: $PLUGIN" >&2; exit 2; }
+
+# --- run ---
+LOG="$(mktemp -t hotloops.XXXXXX.log)"
+trap 'rm -f "$LOG"' EXIT
+
+"$QEMU" \
+    -plugin "${PLUGIN},limit=${LIMIT},min_iters=${MIN_ITERS}" \
+    -d plugin -D "$LOG" \
+    -- "$ELF" "${PROG_ARGS[@]}" >/dev/null
+
+if [[ "$RAW" -eq 1 ]]; then
+    cat "$LOG"
+    exit 0
+fi
+
+# --- symbol table from objdump (best effort) ---
+if [[ -z "$OBJDUMP" ]]; then
+    for cand in llvm-objdump riscv64-unknown-elf-objdump \
+                riscv32-unknown-elf-objdump objdump; do
+        if command -v "$cand" >/dev/null 2>&1; then
+            OBJDUMP="$cand"
+            break
+        fi
+    done
+fi
+
+SYMS="$(mktemp -t hotloops_syms.XXXXXX)"
+LINES="$(mktemp -t hotloops_lines.XXXXXX)"
+trap 'rm -f "$LOG" "$SYMS" "$LINES"' EXIT
+if [[ -n "$OBJDUMP" ]]; then
+    # Capture FUNC symbols: addr size type name
+    "$OBJDUMP" -t "$ELF" 2>/dev/null \
+        | awk 'tolower($0) ~ /[ \t]f[ \t]/ && NF>=5 {
+                  addr=strtonum("0x" $1);
+                  size=strtonum("0x" $(NF-1));
+                  name=$NF;
+                  if (size>0) print addr, size, name;
+              }' \
+        | sort -n -k1,1 > "$SYMS" || true
+fi
+
+# --- locate addr2line for source line resolution (DWARF) ---
+if [[ "$NO_SOURCE" -eq 0 && -z "$ADDR2LINE" ]]; then
+    for cand in llvm-addr2line addr2line \
+                riscv64-unknown-elf-addr2line riscv32-unknown-elf-addr2line \
+                riscv64-linux-gnu-addr2line; do
+        if command -v "$cand" >/dev/null 2>&1; then
+            ADDR2LINE="$cand"
+            break
+        fi
+    done
+fi
+
+# Pre-collect all PCs from the log and batch-resolve to file:line.
+# LINES file format: <hex-pc> <file:line>
+if [[ "$NO_SOURCE" -eq 0 && -n "$ADDR2LINE" ]]; then
+    pcs="$(awk -F',' '/^0x/ {gsub(/[ \t]/,"",$1); gsub(/[ \t]/,"",$2); print $1; print $2}' "$LOG" | sort -u)"
+    if [[ -n "$pcs" ]]; then
+        # addr2line: -e <elf> -f -s -C reads addrs on stdin, prints
+        # alternating function/file:line; we ask for file:line only via -p.
+        out="$(printf '%s\n' $pcs | "$ADDR2LINE" -e "$ELF" -s 2>/dev/null || true)"
+        paste <(printf '%s\n' $pcs) <(printf '%s\n' "$out") > "$LINES" || true
+    fi
+fi
+
+# --- format ---
+python3 - "$LOG" "$SYMS" "$LINES" "$LIMIT" "$MIN_ITERS" <<'PY'
+import sys, re
+
+log_path = sys.argv[1]
+syms_path = sys.argv[2]
+lines_path = sys.argv[3]
+limit = int(sys.argv[4])
+min_iters = int(sys.argv[5])
+
+syms = []
+try:
+    with open(syms_path) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 3:
+                addr = int(parts[0])
+                size = int(parts[1])
+                name = " ".join(parts[2:])
+                syms.append((addr, size, name))
+except FileNotFoundError:
+    pass
+
+def resolve(pc):
+    for addr, size, name in syms:
+        if addr <= pc < addr + size:
+            return f"{name}+0x{pc-addr:x}"
+    return "?"
+
+src_map = {}
+try:
+    with open(lines_path) as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t", 1)
+            if len(parts) == 2:
+                pc_str, src = parts
+                src = src.strip()
+                if src and not src.startswith("??"):
+                    try:
+                        src_map[int(pc_str, 16)] = src
+                    except ValueError:
+                        pass
+except FileNotFoundError:
+    pass
+
+def src_line(pc):
+    return src_map.get(pc, "")
+
+rows = []
+with open(log_path) as f:
+    for line in f:
+        m = re.match(r"\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*,\s*(\d+)", line)
+        if m:
+            rows.append((int(m.group(1), 16),
+                         int(m.group(2), 16),
+                         int(m.group(3))))
+
+if not rows:
+    sys.stderr.write("hotloops: no backward edges observed\n")
+    sys.exit(0)
+
+rows = [r for r in rows if r[2] >= min_iters]
+rows.sort(key=lambda r: -r[2])
+rows = rows[:limit]
+
+if not rows:
+    sys.stderr.write(f"hotloops: no loops with iters >= {min_iters}\n")
+    sys.exit(0)
+
+print(f"# hot loops (iters >= {min_iters}), sorted desc, top {len(rows)}")
+
+have_src = bool(src_map)
+
+w_iter = max(len("iters"), max(len(str(r[2])) for r in rows))
+w_pc = 18  # 0x + 16 hex
+w_sym = max(len("location"),
+            max(len(f"{resolve(r[0])} -> {resolve(r[1])}") for r in rows))
+
+if have_src:
+    def srcpair(s, e):
+        a, b = src_line(s), src_line(e)
+        if a and b and a == b:
+            return a
+        return f"{a or '?'} -> {b or '?'}"
+    w_src = max(len("source"),
+                max(len(srcpair(r[0], r[1])) for r in rows))
+    print(f"{'iters':>{w_iter}} | {'start_pc':<{w_pc}} -> {'end_pc':<{w_pc}} | "
+          f"{'location':<{w_sym}} | source")
+    print("-" * (w_iter + 3 + w_pc + 4 + w_pc + 3 + w_sym + 3 + w_src))
+    for s, e, c in rows:
+        loc = f"{resolve(s)} -> {resolve(e)}"
+        print(f"{c:>{w_iter}} | 0x{s:016x} -> 0x{e:016x} | "
+              f"{loc:<{w_sym}} | {srcpair(s, e)}")
+else:
+    print(f"{'iters':>{w_iter}} | {'start_pc':<{w_pc}} -> {'end_pc':<{w_pc}} | location")
+    print("-" * (w_iter + 3 + w_pc + 4 + w_pc + 3 + w_sym))
+    for s, e, c in rows:
+        loc = f"{resolve(s)} -> {resolve(e)}"
+        print(f"{c:>{w_iter}} | 0x{s:016x} -> 0x{e:016x} | {loc}")
+PY

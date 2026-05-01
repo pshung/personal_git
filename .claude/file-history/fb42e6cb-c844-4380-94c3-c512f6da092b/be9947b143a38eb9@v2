@@ -1,0 +1,136 @@
+# QEMU hotloops + vsim Kanata loop-window: verification on libnn
+
+## What I tried to do
+
+You asked me to verify two tools end-to-end on real libnn binaries, before wiring them into `/optimize`:
+
+- **Tool A (QEMU hotloops)** - feed an ELF to QEMU, it tells you "the hottest loops are at these PC addresses".
+- **Tool B (vsim Kanata loop-window)** - feed an ELF to vsim *plus* the PC range of one loop, vsim dumps a Konata pipeline trace for just that loop and exits.
+
+The intended flow: A finds the loop, B dumps its pipeline. Together they replace the manual "extract a synthetic kernel into vsim" step.
+
+I picked two existing libnn perf ELFs:
+- `conv_HWC_s8_s8_s8_sym_bias_fast_perf.adx` (heavy - 524k FPGA cycles)
+- `relu_s8_perf.adx` (light - 3k FPGA cycles)
+
+Both already built without `-g`, as you required.
+
+---
+
+## Tool A: QEMU hotloops
+
+**It works in principle.** I ran QEMU in system-mode with the plugin attached:
+
+```
+qemu-system-riscv64 -M andes_ae350 -cpu andes-ax45mpv,vlen=1024 \
+  -nographic -semihosting -bios <elf> \
+  -plugin libhotloops.so -d plugin -D log.txt
+```
+
+Output for the conv ELF:
+
+```
+12800 | 0x11288 -> 0x11308 | nn_mat_mul_kernel_q7_bias_2sft_unroll4+0x88 -> +0x108
+ 1600 | 0x10be8 -> 0x10c20 | riscv_nn_conv_HWC_s8_s8_s8_sym_bias_fast+0x2d0 ...
+ 1416 | 0x133ec -> 0x1343e | memcpy+0xac -> memcpy+0xfe
+ ...
+```
+
+The top loop is the actual GEMM inner body (8 `vle8.v` + 16 `nds.vd4dots` + `bnez`). PCs match the back-branch. So *for heavy kernels*, the tool gives the right answer.
+
+### Problem 1 - the wrapper script is wrong for our use case
+
+There's a wrapper at `/local/nick/qemu_v5/scripts/hotloops.sh`. It assumes you have a *Linux* binary that runs under user-mode QEMU (`qemu-riscv64`). Our libnn perf ELFs are *baremetal* - they need system-mode QEMU with `-M andes_ae350 -cpu andes-ax45mpv -bios <elf>`. The wrapper can't do that. So if `/optimize` integrates A, it must call `qemu-system-riscv64` directly, not via the wrapper.
+
+### Problem 2 - top-1 is not always the kernel
+
+For the *light* kernel `relu_s8`, the inner loop ran only 26 times. But the test harness has an accuracy-check loop that compares 65,534 output bytes one-by-one - so *that* loop topped the list with 65,534 iters, drowning out the 26-iter kernel:
+
+```
+65534 | test+0x104 -> +0x128       <- harness verify loop, NOT the kernel
+ 1664 | memcpy+0xac -> +0xfe
+  170 | memset+0x18 -> +0x1e
+  ...
+   26 | riscv_nn_relu_s8+0x58 -> +0xa6   <- the actual kernel, way down
+```
+
+If `/optimize` blindly takes rank-1, it optimizes the wrong loop. Fix is easy: read the ELF symbol table, drop any row whose PC isn't inside `riscv_nn_<your_function>` (or one of its callees like `nn_mat_mul_kernel_*`).
+
+---
+
+## Tool B: vsim Kanata loop-window
+
+**This is where I hit real problems.**
+
+The doc promises: pass `--kanata-loop-start <pc> --kanata-loop-end <pc> --kanata-loop-skip 0 --kanata-loop-record 4` and vsim will:
+- Suppress all pipeline log output until the gate opens.
+- Record exactly 4 iterations of the chosen loop.
+- Print `Kanata loop window [...] : 4 iters, ... IPC=...` and exit cleanly.
+
+I ran it on `relu_s8` with the PCs that hotloops gave me (`0x105f4 -> 0x10642`):
+
+```
+sim_ax45mpv_premium relu_s8_perf.adx \
+  --kanata out.kanata \
+  --kanata-loop-start 0x105f4 --kanata-loop-end 0x10642 \
+  --kanata-loop-skip 0 --kanata-loop-record 4
+```
+
+After **19 minutes of CPU time**, vsim was still running. I had to kill it at the 10-minute wallclock timeout. When I inspected what it had produced:
+
+### Issue 1 - the gate does not filter
+
+`out.kanata` was 28 MB containing 266,978 instruction records, with PC labels starting at `0x10140` (the very first instruction of CRT, long before our `--kanata-loop-start = 0x105f4`). The doc says: *"While the gate is closed, no I/C/R records are emitted."* In practice, vsim emitted everything from cycle 0. The gate is configured (vsim prints `[info] Kanata loop gate: start=... end=... skip=0 record=4` at startup) but it doesn't actually suppress output.
+
+### Issue 2 - the record-complete exit never fires
+
+Even if the gate had filtered, vsim is supposed to exit after the 4th iter. It didn't. No summary line was printed. vsim ran forever and had to be SIGKILLed.
+
+### Issue 3 - vsim never even reached the kernel
+
+This is the most damaging finding. I grepped the trace for any PC in the relu_s8 region (`0x1059c-0x10670`). **Zero hits.** vsim had executed 4 million simulated cycles' worth of code but had not yet entered `relu_s8`. It was stuck inside the libgloss/HTIF `fread` path that loads 65,534 bytes of golden-output data into memory before the kernel runs. vsim is roughly 8 kHz; reading 65k bytes one syscall at a time is a wall.
+
+The implication is bigger than the gate bugs: even if Issues 1 and 2 are fixed, simply running a perf-test ELF inside vsim is not viable - the data-load prelude alone takes hours of wallclock. The reason `hot-inner-kernel-extractor` exists in the skills directory is precisely to dodge this: it builds a tiny synthetic harness with the kernel preloaded into a buffer, no fread, no golden data.
+
+---
+
+## Why this matters for `/optimize`
+
+The clean-looking idea was:
+
+```
+hotloops -> (start_pc, end_pc) -> vsim Kanata gate on full perf ELF -> pipeline log
+```
+
+That can't work today. Two of the three steps each have showstopper issues for our real binaries.
+
+The salvageable plan:
+
+```
+hotloops on full perf ELF (works, with two fixes)
+  |
+  v  start_pc, end_pc
+  |
+hot-inner-kernel-extractor builds a synthetic harness for that loop
+  |
+  v  small ELF that hits the kernel in milliseconds
+  |
+vsim Kanata gate on the synthetic ELF (gate bugs may matter less here)
+  |
+  v Konata pipeline trace
+```
+
+In other words: keep the existing extractor in the loop. Use hotloops *only* to pick which loop to feed it.
+
+---
+
+## What needs to be filed before integration
+
+Against `hotloops.sh`: add a baremetal/system-mode path so it can launch `qemu-system-riscv64 -M ... -cpu ... -bios <elf>` instead of user-mode `qemu-riscv64 -- <elf>`.
+
+Against vsim: the loop-window gate doesn't gate (Issue 1) and doesn't exit on `record` complete (Issue 2). Reproducer:
+
+- ELF: `/home/nick/work/libnn_0421/.claude/skills/optimize/work/t_relu_s8_perf.adx`
+- Flags: `--kanata-loop-start 0x105f4 --kanata-loop-end 0x10642 --kanata-loop-skip 0 --kanata-loop-record 4`
+
+Both need fixing before vsim Kanata can be a useful direct target.
