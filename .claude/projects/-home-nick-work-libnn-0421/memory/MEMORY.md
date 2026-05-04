@@ -12,4 +12,3 @@
 - [Vector init affects steady-state cycles](feedback_vector_init_residual_data.md) — Skipping vector live-in init in extracted-kernel harness slowed AX45MPV conv by 53 cyc/iter. Don't strip "dead" prologue without measuring.
 - [vsim build gotchas](reference_vsim_build.md) — sim_ax45mpv_premium needs zve32x_xandes (not full v), -fno-tree-vectorize, and mstatus.VS-enable in main(). vsim ~7-9 kHz, ~2.3x faster than FPGA per iter (no cache).
 - [extractor skill revisions](feedback_extractor_skill_revisions.md) — Three failure modes from running on conv_HWC_u8_u8: bare-name FN, missing nds.bbs/bbc/beqc/bnec branch mnemonics, live-in same-pointer short-circuit. All fixed; warning detects the bogus-PASS case.
-- [FPGA perf tests live in unit_performance](feedback_perf_test_dir.md) — Perf scripts must use Examples/unit_performance/t_pf_<name>.c; unit_func is correctness-only.
