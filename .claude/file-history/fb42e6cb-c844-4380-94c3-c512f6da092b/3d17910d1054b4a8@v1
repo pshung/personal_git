@@ -1,0 +1,131 @@
+#include "pipeview/kanata_logger.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <sstream>
+#include <string>
+
+namespace {
+
+constexpr uint64_t START_PC = 0x100;
+constexpr uint64_t END_PC   = 0x118;
+constexpr uint64_t OTHER_PC = 0x110;
+
+bool contains(const std::string& haystack, const std::string& needle)
+{
+  return haystack.find(needle) != std::string::npos;
+}
+
+} // namespace
+
+TEST_CASE("no gate: writes pass through unchanged")
+{
+  std::stringstream ss;
+  kanata::KanataLogger log{ss};
+
+  log.start_insn(START_PC, /*id=*/1);
+  log.advance_cycle(1);
+  log.retire_insn(/*id=*/1);
+
+  const auto out = ss.str();
+  CHECK(contains(out, "I\t1\t1\t0"));
+  CHECK(contains(out, "L\t1\t0\t0x100"));
+  CHECK(contains(out, "C\t1"));
+  CHECK(contains(out, "R\t1\t1\t0"));
+}
+
+TEST_CASE("gate skip=0: records from the first instruction (no warmup)")
+{
+  std::stringstream ss;
+  kanata::KanataLogger log{
+    ss, kanata::LoopGate{START_PC, END_PC, /*skip=*/0, /*record=*/10}};
+
+  // skip=0 means no warmup: the very first insn must be recorded.
+  log.start_insn(OTHER_PC, /*id=*/1);
+  log.advance_cycle(1);
+  log.retire_insn(/*id=*/1);
+
+  const auto out = ss.str();
+  CHECK(contains(out, "I\t1"));
+  CHECK(contains(out, "C\t1"));
+  CHECK(contains(out, "R\t1\t1\t0"));
+}
+
+TEST_CASE("gate skip=2: window opens on 3rd end_pc retire")
+{
+  std::stringstream ss;
+  kanata::KanataLogger log{
+    ss, kanata::LoopGate{START_PC, END_PC, /*skip=*/2, /*record=*/10}};
+
+  // Iterations 1 and 2: must NOT be recorded.
+  for (uint64_t id : {1ULL, 2ULL}) {
+    log.start_insn(END_PC, id);
+    log.retire_insn(id);
+  }
+  CHECK(ss.str().find("I\t") == std::string::npos);
+
+  // Iteration 3: window opens after this end_pc retire.
+  log.start_insn(END_PC, /*id=*/3);
+  log.retire_insn(/*id=*/3);
+
+  // Iteration 4 body: now recorded.
+  log.start_insn(OTHER_PC, /*id=*/4);
+  log.retire_insn(/*id=*/4);
+
+  const auto out = ss.str();
+  CHECK_FALSE(contains(out, "I\t1"));
+  CHECK_FALSE(contains(out, "I\t2"));
+  CHECK(contains(out, "I\t4"));
+}
+
+TEST_CASE("gate: flush_insn(end_pc) does NOT advance the iteration counter")
+{
+  std::stringstream ss;
+  kanata::KanataLogger log{
+    ss, kanata::LoopGate{START_PC, END_PC, /*skip=*/1, /*record=*/10}};
+
+  // Speculatively-fetched end_pc that gets flushed (mispredict).
+  log.start_insn(END_PC, /*id=*/1);
+  log.flush_insn(/*id=*/1);
+
+  // First *real* retire of end_pc. Skip=1 means this completes the warmup.
+  log.start_insn(END_PC, /*id=*/2);
+  log.retire_insn(/*id=*/2);
+
+  // Next insn must be recorded (window open). If flush had counted, the
+  // window would have opened earlier; either way insn id=3 should be
+  // recorded once warmup is satisfied.
+  log.start_insn(OTHER_PC, /*id=*/3);
+  log.retire_insn(/*id=*/3);
+
+  CHECK(contains(ss.str(), "I\t3"));
+
+  // Now drive a second pre-warmup variant to confirm flushed end_pc is
+  // truly ignored: a fresh logger, skip=1, flush end_pc THEN retire other.
+  // Window must NOT open from the flush alone.
+  std::stringstream ss2;
+  kanata::KanataLogger log2{
+    ss2, kanata::LoopGate{START_PC, END_PC, /*skip=*/1, /*record=*/10}};
+  log2.start_insn(END_PC, /*id=*/10);
+  log2.flush_insn(/*id=*/10);
+  log2.start_insn(OTHER_PC, /*id=*/11);
+  log2.retire_insn(/*id=*/11);
+  CHECK_FALSE(contains(ss2.str(), "I\t11"));
+}
+
+TEST_CASE("gate: stage and comment writes are silenced pre-window")
+{
+  std::stringstream ss;
+  kanata::KanataLogger log{
+    ss, kanata::LoopGate{START_PC, END_PC, /*skip=*/1, /*record=*/10}};
+
+  log.start_insn(OTHER_PC, /*id=*/1);
+  log.stage_insn(/*id=*/1, "IF");
+  log.comment_insn(/*id=*/1, "hello");
+  log.retire_insn(/*id=*/1);
+
+  const auto out = ss.str();
+  CHECK_FALSE(contains(out, "S\t1"));
+  CHECK_FALSE(contains(out, "L\t1\t1\thello"));
+}
