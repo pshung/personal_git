@@ -1,0 +1,566 @@
+#!/usr/bin/env bash
+# Hot inner-loop detector wrapper (system-mode, baremetal RISC-V).
+#
+# Runs a baremetal ELF under qemu-system-<arch> with the hotloops plugin
+# and prints a sorted table of detected backward branches:
+#
+#   iters | start_pc -> end_pc | function:offset
+#
+# Usage:
+#   scripts/hotloops.sh [opts] <elf>
+#
+# Options:
+#   --arch <riscv32|riscv64|auto>   Target arch (default: auto)
+#   --qemu <path>                   Override qemu-system binary
+#   --plugin <path>                 Override plugin .so
+#   --machine <name>                -M <name> (default andes_ae350)
+#   --cpu <spec>                    -cpu <spec>
+#                                   (default andes-ax45mpv,vext_spec=v1.0,vlen=1024)
+#   --qemu-config <file>            -readconfig <file> (e.g. AE350 device cfg)
+#   --cwd <dir>                     chdir before launching QEMU so semihosting
+#                                   opens (fread of bin/*.bin) resolve
+#   --qemu-arg <arg>                Append an extra arg to the QEMU command
+#                                   (repeatable)
+#   --limit <N>                     Top-N loops to print (default 50)
+#   --min-iters <N>                 Drop loops with fewer than N iters (default 1)
+#   --objdump <path>                Override objdump (resolves symbols)
+#   --addr2line <path>              Override addr2line (resolves source lines)
+#   --no-source                     Disable source file:line resolution
+#   --raw                           Print raw plugin output, no formatting
+#   --optimize-rvv                  Only report loops with at least one RVV
+#                                   instruction (default: on)
+#   --no-optimize-rvv               Disable the RVV-only filter
+#   --llm                           Emit a Markdown report tuned for LLM
+#                                   consumption: TL;DR + per-loop fact-sheets
+#                                   with stable IDs, source snippets, RVV
+#                                   instruction listings, nesting, and direct
+#                                   callees (default: on).
+#   --no-llm                        Emit the plain human-readable table.
+#   -h | --help                     Show help
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+QEMU_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
+ARCH="auto"
+QEMU=""
+PLUGIN=""
+LIMIT=50
+MIN_ITERS=1
+OBJDUMP=""
+ADDR2LINE=""
+NO_SOURCE=0
+RAW=0
+OPTIMIZE_RVV=1
+LLM=1
+MACHINE="andes_ae350"
+CPU="andes-ax45mpv,vext_spec=v1.0,vlen=1024"
+QEMU_CONFIG=""
+QEMU_CWD=""
+EXTRA_QEMU_ARGS=()
+
+usage() { sed -n '2,39p' "$0"; exit 0; }
+
+# --- arg parsing ---
+ELF=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --arch)        ARCH="$2"; shift 2 ;;
+        --qemu)        QEMU="$2"; shift 2 ;;
+        --plugin)      PLUGIN="$2"; shift 2 ;;
+        --machine)     MACHINE="$2"; shift 2 ;;
+        --cpu)         CPU="$2"; shift 2 ;;
+        --qemu-config) QEMU_CONFIG="$2"; shift 2 ;;
+        --cwd)         QEMU_CWD="$2"; shift 2 ;;
+        --qemu-arg)    EXTRA_QEMU_ARGS+=("$2"); shift 2 ;;
+        --limit)       LIMIT="$2"; shift 2 ;;
+        --min-iters)   MIN_ITERS="$2"; shift 2 ;;
+        --objdump)     OBJDUMP="$2"; shift 2 ;;
+        --addr2line)   ADDR2LINE="$2"; shift 2 ;;
+        --no-source)   NO_SOURCE=1; shift ;;
+        --raw)         RAW=1; shift ;;
+        --optimize-rvv)    OPTIMIZE_RVV=1; shift ;;
+        --no-optimize-rvv) OPTIMIZE_RVV=0; shift ;;
+        --llm)             LLM=1; shift ;;
+        --no-llm)          LLM=0; shift ;;
+        -h|--help)     usage ;;
+        -*) echo "unknown option: $1" >&2; exit 2 ;;
+        *)
+            if [[ -z "$ELF" ]]; then
+                ELF="$1"; shift
+            else
+                echo "error: unexpected positional arg: $1" >&2; exit 2
+            fi ;;
+    esac
+done
+
+[[ -n "$ELF" ]] || { echo "error: ELF path required" >&2; exit 2; }
+[[ -f "$ELF" ]] || { echo "error: not found: $ELF" >&2; exit 2; }
+
+# --- arch detection ---
+if [[ "$ARCH" == "auto" ]]; then
+    file_out="$(file -L -- "$ELF" 2>/dev/null || true)"
+    case "$file_out" in
+        *"ELF 64-bit"*"RISC-V"*)  ARCH=riscv64 ;;
+        *"ELF 32-bit"*"RISC-V"*)  ARCH=riscv32 ;;
+        *) echo "error: cannot auto-detect arch (not RISC-V?), pass --arch" >&2; exit 2 ;;
+    esac
+fi
+
+# --- locate qemu + plugin ---
+if [[ -z "$QEMU" ]]; then
+    QEMU="${QEMU_ROOT}/build/qemu-system-${ARCH}"
+fi
+[[ -x "$QEMU" ]] || { echo "error: qemu not found/executable: $QEMU" >&2; exit 2; }
+
+if [[ -z "$PLUGIN" ]]; then
+    PLUGIN="${QEMU_ROOT}/build/contrib/plugins/libhotloops.so"
+fi
+[[ -f "$PLUGIN" ]] || { echo "error: plugin not built: $PLUGIN" >&2; exit 2; }
+
+# --- run ---
+LOG="$(mktemp -t hotloops.XXXXXX.log)"
+trap 'rm -f "$LOG"' EXIT
+
+QEMU_CMD=("$QEMU"
+          -plugin "${PLUGIN},limit=${LIMIT},min_iters=${MIN_ITERS}"
+          -d plugin -D "$LOG"
+          -M "$MACHINE"
+          -cpu "$CPU"
+          -nographic -semihosting
+          -bios "$ELF")
+[[ -n "$QEMU_CONFIG" ]] && QEMU_CMD+=(-readconfig "$QEMU_CONFIG")
+[[ ${#EXTRA_QEMU_ARGS[@]} -gt 0 ]] && QEMU_CMD+=("${EXTRA_QEMU_ARGS[@]}")
+if [[ -n "$QEMU_CWD" ]]; then
+    ( cd "$QEMU_CWD" && "${QEMU_CMD[@]}" ) >/dev/null
+else
+    "${QEMU_CMD[@]}" >/dev/null
+fi
+
+if [[ "$RAW" -eq 1 ]]; then
+    cat "$LOG"
+    exit 0
+fi
+
+# --- symbol table from objdump (best effort) ---
+if [[ -z "$OBJDUMP" ]]; then
+    for cand in llvm-objdump riscv64-unknown-elf-objdump \
+                riscv32-unknown-elf-objdump objdump; do
+        if command -v "$cand" >/dev/null 2>&1; then
+            OBJDUMP="$cand"
+            break
+        fi
+    done
+fi
+
+SYMS="$(mktemp -t hotloops_syms.XXXXXX)"
+LINES="$(mktemp -t hotloops_lines.XXXXXX)"
+DISASM="$(mktemp -t hotloops_disasm.XXXXXX)"
+trap 'rm -f "$LOG" "$SYMS" "$LINES" "$DISASM"' EXIT
+if [[ -n "$OBJDUMP" ]]; then
+    # Capture FUNC symbols: addr size type name
+    "$OBJDUMP" -t "$ELF" 2>/dev/null \
+        | awk 'tolower($0) ~ /[ \t]f[ \t]/ && NF>=5 {
+                  addr=strtonum("0x" $1);
+                  size=strtonum("0x" $(NF-1));
+                  name=$NF;
+                  if (size>0) print addr, size, name;
+              }' \
+        | sort -n -k1,1 > "$SYMS" || true
+
+    # Capture disassembly: each output line is "<hex-pc> <mnemonic> <operands>".
+    # Works for both GNU binutils objdump and llvm-objdump. Used by the RVV
+    # filter (mnemonic) and --llm mode (operands, callee names).
+    if [[ "$OPTIMIZE_RVV" -eq 1 || "$LLM" -eq 1 ]]; then
+        "$OBJDUMP" -d --no-show-raw-insn "$ELF" 2>/dev/null \
+            | awk '
+                /^[ \t]*[0-9a-fA-F]+:[ \t]+[^ \t]+/ {
+                    line = $0;
+                    sub(/^[ \t]+/, "", line);
+                    sub(/[ \t]+$/, "", line);
+                    sub(/:[ \t]+/, " ", line);
+                    print line;
+                }' > "$DISASM" || true
+    fi
+fi
+
+# --- locate addr2line for source line resolution (DWARF) ---
+if [[ "$NO_SOURCE" -eq 0 && -z "$ADDR2LINE" ]]; then
+    for cand in llvm-addr2line addr2line \
+                riscv64-unknown-elf-addr2line riscv32-unknown-elf-addr2line \
+                riscv64-linux-gnu-addr2line; do
+        if command -v "$cand" >/dev/null 2>&1; then
+            ADDR2LINE="$cand"
+            break
+        fi
+    done
+fi
+
+# Pre-collect all PCs from the log and batch-resolve to file:line.
+# LINES file format: <hex-pc> <file:line>
+if [[ "$NO_SOURCE" -eq 0 && -n "$ADDR2LINE" ]]; then
+    pcs="$(awk -F',' '/^0x/ {gsub(/[ \t]/,"",$1); gsub(/[ \t]/,"",$2); print $1; print $2}' "$LOG" | sort -u)"
+    if [[ -n "$pcs" ]]; then
+        # addr2line: -e <elf> reads addrs on stdin, prints file:line.
+        # We keep full paths here (no -s) so --llm mode can locate the
+        # source file for code snippets; table mode basenames in Python.
+        out="$(printf '%s\n' $pcs | "$ADDR2LINE" -e "$ELF" 2>/dev/null || true)"
+        paste <(printf '%s\n' $pcs) <(printf '%s\n' "$out") > "$LINES" || true
+    fi
+fi
+
+# --- format ---
+python3 - "$LOG" "$SYMS" "$LINES" "$DISASM" "$LIMIT" "$MIN_ITERS" \
+        "$OPTIMIZE_RVV" "$LLM" "$ELF" <<'PY'
+import sys, os, re, bisect
+
+log_path     = sys.argv[1]
+syms_path    = sys.argv[2]
+lines_path   = sys.argv[3]
+disasm_path  = sys.argv[4]
+limit        = int(sys.argv[5])
+min_iters    = int(sys.argv[6])
+optimize_rvv = int(sys.argv[7]) == 1
+llm_mode     = int(sys.argv[8]) == 1
+elf_path     = sys.argv[9]
+
+# --- symbols (FUNC syms): list of (addr, size, name) sorted by addr ---
+syms = []
+try:
+    with open(syms_path) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 3:
+                syms.append((int(parts[0]), int(parts[1]),
+                             " ".join(parts[2:])))
+except FileNotFoundError:
+    pass
+
+def resolve(pc):
+    for addr, size, name in syms:
+        if addr <= pc < addr + size:
+            return f"{name}+0x{pc-addr:x}"
+    return "?"
+
+def fn_of(pc):
+    for addr, size, name in syms:
+        if addr <= pc < addr + size:
+            return name
+    return None
+
+# --- source map: pc -> "path:line" (full path; basename in Python for table) ---
+src_map = {}
+try:
+    with open(lines_path) as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t", 1)
+            if len(parts) == 2:
+                pc_str, src = parts
+                src = src.strip()
+                if src and not src.startswith("??"):
+                    try:
+                        src_map[int(pc_str, 16)] = src
+                    except ValueError:
+                        pass
+except FileNotFoundError:
+    pass
+
+def src_full(pc):
+    return src_map.get(pc, "")
+
+def src_basename(s):
+    """Basename the path part of a 'path:line[ (extra)]' string."""
+    if not s:
+        return ""
+    head, sep, tail = s.partition(" ")
+    return os.path.basename(head) + (sep + tail if sep else "")
+
+def src_short(pc):
+    return src_basename(src_full(pc))
+
+# --- disassembly: pc -> (mnemonic, operands) ---
+disasm = {}
+try:
+    with open(disasm_path) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            parts = line.split(None, 2)
+            if len(parts) < 2:
+                continue
+            try:
+                pc = int(parts[0], 16)
+            except ValueError:
+                continue
+            mnemonic = parts[1]
+            operands = parts[2] if len(parts) >= 3 else ""
+            disasm[pc] = (mnemonic, operands)
+except FileNotFoundError:
+    pass
+
+disasm_pcs = sorted(disasm.keys())
+
+def is_rvv_mnemonic(mn):
+    mn = mn.lower()
+    return mn.startswith("v") and len(mn) > 1 and mn[1].isalpha()
+
+rvv_pcs = sorted(pc for pc, (mn, _) in disasm.items() if is_rvv_mnemonic(mn))
+
+def has_rvv_in_range(s, e):
+    if not rvv_pcs or s > e:
+        return False
+    i = bisect.bisect_left(rvv_pcs, s)
+    return i < len(rvv_pcs) and rvv_pcs[i] <= e
+
+def rvv_insns_in_range(s, e):
+    out = []
+    if not rvv_pcs or s > e:
+        return out
+    i = bisect.bisect_left(rvv_pcs, s)
+    while i < len(rvv_pcs) and rvv_pcs[i] <= e:
+        pc = rvv_pcs[i]
+        mn, ops = disasm[pc]
+        out.append((pc, mn, ops))
+        i += 1
+    return out
+
+CALL_MN = {"jal", "jalr", "c.jal", "c.jalr"}
+CALLEE_RE = re.compile(r"<([^>]+)>")
+
+def calls_in_range(s, e):
+    out = []
+    if not disasm_pcs or s > e:
+        return out
+    i = bisect.bisect_left(disasm_pcs, s)
+    while i < len(disasm_pcs) and disasm_pcs[i] <= e:
+        pc = disasm_pcs[i]
+        mn, ops = disasm[pc]
+        if mn in CALL_MN:
+            m = CALLEE_RE.search(ops)
+            target = m.group(1) if m else "(indirect)"
+            out.append((pc, mn, target))
+        i += 1
+    return out
+
+def parse_file_line(s):
+    """'path:42' or 'path:42 (discriminator 1)' -> (path, 42)."""
+    if not s or s.startswith("??"):
+        return None, None
+    m = re.match(r"^(.+?):(\d+)(?::\d+)?(?:\s|$)", s)
+    if not m:
+        return None, None
+    return m.group(1), int(m.group(2))
+
+def read_source_line(path, lineno):
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, errors="replace") as f:
+            for i, line in enumerate(f, 1):
+                if i == lineno:
+                    return line.rstrip()
+    except OSError:
+        return None
+    return None
+
+# --- raw rows from plugin ---
+rows = []
+with open(log_path) as f:
+    for line in f:
+        m = re.match(r"\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*,\s*(\d+)",
+                     line)
+        if m:
+            rows.append((int(m.group(1), 16),
+                         int(m.group(2), 16),
+                         int(m.group(3))))
+
+if not rows:
+    sys.stderr.write("hotloops: no backward edges observed\n")
+    sys.exit(0)
+
+total_iters_all = sum(r[2] for r in rows)
+
+rows = [r for r in rows if r[2] >= min_iters]
+if optimize_rvv:
+    rows = [r for r in rows if has_rvv_in_range(r[0], r[1])]
+rows.sort(key=lambda r: -r[2])
+rows = rows[:limit]
+
+if not rows:
+    msg = f"hotloops: no loops with iters >= {min_iters}"
+    if optimize_rvv:
+        msg += " containing RVV instructions"
+    sys.stderr.write(msg + "\n")
+    sys.exit(0)
+
+# --- Loop objects + nesting (PC-range containment) ---
+class Loop:
+    __slots__ = ("id", "start", "end", "iters", "parent", "children")
+    def __init__(self, idx, s, e, c):
+        self.id = f"L{idx}"
+        self.start = s
+        self.end = e
+        self.iters = c
+        self.parent = None
+        self.children = []
+
+loops = [Loop(i + 1, s, e, c) for i, (s, e, c) in enumerate(rows)]
+
+for loop in loops:
+    best = None
+    best_size = None
+    for cand in loops:
+        if cand is loop:
+            continue
+        if cand.start <= loop.start and loop.end <= cand.end:
+            if cand.start == loop.start and cand.end == loop.end:
+                continue  # identical range, ambiguous - skip
+            sz = cand.end - cand.start
+            if best is None or sz < best_size:
+                best = cand
+                best_size = sz
+    loop.parent = best
+
+for loop in loops:
+    if loop.parent is not None:
+        loop.parent.children.append(loop)
+
+# ============================================================
+# --- LLM mode: Markdown report with TL;DR + per-loop blocks ---
+# ============================================================
+if llm_mode:
+    def pct(n):
+        return (100.0 * n / total_iters_all) if total_iters_all else 0.0
+
+    def render_tldr(top):
+        rvv_list = rvv_insns_in_range(top.start, top.end)
+        if rvv_list:
+            uniq = []
+            seen = set()
+            for _, mn, _ in rvv_list:
+                if mn not in seen:
+                    seen.add(mn)
+                    uniq.append(mn)
+            rvv_str = "RVV (" + ", ".join(uniq[:3])
+            if len(uniq) > 3:
+                rvv_str += f", +{len(uniq) - 3} more"
+            rvv_str += ")"
+        else:
+            rvv_str = "scalar"
+        fn = fn_of(top.start) or "?"
+        src_s = src_short(top.start) or "?"
+        if top.parent is None:
+            nest_str = "top-level (no parent loop)"
+        else:
+            nest_str = f"nested inside {top.parent.id}"
+        if top.children:
+            cs = ", ".join(c.id for c in top.children)
+            child_str = (f"and contains {len(top.children)} inner loop(s): "
+                         f"{cs}")
+        else:
+            child_str = "and contains no inner loop"
+        return (f"Hottest loop is {top.id} in `{fn}` ({src_s}), "
+                f"{top.iters} iters = {pct(top.iters):.1f}% of total. "
+                f"Body is {rvv_str}. It is {nest_str}, {child_str}.")
+
+    print("# Hotloops Report")
+    print(f"target:           {os.path.basename(elf_path)}")
+    print(f"total_iters:      {total_iters_all}")
+    print(f"reported_loops:   {len(loops)}")
+    print(f"min_iters:        {min_iters}")
+    print(f"rvv_filter:       {'on' if optimize_rvv else 'off'}")
+    print()
+    print("## TL;DR")
+    print(render_tldr(loops[0]))
+    print()
+    print("## Loops")
+    for idx, loop in enumerate(loops):
+        tag = " [hottest]" if idx == 0 else ""
+        print()
+        print(f"### {loop.id}{tag}  ({pct(loop.iters):.1f}% of total)")
+        print(f"iters:        {loop.iters}")
+        size = loop.end - loop.start
+        print(f"pc_range:     0x{loop.start:x} .. 0x{loop.end:x}  "
+              f"(size: {size} B)")
+        print(f"function:     {resolve(loop.start)} -> {resolve(loop.end)}")
+        src_s = src_full(loop.start)
+        src_e = src_full(loop.end)
+        if src_s and src_e and src_s == src_e:
+            print(f"source:       {src_basename(src_s)}")
+        else:
+            print(f"source:       {src_basename(src_s) or '?'}"
+                  f" -> {src_basename(src_e) or '?'}")
+        path, lineno = parse_file_line(src_s)
+        snippet = read_source_line(path, lineno) if path and lineno else None
+        if snippet:
+            snippet = snippet.strip()
+            if len(snippet) > 200:
+                snippet = snippet[:197] + "..."
+            print(f"code:         {snippet}")
+        rvv_list = rvv_insns_in_range(loop.start, loop.end)
+        if rvv_list:
+            print(f"rvv:          yes ({len(rvv_list)} insn"
+                  f"{'s' if len(rvv_list) != 1 else ''})")
+            print(f"rvv_insns:")
+            for pc, mn, ops in rvv_list[:8]:
+                print(f"  - 0x{pc:x}  {mn:<10s} {ops}")
+            if len(rvv_list) > 8:
+                print(f"  - ... ({len(rvv_list) - 8} more)")
+        else:
+            print(f"rvv:          no")
+        print(f"parent:       {loop.parent.id if loop.parent else '-'}")
+        if loop.children:
+            cs = ", ".join(c.id for c in loop.children)
+            print(f"children:     [{cs}]")
+        else:
+            print(f"children:     []")
+        callees = calls_in_range(loop.start, loop.end)
+        if callees:
+            print(f"calls:")
+            for pc, mn, target in callees[:8]:
+                print(f"  - 0x{pc:x}  {mn} -> {target}")
+            if len(callees) > 8:
+                print(f"  - ... ({len(callees) - 8} more)")
+        else:
+            print(f"calls:        []")
+    sys.exit(0)
+
+# ============================================================
+# --- table mode (default, human-readable) ---
+# ============================================================
+hdr = f"# hot loops (iters >= {min_iters}"
+if optimize_rvv:
+    hdr += ", RVV-only"
+hdr += f"), sorted desc, top {len(rows)}"
+print(hdr)
+
+have_src = bool(src_map)
+
+w_iter = max(len("iters"), max(len(str(r[2])) for r in rows))
+w_pc = 18  # 0x + 16 hex
+w_sym = max(len("location"),
+            max(len(f"{resolve(r[0])} -> {resolve(r[1])}") for r in rows))
+
+if have_src:
+    def srcpair(s, e):
+        a, b = src_short(s), src_short(e)
+        if a and b and a == b:
+            return a
+        return f"{a or '?'} -> {b or '?'}"
+    w_src = max(len("source"),
+                max(len(srcpair(r[0], r[1])) for r in rows))
+    print(f"{'iters':>{w_iter}} | {'start_pc':<{w_pc}} -> "
+          f"{'end_pc':<{w_pc}} | {'location':<{w_sym}} | source")
+    print("-" * (w_iter + 3 + w_pc + 4 + w_pc + 3 + w_sym + 3 + w_src))
+    for s, e, c in rows:
+        loc = f"{resolve(s)} -> {resolve(e)}"
+        print(f"{c:>{w_iter}} | 0x{s:016x} -> 0x{e:016x} | "
+              f"{loc:<{w_sym}} | {srcpair(s, e)}")
+else:
+    print(f"{'iters':>{w_iter}} | {'start_pc':<{w_pc}} -> "
+          f"{'end_pc':<{w_pc}} | location")
+    print("-" * (w_iter + 3 + w_pc + 4 + w_pc + 3 + w_sym))
+    for s, e, c in rows:
+        loc = f"{resolve(s)} -> {resolve(e)}"
+        print(f"{c:>{w_iter}} | 0x{s:016x} -> 0x{e:016x} | {loc}")
+PY
