@@ -1,0 +1,191 @@
+/*
+ * Hot-loop detector plugin.
+ *
+ * Detects loops by observing backward TB transitions: when the next
+ * executed translation block starts at a PC strictly less than the
+ * last instruction PC of the previously executed TB, we treat that
+ * pair (header_pc=current_tb_start, tail_pc=last_insn_of_prev_tb) as
+ * a loop edge and bump its iteration count.
+ *
+ * Output (at exit, sorted by iteration count desc):
+ *   start_pc, end_pc, iterations
+ *
+ * Copyright (C) 2026
+ * License: GNU GPL, version 2 or later.
+ *   See the COPYING file in the top-level directory.
+ */
+#include <inttypes.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <glib.h>
+
+#include <qemu-plugin.h>
+
+QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
+
+static GMutex lock;
+static GHashTable *loops;        /* key: (start<<1)^end -> LoopEdge* */
+static GArray *vcpu_state;       /* indexed by cpu_index */
+static guint64 limit = 50;       /* max rows printed */
+static guint64 min_iters = 1;    /* rows with count < min_iters are dropped */
+
+typedef struct {
+    uint64_t start_pc;           /* loop header (target of backward branch) */
+    uint64_t end_pc;             /* tail: last insn pc of preceding TB */
+    uint64_t count;              /* iterations observed */
+} LoopEdge;
+
+typedef struct {
+    uint64_t last_tail_pc;       /* PC of last insn of previously executed TB */
+    bool     valid;
+} VCPUState;
+
+typedef struct {
+    uint64_t tb_start;
+    uint64_t tb_last_insn_pc;
+} TBInfo;
+
+static guint loop_hash(gconstpointer p)
+{
+    const LoopEdge *e = p;
+    return (guint)(e->start_pc * 1315423911u ^ e->end_pc);
+}
+
+static gboolean loop_equal(gconstpointer a, gconstpointer b)
+{
+    const LoopEdge *x = a, *y = b;
+    return x->start_pc == y->start_pc && x->end_pc == y->end_pc;
+}
+
+static gint cmp_count_desc(gconstpointer a, gconstpointer b)
+{
+    const LoopEdge *x = a, *y = b;
+    if (x->count == y->count) {
+        return 0;
+    }
+    return x->count > y->count ? -1 : 1;
+}
+
+static VCPUState *get_vcpu_state(unsigned int cpu_index)
+{
+    g_mutex_lock(&lock);
+    while (vcpu_state->len <= cpu_index) {
+        VCPUState init = { 0, false };
+        g_array_append_val(vcpu_state, init);
+    }
+    VCPUState *st = &g_array_index(vcpu_state, VCPUState, cpu_index);
+    g_mutex_unlock(&lock);
+    return st;
+}
+
+static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
+{
+    TBInfo *tbi = (TBInfo *)udata;
+    VCPUState *st = get_vcpu_state(cpu_index);
+
+    if (st->valid && tbi->tb_start <= st->last_tail_pc) {
+        LoopEdge probe = {
+            .start_pc = tbi->tb_start,
+            .end_pc   = st->last_tail_pc,
+        };
+        g_mutex_lock(&lock);
+        LoopEdge *e = g_hash_table_lookup(loops, &probe);
+        if (!e) {
+            e = g_new0(LoopEdge, 1);
+            e->start_pc = probe.start_pc;
+            e->end_pc   = probe.end_pc;
+            e->count    = 0;
+            g_hash_table_insert(loops, e, e);
+        }
+        e->count++;
+        g_mutex_unlock(&lock);
+    }
+
+    st->last_tail_pc = tbi->tb_last_insn_pc;
+    st->valid = true;
+}
+
+static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
+{
+    size_t n = qemu_plugin_tb_n_insns(tb);
+    if (n == 0) {
+        return;
+    }
+    struct qemu_plugin_insn *last = qemu_plugin_tb_get_insn(tb, n - 1);
+
+    TBInfo *tbi = g_new0(TBInfo, 1);
+    tbi->tb_start = qemu_plugin_tb_vaddr(tb);
+    tbi->tb_last_insn_pc = qemu_plugin_insn_vaddr(last);
+
+    qemu_plugin_register_vcpu_tb_exec_cb(tb, vcpu_tb_exec,
+                                         QEMU_PLUGIN_CB_NO_REGS,
+                                         (void *)tbi);
+}
+
+static void plugin_exit(qemu_plugin_id_t id, void *p)
+{
+    g_autoptr(GString) report = g_string_new("");
+    GList *vals = g_hash_table_get_values(loops);
+    vals = g_list_sort(vals, cmp_count_desc);
+
+    guint hot = 0;
+    for (GList *it = vals; it; it = it->next) {
+        LoopEdge *e = it->data;
+        if (e->count >= min_iters) {
+            hot++;
+        }
+    }
+
+    g_string_append_printf(report,
+        "hotloops: %u distinct backward edges, %u hot (>= %" PRIu64
+        " iters), sorted by iterations desc\n",
+        g_hash_table_size(loops), hot, min_iters);
+    g_string_append_printf(report, "start_pc, end_pc, iterations\n");
+
+    guint64 i = 0;
+    for (GList *it = vals; it && i < limit; it = it->next) {
+        LoopEdge *e = it->data;
+        if (e->count < min_iters) {
+            continue;
+        }
+        g_string_append_printf(report,
+            "0x%016" PRIx64 ", 0x%016" PRIx64 ", %" PRIu64 "\n",
+            e->start_pc, e->end_pc, e->count);
+        i++;
+    }
+
+    qemu_plugin_outs(report->str);
+
+    g_list_free(vals);
+    g_hash_table_destroy(loops);
+    g_array_free(vcpu_state, TRUE);
+}
+
+QEMU_PLUGIN_EXPORT
+int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
+                        int argc, char **argv)
+{
+    for (int i = 0; i < argc; i++) {
+        char *opt = argv[i];
+        g_auto(GStrv) tok = g_strsplit(opt, "=", 2);
+        if (g_strcmp0(tok[0], "limit") == 0 && tok[1]) {
+            limit = g_ascii_strtoull(tok[1], NULL, 0);
+        } else if (g_strcmp0(tok[0], "min_iters") == 0 && tok[1]) {
+            min_iters = g_ascii_strtoull(tok[1], NULL, 0);
+            if (min_iters == 0) {
+                min_iters = 1;
+            }
+        } else {
+            fprintf(stderr, "hotloops: unknown option: %s\n", opt);
+            return -1;
+        }
+    }
+
+    loops = g_hash_table_new_full(loop_hash, loop_equal, NULL, g_free);
+    vcpu_state = g_array_new(FALSE, TRUE, sizeof(VCPUState));
+
+    qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
+    qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
+    return 0;
+}
