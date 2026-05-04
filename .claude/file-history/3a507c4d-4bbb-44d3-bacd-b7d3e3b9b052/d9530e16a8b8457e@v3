@@ -1,0 +1,165 @@
+# hotloops - hot inner-loop detector
+
+Detects the hottest loops in a RISC-V ELF by observing backward
+translation-block transitions in QEMU. For each detected loop you get
+the loop header PC, the backward-branch PC, and the iteration count.
+With DWARF, you also get the source `file:line`.
+
+Two parts ship together:
+
+- `contrib/plugins/hotloops.c` - QEMU TCG plugin that records edges.
+- `scripts/hotloops.sh` - wrapper that runs the plugin and formats output.
+
+## Usage
+
+```
+scripts/hotloops.sh [options] <elf> [--] [program args...]
+```
+
+### Options
+
+| Flag                | Default | Description                                                    |
+|---------------------|---------|----------------------------------------------------------------|
+| `--arch <a>`        | auto    | Target arch: `riscv32`, `riscv64`, or `auto` (from `file`).    |
+| `--qemu <path>`     | auto    | Override the QEMU binary.                                      |
+| `--plugin <path>`   | auto    | Override the plugin `.so`.                                     |
+| `--limit <N>`       | 50      | Print at most N loops.                                         |
+| `--min-iters <N>`   | 1       | Drop loops with fewer than N iterations (hot-loop threshold).  |
+| `--objdump <path>`  | auto    | Override objdump (for `function+offset` resolution).           |
+| `--addr2line <path>`| auto    | Override addr2line (for source line resolution).               |
+| `--no-source`       | off     | Skip source resolution even if DWARF is present.               |
+| `--raw`             | off     | Print raw plugin output (CSV-ish), no formatting.              |
+| `--optimize-rvv`    | on      | Only report loops that contain at least one RVV instruction.   |
+| `--no-optimize-rvv` | off     | Disable the RVV-only filter; report all loops.                 |
+
+### Build prerequisites
+
+The plugin lives in `contrib/plugins/`. Build once:
+
+```
+ninja -C build contrib-plugins
+```
+
+It is incremental on subsequent edits to `hotloops.c`. The QEMU binaries
+themselves (`qemu-riscv64`, `qemu-riscv32`) do **not** need to be rebuilt.
+
+## How it detects a loop
+
+For every translated block, the plugin remembers the PC of its last
+instruction. When the next-executed block starts at a PC `<=` that
+remembered PC, the transition is a backward edge - i.e. a loop iteration.
+The pair `(header_pc, tail_pc)` is the key; the count is the number of
+iterations.
+
+This catches every loop a real backward branch closes (for/while/do-while,
+goto, manually unrolled tails, etc.) without needing to model branch
+semantics.
+
+Caveat: each iteration counted is one *taken* backward branch. A loop
+that runs N times has N-1 taken backward branches plus one fall-through
+on exit, so the reported count is N-1 per call to the enclosing function.
+
+## Output format
+
+Header line, then a fixed-width table sorted by `iters` descending:
+
+```
+# hot loops (iters >= <threshold>), sorted desc, top <K>
+iters | start_pc           -> end_pc             | location              | source
+-------------------------------------------------------------------------------------
+<n>   | 0x<16-hex>         -> 0x<16-hex>         | <fn>+0x<o> -> <fn>+0x<o> | file:line -> file:line
+...
+```
+
+Columns:
+
+- `iters`     - taken backward-branch count (sorted desc).
+- `start_pc`  - PC of the loop header (the branch target).
+- `end_pc`    - PC of the backward branch (the loop tail).
+- `location`  - `function+offset -> function+offset` from the ELF symbol table.
+                Shows `?` if the address is not inside any sized FUNC symbol.
+- `source`    - `file:line -> file:line` from DWARF. Collapsed to a single
+                `file:line` when both ends map to the same source line.
+                Only present when the ELF has debug info and `--no-source`
+                is not set.
+
+The `--raw` mode prints the unformatted plugin output instead:
+
+```
+hotloops: <distinct> distinct backward edges, <hot> hot (>= <thr> iters), sorted by iterations desc
+start_pc, end_pc, iterations
+0x..., 0x..., <n>
+...
+```
+
+## Example
+
+Source:
+
+```c
+/* /tmp/hotloops_demo.c */
+#include <stdio.h>
+
+__attribute__((noinline))
+static int dot(volatile const int *a, volatile const int *b, int n) {
+    int s = 0;
+    for (int i = 0; i < n; i++) s += a[i] * b[i];   /* line 6 */
+    return s;
+}
+
+int main(void) {
+    int a[64], b[64];
+    for (int i = 0; i < 64; i++) { a[i] = i; b[i] = 64 - i; }
+    long total = 0;
+    for (int outer = 0; outer < 500; outer++)
+        total += dot(a, b, 64);                      /* 64 * 500 inner iters */
+    printf("total=%ld\n", total);
+    return 0;
+}
+```
+
+Build with debug info and run:
+
+```
+$ riscv64-linux-gnu-gcc -O1 -g -static /tmp/hotloops_demo.c -o /tmp/hotloops_demo
+$ scripts/hotloops.sh --limit 5 --min-iters 100 /tmp/hotloops_demo
+```
+
+Output:
+
+```
+# hot loops (iters >= 100), sorted desc, top 5
+iters | start_pc           -> end_pc             | location                                                                | source
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+31500 | 0x000000000001056e -> 0x000000000001057c | dot+0xc -> dot+0x1a                                                     | hotloops_demo.c:6 (discriminator 3) -> hotloops_demo.c:6 (discriminator 1)
+ 1757 | 0x000000000004ab54 -> 0x000000000004abe8 | read_encoded_value_with_base+0x70 -> read_encoded_value_with_base+0x104 | unwind-pe.h:265 -> unwind-pe.h:255
+  876 | 0x000000000004bc5e -> 0x000000000004bd00 | classify_object_over_fdes+0x46 -> classify_object_over_fdes+0xe8        | unwind-dw2-fde.c:738 -> unwind-dw2-fde.c:732 (discriminator 1)
+  876 | 0x000000000004aae4 -> 0x000000000004bcdc | read_encoded_value_with_base+0x0 -> classify_object_over_fdes+0xc4      | unwind-pe.h:203 -> unwind-dw2-fde.c:781
+  869 | 0x000000000004bcf2 -> 0x000000000004bd64 | classify_object_over_fdes+0xda -> classify_object_over_fdes+0x14c       | unwind-dw2-fde.c:786 -> unwind-dw2-fde.c:793
+```
+
+Reading the top row:
+
+- `iters = 31500` - close to the expected `64 * 500 = 32000`; the missing
+  500 are the per-call exits (last iter of `dot` falls through instead of
+  branching back).
+- `start_pc = 0x1056e`, `end_pc = 0x1057c` - the header and backward
+  branch of the inner loop.
+- `location` - both PCs are inside `dot`, header at `+0xc`, tail at `+0x1a`.
+- `source` - both map to `hotloops_demo.c:6`, which is exactly
+  `for (int i = 0; i < n; i++) s += a[i] * b[i];`.
+
+The remaining rows are glibc unwinder loops that ran during static init.
+The 500-iter outer loop (`main+0x38 -> main+0x3a`) was filtered out by
+`--min-iters 100` - well below the inner loop's contribution.
+
+## Tips
+
+- Strip rarely-interesting libc/startup loops by raising `--min-iters`
+  to a value above your background noise floor (e.g. `--min-iters 1000`
+  for a workload that runs your hot path millions of times).
+- For a very short workload, lower `--min-iters` and raise `--limit`
+  to see the full distribution.
+- Pass program arguments after `--`, e.g.
+  `scripts/hotloops.sh ./prog -- --bench fast`.
+- `--raw` is useful when piping into another tool; the format is stable.
