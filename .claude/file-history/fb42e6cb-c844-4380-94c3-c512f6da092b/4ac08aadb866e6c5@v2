@@ -1,0 +1,69 @@
+# Kanata Loop-Window Pipeline Dump
+
+Restrict a Kanata or Clarity pipeline dump to a chosen number of iterations of one specific loop body, after a configurable warmup. The simulator exits as soon as the window closes and reports per-window IPC.
+
+## When to use it
+
+- Inspect steady-state pipeline behavior of a hot loop in Konata.
+- Get IPC for the loop body alone, ignoring warmup and tail effects.
+- Produce a small, shareable pipeline trace instead of a multi-GB full-run log.
+
+## Flags
+
+All flags are optional and only take effect with `--kanata` or `--clarity`. `--kanata-loop-start` and `--kanata-loop-end` must be specified together.
+
+| Flag | Argument | Default | Meaning |
+| --- | --- | --- | --- |
+| `--kanata-loop-start`  | `<pc>` | -  | First PC of the loop body. The window opens on the first **fetch** of this PC after warmup, so all pre-loop code (CRT, init, library calls) is filtered out. Hex (`0x...`) or decimal accepted. |
+| `--kanata-loop-end`    | `<pc>` | -  | Back-branch PC of the loop body. Each retire of this PC counts as one iteration. |
+| `--kanata-loop-skip`   | `<N>`  | 0  | Warmup iterations to discard before the window opens. `0` opens the window the first time we enter the loop body. |
+| `--kanata-loop-record` | `<X>`  | 1  | Iterations to capture after warmup. Must be >= 1. Simulator exits cleanly when this many iterations have retired. |
+
+## How the window opens and closes
+
+- Each retire of `--kanata-loop-end` advances the iteration counter, whether the gate is open or closed. Mispredicted/flushed fetches of that PC do not advance it.
+- The gate **opens** the first time `--kanata-loop-start` is fetched *after* `skip_iters` end-PC retires have been observed. From that fetch onward, all I/L/R/S records are emitted, and the on-disk Konata cycle counter is realigned to the simulator's absolute cycle so timing inside the window is correct.
+- The gate **closes** when the iteration counter reaches `skip_iters + record_iters`. The simulator prints the summary line and returns `0` from its run loop (no `std::exit`, so waveform / pc-trace cleanup still runs).
+
+The recorded window is always exactly `record_iters` complete iterations of the loop body, and the trace contains *only* code reachable from the loop's start PC.
+
+## Picking the start/end PCs
+
+Use `objdump -d` on your ELF and pick:
+
+- `start` = first instruction of the loop body (the back-branch target / loop label).
+- `end`   = the back-branch instruction itself (typically `bnez`, `bne`, or `nds.bnec`).
+
+Both PCs must be reachable in the simulated execution. If `start` is never fetched, the window never opens and the trace contains only the header (no I/L/R records). If `end` is never retired, the window never closes and the simulator runs to completion normally.
+
+The `hotloops` QEMU plugin (`/local/nick/qemu_v5/scripts/hotloops.sh`) reports loops as `start_pc -> end_pc` matching exactly these conventions, so its output can be fed in directly.
+
+## Output
+
+While the gate is closed (boot, init, warmup iterations), no `I` / `C` / `R` records are emitted, but the internal cycle counter still advances so timing inside the window is accurate. When the gate opens, a single `C\t<delta>` record realigns the on-disk cycle counter. When the gate closes, the logger writes to spdlog:
+
+```
+Kanata loop window [pc 0x...start..0x...end]: <iters> iters, <insns> insns, <cycles> cycles, IPC=<ipc>
+```
+
+and the simulator returns 0 from its run loop. The dump file contains a self-consistent Kanata trace for those iterations only and can be opened directly in Konata.
+
+## Example
+
+```
+vsim --elf bench.elf \
+     --kanata bench.kanata \
+     --kanata-loop-start 0x80001234 \
+     --kanata-loop-end   0x80001260 \
+     --kanata-loop-skip  100 \
+     --kanata-loop-record 8
+```
+
+Skips the first 100 iterations, records the next 8, prints the IPC summary, and exits. `bench.kanata` contains those 8 iterations only.
+
+## Constraints
+
+- `--kanata-loop-*` requires `--kanata` or `--clarity`; otherwise startup fails.
+- `--kanata-loop-start` and `--kanata-loop-end` must both be present or both absent.
+- `--kanata-loop-record` must be >= 1.
+- `--kanata` and `--clarity` remain mutually exclusive.

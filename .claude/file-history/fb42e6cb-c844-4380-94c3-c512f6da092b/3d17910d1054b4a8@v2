@@ -1,0 +1,191 @@
+#include "pipeview/kanata_logger.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <sstream>
+#include <string>
+
+namespace {
+
+constexpr uint64_t START_PC = 0x100;
+constexpr uint64_t END_PC   = 0x118;
+constexpr uint64_t OTHER_PC = 0x110;
+
+bool contains(const std::string& haystack, const std::string& needle)
+{
+  return haystack.find(needle) != std::string::npos;
+}
+
+} // namespace
+
+TEST_CASE("no gate: writes pass through unchanged")
+{
+  std::stringstream ss;
+  kanata::KanataLogger log{ss};
+
+  log.start_insn(START_PC, /*id=*/1);
+  log.advance_cycle(1);
+  log.retire_insn(/*id=*/1);
+
+  const auto out = ss.str();
+  CHECK(contains(out, "I\t1\t1\t0"));
+  CHECK(contains(out, "L\t1\t0\t0x100"));
+  CHECK(contains(out, "C\t1"));
+  CHECK(contains(out, "R\t1\t1\t0"));
+}
+
+TEST_CASE("gate skip=0: nothing recorded before start_pc fetch")
+{
+  std::stringstream ss;
+  kanata::KanataLogger log{
+    ss, kanata::LoopGate{START_PC, END_PC, /*skip=*/0, /*record=*/10}};
+
+  // CRT/init: many insns at OTHER_PC. With skip=0 the doc says "records from
+  // the first iteration" — meaning the first iteration of THIS loop, not from
+  // cycle 0. The gate must stay closed until start_pc is fetched.
+  for (uint64_t id = 1; id <= 5; ++id) {
+    log.start_insn(OTHER_PC, id);
+    log.advance_cycle(1);
+    log.retire_insn(id);
+  }
+
+  CHECK(ss.str().find("I\t") == std::string::npos);
+  CHECK(ss.str().find("R\t") == std::string::npos);
+
+  // First iteration of the loop body begins now.
+  log.start_insn(START_PC, /*id=*/100);
+  log.retire_insn(/*id=*/100);
+  log.start_insn(END_PC, /*id=*/101);
+  log.retire_insn(/*id=*/101);
+
+  const auto out = ss.str();
+  CHECK(contains(out, "I\t100"));
+  CHECK(contains(out, "L\t100\t0\t0x100"));
+  CHECK(contains(out, "I\t101"));
+}
+
+TEST_CASE("gate skip=2: window opens on the 3rd start_pc fetch")
+{
+  std::stringstream ss;
+  kanata::KanataLogger log{
+    ss, kanata::LoopGate{START_PC, END_PC, /*skip=*/2, /*record=*/10}};
+
+  // Iterations 1 and 2: start_pc fetch + end_pc retire each. Skip horizon
+  // not yet crossed.
+  for (uint64_t i = 1; i <= 2; ++i) {
+    auto sid = 10 * i;
+    auto eid = 10 * i + 1;
+    log.start_insn(START_PC, sid);
+    log.retire_insn(sid);
+    log.start_insn(END_PC, eid);
+    log.retire_insn(eid);
+  }
+  CHECK(ss.str().find("I\t") == std::string::npos);
+
+  // Iteration 3: start_pc fetch must trigger the open transition.
+  log.start_insn(START_PC, /*id=*/30);
+  log.retire_insn(/*id=*/30);
+  log.start_insn(OTHER_PC, /*id=*/31);
+  log.retire_insn(/*id=*/31);
+
+  const auto out = ss.str();
+  CHECK(contains(out, "I\t30"));
+  CHECK(contains(out, "I\t31"));
+}
+
+TEST_CASE("gate: flush_insn(end_pc) does NOT advance the iteration counter")
+{
+  std::stringstream ss;
+  kanata::KanataLogger log{
+    ss, kanata::LoopGate{START_PC, END_PC, /*skip=*/1, /*record=*/10}};
+
+  // Speculatively-fetched end_pc that gets flushed (mispredict). Must not
+  // count as a completed iteration.
+  log.start_insn(END_PC, /*id=*/1);
+  log.flush_insn(/*id=*/1);
+
+  // Real iteration 1: start_pc fetch + end_pc retire. Skip=1 satisfied after.
+  log.start_insn(START_PC, /*id=*/2);
+  log.retire_insn(/*id=*/2);
+  log.start_insn(END_PC, /*id=*/3);
+  log.retire_insn(/*id=*/3);
+
+  // Real iteration 2: start_pc fetch is the open trigger.
+  log.start_insn(START_PC, /*id=*/4);
+  log.retire_insn(/*id=*/4);
+
+  CHECK(contains(ss.str(), "I\t4"));
+  CHECK_FALSE(contains(ss.str(), "I\t2"));
+  CHECK_FALSE(contains(ss.str(), "I\t3"));
+}
+
+TEST_CASE("gate: stage and comment writes are silenced pre-window")
+{
+  std::stringstream ss;
+  kanata::KanataLogger log{
+    ss, kanata::LoopGate{START_PC, END_PC, /*skip=*/1, /*record=*/10}};
+
+  log.start_insn(OTHER_PC, /*id=*/1);
+  log.stage_insn(/*id=*/1, "IF");
+  log.comment_insn(/*id=*/1, "hello");
+  log.retire_insn(/*id=*/1);
+
+  const auto out = ss.str();
+  CHECK_FALSE(contains(out, "S\t1"));
+  CHECK_FALSE(contains(out, "L\t1\t1\thello"));
+}
+
+TEST_CASE("gate: window_complete() trips after skip+record end_pc retires")
+{
+  std::stringstream ss;
+  kanata::KanataLogger log{
+    ss, kanata::LoopGate{START_PC, END_PC, /*skip=*/0, /*record=*/3}};
+
+  CHECK_FALSE(log.window_complete());
+
+  // Open the gate on the first start_pc fetch.
+  log.start_insn(START_PC, /*id=*/1);
+  log.retire_insn(/*id=*/1);
+  CHECK_FALSE(log.window_complete());
+
+  // 1st end_pc retire.
+  log.start_insn(END_PC, /*id=*/2);
+  log.retire_insn(/*id=*/2);
+  CHECK_FALSE(log.window_complete());
+
+  // 2nd end_pc retire.
+  log.start_insn(START_PC, /*id=*/3);
+  log.retire_insn(/*id=*/3);
+  log.start_insn(END_PC, /*id=*/4);
+  log.retire_insn(/*id=*/4);
+  CHECK_FALSE(log.window_complete());
+
+  // 3rd end_pc retire — must trip window_complete and emit summary.
+  log.start_insn(START_PC, /*id=*/5);
+  log.retire_insn(/*id=*/5);
+  log.start_insn(END_PC, /*id=*/6);
+  log.retire_insn(/*id=*/6);
+  CHECK(log.window_complete());
+}
+
+TEST_CASE("gate: cycle realignment when window opens")
+{
+  std::stringstream ss;
+  kanata::KanataLogger log{
+    ss, kanata::LoopGate{START_PC, END_PC, /*skip=*/0, /*record=*/10}};
+
+  // 4 cycles of pre-window noise.
+  for (int i = 0; i < 4; ++i)
+    log.advance_cycle(1);
+
+  // Gate opens here — the on-disk cycle counter must jump forward to match
+  // the simulator's total_cycles_, otherwise Konata draws the loop at cycle
+  // 0 instead of cycle 4.
+  log.start_insn(START_PC, /*id=*/1);
+  log.retire_insn(/*id=*/1);
+
+  const auto out = ss.str();
+  // After the open transition the trace should have advanced by 4 cycles.
+  CHECK(contains(out, "C\t4"));
+}

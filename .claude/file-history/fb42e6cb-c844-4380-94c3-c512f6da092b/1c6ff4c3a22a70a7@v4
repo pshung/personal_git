@@ -1,0 +1,144 @@
+# Fix vsim Kanata loop-window: gate must close at boot and exit on record-complete
+
+## Context
+
+We verified vsim's `--kanata-loop-{start,end,skip,record}` end-to-end on a libnn baremetal ELF and saw two bugs (matches the doc at `/local/nick/vsim/docs/KANATA_LOOP_WINDOW.md`):
+
+1. **Gate does not close at boot.** With `--kanata-loop-start 0x105f4 --kanata-loop-end 0x10642 --kanata-loop-skip 0 --kanata-loop-record 4`, vsim emitted I/L/R records from PC `0x10140` (CRT entry) onward — the `start_pc` filter is ignored. Resulting `.kanata` is full-run, multi-MB.
+2. **No exit on record-complete.** vsim never prints the `Kanata loop window [...] : N iters, ... IPC=...` summary line and never returns; it has to be SIGKILL'd.
+
+Root cause (in `/local/nick/vsim/src/pipeview/kanata_logger.hpp`):
+
+- Bug 1: `enabled_(skip_iters == 0)` initialises the gate as OPEN whenever skip=0. The gate has *no concept of* the start_pc — it only counts end_pc retires. So with skip=0 the gate opens at cycle 0 and never closes until the iteration counter is reached.
+- Bug 2: `on_retire_pc()` calls `std::exit(0)` (line 273) when the window completes. Tests confirm the summary spdlog line happens, but in the real vsim run the summary is never reached because... actually it IS reached; the bug is that `std::exit(0)` bypasses the simulator's own cleanup and looks like a hang in our case because the gate never closes (Bug 1) so we never get there. Even when fixed, `std::exit(0)` is the wrong shutdown path — replace it with a clean signal that the simulator's run-loop checks.
+
+The existing test at `/local/nick/vsim/tests/pipeview/kanata_logger_loopgate.test.cpp` line 38 ("gate skip=0: records from the first instruction") encodes the wrong semantic — it asserts that with skip=0 the very first `start_insn(OTHER_PC, 1)` is recorded. That contradicts the doc ("While the gate is closed, no I/C/R records are emitted") and the user-visible promise of a loop-window dump. The test must be rewritten.
+
+## How start_pc and end_pc relate to hotloops output
+
+`hotloops.sh` emits `start_pc -> end_pc` from QEMU TB transitions in `/local/nick/qemu_v5/contrib/plugins/hotloops.c`:
+
+- `start_pc` = first PC of the TB that follows a backward edge = **loop header** (branch target).
+- `end_pc` = `tb_last_insn_pc` of the preceding TB = the **back-branch instruction itself** (QEMU ends TBs at every branch).
+
+So `start_pc` is the first instruction executed each iteration, `end_pc` retires exactly once per iteration. That makes "open on `start_insn(start_pc, ...)`" and "count by `end_pc` retires" perfectly aligned: each iteration begins with `start_insn(start_pc)` and ends with `retire_insn(end_pc)`.
+
+## New semantics (matches the doc)
+
+- `enabled_` ALWAYS starts FALSE when a gate is set.
+- Each retire of `end_pc` advances `end_retired_`, **whether the gate is open or closed**. (Already the case — no change.)
+- The gate **OPENS** the first time `start_insn(pc, ...)` is called with `pc == start_pc` AND `end_retired_ >= skip_iters`. At the open transition, capture `start_cycle_ = total_cycles_` and emit a single `C\t<delta>` record so the on-disk cycle counter matches `total_cycles_`.
+- The gate **CLOSES** when `end_retired_ == skip_iters + record_iters` while open. At close: print the `Kanata loop window [...]` summary, flush, and set `window_complete_ = true`. **Do not** call `std::exit(0)`.
+- `Simulator::run()` polls a new `TraceController::pipeview_wants_exit()` after `trace_.on_cycle(cpu)` and `return 0;`s when set. Existing `~Simulator()` already calls `trace_.close()` which flushes and shuts down everything cleanly.
+
+Trace under new semantics with `skip=2, record=4`:
+
+| event                              | end_retired | enabled | recorded? |
+|------------------------------------|-------------|---------|-----------|
+| any insn, before loop entered      | 0           | F       | no        |
+| iter 1: start_pc fetch             | 0           | F       | no (0<2)  |
+| iter 1: end_pc retire              | 1           | F       | no        |
+| iter 2: start_pc fetch             | 1           | F       | no (1<2)  |
+| iter 2: end_pc retire              | 2           | F       | no        |
+| iter 3: start_pc fetch             | 2           | T       | yes (open)|
+| iter 3..6: bodies recorded         | ...         | T       | yes       |
+| iter 6: end_pc retire (==2+4)      | 6           | T->done | exit      |
+
+Records = 4 complete iterations of the loop body (3, 4, 5, 6).
+
+For `skip=0, record=4`: the gate stays closed through all CRT/init/load code, opens on the **first** `start_insn(start_pc, ...)`, records exactly 4 iterations, exits.
+
+## Files to modify
+
+### Behavioral
+
+`/local/nick/vsim/src/pipeview/kanata_logger.hpp` (the gate itself)
+
+- Change both ctors line 75 and 97: `enabled_(!gate_.has_value())` (no skip-special-case; gate always closed if present).
+- In `start_insn(pc, id)` (line 114): after `id_to_pc_[id] = pc`, add the gate-open check:
+  ```cpp
+  if (!enabled_ && gate_ && pc == gate_->start_pc
+      && end_retired_ >= gate_->skip_iters) {
+      enabled_ = true;
+      auto delta = total_cycles_ - start_cycle_; // start_cycle_ still 0 until now
+      start_cycle_ = total_cycles_;
+      *output_ << "C\t" << delta << '\n';        // realign Konata timeline
+      spdlog::info("Kanata loop gate: window opens at cycle {} (pc {:#x})",
+                   total_cycles_, pc);
+  }
+  ```
+  Then continue with the existing `if (!enabled_) return;` block.
+- In `on_retire_pc()` (line 241): remove the `enabled_ = true` branch (line 256-261) — opening is now handled in `start_insn`. Keep the close branch (line 262-273) but replace `std::exit(0)` with `window_complete_ = true;`.
+- Add private member `bool window_complete_ = false;` and public accessor `bool window_complete() const { return window_complete_; }`.
+
+`/local/nick/vsim/src/pipeview/pipeline_viewer.hpp` (interface)
+
+- Add virtual `bool wants_exit() const { return false; }` (default impl so non-Kanata viewers don't need overrides).
+
+`/local/nick/vsim/src/pipeview/kanata_viewer.hpp` (concrete viewers)
+
+- `KanataViewer<CPU>` and `OoOKanataViewer<CPU>`: override `bool wants_exit() const override { return logger_->window_complete(); }`.
+- `MultiCoreOoOKanataViewer<CPU>`: override returning `std::any_of(viewers_.begin(), viewers_.end(), [](auto& v){ return v->wants_exit(); })`.
+
+`/local/nick/vsim/src/pipeview/clarity_viewer.hpp`
+
+- `ClarityViewer<CPU>` and `MultiCoreClarityViewer<CPU>`: forward `wants_exit()` to `inner_->wants_exit()` / any of `viewers_`.
+
+`/local/nick/vsim/src/simulator_trace.hpp`
+
+- Add `bool pipeview_wants_exit() const { return pipeline_viewer_ && pipeline_viewer_->wants_exit(); }`.
+
+`/local/nick/vsim/src/simulator.hpp`
+
+- In `run()` after `trace_.on_cycle(cpu);` (line 300), add:
+  ```cpp
+  if (trace_.pipeview_wants_exit()) {
+      spdlog::info("Pipeline viewer requested exit (Kanata loop window complete)");
+      return 0;
+  }
+  ```
+
+### Test rewrite
+
+`/local/nick/vsim/tests/pipeview/kanata_logger_loopgate.test.cpp`
+
+- Replace the buggy "gate skip=0" test with one that proves `start_insn(OTHER_PC, ...)` is **not** recorded until `start_insn(START_PC, ...)` fires.
+- Update the "gate skip=2" test to count from start_pc fetches (open trigger), not end_pc retires alone.
+- Add new test "gate: window_complete() trips after exactly skip+record end_pc retires" — proves the exit signal without triggering `std::exit`.
+- Keep the flush-doesn't-count and stage-silenced tests (still valid).
+
+### Doc
+
+`/local/nick/vsim/docs/KANATA_LOOP_WINDOW.md`
+
+- Tighten the "How iterations are counted" section: clarify "the gate opens on the first **fetch** (start_insn) of `start_pc` after `skip_iters` retires of `end_pc` have been observed". Update the skip=0 example to "open on the first time we enter the loop body".
+
+## Build & verify
+
+```bash
+cd /local/nick/vsim/build
+cmake --build . --target test_kanata_logger_loopgate sim_ax45mpv_premium
+ctest -R test_kanata_logger_loopgate --output-on-failure
+```
+
+End-to-end on libnn (must reproduce the 0x105f4..0x10642 region):
+
+```bash
+cd /home/nick/work/libnn_0421/Examples/unit_func
+timeout 600 /local/nick/vsim/build/sim_ax45mpv_premium \
+  /home/nick/work/libnn_0421/.claude/skills/optimize/work/t_relu_s8_perf.adx \
+  --kanata /tmp/relu_loop.kanata \
+  --kanata-loop-start 0x105f4 --kanata-loop-end 0x10642 \
+  --kanata-loop-skip 0 --kanata-loop-record 4
+```
+
+Expect:
+- vsim prints `[info] Kanata loop window [pc 0x105f4..0x10642]: 4 iters, ... insns, ... cycles, IPC=...`.
+- vsim exits 0 (no SIGKILL needed) — though wallclock will still be minutes because vsim must crawl through the pre-kernel `fread` (separate slim-the-harness concern, see tmp.md).
+- `/tmp/relu_loop.kanata` is small (KB range), lowest `L\t...0x...:` PC is `0x105f4`, no record below it.
+
+## Out of scope
+
+- vsim throughput / fread bottleneck (the "slim the harness" workflow item in tmp.md).
+- Any change to `hotloops.sh` (already fixed in a prior commit on the qemu_v5 side).
+- /optimize wiring — that's the next task once vsim is fixed.
