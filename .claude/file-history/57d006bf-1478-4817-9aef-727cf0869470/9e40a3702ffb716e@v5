@@ -1,0 +1,283 @@
+// QEMU TCG plugin: drains architectural state and exits when the guest
+// executes `csrwi 0x7C0, 0`. Shares hybrid/insn_match.h and
+// hybrid/state_abi.h with the vsim side.
+
+#include "hybrid/insn_match.h"
+#include "hybrid/reg_names.h"
+#include "hybrid/state_abi.h"
+
+#include <qemu-plugin.h>
+
+#include <glib.h>
+
+#include <fcntl.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <limits.h>
+
+QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
+
+typedef struct {
+    struct qemu_plugin_register *gpr[32];
+    struct qemu_plugin_register *fpr[32];
+    struct qemu_plugin_register *pc;
+
+    // M-mode CSRs as exposed by QEMU's gdbstub csr feature.
+    struct qemu_plugin_register *mstatus;
+    struct qemu_plugin_register *mepc;
+    struct qemu_plugin_register *mtvec;
+    struct qemu_plugin_register *mcause;
+    struct qemu_plugin_register *mtval;
+    struct qemu_plugin_register *mscratch;
+    struct qemu_plugin_register *medeleg;
+    struct qemu_plugin_register *mideleg;
+    struct qemu_plugin_register *mip;
+    struct qemu_plugin_register *mie;
+    struct qemu_plugin_register *mcycle;
+    struct qemu_plugin_register *minstret;
+    struct qemu_plugin_register *satp;
+
+    struct qemu_plugin_register *pmpcfg[HYBRID_PMP_CFG_NUM];
+    struct qemu_plugin_register *pmpaddr[HYBRID_PMP_ADDR_NUM];
+
+    struct qemu_plugin_register *vstart;
+    struct qemu_plugin_register *vtype;
+    struct qemu_plugin_register *vl;
+    struct qemu_plugin_register *vlenb;
+    struct qemu_plugin_register *vreg[32];
+} VcpuRegs;
+
+static struct qemu_plugin_scoreboard *vcpu_state;
+static char *outfile_path;
+
+static struct qemu_plugin_register *find_reg(GArray *regs, const char *name)
+{
+    for (guint i = 0; i < regs->len; i++) {
+        qemu_plugin_reg_descriptor *rd =
+            &g_array_index(regs, qemu_plugin_reg_descriptor, i);
+        if (g_ascii_strcasecmp(rd->name, name) == 0) {
+            return rd->handle;
+        }
+    }
+    return NULL;
+}
+
+// Lazily resolves register handles. The plugin's vcpu_init runs before
+// QEMU has registered the dynamic gdb coprocessors (FPU, virtual, csr,
+// vector), so qemu_plugin_get_registers() returns only the 33 core CPU
+// regs at that moment. By the time the entry trigger fires, all dynamic
+// features are registered and a fresh call returns the full list.
+static void resolve_handles(VcpuRegs *v)
+{
+    g_autoptr(GArray) regs = qemu_plugin_get_registers();
+    for (int i = 0; i < 32; i++) {
+        v->gpr[i] = find_reg(regs, hybrid_gpr_names[i]);
+        v->fpr[i] = find_reg(regs, hybrid_fpr_names[i]);
+    }
+    v->pc = find_reg(regs, "pc");
+
+    v->mstatus  = find_reg(regs, "mstatus");
+    v->mepc     = find_reg(regs, "mepc");
+    v->mtvec    = find_reg(regs, "mtvec");
+    v->mcause   = find_reg(regs, "mcause");
+    v->mtval    = find_reg(regs, "mtval");
+    v->mscratch = find_reg(regs, "mscratch");
+    v->medeleg  = find_reg(regs, "medeleg");
+    v->mideleg  = find_reg(regs, "mideleg");
+    v->mip      = find_reg(regs, "mip");
+    v->mie      = find_reg(regs, "mie");
+    v->mcycle   = find_reg(regs, "mcycle");
+    v->minstret = find_reg(regs, "minstret");
+    v->satp     = find_reg(regs, "satp");
+
+    char buf[16];
+    for (int i = 0; i < HYBRID_PMP_CFG_NUM; i++) {
+        g_snprintf(buf, sizeof(buf), "pmpcfg%d", i);
+        v->pmpcfg[i] = find_reg(regs, buf);
+    }
+    for (int i = 0; i < HYBRID_PMP_ADDR_NUM; i++) {
+        g_snprintf(buf, sizeof(buf), "pmpaddr%d", i);
+        v->pmpaddr[i] = find_reg(regs, buf);
+    }
+
+    v->vstart = find_reg(regs, "vstart");
+    v->vtype  = find_reg(regs, "vtype");
+    v->vl     = find_reg(regs, "vl");
+    v->vlenb  = find_reg(regs, "vlenb");
+    for (int i = 0; i < 32; i++) {
+        g_snprintf(buf, sizeof(buf), "v%d", i);
+        v->vreg[i] = find_reg(regs, buf);
+    }
+}
+
+static uint64_t read_reg64(struct qemu_plugin_register *h)
+{
+    if (!h) return 0;
+    g_autoptr(GByteArray) buf = g_byte_array_new();
+    int sz = qemu_plugin_read_register(h, buf);
+    if (sz <= 0) return 0;
+    uint64_t v = 0;
+    memcpy(&v, buf->data, sz < 8 ? (size_t) sz : 8);
+    return v;
+}
+
+// Reads up to `dst_max` bytes from a register handle. Returns the byte
+// count written (0 on failure or NULL handle). Used for vector regs whose
+// width = vlenb bytes.
+static size_t read_reg_bytes(struct qemu_plugin_register *h,
+                             uint8_t *dst, size_t dst_max)
+{
+    if (!h || dst_max == 0) return 0;
+    g_autoptr(GByteArray) buf = g_byte_array_new();
+    int sz = qemu_plugin_read_register(h, buf);
+    if (sz <= 0) return 0;
+    size_t n = (size_t) sz < dst_max ? (size_t) sz : dst_max;
+    memcpy(dst, buf->data, n);
+    return n;
+}
+
+// Atomic on POSIX: write to .tmp, fsync, rename.
+static int write_state_atomic(const struct hybrid_state_v1 *s, const char *path)
+{
+    char tmp[PATH_MAX];
+    g_snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int) getpid());
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        perror("hybrid_handoff: open tmp");
+        return -1;
+    }
+    ssize_t want = (ssize_t) sizeof(*s);
+    ssize_t got = write(fd, s, sizeof(*s));
+    if (got != want) {
+        perror("hybrid_handoff: write");
+        close(fd);
+        unlink(tmp);
+        return -1;
+    }
+    fsync(fd);
+    close(fd);
+    if (rename(tmp, path) != 0) {
+        perror("hybrid_handoff: rename");
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+static void on_handoff(unsigned int vcpu_idx, void *udata)
+{
+    hybrid_handoff_kind kind = (hybrid_handoff_kind) (uintptr_t) udata;
+    if (kind != HYBRID_HANDOFF_ENTER) return;
+
+    VcpuRegs *v = qemu_plugin_scoreboard_find(vcpu_state, vcpu_idx);
+    resolve_handles(v);
+    struct hybrid_state_v1 s = {0};
+    s.magic   = HYBRID_STATE_MAGIC;
+    s.version = HYBRID_STATE_VERSION;
+    s.flags   = HYBRID_FLAG_RV64;
+    s.hart_id = vcpu_idx;
+    s.priv    = 3;
+    s.pc      = read_reg64(v->pc);
+    for (int i = 0; i < 32; i++) s.gpr[i] = read_reg64(v->gpr[i]);
+
+    // Floating-point: only set FP flag if at least one handle was bound,
+    // i.e. QEMU advertised the FPU feature (D extension).
+    int has_fp = 0;
+    for (int i = 0; i < 32; i++) {
+        s.fpr[i] = read_reg64(v->fpr[i]);
+        if (v->fpr[i]) has_fp = 1;
+    }
+    if (has_fp) s.flags |= HYBRID_FLAG_FP;
+
+    s.mstatus  = read_reg64(v->mstatus);
+    s.mepc     = read_reg64(v->mepc);
+    s.mtvec    = read_reg64(v->mtvec);
+    s.mcause   = read_reg64(v->mcause);
+    s.mtval    = read_reg64(v->mtval);
+    s.mscratch = read_reg64(v->mscratch);
+    s.medeleg  = read_reg64(v->medeleg);
+    s.mideleg  = read_reg64(v->mideleg);
+    s.mip      = read_reg64(v->mip);
+    s.mie      = read_reg64(v->mie);
+    s.mcycle   = read_reg64(v->mcycle);
+    s.minstret = read_reg64(v->minstret);
+    s.satp     = read_reg64(v->satp);
+
+    for (int i = 0; i < HYBRID_PMP_CFG_NUM; i++)
+        s.pmpcfg[i] = read_reg64(v->pmpcfg[i]);
+    for (int i = 0; i < HYBRID_PMP_ADDR_NUM; i++)
+        s.pmpaddr[i] = read_reg64(v->pmpaddr[i]);
+
+    // Vector: only set V flag if QEMU advertised the V extension. vlenb
+    // bounds the per-register byte count copied into vreg[].
+    s.vstart = read_reg64(v->vstart);
+    s.vtype  = read_reg64(v->vtype);
+    s.vl     = read_reg64(v->vl);
+    s.vlenb  = read_reg64(v->vlenb);
+    if (v->vlenb && s.vlenb > 0) {
+        s.flags |= HYBRID_FLAG_V;
+        size_t bytes = s.vlenb < HYBRID_VLEN_BYTES_MAX
+                     ? (size_t) s.vlenb
+                     : (size_t) HYBRID_VLEN_BYTES_MAX;
+        for (int i = 0; i < 32; i++)
+            (void) read_reg_bytes(v->vreg[i],
+                                  &s.vreg[(size_t) i * HYBRID_VLEN_BYTES_MAX],
+                                  bytes);
+    }
+
+    if (write_state_atomic(&s, outfile_path) != 0) {
+        fprintf(stderr, "hybrid_handoff: failed to write state file\n");
+        exit(2);
+    }
+    fprintf(stderr,
+            "hybrid_handoff: drained state to %s (pc=%#" PRIx64 "), exiting\n",
+            outfile_path, s.pc);
+    exit(0);
+}
+
+static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
+{
+    (void) id;
+    size_t n = qemu_plugin_tb_n_insns(tb);
+    for (size_t i = 0; i < n; i++) {
+        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+        size_t sz = qemu_plugin_insn_size(insn);
+        if (sz != 4) continue;
+        uint32_t raw = 0;
+        if (qemu_plugin_insn_data(insn, &raw, sizeof(raw)) != sizeof(raw))
+            continue;
+        hybrid_handoff_kind kind = HYBRID_HANDOFF_NONE;
+        if (!hybrid_match_handoff_insn(raw, &kind)) continue;
+        qemu_plugin_register_vcpu_insn_exec_cb(
+            insn, on_handoff, QEMU_PLUGIN_CB_R_REGS,
+            (void *) (uintptr_t) kind);
+    }
+}
+
+QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
+                                           const qemu_info_t *info,
+                                           int argc, char **argv)
+{
+    (void) info;
+    for (int i = 0; i < argc; i++) {
+        g_auto(GStrv) tok = g_strsplit(argv[i], "=", 2);
+        if (g_strcmp0(tok[0], "outfile") == 0 && tok[1]) {
+            outfile_path = g_strdup(tok[1]);
+        } else {
+            fprintf(stderr, "hybrid_handoff: unknown option: %s\n", argv[i]);
+            return -1;
+        }
+    }
+    if (!outfile_path) {
+        fputs("hybrid_handoff: outfile=PATH is required\n", stderr);
+        return -1;
+    }
+
+    vcpu_state = qemu_plugin_scoreboard_new(sizeof(VcpuRegs));
+    qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
+    return 0;
+}

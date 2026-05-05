@@ -1,0 +1,511 @@
+#pragma once
+
+#include "cpu_config.hpp"
+#include "hybrid/csr_trigger.hpp"
+#include "hybrid/exit_codes.hpp"
+#include "hybrid/handoff_controller.hpp"
+#include "hybrid/resume_driver.hpp"
+#include "hybrid/state_loader.hpp"
+#include "hybrid/systemc_dmi_bus.hpp"
+#include "platform/memory_map.h"
+#include "platform/platform.hpp"
+#include "pybind11.hpp"
+#include "simulator_context.hpp"
+#include "simulator_trace.hpp"
+#include "utils/axi.hpp"
+#include "utils/axi_to_tlm_bridge.hpp"
+#include "utils/elf_loader.hpp"
+#include "utils/sizeconvert.hpp"
+
+#include <LIEF/ELF.hpp>
+#include <systemc>
+#include <tlm>
+
+#include <csignal>
+#include <cstdint>
+
+#include <experimental/scope>
+#include <fstream>
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
+
+template<typename CPU>
+class Simulator : sc_core::sc_module
+{
+  using PLATFORM = Platform<platform_config<CPU>>;
+  static constexpr bool is_axi = (CPU::SYSTEM_BUS_TYPE == BusTypes::AXI);
+  static constexpr auto bus_width = PLATFORM::data_width;
+
+  // Helper: create an AXI→TLM bridge, bind clock, connect initiator BFM
+  auto make_axi_to_tlm(const char* name, auto& bfm_socket)
+    -> std::unique_ptr<axi_to_tlm_bridge<bus_width>>
+  {
+    auto bridge = std::make_unique<axi_to_tlm_bridge<bus_width>>(name);
+    bridge->pe.clk_i.bind(platform.clk);
+    bfm_socket.bind(bridge->axi_tsck);
+    return bridge;
+  }
+
+  // Helper: create a TLM→AXI bridge, bind clock, connect target BFM
+  auto make_tlm_to_axi(const char* name, auto& bfm_socket)
+    -> std::unique_ptr<tlm_to_axi_bridge<bus_width>>
+  {
+    auto bridge = std::make_unique<tlm_to_axi_bridge<bus_width>>(name);
+    bridge->pe.clk_i.bind(platform.clk);
+    bridge->axi_isck.bind(bfm_socket);
+    return bridge;
+  }
+
+public:
+  CPU cpu;
+  PLATFORM platform;
+
+  // AXI bridges (only used when is_axi == true, null otherwise)
+  std::unique_ptr<axi_to_tlm_bridge<bus_width>> mem_bridge;
+  std::unique_ptr<axi_to_tlm_bridge<bus_width>> mmio_bridge;
+  std::unique_ptr<tlm_to_axi_bridge<bus_width>> hvm_bridge;
+  std::unique_ptr<tlm_to_axi_bridge<bus_width>> slv_bridge;
+
+  // sys bus (64-bit slave port on CPU, needs width adapter to 256-bit
+  // interconnect)
+  static constexpr std::size_t sys_bus_width = 64;
+  std::unique_ptr<socket_width_adapter<bus_width, sys_bus_width>> sys_adapter;
+  std::unique_ptr<tlm_to_axi_bridge<sys_bus_width>> sys_bridge;
+
+#if _NDS_IOCP_NUM > 0
+  // iocp_master connects directly to CPU, not through the interconnect.
+  // It needs to speak the CPU's bus protocol.
+  using IocpInitiatorType = std::
+    conditional_t<is_axi, AxiPeInitiator<bus_width>, AhbPeInitiator<bus_width>>;
+  IocpInitiatorType iocp_master;
+#endif // _NDS_IOCP_NUM
+
+private:
+  // debug
+  jtag_dtm& dtm;
+  bool dtm_debug = false;
+  TraceController<CPU> trace_;
+
+  // Hybrid handoff (vsim->QEMU). Order matters: dmi_bus_ is referenced by
+  // handoff_, so it must be declared first.
+  std::unique_ptr<hybrid::SystemCDmiBus<PLATFORM::dmi_addr_width,
+                                        PLATFORM::dmi_data_width>>
+    hybrid_dmi_bus_;
+  std::optional<hybrid::HandoffController> hybrid_handoff_;
+  std::string hybrid_state_path_;
+  std::optional<hybrid_state_v1> hybrid_input_state_;
+
+  using xlen_t = std::conditional_t<CPU::NDS_XLEN <= 32, uint32_t, uint64_t>;
+
+public:
+  ContextManager<CPU> context_config;
+
+  Simulator(const sc_core::sc_module_name& name,
+            std::span<uint8_t> ram_buffer = {},
+            MemoryRegion ram_region = {RAM_BASE, RAM_END},
+            MemoryRegion ram_alias_region = {RAM_ALIAS_BASE, RAM_ALIAS_END})
+      : sc_core::sc_module{name},
+        platform("platform", ram_buffer, ram_region, ram_alias_region),
+        dtm(platform.dtm)
+  {
+    cpu.bind(platform.clk, platform.resetn, platform.reset_vector,
+             platform.dmi_signals, platform.wfi_signal, platform.int_trigger);
+
+    // --- CPU memory BFM → interconnect ---
+    if constexpr (is_axi) {
+      mem_bridge = make_axi_to_tlm("mem_bridge", cpu.mem_bfm.isckt);
+      platform.interconnect.bind_initiator(mem_bridge->tlm_isck);
+    } else {
+      platform.interconnect.bind_initiator(cpu.mem_bfm.isckt);
+    }
+
+    // --- CPU MMIO BFM → interconnect ---
+    if constexpr (requires { cpu.mmio_bfm; }) {
+      if constexpr (is_axi) {
+        mmio_bridge = make_axi_to_tlm("mmio_bridge", cpu.mmio_bfm.isckt);
+        platform.interconnect.bind_initiator(mmio_bridge->tlm_isck);
+      } else {
+        platform.interconnect.bind_initiator(cpu.mmio_bfm.isckt);
+      }
+    }
+
+    // --- CPU HVM subordinate port ---
+    if constexpr (requires { cpu.hvm_bfm; }) {
+      if constexpr (is_axi) {
+        hvm_bridge = make_tlm_to_axi("hvm_bridge", cpu.hvm_bfm.tsckt);
+        platform.interconnect.bind_target(
+          hvm_bridge->tlm_tsck,
+          {CPU::NDS_HVM_BASE,
+           CPU::NDS_HVM_BASE + CPU::NDS_HVM_SIZE_KB * 0x1000 - 1});
+      } else {
+        platform.interconnect.bind_target(
+          cpu.hvm_bfm.tsckt,
+          {CPU::NDS_HVM_BASE,
+           CPU::NDS_HVM_BASE + CPU::NDS_HVM_SIZE_KB * 0x1000 - 1});
+      }
+      platform.custom_master.hvm_base = CPU::NDS_HVM_BASE;
+    }
+
+    // --- CPU slave port ---
+    if constexpr (requires { cpu.slv_bfm; }) {
+      if constexpr (is_axi) {
+        slv_bridge = make_tlm_to_axi("slv_bridge", cpu.slv_bfm.tsckt);
+        platform.interconnect.bind_target(slv_bridge->tlm_tsck,
+                                          {HART0_ILM_BASE, HART0_DLM_END});
+      } else {
+        platform.interconnect.bind_target(cpu.slv_bfm.tsckt,
+                                          {HART0_ILM_BASE, HART0_DLM_END});
+      }
+      platform.custom_master.ilm_base = HART0_ILM_BASE;
+      platform.custom_master.dlm_base = HART0_DLM_BASE;
+    }
+
+    // --- CPU sys bus (slave port, 64-bit) → interconnect ---
+    if constexpr (requires { cpu.sys_bfm; }) {
+      sys_adapter =
+        std::make_unique<socket_width_adapter<bus_width, sys_bus_width>>(
+          "sys_adapter");
+      sys_bridge =
+        std::make_unique<tlm_to_axi_bridge<sys_bus_width>>("sys_bridge");
+      sys_bridge->pe.clk_i.bind(platform.clk);
+      sys_bridge->axi_isck.bind(cpu.sys_bfm.tsckt);
+      sys_adapter->isck.bind(sys_bridge->tlm_tsck);
+      platform.interconnect.bind_target(sys_adapter->tsck,
+                                        {MLIF_BASE, SLIF_END});
+    }
+
+#if _NDS_IOCP_NUM > 0
+    iocp_master.protocol_engine.clk_i.bind(platform.clk);
+    iocp_master.socket.bind(cpu.iocp_bfm.tsckt);
+#endif // _NDS_IOCP_NUM
+  }
+
+  ~Simulator() { trace_.close(); }
+
+  void init_debug_port(const uint16_t port = 9104)
+  {
+    dtm_debug = true;
+    dtm.init_port(port);
+    spdlog::info("waiting for debugger connection");
+  }
+
+  // Caller invariant: the CPU must already be out of reset.
+  void apply_resume_from_qemu(const std::string& path)
+  {
+    hybrid::SystemCDmiBus<PLATFORM::dmi_addr_width, PLATFORM::dmi_data_width>
+      bus{platform.dmi, platform.clk.period()};
+    hybrid_input_state_ = hybrid::load_state(path);
+    hybrid::ResumeDriver driver(bus);
+    driver.resume(*hybrid_input_state_);
+  }
+
+  // Enables the vsim->QEMU handoff drain. After this is set, run() watches
+  // committed PCs and on retire of a `csrw 0x7C0, *` exit-trigger drains
+  // architectural state to `state_out_path` and returns kExitHandoffToQemu.
+  void enable_hybrid_handoff(const std::string& elf_path,
+                             const std::string& state_out_path)
+  {
+    auto elf = LIEF::ELF::Parser::parse(elf_path);
+    if (!elf)
+      throw std::runtime_error(
+        "enable_hybrid_handoff: failed to parse " + elf_path);
+
+    hybrid::CsrTrigger trigger;
+    for (const auto& seg: elf->segments()) {
+      if (seg.type() != LIEF::ELF::SEGMENT_TYPES::PT_LOAD) continue;
+      if ((static_cast<unsigned>(seg.flags()) & 1u) == 0u) continue;  // PF_X
+      const auto content = seg.content();
+      const std::span<const uint8_t> bytes{content.data(), content.size()};
+      trigger.scan_buffer(bytes, seg.virtual_address());
+    }
+
+    hybrid_dmi_bus_ = std::make_unique<
+      hybrid::SystemCDmiBus<PLATFORM::dmi_addr_width,
+                            PLATFORM::dmi_data_width>>(platform.dmi,
+                                                       platform.clk.period());
+    hybrid_handoff_.emplace(std::move(trigger), *hybrid_dmi_bus_);
+    if (hybrid_input_state_)
+      hybrid_handoff_->set_passthrough_input(*hybrid_input_state_);
+    hybrid_state_path_ = state_out_path;
+  }
+
+  void restore_context(const std::string& dir)
+  {
+    context_config.dir = dir;
+    context_config.restore(platform, cpu);
+  }
+
+  void save_context(const std::string& dir)
+  {
+    context_config.dir = dir;
+    context_config.save(platform, cpu);
+  }
+
+  void load_elf(const std::string& path)
+  {
+    const auto elf = LIEF::ELF::Parser::parse(path);
+    if (!elf) {
+      spdlog::critical("Check if it's a valid ELF file path : {}", path);
+      exit(1);
+    }
+
+    read_elf_into_memory(
+      *elf,
+      static_cast<xlen_t>(platform.main_memory.region.base_address),
+      platform.main_memory.data);
+    for (auto& rv: platform.reset_vector)
+      rv.write(elf->entrypoint());
+  }
+
+  void set_reset_vector(size_t hart, uint64_t addr)
+  {
+    if (hart >= platform.reset_vector.size()) {
+      spdlog::critical("hart {} out of range (max {})", hart,
+                       platform.reset_vector.size() - 1);
+      std::exit(EXIT_FAILURE);
+    }
+    platform.reset_vector[hart].write(addr);
+  }
+
+  void load_image(const std::string& path, MEM_TYPE type)
+  {
+    switch (type) {
+    case MEM_TYPE::ILM:
+      if constexpr (requires { cpu.set_ilm({}); }) {
+        read_binary_file(path, [this](const auto& data) { cpu.set_ilm(data); });
+      } else {
+        throw std::runtime_error(
+          "CPU does not support ILM - cannot load ILM ROM image");
+      }
+      break;
+
+    case MEM_TYPE::DLM:
+      if constexpr (requires { cpu.set_dlm({}); }) {
+        read_binary_file(path, [this](const auto& data) { cpu.set_dlm(data); });
+      } else {
+        throw std::runtime_error(
+          "CPU does not support DLM - cannot load DLM ROM image");
+      }
+      break;
+
+    case MEM_TYPE::RAM:
+      read_binary_file(path, [this](const auto& data) {
+        if (data.size() > platform.main_memory.data.size())
+          throw std::runtime_error("RAM image size exceeds main memory size");
+        std::copy(data.begin(), data.end(), platform.main_memory.data.begin());
+      });
+      break;
+
+    default:
+      throw std::runtime_error("Unknown memory type");
+    }
+  }
+
+  void reset()
+  {
+    static constexpr int core_num = CPU::NDS_NHART;
+    static constexpr int reset_val = (1 << core_num) - 1;
+
+    platform.resetn.write(0);
+    auto saved = context_config;
+    context_config = {};
+    this->run(1);
+    context_config = saved;
+
+    for (size_t i = 0; i < platform.reset_vector.size(); ++i)
+      spdlog::info("hart {} reset vector: {:#x}", i,
+                   (uint64_t) platform.reset_vector[i].read());
+
+    platform.resetn.write(reset_val);
+
+    if (context_config.continue_from)
+      restore_context(context_config.dir);
+  }
+
+  int run(const uint64_t max_cycles = std::numeric_limits<uint64_t>::max())
+  {
+    auto sa = memzeroed<struct sigaction>();
+    sa.sa_handler = sigint_handler;
+    sigemptyset(&sa.sa_mask);
+
+    auto oact = memzeroed<struct sigaction>();
+    if (sigaction(SIGINT, &sa, &oact) == -1)
+      perror("sigaction");
+
+    const auto restore_sigint = std::experimental::scope_exit{[&] {
+      if (sigaction(SIGINT, &oact, nullptr) == -1)
+        perror("sigaction");
+    }};
+
+    // wait for debugger connections
+    while (dtm_debug && !dtm.is_connected()) {
+      dtm.try_accept_socket();
+      if (ctrlc != 0) {
+        return 130;
+      }
+      sleep(1);
+    }
+
+    [[maybe_unused]]
+    bool ctx_resuming = context_config.continue_from;
+    [[maybe_unused]]
+    bool ctx_triggered = false;
+
+    for (auto n = uint64_t{0}; n < max_cycles; ++n) {
+
+      if (ctx_resuming) [[unlikely]] {
+        // Pull up PLIC interrupt signal at the first cycle of the resume
+        platform.int_trigger.write(1);
+        ctx_resuming = false;
+        ctx_triggered = true;
+      }
+
+      sc_core::sc_start(platform.clk.period());
+
+      trace_.on_cycle(cpu);
+
+      if (hybrid_handoff_) [[unlikely]] {
+        if (auto code = check_hybrid_handoff(); code) return *code;
+      }
+
+      if (trace_.pipeview_wants_exit()) {
+        spdlog::info("Pipeline viewer requested exit (Kanata loop window complete)");
+        return 0;
+      }
+
+      if (context_config.save_on_wfi && platform.wfi_signal.read() == true)
+        [[unlikely]]
+      {
+        context_config.save(platform, cpu);
+        spdlog::info("User save context");
+        return 0;
+      }
+
+      if (ctrlc != 0) {
+        ctrlc = 0;
+        spdlog::info("Ctrl+C PC: {:x}", get_current_pc());
+        trace_.log_committed_pcs(cpu);
+        return 130;
+      }
+
+      if (ctx_triggered) [[unlikely]] {
+        // Pull down the interrupt signal after 1 cycle
+        platform.int_trigger.write(0);
+        ctx_triggered = false;
+      }
+
+      if (platform.sim_control.exits >= 0) {
+        spdlog::info("sim_control: got exit {}, stopping",
+                     platform.sim_control.exits);
+        spdlog::info("Exit PC: {:x}", get_current_pc());
+        trace_.log_committed_pcs(cpu);
+        return platform.sim_control.exits;
+      }
+
+      if (this->cpu.contextp()->gotFinish())
+        return 0;
+
+      spdlog::trace("PC: {:x}", get_current_pc());
+    }
+    return 0;
+  }
+
+  uint64_t get_current_pc()
+  {
+    if constexpr (requires { cpu.get_current_pc(); }) {
+      return cpu.get_current_pc();
+    }
+    return std::numeric_limits<uint64_t>::max();
+  }
+
+  auto check_hybrid_handoff() -> std::optional<int>
+  {
+    if constexpr (!requires { cpu.get_committed_pc(); }) {
+      return std::nullopt;
+    } else {
+      const auto committed = cpu.get_committed_pc();
+      if (committed.empty()) return std::nullopt;
+      for (const auto pc: committed[0]) {
+        auto state = hybrid_handoff_->on_retire(
+          pc, [&](uint8_t r) -> uint64_t {
+            if constexpr (requires { cpu.get_gpr(r); }) {
+              return cpu.get_gpr(r);
+            }
+            return 0;
+          });
+        if (state) {
+          spdlog::info("hybrid handoff: drained at pc=0x{:x}, writing {}",
+                       pc, hybrid_state_path_);
+          std::ofstream f(hybrid_state_path_, std::ios::binary);
+          f.write(reinterpret_cast<const char*>(&*state), sizeof(*state));
+          return hybrid::kExitHandoffToQemu;
+        }
+      }
+      return std::nullopt;
+    }
+  }
+
+  void enable_waveform(const std::string& waveform_filename)
+  {
+    trace_.enable_waveform(cpu, waveform_filename);
+  }
+
+  void enable_pc_trace(const std::string& filename)
+  {
+    trace_.enable_pc_trace(filename);
+  }
+
+  void disable_pc_trace() { trace_.disable_pc_trace(); }
+
+  void enable_kanata(const std::string& filename,
+                     const std::string& objdump_file = "",
+                     std::optional<kanata::LoopGate> gate = std::nullopt)
+  {
+    trace_.enable_kanata(cpu, filename, objdump_file, gate);
+  }
+
+  void enable_clarity(const std::string& filename,
+                      const std::string& objdump_file = "",
+                      std::optional<kanata::LoopGate> gate = std::nullopt)
+  {
+    trace_.enable_clarity(cpu, filename, objdump_file, gate);
+  }
+
+  void disable_pipeview() { trace_.disable_pipeview(); }
+
+  void dump_cycle_pcs() { trace_.dump_cycle_pcs(cpu); }
+
+  auto get_cycles() -> std::uint64_t { return trace_.get_cycles(platform.clk); }
+
+  auto get_exits() { return platform.sim_control.exits; }
+
+  void log_committed_pcs() { trace_.log_committed_pcs(cpu); }
+
+  void set_mem_latency(const uint32_t latency)
+  {
+    platform.main_memory.latency = latency;
+  }
+
+  void close_trace() { trace_.close(); }
+
+#if ENABLE_PYBIND11
+  static void bind_pybind11(pybind11::module_& m, const char* name)
+  {
+    namespace py = pybind11;
+    auto c = py::class_<Simulator<CPU>>(m, name);
+    c.def(py::init([](const char* name) { return new Simulator<CPU>(name); }));
+    c.def("init_debug_port", &Simulator<CPU>::init_debug_port);
+    c.def("load_elf", &Simulator<CPU>::load_elf);
+    c.def("get_cycles", &Simulator<CPU>::get_cycles);
+    c.def("reset", &Simulator<CPU>::reset);
+    c.def("set_mem_latency", &Simulator<CPU>::set_mem_latency);
+    c.def("get_exits", &Simulator<CPU>::get_exits);
+    c.def("run", &Simulator<CPU>::run, "",
+          py::arg("max_cycles") = std::numeric_limits<uint64_t>::max());
+    c.def_readonly("cpu", &Simulator<CPU>::cpu,
+                   py::return_value_policy::reference);
+  }
+#endif
+};
