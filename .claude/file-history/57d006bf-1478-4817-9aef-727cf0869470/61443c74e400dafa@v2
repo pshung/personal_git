@@ -1,0 +1,402 @@
+# Hybrid vsim: QEMU + Verilator Co-simulation
+
+## TL;DR
+
+`vsim` runs RTL at ~5-9 KHz. A typical workload spends 99% of cycles in
+boot, libc init, and warm-up before reaching the kernel under study.
+Hybrid mode runs that boring prefix in QEMU at MHz speeds, hands the
+architectural state to vsim for a small cycle-accurate Region of
+Interest (ROI), then optionally hands back to QEMU to finish. The ROI
+boundaries are marked in the guest binary by writing to a magic CSR
+(`0x7C0`).
+
+This document is a starting point for new engineers joining the hybrid
+work. It explains what state is exchanged between simulators, how
+control flow crosses the boundary, what is verified end-to-end today,
+and what is intentionally out of scope.
+
+---
+
+## 1. End-to-end picture
+
+```mermaid
+flowchart LR
+    G[Guest ELF<br/>contains csrwi 0x7C0, 0/1]
+    Q1[QEMU 1<br/>functional, fast]
+    V[vsim<br/>RTL, cycle-accurate]
+    Q2[QEMU 2<br/>functional, fast]
+
+    G --> Q1
+    Q1 -->|state.bin: x1..x31, PC| V
+    V -->|state.bin: x1..x31, PC| Q2
+
+    M[/"/dev/shm/vsim-ram (mmap)"/]
+    Q1 <-->|MAP_SHARED| M
+    V  <-->|MAP_SHARED| M
+    Q2 <-->|MAP_SHARED| M
+```
+
+A single guest ELF runs through three processes in sequence. Memory is
+backed by one host file that all three processes mmap. Registers are
+copied through small `state.bin` snapshots between processes, because
+each simulator owns its own register state internally.
+
+---
+
+## 2. Architectural state exchange
+
+There are two kinds of architectural state and they use very different
+mechanisms.
+
+### 2.1 Registers and PC: copy via `state.bin`
+
+The cross-simulator register snapshot is a packed C struct defined in
+`hybrid/include/state_abi.h`:
+
+```c
+struct hybrid_state_v1 {
+    uint32_t magic;     // 'AHYB'
+    uint32_t version;
+    uint64_t flags;
+    uint64_t pc;
+    uint8_t  priv;      // hardcoded to 3 (M-mode) today
+    uint64_t gpr[32];   // x0..x31; x0 is always 0
+    /* future: f[32], csr[N], v[32 * VLEN/8] */
+} __attribute__((packed));
+```
+
+Only `gpr[1..31]` and `pc` are actually round-tripped today. Everything
+else in the table below is in the "Known limitations" list.
+
+#### QEMU -> vsim (resume)
+
+```mermaid
+sequenceDiagram
+    participant Plugin as hybrid_handoff.so<br/>(QEMU TCG plugin)
+    participant File as state.bin
+    participant Vsim as vsim main loop
+    participant DM as RISC-V Debug Module<br/>(in RTL)
+
+    Note over Plugin: csrwi 0x7C0, 0 retires
+    Plugin->>Plugin: read x1..x31, pc via<br/>qemu_plugin_read_register
+    Plugin->>File: write hybrid_state_v1
+    Plugin->>Plugin: qemu_plugin_request_exit
+
+    Vsim->>File: load_state(path)
+    File-->>Vsim: validate magic + version
+    Note over Vsim: hold reset, then halt via DM
+    Vsim->>DM: Abstract Command write x1..x31
+    Vsim->>DM: write DPC = pc
+    Vsim->>DM: dret -> resume at pc
+```
+
+The vsim side uses the existing JTAG DMI infrastructure
+(`src/platform/jtag_dtm.hpp`) in-process - no socket, no DPI. Each
+register write is a Debug Module Abstract Command driven over the DMI
+bus from `src/hybrid/resume_driver.hpp`. The full ~33 transactions take
+hundreds of RTL cycles, negligible against the millions of cycles
+saved.
+
+Files: `src/hybrid/state_loader.hpp`,
+`src/hybrid/resume_from_qemu.hpp`, `src/hybrid/resume_driver.hpp`,
+`src/hybrid/abstract_command.hpp`.
+
+#### vsim -> QEMU (handback)
+
+```mermaid
+sequenceDiagram
+    participant Vsim as vsim main loop
+    participant DM as RISC-V Debug Module
+    participant File as state.bin
+    participant Q2 as QEMU 2 (-gdb -S)
+    participant GDB as gdbstub::Session
+
+    Note over Vsim: csrwi 0x7C0, 1 retires
+    Vsim->>DM: halt, read x1..x31, pc<br/>via Abstract Commands
+    Vsim->>File: write hybrid_state_v1
+    Vsim->>Vsim: run() returns kExitHandoffToQemu (200)
+    Vsim->>Q2: fork+exec qemu-system-riscv64<br/>-gdb tcp::PORT -S
+    Vsim->>GDB: connect_loopback (5 s budget)
+    GDB->>Q2: P&lt;reg&gt;=&lt;value&gt; for x1..x31
+    GDB->>Q2: P32=&lt;pc&gt;
+    GDB->>Q2: c (continue)
+    Q2->>Q2: run until semihosting exit
+    Q2-->>Vsim: waitpid -> exit code
+    Vsim-->>Vsim: propagate exit code
+```
+
+The handback uses QEMU's built-in gdbstub (`-gdb tcp::PORT -S` makes
+QEMU pause at start and listen on a TCP port for GDB Remote Serial
+Protocol packets). vsim implements just the subset needed to write
+registers (`P<reg>=<value>`) and continue (`c`) in
+`src/hybrid/gdbstub_client.hpp` and `src/hybrid/gdbstub_session.hpp`.
+
+Files: `src/hybrid/state_drain.hpp`, `src/hybrid/qemu_handback.hpp`,
+`src/hybrid/gdbstub_session.hpp`, `src/hybrid/gdbstub_client.hpp`.
+
+### 2.2 Memory: share via mmap
+
+Copying a register file is fine; copying gigabytes of guest RAM between
+simulators is not. So we don't copy. We share.
+
+```
+host file: /dev/shm/vsim-ram (e.g. 128 MB, truncate-allocated)
+                |
+                +--- mmap MAP_SHARED ---> QEMU 1 RAM at GPA 0x80000000
+                +--- mmap MAP_SHARED ---> vsim  RAM at GPA 0x80000000
+                +--- mmap MAP_SHARED ---> QEMU 2 RAM at GPA 0x80000000
+
+GPA 0x80010000 -> file offset 0x10000  (in all three processes)
+```
+
+QEMU sees this through `-object memory-backend-file,id=mem,share=on,mem-path=...
+,size=...` plus `-machine virt,memory-backend=mem`. The `virt` machine
+puts RAM at GPA `0x80000000` (the base is hardcoded in QEMU's
+`hw/riscv/virt.c`).
+
+vsim sees the same file through `--shared-mem-path PATH
+--shared-mem-size N`. Internally:
+
+- `MmapBacking` (`src/platform/mmap_backing.hpp`) opens the file and
+  hands a `std::span<uint8_t>` to `SimpleMemory`.
+- `SimpleMemory`'s `MemoryRegion` is narrowed to `[base, base+size)`
+  with `base = 0x80000000` (the `--shared-mem-base` flag, defaulting to
+  the QEMU virt RAM base). With the narrow region, the SimpleMemory
+  translation `addr - region.base_address` makes file byte 0 correspond
+  to GPA `0x80000000`, exactly as in QEMU.
+- `Simulator::load_elf` uses `region.base_address` as the load base,
+  so an ELF segment at GPA `0x80000000` lands at file offset `0`.
+
+When `--shared-mem-path` is unset, vsim falls back to a `std::vector`
+big enough for the wide `[RAM_BASE=0, RAM_END=0x8FFFFFFF]` region. All
+existing non-hybrid tests use this path unchanged.
+
+A 4 KB write in vsim at GPA `0x80010000` is observable by an
+independent host process that mmaps the same file at offset `0x10000`.
+This is the property `tests/hybrid/shared_mem_offset.test.cpp` and
+`tests/hybrid/rt_shared_mem.sh` lock in.
+
+Files: `src/platform/mmap_backing.hpp`, `src/platform/simple_memory.hpp`,
+`src/platform/platform.hpp`, `src/main.cpp` (CLI flags).
+
+---
+
+## 3. Control flow exchange
+
+### 3.1 The `0x7C0` magic CSR
+
+`0x7C0` is a user-defined RISC-V CSR address with no architectural
+meaning. The hybrid system claims it as the boundary marker:
+
+```mermaid
+flowchart TD
+    A[guest ELF retires<br/>csrwi 0x7C0, imm] --> B{imm}
+    B -->|0| C[ENTER detail<br/>QEMU drains, exits]
+    B -->|1| D[EXIT detail<br/>vsim drains, returns 200]
+
+    E[guest ELF retires<br/>csrrw rd, 0x7C0, rs1] --> F{value of GPR rs1}
+    F -->|0| C
+    F -->|1| D
+```
+
+Two equivalent encodings are accepted:
+
+- **Immediate form** (`csrwi 0x7C0, 0` / `csrwi 0x7C0, 1`): the simplest
+  fixture style.
+- **Runtime form** (`csrrw rd, 0x7C0, rs1`): the fixture loads `0` or
+  `1` into a GPR first; the trigger reads that GPR's live value.
+  Useful when the boundary is computed at runtime.
+
+QEMU sees the trigger via a TCG plugin
+(`hybrid/qemu_plugin/hybrid_handoff.c`) registered with
+`qemu_plugin_register_vcpu_insn_exec_cb()`. The plugin pre-decodes
+each instruction once; the per-instruction callback only fires on a
+matching `csrrw`/`csrwi` opcode.
+
+vsim sees the trigger via the existing retire signal taps. Before the
+ROI starts, `Simulator::enable_hybrid_handoff()` (defined in
+`src/simulator.hpp`) pre-scans the ELF for PCs whose instruction is a
+write to `0x7C0`. During the run loop, a retire of one of those PCs
+calls the `HandoffController` (`src/hybrid/handoff_controller.hpp`)
+which decodes the immediate / GPR value and either drains state or
+ignores the event.
+
+We deliberately avoid HTIF (`tohost`/`fromhost`) and `ecall`, which
+already have meanings.
+
+### 3.2 The `--resume-from-qemu` / `--qemu-binary` plumbing
+
+The vsim CLI exposes three flags that together drive a round-trip:
+
+| Flag | Meaning |
+|---|---|
+| `--resume-from-qemu PATH` | Load `PATH` as the entry-state snapshot. After `reset()`, drive the DM to write registers + PC. |
+| `--handoff-out PATH` | After this point the run loop watches retires for `csrwi/csrrw 0x7C0, *`. On exit-detail (value 1), drain state to `PATH` and exit with code 200. |
+| `--qemu-binary PATH` | When the run exits with code 200, fork+exec `PATH` with `-gdb tcp::PORT -S`, restore state via gdbstub, propagate QEMU's exit code. |
+
+Set just `--resume-from-qemu` for one-way QEMU -> vsim.
+Add `--handoff-out` to drain state on the way out of vsim.
+Add `--qemu-binary` to also do the vsim -> QEMU 2 handback.
+
+The shared-memory flags layer onto the same flow:
+
+| Flag | Meaning |
+|---|---|
+| `--shared-mem-path PATH` | mmap-backed file used as main RAM. Required for cross-simulator memory survival. |
+| `--shared-mem-size N` | Size of the mmap region (must match QEMU's `size=` argument). |
+| `--shared-mem-base HEX` | GPA that file offset 0 maps to. Default `0x80000000`. Override only for non-`virt` machine types. |
+
+`run_qemu_handback` propagates these to QEMU 2's command line so all
+three processes see the same backing file.
+
+---
+
+## 4. Verified end-to-end test cases
+
+All twelve drivers live under `tests/hybrid/` and are wired into CTest
+under the `hybrid-e2e` label. They `exit 77` (skip) when the QEMU
+binary, plugin, or fixture ELFs are missing, so a clean container gives
+SKIP not FAIL.
+
+Run the full suite with:
+
+```bash
+ctest -L hybrid-e2e --output-on-failure   # from build/
+```
+
+### 4.1 Tier-1: round-trip happy paths (8)
+
+Each fixture follows the three-phase template (Phase A in QEMU 1,
+Phase B in vsim, Phase C in QEMU 2). Pass/fail is the QEMU 2
+process exit code, propagated by vsim.
+
+| Driver | Fixture | What it verifies | Pass code |
+|---|---|---|---|
+| `test_e2e_handoff_roundtrip` | `handoff_roundtrip.S` | Baseline: minimal `a2 = 1 + 2 = 3` round-trip, PC and one GPR survive both handoffs. | 3 |
+| `test_e2e_rt_pc_jump` | `rt_pc_jump.S` | PC fidelity: Phase B `j .+0x40` puts the exit csrwi 64 bytes ahead of where it started. | 0 |
+| `test_e2e_rt_sign_bits` | `rt_sign_bits.S` | 64-bit width fidelity through the DM Abstract Command path: `0`, `-1`, `0x8000_..._0`, `0x7FFF_..._F`, `0x0000_..._F`. | 0 |
+| `test_e2e_rt_abi_aliases` | `rt_abi_aliases.S` | `ra (x1)`, `sp (x2)`, `gp (x3)`, `tp (x4)`, `fp (x8)` all survive untouched across two handoffs. | 0 |
+| `test_e2e_rt_long_roi` | `rt_long_roi.S` | Vsim runs a 100-iteration loop summing 1..100 = 5050; catches resume-state corruption only visible after many cycles. | 0 |
+| `test_e2e_rt_all_gprs` | `rt_all_gprs.S` | All 31 GPRs survive QEMU 1 -> vsim -> QEMU 2; bit `i` of `t2` reports a mismatch on register `i`. | 0 |
+| `test_e2e_rt_mem_loadstore` | `rt_mem_loadstore.S` | Vsim's memory subsystem under load while resumed from foreign state: load-after-store, RAW within vsim's pipeline. | 0 |
+| `test_e2e_rt_unaligned_lh` | `rt_unaligned_lh.S` | Halfword/byte loads at unaligned addresses inside the vsim ROI. | 0 |
+
+### 4.2 Tier-2: cross-simulator memory survival (1)
+
+| Driver | What it verifies | Pass code |
+|---|---|---|
+| `test_e2e_rt_shared_mem` | Memory written by one simulator is visible to the next through the shared mmap. Phase A fills 4 KB at GPA `0x80010000` with `0xA5`; Phase B (vsim) verifies + XORs with `0x5A` to leave `0xFF`; Phase C (QEMU 2) reads back through the same mmap and confirms. | 0 |
+
+This is the only test that detects regressions in "memory written in
+vsim is visible to QEMU 2", the key promise of hybrid mode beyond
+register transfer. It uses a separate driver (`rt_shared_mem.sh`)
+because it allocates `/dev/shm` and adds `--shared-mem-*` CLI flags.
+
+### 4.3 Negative / robustness drivers (3)
+
+These guard quietly-degrading failure paths the happy-path tests can't
+see.
+
+| Driver | Failure mode | Asserts |
+|---|---|---|
+| `test_e2e_rt_corrupt_state` | Vsim is given a 32-byte truncated `state.bin`. | Exit non-zero, non-200, non-timeout; stderr matches `short read\|bad magic\|cannot open`. |
+| `test_e2e_rt_no_qemu_binary` | `--qemu-binary /nonexistent`. Drain still fires; exec in the spawned child fails. | Exit `127` (standard exec-failure code), elapsed under 15 s. Surfaced via `connect_loopback` polling `waitpid(WNOHANG)` in parallel with `::connect`. |
+| `test_e2e_rt_gdbstub_timeout` | `--qemu-binary` is `qemu_silent_stub.py`, which opens the gdb port, accepts the connection, and sleeps. | Vsim's `gdbstub::Session::recv_byte` hits `SO_RCVTIMEO=5 s`, throws "recv timeout", vsim exits non-zero in under 25 s. |
+
+Together: vsim exits non-zero, exits cleanly, and exits promptly, in
+each respective failure mode.
+
+---
+
+## 5. Known limitations
+
+These are intentional gaps as of the current snapshot. Each is either
+a deliberate scoping decision or a parked Phase 5 follow-up.
+
+### 5.1 State not transferred today
+
+Only `gpr[1..31]` and `pc` are round-tripped. Everything else is reset
+or undefined on the receiving side:
+
+- **Floating-point registers** `f0..f31` and `mstatus.FS`: not in the
+  ABI struct, no DM/gdbstub path wired.
+- **Control and Status Registers**: `mstatus`, `mepc`, `mtvec`,
+  `mcause`, `mtval`, `mscratch`, `medeleg`, `mideleg`, `mip`, `mie`,
+  `satp`, `mcycle`, `minstret`, all PMP entries - none are
+  transferred. Use of these inside the ROI is undefined.
+- **Vector state**: `vstart`, `vtype`, `vl`, `vlenb`, `v0..v31`. Not
+  transferred. The fixture must avoid the V extension entirely until
+  Phase 5.
+- **Privilege mode**: hardcoded to M-mode (3) on both sides. S-mode /
+  U-mode round-trip is not supported.
+- **lr/sc reservations**: explicitly invalidated at handoff, not
+  transferred.
+
+### 5.2 Microarchitectural state is discarded
+
+Caches, TLBs, branch predictor, and store buffer all start cold on
+entry to vsim. This is by design: the existing `--kanata-loop-skip N`
+mechanism is used to warm the pipeline before recording. Any
+measurement that depends on first-iteration cache behaviour is
+scientifically suspect under hybrid mode.
+
+`mcycle` and `minstret` are continuous within each simulator but the
+absolute values across the QEMU/vsim/QEMU spans are not equal to a
+fully-RTL run. The discontinuity is documented, not fixed.
+
+### 5.3 Memory model boundary cases
+
+- **MMIO inside the ROI**: device registers live in QEMU C code with
+  no mirror in RTL. Touching MMIO between the entry and exit triggers
+  is undefined. There is no interconnect watch yet that would fail
+  loudly on this.
+- **Shared mmap base address**: hardcoded default `0x80000000` matches
+  QEMU `virt`. Other machine types need `--shared-mem-base HEX`. The
+  64-bit RAM alias region `[0x800000000, 0x880000000)` collapses to a
+  no-alias sentinel in hybrid mode (QEMU `virt` has no mirror).
+- **ILM / DLM**: separate physical regions, not shared via mmap.
+  Programs that rely on ILM/DLM contents surviving across handoffs are
+  not supported.
+
+### 5.4 Trigger boundary semantics
+
+- **Self-modifying code at the trigger**: undefined. The `csrwi 0x7C0, *`
+  instruction must be statically resolvable from the ELF.
+- **Traps inside the ROI**: trap stays in vsim until the exit trigger
+  retires. `mepc` / `mcause` are not transferred to QEMU 2.
+- **Multi-hart**: the ABI struct is single-hart. `_NDS_NHART <= 2` is
+  enforced at build time; meaningful multi-hart hybrid is Phase 5.
+
+### 5.5 Failure-path response times
+
+- **gdbstub recv timeout**: 5 s (`gdbstub::Session::kRecvTimeoutSeconds`).
+  A real but slow QEMU could trip this on a heavily loaded host.
+- **connect_loopback timeout**: 5 s for the initial TCP connect.
+  Polled alongside `waitpid(WNOHANG)` so an exec failure surfaces in
+  ~ms, but a slow but live QEMU still has the full 5 s.
+
+### 5.6 Out of scope for this snapshot
+
+These are explicitly *not* yet planned:
+
+- Andes-internal QEMU fork support (we target mainline QEMU 9.2.0).
+- A `--hybrid-mode=auto` orchestrator script that wraps the existing
+  `--kanata-loop-{start,end}` flags as PC triggers (Phase 4 of the
+  larger plan).
+- Negative tests for malformed plugin args or version-skewed
+  `state.bin`.
+
+---
+
+## 6. Where to look next
+
+If you are starting from scratch:
+
+1. Read `hybrid/test/handoff_roundtrip.S` first - it is the simplest
+   round-trip fixture and demonstrates the three-phase template.
+2. Then `tests/hybrid/roundtrip_e2e.sh` to see how a fixture is driven.
+3. Then `src/simulator.hpp` (`apply_resume_from_qemu`,
+   `enable_hybrid_handoff`, the run loop) to see how the simulator
+   reacts to the trigger.
+4. `hybrid_plan.md` has the longer-form rationale and phase plan that
+   this document distills.
