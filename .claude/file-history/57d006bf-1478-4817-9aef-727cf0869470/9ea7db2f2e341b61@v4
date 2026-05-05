@@ -1,0 +1,615 @@
+cmake_minimum_required(VERSION 3.20)
+
+# default to clang, the compiled binary runs faster than gcc after experiment
+# need to be placed before project(...), because project(...) will decide
+# which compiler to use
+set(CMAKE_C_COMPILER clang CACHE STRING "C compiler")
+set(CMAKE_CXX_COMPILER clang++ CACHE STRING "C++ compiler")
+
+project(vsim LANGUAGES C CXX)
+
+# these settings should be placed after project(...) i.e. after
+# compiler is chosen
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# ##############################################################################
+# Options
+# ##############################################################################
+option(VSIM_DEBUG "Enable VCD waveform tracing" OFF)
+option(VSIM_DEBUG_FST "Enable FST waveform tracing (for long recordings)" OFF)
+option(VSIM_SAVABLE "Enable save/resume simulation (increases build and run time)" OFF)
+option(VSIM_NO_VERILATOR "Assume verilated modules are already built" OFF)
+
+set(VSIM_CONFIG_FILE "${CMAKE_SOURCE_DIR}/config.yaml"
+  CACHE FILEPATH "CPU/platform configuration YAML file")
+set(VSIM_CCS_OPT ""
+  CACHE STRING "Extra optimization flags for cpu_cluster_subsystem compilation")
+set(VSIM_VERILATOR_EXECUTABLE ""
+  CACHE FILEPATH "Path to verilator executable")
+set(VSIM_VERILATOR_ROOT ""
+  CACHE PATH "Verilator source root (auto-detected if empty)")
+set(VSIM_CPUS ""
+  CACHE STRING "Semicolon-separated list of CPUs to build (empty = all from config.yaml)")
+
+if(VSIM_DEBUG AND VSIM_DEBUG_FST)
+  message(FATAL_ERROR "VSIM_DEBUG and VSIM_DEBUG_FST are mutually exclusive")
+endif()
+
+# ##############################################################################
+# Find Python (needed for config parsing)
+# ##############################################################################
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+# ##############################################################################
+# Find Verilator
+# ##############################################################################
+include(${CMAKE_SOURCE_DIR}/cmake/FindVerilator.cmake)
+include(${CMAKE_SOURCE_DIR}/cmake/VerilatorHelpers.cmake)
+
+# ##############################################################################
+# Parse config.yaml into cpu_config.cmake
+# ##############################################################################
+execute_process(
+  COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/cmake/parse_config_yaml.py"
+  "${VSIM_CONFIG_FILE}"
+  "${CMAKE_BINARY_DIR}/cpu_config.cmake"
+  RESULT_VARIABLE _parse_result
+)
+
+if(NOT _parse_result EQUAL 0)
+  message(FATAL_ERROR "Failed to parse ${VSIM_CONFIG_FILE}")
+endif()
+
+include("${CMAKE_BINARY_DIR}/cpu_config.cmake")
+
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${VSIM_CONFIG_FILE}"
+  "${CMAKE_SOURCE_DIR}/cmake/parse_config_yaml.py"
+)
+
+# Filter CPU list if VSIM_CPUS is specified
+if(VSIM_CPUS)
+  set(_filtered_cpus "")
+
+  foreach(_cpu IN LISTS VSIM_CPUS)
+    if(_cpu IN_LIST VSIM_CPU_LIST)
+      list(APPEND _filtered_cpus "${_cpu}")
+    else()
+      message(FATAL_ERROR "Unknown CPU '${_cpu}'. Available: ${VSIM_CPU_LIST}")
+    endif()
+  endforeach()
+
+  set(VSIM_CPU_LIST "${_filtered_cpus}")
+  message(STATUS "Building CPUs: ${VSIM_CPU_LIST}")
+else()
+  message(STATUS "Building all CPUs: ${VSIM_CPU_LIST}")
+endif()
+
+# ##############################################################################
+# Generate cpu_config.hpp
+# Uses copy_if_different so dependents are only recompiled when content changes.
+# ##############################################################################
+add_custom_command(
+  OUTPUT "${CMAKE_BINARY_DIR}/cpu_config.hpp"
+  COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_SOURCE_DIR}/cmake/generate_cpu_config_hpp.py"
+  "${VSIM_CONFIG_FILE}"
+  "${CMAKE_BINARY_DIR}/cpu_config.hpp.tmp"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+  "${CMAKE_BINARY_DIR}/cpu_config.hpp.tmp"
+  "${CMAKE_BINARY_DIR}/cpu_config.hpp"
+  COMMAND ${CMAKE_COMMAND} -E remove
+  "${CMAKE_BINARY_DIR}/cpu_config.hpp.tmp"
+  DEPENDS "${VSIM_CONFIG_FILE}"
+  "${CMAKE_SOURCE_DIR}/cmake/generate_cpu_config_hpp.py"
+  COMMENT "Generating cpu_config.hpp"
+)
+
+# ##############################################################################
+# Generate version.hpp (rebuild if git HEAD changes)
+# ##############################################################################
+set(VSIM_VERSION_OVERRIDE "" CACHE STRING "Override the version string (bypasses git describe; useful for Docker/CI builds)")
+
+# Only depend on .git/HEAD if it exists (.git is absent in Docker builds)
+if(EXISTS "${CMAKE_SOURCE_DIR}/.git/HEAD")
+  set(_git_head_dep "${CMAKE_SOURCE_DIR}/.git/HEAD")
+else()
+  set(_git_head_dep "")
+endif()
+
+add_custom_command(
+  OUTPUT "${CMAKE_BINARY_DIR}/version.hpp"
+  COMMAND ${CMAKE_COMMAND}
+  -DSRC_DIR=${CMAKE_SOURCE_DIR}
+  -DOUT_FILE=${CMAKE_BINARY_DIR}/version.hpp
+  "-DVERSION_OVERRIDE=${VSIM_VERSION_OVERRIDE}"
+  -P ${CMAKE_SOURCE_DIR}/cmake/GenerateVersion.cmake
+  DEPENDS ${_git_head_dep}
+  COMMENT "Generating version.hpp"
+)
+
+# Single target for both generated headers
+add_custom_target(generate_headers DEPENDS
+  "${CMAKE_BINARY_DIR}/cpu_config.hpp"
+  "${CMAKE_BINARY_DIR}/version.hpp"
+)
+
+# Compiler / linker flags
+# ##############################################################################
+set(VSIM_COMPILE_FLAGS -Wall -Wextra -pedantic -O2 -march=x86-64-v3 -fdiagnostics-color=always)
+set(VSIM_COMPILE_DEFS SPDLOG_COMPILED_LIB=1 SPDLOG_FMT_EXTERNAL=1 VL_NO_LEGACY=1)
+set(VSIM_LINK_FLAGS -fuse-ld=lld -lpthread "-Wl,-O1,-z,relro,-z,now,--allow-multiple-definition")
+set(VSIM_LINK_LIBS atomic dl z)
+
+option(VSIM_LINK_STATIC "Link executables statically (for self-contained Docker/scratch images)" OFF)
+
+if(VSIM_LINK_STATIC)
+  list(APPEND VSIM_LINK_FLAGS -static)
+endif()
+
+# Conditional definitions
+if(VSIM_DEBUG)
+  list(APPEND VSIM_COMPILE_DEFS VSIMDEBUG)
+endif()
+
+if(VSIM_DEBUG_FST)
+  list(APPEND VSIM_COMPILE_DEFS VSIMDEBUG TRACEFST)
+endif()
+
+if(VSIM_SAVABLE)
+  list(APPEND VSIM_COMPILE_DEFS VSIMSAVABLE)
+endif()
+
+# ##############################################################################
+# External dependencies via ExternalProject_Add
+# ##############################################################################
+include(ExternalProject)
+include(ProcessorCount)
+ProcessorCount(NPROC)
+
+if(NPROC EQUAL 0)
+  set(NPROC 4)
+endif()
+
+set(DEPS_DIR "${CMAKE_BINARY_DIR}/deps")
+
+# Imported targets reference install include directories that may not exist yet
+# in a fresh build tree. Create the expected layout up front so CMake does not
+# reject the interface include paths during configure.
+file(MAKE_DIRECTORY
+  "${DEPS_DIR}/fmt/include"
+  "${DEPS_DIR}/spdlog/include"
+  "${DEPS_DIR}/systemc/include"
+  "${DEPS_DIR}/systemc-cci/include"
+  "${DEPS_DIR}/yaml-cpp/include"
+  "${DEPS_DIR}/systemc-components/include"
+  "${DEPS_DIR}/lief/include"
+  "${DEPS_DIR}/andes_clarity/lib"
+)
+
+# -- fmt --
+ExternalProject_Add(ext_fmt
+  SOURCE_DIR "${CMAKE_SOURCE_DIR}/external/fmt"
+  BINARY_DIR "${DEPS_DIR}/fmt-build"
+  INSTALL_DIR "${DEPS_DIR}/fmt"
+  EXCLUDE_FROM_ALL TRUE
+  CMAKE_ARGS
+  -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+  -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+  -DBUILD_SHARED_LIBS=OFF
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+  -DCMAKE_INSTALL_PREFIX=${DEPS_DIR}/fmt
+  -DCMAKE_INSTALL_LIBDIR=lib
+  -DFMT_TEST=OFF
+  -DFMT_DOC=OFF
+  BUILD_BYPRODUCTS "${DEPS_DIR}/fmt/lib/libfmt.a"
+)
+
+# -- spdlog (depends on fmt) --
+ExternalProject_Add(ext_spdlog
+  SOURCE_DIR "${CMAKE_SOURCE_DIR}/external/spdlog"
+  BINARY_DIR "${DEPS_DIR}/spdlog-build"
+  INSTALL_DIR "${DEPS_DIR}/spdlog"
+  EXCLUDE_FROM_ALL TRUE
+  CMAKE_ARGS
+  -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+  -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+  -DBUILD_SHARED_LIBS=OFF
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+  -DCMAKE_INSTALL_PREFIX=${DEPS_DIR}/spdlog
+  -DCMAKE_INSTALL_LIBDIR=lib
+  -DSPDLOG_FMT_EXTERNAL=ON
+  -DSPDLOG_BUILD_TESTS=OFF
+  -DSPDLOG_BUILD_EXAMPLE=OFF
+  "-DCMAKE_PREFIX_PATH=${DEPS_DIR}/fmt/lib/cmake"
+  DEPENDS ext_fmt
+  BUILD_BYPRODUCTS "${DEPS_DIR}/spdlog/lib/libspdlog.a"
+)
+
+# -- systemc --
+ExternalProject_Add(ext_systemc
+  SOURCE_DIR "${CMAKE_SOURCE_DIR}/external/systemc"
+  BINARY_DIR "${DEPS_DIR}/systemc-build"
+  INSTALL_DIR "${DEPS_DIR}/systemc"
+  EXCLUDE_FROM_ALL TRUE
+  CMAKE_ARGS
+  -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+  -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+  -DCMAKE_CXX_STANDARD=20
+  -DBUILD_SHARED_LIBS=OFF
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+  -DDISABLE_COPYRIGHT_MESSAGE=ON
+  -DENABLE_PHASE_CALLBACKS_TRACING=OFF
+  -DCMAKE_INSTALL_PREFIX=${DEPS_DIR}/systemc
+  -DCMAKE_INSTALL_LIBDIR=lib
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+  BUILD_BYPRODUCTS "${DEPS_DIR}/systemc/lib/libsystemc.a"
+)
+
+# -- systemc-cci (depends on systemc, uses autoconf) --
+ExternalProject_Add(ext_systemc_cci
+  SOURCE_DIR "${CMAKE_SOURCE_DIR}/external/systemc-cci"
+  BINARY_DIR "${DEPS_DIR}/systemc-cci-build"
+  INSTALL_DIR "${DEPS_DIR}/systemc-cci"
+  EXCLUDE_FROM_ALL TRUE
+  CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env
+  "CPPFLAGS=-DSC_DISABLE_API_VERSION_CHECK=1 -DCCI_HAS_CXX_RVALUE_REFS"
+  sh -c "cd <BINARY_DIR> && autoreconf --force --install --verbose <SOURCE_DIR> && <SOURCE_DIR>/configure --prefix=<INSTALL_DIR> --with-systemc=${DEPS_DIR}/systemc --with-json=${CMAKE_SOURCE_DIR}/external/rapidjson --enable-static --disable-shared --with-pic --with-layout=unix --with-arch-suffix="
+  BUILD_COMMAND make -j${NPROC}
+  INSTALL_COMMAND sh -c "make install && ln -sf cci/cfg <INSTALL_DIR>/include/cci_cfg"
+  DEPENDS ext_systemc
+  BUILD_BYPRODUCTS "${DEPS_DIR}/systemc-cci/lib/libcci.a"
+)
+
+# -- yaml-cpp --
+ExternalProject_Add(ext_yaml_cpp
+  SOURCE_DIR "${CMAKE_SOURCE_DIR}/external/yaml-cpp"
+  BINARY_DIR "${DEPS_DIR}/yaml-cpp-build"
+  INSTALL_DIR "${DEPS_DIR}/yaml-cpp"
+  EXCLUDE_FROM_ALL TRUE
+  CMAKE_ARGS
+  -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+  -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+  -DCMAKE_INSTALL_PREFIX=${DEPS_DIR}/yaml-cpp
+  -DCMAKE_INSTALL_LIBDIR=lib
+  -DYAML_CPP_BUILD_TESTS=OFF
+  -DYAML_CPP_BUILD_TOOLS=OFF
+  BUILD_BYPRODUCTS "${DEPS_DIR}/yaml-cpp/lib/libyaml-cpp.a"
+)
+
+# -- systemc-components (depends on fmt, spdlog, systemc, systemc-cci, yaml-cpp) --
+# Use CONFIGURE_COMMAND override to set CMAKE_PREFIX_PATH as an env var with ':'
+# separators. Passing it via CMAKE_ARGS mangles the semicolons.
+ExternalProject_Add(ext_systemc_components
+  SOURCE_DIR "${CMAKE_SOURCE_DIR}/external/systemc-components"
+  BINARY_DIR "${DEPS_DIR}/systemc-components-build"
+  INSTALL_DIR "${DEPS_DIR}/systemc-components"
+  EXCLUDE_FROM_ALL TRUE
+  CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env
+  "CMAKE_PREFIX_PATH=${DEPS_DIR}/yaml-cpp:${DEPS_DIR}/fmt:${DEPS_DIR}/spdlog:${DEPS_DIR}/systemc"
+  ${CMAKE_COMMAND} <SOURCE_DIR>
+  -DENABLE_CONAN=0
+  -DCMAKE_CXX_FLAGS=-DSC_DISABLE_API_VERSION_CHECK=1
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+  -DBUILD_SCC_LIB_ONLY=ON
+  -DCMAKE_INSTALL_PREFIX=${DEPS_DIR}/systemc-components
+  -DCMAKE_INSTALL_LIBDIR=lib
+  DEPENDS ext_fmt ext_spdlog ext_systemc ext_systemc_cci ext_yaml_cpp
+  BUILD_BYPRODUCTS
+  "${DEPS_DIR}/systemc-components/lib/libinterfaces.a"
+  "${DEPS_DIR}/systemc-components/lib/libscc-sysc.a"
+  "${DEPS_DIR}/systemc-components/lib/libtlm-interfaces.a"
+)
+
+# -- lief --
+ExternalProject_Add(ext_lief
+  SOURCE_DIR "${CMAKE_SOURCE_DIR}/external/lief"
+  BINARY_DIR "${DEPS_DIR}/lief-build"
+  INSTALL_DIR "${DEPS_DIR}/lief"
+  EXCLUDE_FROM_ALL TRUE
+  CMAKE_ARGS
+  -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+  -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+  -DBUILD_SHARED_LIBS=OFF
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+  -DCMAKE_INSTALL_PREFIX=${DEPS_DIR}/lief
+  -DCMAKE_INSTALL_LIBDIR=lib
+  -DLIEF_C_API=OFF
+  -DLIEF_EXAMPLES=OFF
+  BUILD_BYPRODUCTS "${DEPS_DIR}/lief/lib/libLIEF.a"
+)
+
+# -- andes_clarity (Clarity DB API, bundles SQLite) --
+ExternalProject_Add(ext_andes_clarity
+  SOURCE_DIR "${CMAKE_SOURCE_DIR}/external/andes_clarity"
+  BINARY_DIR "${DEPS_DIR}/andes_clarity-build"
+  INSTALL_DIR "${DEPS_DIR}/andes_clarity"
+  EXCLUDE_FROM_ALL TRUE
+  CMAKE_ARGS
+  -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+  -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+  -DBUILD_SHARED_LIBS=OFF
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+  -DCMAKE_INSTALL_PREFIX=${DEPS_DIR}/andes_clarity
+  INSTALL_COMMAND sh -c "mkdir -p '${DEPS_DIR}/andes_clarity/lib' && cp '${DEPS_DIR}/andes_clarity-build/libdatabase_handler.a' '${DEPS_DIR}/andes_clarity/lib/'"
+  BUILD_BYPRODUCTS "${DEPS_DIR}/andes_clarity/lib/libdatabase_handler.a"
+)
+
+# Aggregate dependency target
+add_custom_target(deps DEPENDS
+  ext_fmt ext_spdlog ext_systemc ext_systemc_cci
+  ext_yaml_cpp ext_systemc_components ext_lief ext_andes_clarity
+)
+
+# ##############################################################################
+# IMPORTED library targets for dependencies
+# ##############################################################################
+# Helper macro to create imported static lib
+macro(vsim_import_lib NAME LOCATION INCLUDE_DIR)
+  add_library(${NAME} STATIC IMPORTED)
+  set_target_properties(${NAME} PROPERTIES IMPORTED_LOCATION "${LOCATION}")
+
+  if(NOT "${INCLUDE_DIR}" STREQUAL "")
+    set_target_properties(${NAME} PROPERTIES
+      INTERFACE_INCLUDE_DIRECTORIES "${INCLUDE_DIR}")
+  endif()
+endmacro()
+
+vsim_import_lib(lib_database_handler
+  "${DEPS_DIR}/andes_clarity/lib/libdatabase_handler.a"
+  "${CMAKE_SOURCE_DIR}/external/andes_clarity")
+
+vsim_import_lib(lib_fmt
+  "${DEPS_DIR}/fmt/lib/libfmt.a"
+  "${DEPS_DIR}/fmt/include")
+
+vsim_import_lib(lib_spdlog
+  "${DEPS_DIR}/spdlog/lib/libspdlog.a"
+  "${DEPS_DIR}/spdlog/include")
+
+vsim_import_lib(lib_systemc
+  "${DEPS_DIR}/systemc/lib/libsystemc.a"
+  "${DEPS_DIR}/systemc/include")
+
+vsim_import_lib(lib_cci
+  "${DEPS_DIR}/systemc-cci/lib/libcci.a"
+  "${DEPS_DIR}/systemc-cci/include")
+
+vsim_import_lib(lib_lief
+  "${DEPS_DIR}/lief/lib/libLIEF.a"
+  "${DEPS_DIR}/lief/include")
+
+vsim_import_lib(lib_interfaces
+  "${DEPS_DIR}/systemc-components/lib/libinterfaces.a"
+  "${DEPS_DIR}/systemc-components/include")
+
+vsim_import_lib(lib_scc_sysc
+  "${DEPS_DIR}/systemc-components/lib/libscc-sysc.a"
+  "")
+
+vsim_import_lib(lib_tlm_interfaces
+  "${DEPS_DIR}/systemc-components/lib/libtlm-interfaces.a"
+  "")
+
+# Common include directories for all vsim targets
+set(VSIM_INCLUDE_DIRS
+  "${DEPS_DIR}/fmt/include"
+  "${DEPS_DIR}/spdlog/include"
+  "${DEPS_DIR}/lief/include"
+  "${DEPS_DIR}/systemc/include"
+  "${DEPS_DIR}/systemc-cci/include"
+  "${DEPS_DIR}/systemc-components/include"
+  "${CMAKE_SOURCE_DIR}/external/andes_clarity"
+  "${CMAKE_SOURCE_DIR}/external/toml11/include"
+  "${VERILATOR_ROOT}/include"
+  "${VERILATOR_ROOT}/include/vltstd"
+)
+
+# Ordered list of all dependency archives for linking
+set(VSIM_DEP_LIBS
+  "${DEPS_DIR}/fmt/lib/libfmt.a"
+  "${DEPS_DIR}/spdlog/lib/libspdlog.a"
+  "${DEPS_DIR}/lief/lib/libLIEF.a"
+  "${DEPS_DIR}/andes_clarity/lib/libdatabase_handler.a"
+  "${DEPS_DIR}/systemc/lib/libsystemc.a"
+  "${DEPS_DIR}/systemc-cci/lib/libcci.a"
+  "${DEPS_DIR}/systemc-components/lib/libinterfaces.a"
+  "${DEPS_DIR}/systemc-components/lib/libscc-sysc.a"
+  "${DEPS_DIR}/systemc-components/lib/libtlm-interfaces.a"
+)
+
+# ##############################################################################
+# custom_master object library (compiled once, shared by all CPU targets)
+# ##############################################################################
+add_library(custom_master OBJECT EXCLUDE_FROM_ALL src/platform/custom_master.cpp)
+target_include_directories(custom_master SYSTEM PRIVATE ${VSIM_INCLUDE_DIRS})
+target_include_directories(custom_master PRIVATE
+  "${CMAKE_BINARY_DIR}"
+  "${CMAKE_SOURCE_DIR}/src"
+)
+target_compile_options(custom_master PRIVATE ${VSIM_COMPILE_FLAGS})
+target_compile_definitions(custom_master PRIVATE ${VSIM_COMPILE_DEFS})
+add_dependencies(custom_master deps generate_headers)
+
+# ##############################################################################
+# Per-CPU targets
+# ##############################################################################
+foreach(CPU_NAME IN LISTS VSIM_CPU_LIST)
+  string(TOUPPER "${CPU_NAME}" CPU_UPPER)
+  string(TOLOWER "${CPU_NAME}" CPU_LOWER)
+
+  set(RTL "${VSIM_CPU_${CPU_UPPER}_RTL_PACKAGE}")
+  set(LIBACEASIM_PATH "${VSIM_CPU_${CPU_UPPER}_LIBACEASIM_PATH}")
+  set(OBJ_SC_DIR "${CMAKE_BINARY_DIR}/V${CPU_NAME}/obj_sc")
+
+  # Resolve libaceasim
+
+  # _aceasim_lib: user's libaceasim.a generated from COPILOT.
+  # _stub_aceasim_lib: stubs-built libaceasim.a, always linked to sim_<cpu> when
+  # given a string.
+  # The stubs provide all required four DPI-C symbols (ace, ace_pre_dec, vace, vace_dec)
+  # as defaults in case _aceasim_lib doesn't include any of them. This can happen
+  # when ACE file only has ACE-Scalar or ACE-RVV instructions, so that COPILOT
+  # doesn't generate the other types of DPI-C modules.
+  #
+  if(LIBACEASIM_PATH AND NOT LIBACEASIM_PATH MATCHES "^stubs")
+    set(_aceasim_lib "${LIBACEASIM_PATH}")
+  endif()
+
+  if(LIBACEASIM_PATH)
+    set(_stub_aceasim_lib "${OBJ_SC_DIR}/libaceasim.a")
+  else()
+    set(_stub_aceasim_lib "")
+    set(_aceasim_lib "")
+  endif()
+
+  # Verilator custom commands (unless --no-verilator)
+  if(NOT VSIM_NO_VERILATOR)
+    vsim_add_verilated_cpu("${CPU_NAME}")
+  endif()
+
+  # ---------- sim_<cpu> executable ----------
+  add_executable(sim_${CPU_NAME} src/main.cpp)
+  list(APPEND ALL_SIM_TARGETS sim_${CPU_NAME})
+
+  target_include_directories(sim_${CPU_NAME} SYSTEM PRIVATE
+    ${VSIM_INCLUDE_DIRS}
+    "${OBJ_SC_DIR}"
+  )
+  target_include_directories(sim_${CPU_NAME} PRIVATE
+    "${CMAKE_BINARY_DIR}"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/hybrid/include"
+  )
+  target_compile_options(sim_${CPU_NAME} PRIVATE ${VSIM_COMPILE_FLAGS})
+  target_compile_definitions(sim_${CPU_NAME} PRIVATE
+    ${VSIM_COMPILE_DEFS}
+    VSIM_CPU_${CPU_UPPER}
+  )
+  target_link_options(sim_${CPU_NAME} PRIVATE ${VSIM_LINK_FLAGS})
+  target_link_libraries(sim_${CPU_NAME} PRIVATE
+    custom_master
+    "${OBJ_SC_DIR}/V${RTL}__ALL.a"
+    ${VSIM_DEP_LIBS}
+    "${OBJ_SC_DIR}/libverilated.a"
+    ${VSIM_LINK_LIBS}
+  )
+
+  if(_aceasim_lib)
+    target_link_libraries(sim_${CPU_NAME} PRIVATE
+      -Wl,--whole-archive
+      "${_aceasim_lib}"
+      -Wl,--no-whole-archive
+    )
+  endif()
+
+  if(_stub_aceasim_lib)
+    target_link_options(sim_${CPU_NAME} PRIVATE "-Wl,--undefined=get_libaceasim_version")
+    target_link_libraries(sim_${CPU_NAME} PRIVATE
+      "${_stub_aceasim_lib}"
+    )
+  endif()
+
+  add_dependencies(sim_${CPU_NAME} deps generate_headers)
+
+  if(NOT VSIM_NO_VERILATOR)
+    add_dependencies(sim_${CPU_NAME} verilated_${CPU_NAME})
+  endif()
+endforeach()
+
+# ##############################################################################
+# Tests
+# ##############################################################################
+enable_testing()
+
+function(vsim_add_test TARGET SOURCE)
+  add_executable(${TARGET} EXCLUDE_FROM_ALL ${SOURCE})
+  target_include_directories(${TARGET} SYSTEM PRIVATE ${VSIM_INCLUDE_DIRS})
+  target_include_directories(${TARGET} PRIVATE
+    "${CMAKE_BINARY_DIR}"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/src/utils")
+  target_include_directories(${TARGET} SYSTEM PRIVATE
+    "${CMAKE_SOURCE_DIR}/external/doctest/doctest")
+  target_compile_options(${TARGET} PRIVATE ${VSIM_COMPILE_FLAGS})
+  target_compile_definitions(${TARGET} PRIVATE ${VSIM_COMPILE_DEFS})
+  target_link_options(${TARGET} PRIVATE ${VSIM_LINK_FLAGS})
+  add_test(NAME ${TARGET} COMMAND $<TARGET_FILE:${TARGET}>)
+endfunction()
+
+vsim_add_test(test_memory_region src/tests/platform/memory_region.test.cpp)
+vsim_add_test(test_optparse src/tests/utils/optparse.test.cpp)
+vsim_add_test(test_cpu_signal_registry src/tests/utils/cpu_signal_registry.test.cpp)
+vsim_add_test(test_sizeconvert src/tests/utils/sizeconvert.test.cpp)
+vsim_add_test(test_simple_memory src/tests/platform/simple_memory.test.cpp)
+vsim_add_test(test_mmap_backing src/tests/platform/mmap_backing.test.cpp)
+vsim_add_test(test_interconnect src/tests/platform/interconnect.test.cpp)
+vsim_add_test(test_duplicator src/tests/utils/duplicator.test.cpp)
+vsim_add_test(test_kanata_logger_loopgate
+  tests/pipeview/kanata_logger_loopgate.test.cpp)
+target_link_libraries(test_kanata_logger_loopgate PRIVATE
+  lib_fmt
+  lib_spdlog
+  ${VSIM_LINK_LIBS}
+)
+add_dependencies(test_kanata_logger_loopgate ext_fmt ext_spdlog)
+
+target_link_libraries(test_sizeconvert PRIVATE
+  lib_fmt
+  lib_spdlog
+  lib_systemc
+  ${VSIM_LINK_LIBS}
+)
+add_dependencies(test_sizeconvert ext_fmt ext_spdlog ext_systemc)
+
+target_link_libraries(test_simple_memory PRIVATE
+  lib_fmt
+  lib_spdlog
+  lib_systemc
+  ${VSIM_LINK_LIBS}
+)
+add_dependencies(test_simple_memory ext_fmt ext_spdlog ext_systemc)
+
+target_link_libraries(test_interconnect PRIVATE
+  lib_fmt
+  lib_spdlog
+  lib_systemc
+  ${VSIM_LINK_LIBS}
+)
+add_dependencies(test_interconnect ext_fmt ext_spdlog ext_systemc)
+
+target_link_libraries(test_duplicator PRIVATE
+  lib_systemc
+  ${VSIM_LINK_LIBS}
+)
+add_dependencies(test_duplicator ext_systemc)
+
+add_custom_target(check
+  COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+  DEPENDS
+    test_memory_region
+    test_optparse
+    test_cpu_signal_registry
+    test_sizeconvert
+    test_simple_memory
+    test_mmap_backing
+    test_interconnect
+    test_duplicator
+  USES_TERMINAL
+)
+
+# ##############################################################################
+# Hybrid (QEMU + Verilator)
+# ##############################################################################
+include(${CMAKE_SOURCE_DIR}/cmake/HybridConfig.cmake)
+
+# ##############################################################################
+# Install
+# ##############################################################################
+install(TARGETS ${ALL_SIM_TARGETS}
+  RUNTIME DESTINATION bin
+)

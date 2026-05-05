@@ -1,0 +1,76 @@
+// Direct integration check for SystemCDmiBus.
+//
+// Builds a real Simulator<CPU>, loads a tiny spinning fixture, and uses
+// SystemCDmiBus to drive the in-process Debug Module: assert haltreq via
+// DMCONTROL and poll DMSTATUS.allhalted. If the path
+//   SystemCDmiBus -> AHB -> Debug Module -> CPU
+// is wired correctly, the CPU halts within the cycle budget and we exit 0.
+
+#include "cpu_config.hpp"
+#include "hybrid/resume_driver.hpp"
+#include "hybrid/systemc_dmi_bus.hpp"
+#include "simulator.hpp"
+
+#include <cci_configuration>
+#include <fmt/core.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
+#include <systemc>
+
+#include <cstdint>
+#include <cstdlib>
+#include <string>
+
+extern "C" const char* get_libaceasim_version() __attribute__((weak));
+
+extern "C" auto sc_main(const int argc, char* argv[]) -> int
+try {
+  spdlog::set_default_logger(spdlog::stderr_color_mt("stderr_logger"));
+  spdlog::set_pattern("[%^%l%$] %v");
+
+  if (argc < 2) {
+    fmt::print(stderr, "usage: {} <spin.elf>\n", argv[0]);
+    return 2;
+  }
+
+  const std::string elf_path = argv[1];
+
+  auto broker = cci_utils::broker{"global_broker"};
+  cci::cci_register_broker(broker);
+
+  using CPU = VSIM_CPU_INTERFACE_CLASS;
+  Simulator<CPU> sim{"sim"};
+
+  sim.load_elf(elf_path);
+  sc_core::sc_start(sc_core::SC_ZERO_TIME);
+  sim.reset();
+
+  using Driver = hybrid::ResumeDriver;
+  hybrid::SystemCDmiBus<CPU::dmi_addr_width, CPU::dmi_data_width> bus{
+    sim.platform.dmi, sim.platform.clk.period()};
+
+  bus.write(Driver::kDmcontrol,
+            Driver::kDmcontrolDmactive | Driver::kDmcontrolHaltreq);
+
+  constexpr unsigned kPollBudget = 4096;
+  for (unsigned i = 0; i < kPollBudget; ++i) {
+    const auto dmstatus = bus.read(Driver::kDmstatus);
+    if ((dmstatus & Driver::kDmstatusAllhalted) != 0) {
+      fmt::print("PASS: allhalted asserted after {} polls (dmstatus=0x{:08x})\n",
+                 i + 1, dmstatus);
+      return 0;
+    }
+  }
+
+  fmt::print(stderr,
+             "FAIL: allhalted never asserted within {} polls\n", kPollBudget);
+  return 1;
+}
+catch (const std::exception& e) {
+  fmt::print(stderr, "FAIL: exception: {}\n", e.what());
+  return 1;
+}
+catch (...) {
+  fmt::print(stderr, "FAIL: unknown exception\n");
+  return 1;
+}

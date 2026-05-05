@@ -1,0 +1,173 @@
+// QEMU TCG plugin: drains architectural state and exits when the guest
+// retires `csrwi 0x7C0, 0` (the magic enter-detail trigger).
+//
+// The plugin uses the same insn pattern matcher and ABI struct as the vsim
+// side; both consume hybrid/insn_match.h and hybrid/state_abi.h verbatim.
+
+#include "hybrid/insn_match.h"
+#include "hybrid/state_abi.h"
+
+#include <qemu-plugin.h>
+
+#include <glib.h>
+
+#include <fcntl.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <limits.h>
+
+QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
+
+typedef struct {
+    struct qemu_plugin_register *gpr[32];
+    struct qemu_plugin_register *pc;
+} VcpuRegs;
+
+static struct qemu_plugin_scoreboard *vcpu_state;
+static char *outfile_path;
+
+// GPR ABI names as exposed by QEMU's RISC-V gdbstub; index = x register index.
+static const char *const gpr_names[32] = {
+    "zero", "ra",  "sp",  "gp",  "tp",  "t0", "t1", "t2",
+    "s0",   "s1",  "a0",  "a1",  "a2",  "a3", "a4", "a5",
+    "a6",   "a7",  "s2",  "s3",  "s4",  "s5", "s6", "s7",
+    "s8",   "s9",  "s10", "s11", "t3",  "t4", "t5", "t6",
+};
+
+static struct qemu_plugin_register *find_reg(GArray *regs, const char *name)
+{
+    for (guint i = 0; i < regs->len; i++) {
+        qemu_plugin_reg_descriptor *rd =
+            &g_array_index(regs, qemu_plugin_reg_descriptor, i);
+        if (g_ascii_strcasecmp(rd->name, name) == 0) {
+            return rd->handle;
+        }
+    }
+    return NULL;
+}
+
+static void vcpu_init(qemu_plugin_id_t id, unsigned int vcpu_idx)
+{
+    (void) id;
+    VcpuRegs *v = qemu_plugin_scoreboard_find(vcpu_state, vcpu_idx);
+    g_autoptr(GArray) regs = qemu_plugin_get_registers();
+    for (int i = 0; i < 32; i++) {
+        v->gpr[i] = find_reg(regs, gpr_names[i]);
+    }
+    v->pc = find_reg(regs, "pc");
+}
+
+static uint64_t read_reg64(struct qemu_plugin_register *h)
+{
+    if (!h) return 0;
+    g_autoptr(GByteArray) buf = g_byte_array_new();
+    int sz = qemu_plugin_read_register(h, buf);
+    if (sz <= 0) return 0;
+    uint64_t v = 0;
+    memcpy(&v, buf->data, sz < 8 ? (size_t) sz : 8);
+    return v;
+}
+
+// Atomic on POSIX: write to .tmp, fsync, rename.
+static int write_state_atomic(const struct hybrid_state_v1 *s, const char *path)
+{
+    char tmp[PATH_MAX];
+    g_snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int) getpid());
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        perror("hybrid_handoff: open tmp");
+        return -1;
+    }
+    ssize_t want = (ssize_t) sizeof(*s);
+    ssize_t got = write(fd, s, sizeof(*s));
+    if (got != want) {
+        perror("hybrid_handoff: write");
+        close(fd);
+        unlink(tmp);
+        return -1;
+    }
+    fsync(fd);
+    close(fd);
+    if (rename(tmp, path) != 0) {
+        perror("hybrid_handoff: rename");
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+static void on_handoff(unsigned int vcpu_idx, void *udata)
+{
+    hybrid_handoff_kind kind = (hybrid_handoff_kind) (uintptr_t) udata;
+    if (kind != HYBRID_HANDOFF_ENTER) {
+        // Phase 2 is one-way (QEMU -> vsim) only; ignore exit/runtime.
+        return;
+    }
+
+    VcpuRegs *v = qemu_plugin_scoreboard_find(vcpu_state, vcpu_idx);
+    struct hybrid_state_v1 s = {0};
+    s.magic   = HYBRID_STATE_MAGIC;
+    s.version = HYBRID_STATE_VERSION;
+    s.flags   = HYBRID_FLAG_RV64;
+    s.hart_id = vcpu_idx;
+    s.priv    = 3;  // refined when CSR plumbing lands in Phase 5
+    s.pc      = read_reg64(v->pc);
+    for (int i = 0; i < 32; i++) s.gpr[i] = read_reg64(v->gpr[i]);
+
+    if (write_state_atomic(&s, outfile_path) != 0) {
+        fprintf(stderr, "hybrid_handoff: failed to write state file\n");
+        exit(2);
+    }
+    fprintf(stderr,
+            "hybrid_handoff: drained state to %s (pc=%#" PRIx64 "), exiting\n",
+            outfile_path, s.pc);
+    exit(0);
+}
+
+static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
+{
+    (void) id;
+    size_t n = qemu_plugin_tb_n_insns(tb);
+    for (size_t i = 0; i < n; i++) {
+        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+        size_t sz = qemu_plugin_insn_size(insn);
+        if (sz != 4) continue;
+        uint32_t raw = 0;
+        if (qemu_plugin_insn_data(insn, &raw, sizeof(raw)) != sizeof(raw))
+            continue;
+        hybrid_handoff_kind kind = HYBRID_HANDOFF_NONE;
+        if (!hybrid_match_handoff_insn(raw, &kind)) continue;
+        qemu_plugin_register_vcpu_insn_exec_cb(
+            insn, on_handoff, QEMU_PLUGIN_CB_R_REGS,
+            (void *) (uintptr_t) kind);
+    }
+}
+
+QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
+                                           const qemu_info_t *info,
+                                           int argc, char **argv)
+{
+    (void) info;
+    for (int i = 0; i < argc; i++) {
+        g_auto(GStrv) tok = g_strsplit(argv[i], "=", 2);
+        if (g_strcmp0(tok[0], "outfile") == 0 && tok[1]) {
+            outfile_path = g_strdup(tok[1]);
+        } else {
+            fprintf(stderr, "hybrid_handoff: unknown option: %s\n", argv[i]);
+            return -1;
+        }
+    }
+    if (!outfile_path) {
+        fputs("hybrid_handoff: outfile=PATH is required\n", stderr);
+        return -1;
+    }
+
+    vcpu_state = qemu_plugin_scoreboard_new(sizeof(VcpuRegs));
+    qemu_plugin_register_vcpu_init_cb(id, vcpu_init);
+    qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
+    return 0;
+}
