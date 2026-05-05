@@ -1,0 +1,90 @@
+// vsim-only handoff smoke test. Loads handoff_exit.elf, enables the hybrid
+// handoff drain path, runs vsim, and expects:
+//   - run() returns EXIT_HANDOFF_TO_QEMU (200)
+//   - state.bin is written with valid magic and gpr[12] == 3
+// The QEMU spawn half lives in the round-trip e2e test.
+
+#include "cpu_config.hpp"
+#include "hybrid/state_abi.h"
+#include "platform/platform.hpp"
+#include "simulator.hpp"
+
+#include <cci_configuration>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
+#include <systemc>
+
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <stdexcept>
+#include <string>
+
+namespace {
+
+template<typename Cpu>
+auto run_smoke(const std::string& elf_path, const std::string& state_path) -> int
+{
+  Simulator<Cpu> sim{"sim"};
+  sim.load_elf(elf_path);
+
+  sc_core::sc_start(sc_core::SC_ZERO_TIME);
+  sim.reset();
+  sim.enable_hybrid_handoff(elf_path, state_path);
+
+  spdlog::info("handoff_smoke: starting run");
+  const auto rc = sim.run();
+
+  if (rc != hybrid::kExitHandoffToQemu) {
+    spdlog::error("handoff_smoke FAIL: run() returned {} (expected {})",
+                  rc, hybrid::kExitHandoffToQemu);
+    return 1;
+  }
+
+  std::ifstream f(state_path, std::ios::binary);
+  if (!f) {
+    spdlog::error("handoff_smoke FAIL: state file {} not readable",
+                  state_path);
+    return 2;
+  }
+  hybrid_state_v1 state{};
+  f.read(reinterpret_cast<char*>(&state), sizeof(state));
+  if (!f) {
+    spdlog::error("handoff_smoke FAIL: short read of state file");
+    return 3;
+  }
+  if (state.magic != HYBRID_STATE_MAGIC) {
+    spdlog::error("handoff_smoke FAIL: bad magic 0x{:08x} (expected 0x{:08x})",
+                  state.magic, HYBRID_STATE_MAGIC);
+    return 4;
+  }
+  if (state.gpr[12] != 3) {
+    spdlog::error("handoff_smoke FAIL: gpr[12] (a2) = {} (expected 3)",
+                  state.gpr[12]);
+    return 5;
+  }
+
+  spdlog::info("handoff_smoke PASS: drained pc=0x{:x}, a2={}",
+               state.pc, state.gpr[12]);
+  return 0;
+}
+
+}  // namespace
+
+extern "C" auto sc_main(int argc, char* argv[]) -> int
+try {
+  spdlog::set_default_logger(spdlog::stderr_color_mt("stderr_logger"));
+  spdlog::set_pattern("[%^%l%$] %v");
+
+  if (argc < 3) {
+    std::fprintf(stderr, "usage: %s <elf> <state-out-path>\n", argv[0]);
+    return EXIT_FAILURE;
+  }
+
+  auto broker = cci_utils::broker{"global_broker"};
+  cci::cci_register_broker(broker);
+  return run_smoke<VSIM_CPU_INTERFACE_CLASS>(argv[1], argv[2]);
+} catch (const std::exception& e) {
+  spdlog::error("handoff_smoke FAIL: exception: {}", e.what());
+  return 99;
+}

@@ -1,0 +1,161 @@
+// StateDrain is the dual of ResumeDriver: halt the hart via the Debug Module,
+// read x1..x31 + DPC via Abstract Commands, populate hybrid_state_v1.
+// Pure-logic test against a recording DMI bus.
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/resume_driver.hpp"  // for DmiBus, ResumeDriver register constants
+#include "hybrid/state_abi.h"
+#include "hybrid/state_drain.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <cstdint>
+#include <unordered_map>
+#include <vector>
+
+namespace {
+
+constexpr uint8_t kDmcontrol  = 0x10;
+constexpr uint8_t kDmstatus   = 0x11;
+constexpr uint8_t kAbstractcs = 0x16;
+constexpr uint8_t kCommand    = 0x17;
+constexpr uint8_t kData0      = 0x04;
+constexpr uint8_t kData1      = 0x05;
+
+constexpr uint16_t kCsrDpc = 0x7B1;
+
+struct DmiOp
+{
+  enum class Kind
+  {
+    Write,
+    Read,
+  };
+  Kind kind;
+  uint8_t reg;
+  uint32_t value;
+};
+
+// Recording bus. For Abstract Command reads, look up the requested regno in
+// `regfile` and latch the value into pending_data0/1 so the next DATA0/DATA1
+// reads return it. This mirrors a real DM that has just completed an
+// abstract read.
+struct RecordingBus final : hybrid::DmiBus
+{
+  std::vector<DmiOp> ops;
+  uint32_t dmstatus_value = 0;
+  uint32_t abstractcs_value = 0;
+  std::unordered_map<uint16_t, uint64_t> regfile;
+  uint32_t pending_data0 = 0;
+  uint32_t pending_data1 = 0;
+
+  void write(uint8_t reg, uint32_t value) override
+  {
+    ops.push_back({DmiOp::Kind::Write, reg, value});
+    if (reg == kCommand) {
+      const uint16_t regno   = value & 0xffffu;
+      const bool is_write    = ((value >> 16) & 1u) != 0;
+      if (!is_write) {
+        const auto it = regfile.find(regno);
+        const uint64_t v = (it == regfile.end()) ? 0 : it->second;
+        pending_data0 = static_cast<uint32_t>(v & 0xffffffffu);
+        pending_data1 = static_cast<uint32_t>((v >> 32) & 0xffffffffu);
+      }
+    }
+  }
+
+  auto read(uint8_t reg) -> uint32_t override
+  {
+    ops.push_back({DmiOp::Kind::Read, reg, 0});
+    if (reg == kDmstatus)   return dmstatus_value;
+    if (reg == kAbstractcs) return abstractcs_value;
+    if (reg == kData0)      return pending_data0;
+    if (reg == kData1)      return pending_data1;
+    return 0;
+  }
+};
+
+}  // namespace
+
+TEST_CASE("state_drain primes dmactive then issues haltreq before any read")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = (1u << 9) | (1u << 17);
+
+  hybrid::StateDrain drain(bus);
+  (void) drain.drain();
+
+  REQUIRE(bus.ops.size() >= 2);
+  CHECK(bus.ops[0].kind == DmiOp::Kind::Write);
+  CHECK(bus.ops[0].reg == kDmcontrol);
+  CHECK((bus.ops[0].value & 1u) == 1u);
+  CHECK(((bus.ops[0].value >> 31) & 1u) == 0u);
+
+  CHECK(bus.ops[1].kind == DmiOp::Kind::Write);
+  CHECK(bus.ops[1].reg == kDmcontrol);
+  CHECK((bus.ops[1].value & 1u) == 1u);
+  CHECK(((bus.ops[1].value >> 31) & 1u) == 1u);
+}
+
+TEST_CASE("state_drain reads x1..x31 via Abstract Commands, skipping x0")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = (1u << 9) | (1u << 17);
+  for (uint16_t i = 0; i < 32; ++i)
+    bus.regfile[hybrid::regno_gpr(i)] = 0xa00000000ULL + i;
+
+  hybrid::StateDrain drain(bus);
+  const auto state = drain.drain();
+
+  for (int i = 1; i < 32; ++i) {
+    CHECK(state.gpr[i] == 0xa00000000ULL + i);
+  }
+  // x0 is hard-wired zero; we never even issue a read for it.
+  for (const auto& op : bus.ops) {
+    if (op.kind == DmiOp::Kind::Write && op.reg == kCommand) {
+      const uint16_t regno = op.value & 0xffffu;
+      CHECK(regno != hybrid::regno_gpr(0));
+    }
+  }
+}
+
+TEST_CASE("state_drain captures pc from DPC")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = (1u << 9) | (1u << 17);
+  bus.regfile[hybrid::regno_csr(kCsrDpc)] = 0x12345678'9ABCDEF0ULL;
+
+  hybrid::StateDrain drain(bus);
+  const auto state = drain.drain();
+
+  CHECK(state.pc == 0x12345678'9ABCDEF0ULL);
+}
+
+TEST_CASE("state_drain populates header fields (magic, version, flags)")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = (1u << 9) | (1u << 17);
+
+  hybrid::StateDrain drain(bus);
+  const auto state = drain.drain();
+
+  CHECK(state.magic == HYBRID_STATE_MAGIC);
+  CHECK(state.version == HYBRID_STATE_VERSION);
+  CHECK((state.flags & HYBRID_FLAG_RV64) != 0u);
+}
+
+TEST_CASE("state_drain issues exactly one COMMAND read per programmed register")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = (1u << 9) | (1u << 17);
+
+  hybrid::StateDrain drain(bus);
+  (void) drain.drain();
+
+  std::size_t cmd_count = 0;
+  for (const auto& op : bus.ops)
+    if (op.kind == DmiOp::Kind::Write && op.reg == kCommand) ++cmd_count;
+  // 31 GPRs + DPC = 32 reads.
+  CHECK(cmd_count >= 32u);
+}

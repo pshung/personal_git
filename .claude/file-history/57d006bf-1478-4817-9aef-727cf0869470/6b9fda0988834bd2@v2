@@ -1,0 +1,130 @@
+// TCP-backed GDB Remote Serial Protocol session. Wraps an already-connected
+// socket fd; the higher-level qemu_handback orchestration spawns QEMU and
+// passes the fd in.
+
+#pragma once
+
+#include "hybrid/gdbstub_client.hpp"
+
+#include <spdlog/spdlog.h>
+
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+
+namespace hybrid::gdbstub
+{
+
+class Session
+{
+public:
+  explicit Session(int fd)
+      : fd_{fd}
+  {}
+
+  Session(const Session&)            = delete;
+  Session& operator=(const Session&) = delete;
+
+  Session(Session&& o) noexcept
+      : fd_{o.fd_}
+  {
+    o.fd_ = -1;
+  }
+
+  ~Session()
+  {
+    if (fd_ >= 0) ::close(fd_);
+  }
+
+  // Sends $body#cs, waits for `+` ack, reads and acks one response packet,
+  // returns the response body. Throws on socket errors or protocol violations.
+  auto send_command(std::string_view body) -> std::string
+  {
+    const auto pkt = encode_packet(body);
+    spdlog::debug("gdbstub send: {}", pkt);
+    send_raw(pkt);
+    expect_ack();
+    auto resp = recv_packet();
+    spdlog::debug("gdbstub recv: {}", resp);
+    send_raw("+");
+    return resp;
+  }
+
+  // Sends $c#cs and waits only for the ack. The target runs until it exits
+  // on its own (e.g., semihosting) -- caller waitpid()s the QEMU process.
+  void cont()
+  {
+    send_raw(encode_continue());
+    expect_ack();
+  }
+
+private:
+  void send_raw(std::string_view data)
+  {
+    std::size_t off = 0;
+    while (off < data.size()) {
+      const ssize_t n =
+        ::send(fd_, data.data() + off, data.size() - off, 0);
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        throw std::runtime_error(std::string{"gdbstub::Session::send: "}
+                                 + std::strerror(errno));
+      }
+      off += static_cast<std::size_t>(n);
+    }
+  }
+
+  auto recv_byte() -> char
+  {
+    char c;
+    while (true) {
+      const ssize_t n = ::recv(fd_, &c, 1, 0);
+      if (n == 1) return c;
+      if (n == 0)
+        throw std::runtime_error("gdbstub::Session: peer closed");
+      if (errno == EINTR) continue;
+      throw std::runtime_error(std::string{"gdbstub::Session::recv: "}
+                               + std::strerror(errno));
+    }
+  }
+
+  void expect_ack()
+  {
+    const auto c = recv_byte();
+    if (c == '+') return;
+    if (c == '-')
+      throw std::runtime_error("gdbstub::Session: peer requested resend");
+    throw std::runtime_error(
+      std::string{"gdbstub::Session: expected ack, got "} + c);
+  }
+
+  // Reads `$body#cs`, validates checksum, returns body. Discards any leading
+  // out-of-frame bytes (some stubs emit unsolicited stop notifications).
+  auto recv_packet() -> std::string
+  {
+    while (recv_byte() != '$') {}
+    std::string body;
+    while (true) {
+      const auto c = recv_byte();
+      if (c == '#') break;
+      body.push_back(c);
+    }
+    const auto cs_hi = recv_byte();
+    const auto cs_lo = recv_byte();
+    const std::string framed = "$" + body + "#" + cs_hi + cs_lo;
+    auto parsed = parse_packet(framed);
+    if (!parsed)
+      throw std::runtime_error("gdbstub::Session: bad checksum");
+    return *parsed;
+  }
+
+  int fd_;
+};
+
+}  // namespace hybrid::gdbstub

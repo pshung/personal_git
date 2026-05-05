@@ -1,0 +1,63 @@
+// StateDrain is the dual of ResumeDriver: halt the hart via the Debug Module,
+// read x1..x31 + DPC via Abstract Commands, populate hybrid_state_v1.
+//
+// Reuses ResumeDriver's DM register constants and DmiBus interface. Vector
+// regs, FPRs, and CSRs beyond DPC are deferred to Phase 5.
+
+#pragma once
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/dmi_poll.hpp"
+#include "hybrid/resume_driver.hpp"
+#include "hybrid/state_abi.h"
+
+#include <cstdint>
+
+namespace hybrid
+{
+
+class StateDrain
+{
+public:
+  using RD = ResumeDriver;
+
+  explicit StateDrain(DmiBus& bus)
+      : bus_{bus}
+  {}
+
+  auto drain() -> hybrid_state_v1
+  {
+    bus_.write(RD::kDmcontrol, RD::kDmcontrolDmactive);
+    bus_.write(RD::kDmcontrol, RD::kDmcontrolDmactive | RD::kDmcontrolHaltreq);
+    poll_until_set(bus_, RD::kDmstatus, RD::kDmstatusAllhalted,
+                   "StateDrain halt");
+
+    hybrid_state_v1 state{};
+    state.magic   = HYBRID_STATE_MAGIC;
+    state.version = HYBRID_STATE_VERSION;
+    state.flags   = HYBRID_FLAG_RV64;
+    state.priv    = 3;
+
+    for (uint16_t i = 1; i < 32; ++i)
+      state.gpr[i] = read_64bit_register(regno_gpr(i));
+
+    state.pc = read_64bit_register(regno_csr(RD::kCsrDpc));
+    return state;
+  }
+
+private:
+  auto read_64bit_register(uint16_t regno) -> uint64_t
+  {
+    bus_.write(RD::kCommand, access_register_command(regno, AarSize::Bits64,
+                                                     /*write=*/false));
+    poll_until_clear(bus_, RD::kAbstractcs, RD::kAbstractcsBusy,
+                     "StateDrain read_register");
+    const uint64_t lo = bus_.read(RD::kData0);
+    const uint64_t hi = bus_.read(RD::kData1);
+    return lo | (hi << 32);
+  }
+
+  DmiBus& bus_;
+};
+
+}  // namespace hybrid

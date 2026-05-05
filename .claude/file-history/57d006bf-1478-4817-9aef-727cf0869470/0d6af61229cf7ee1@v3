@@ -1,0 +1,98 @@
+// StateDrain is the dual of ResumeDriver: halt the hart via the Debug Module,
+// read x1..x31 + DPC via Abstract Commands, populate hybrid_state_v1.
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/resume_driver.hpp"
+#include "hybrid/state_abi.h"
+#include "hybrid/state_drain.hpp"
+#include "recording_bus.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <cstdint>
+
+using hybrid::test::DmiOp;
+using hybrid::test::kDmstatusHaltedAndAcked;
+using hybrid::test::RecordingBus;
+using RD = hybrid::ResumeDriver;
+
+TEST_CASE("state_drain primes dmactive then issues haltreq before any read")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid::StateDrain drain(bus);
+  (void) drain.drain();
+
+  REQUIRE(bus.ops.size() >= 2);
+  CHECK(bus.ops[0].kind == DmiOp::Kind::Write);
+  CHECK(bus.ops[0].reg == RD::kDmcontrol);
+  CHECK((bus.ops[0].value & RD::kDmcontrolDmactive) != 0u);
+  CHECK((bus.ops[0].value & RD::kDmcontrolHaltreq) == 0u);
+
+  CHECK(bus.ops[1].kind == DmiOp::Kind::Write);
+  CHECK(bus.ops[1].reg == RD::kDmcontrol);
+  CHECK((bus.ops[1].value & RD::kDmcontrolDmactive) != 0u);
+  CHECK((bus.ops[1].value & RD::kDmcontrolHaltreq) != 0u);
+}
+
+TEST_CASE("state_drain reads x1..x31 via Abstract Commands, skipping x0")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  for (uint16_t i = 0; i < 32; ++i)
+    bus.regfile[hybrid::regno_gpr(i)] = 0xa00000000ULL + i;
+
+  hybrid::StateDrain drain(bus);
+  const auto state = drain.drain();
+
+  for (int i = 1; i < 32; ++i) {
+    CHECK(state.gpr[i] == 0xa00000000ULL + i);
+  }
+  for (const auto& op : bus.ops) {
+    if (op.kind == DmiOp::Kind::Write && op.reg == RD::kCommand) {
+      const uint16_t regno = op.value & 0xffffu;
+      CHECK(regno != hybrid::regno_gpr(0));
+    }
+  }
+}
+
+TEST_CASE("state_drain captures pc from DPC")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_csr(RD::kCsrDpc)] = 0x12345678'9ABCDEF0ULL;
+
+  hybrid::StateDrain drain(bus);
+  const auto state = drain.drain();
+
+  CHECK(state.pc == 0x12345678'9ABCDEF0ULL);
+}
+
+TEST_CASE("state_drain populates header fields (magic, version, flags)")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid::StateDrain drain(bus);
+  const auto state = drain.drain();
+
+  CHECK(state.magic == HYBRID_STATE_MAGIC);
+  CHECK(state.version == HYBRID_STATE_VERSION);
+  CHECK((state.flags & HYBRID_FLAG_RV64) != 0u);
+}
+
+TEST_CASE("state_drain issues a COMMAND read for each x1..x31 + DPC")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid::StateDrain drain(bus);
+  (void) drain.drain();
+
+  std::size_t cmd_count = 0;
+  for (const auto& op : bus.ops)
+    if (op.kind == DmiOp::Kind::Write && op.reg == RD::kCommand) ++cmd_count;
+  CHECK(cmd_count >= 32u);
+}
