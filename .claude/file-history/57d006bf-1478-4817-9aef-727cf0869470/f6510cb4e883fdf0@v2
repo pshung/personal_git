@@ -1,0 +1,75 @@
+#include "platform/mmap_backing.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <string>
+
+namespace {
+auto unique_tmp_path(const char* tag) -> std::string
+{
+  auto p = std::filesystem::temp_directory_path()
+           / (std::string{"vsim_mmap_"} + tag + "_"
+              + std::to_string(::getpid()));
+  std::filesystem::remove(p);
+  return p.string();
+}
+}  // namespace
+
+TEST_CASE("MmapBacking sizes the file and exposes the requested span")
+{
+  const auto path = unique_tmp_path("size");
+  {
+    MmapBacking backing(path, 0x4000);
+    CHECK(backing.span().size() == 0x4000);
+
+    struct stat st{};
+    REQUIRE(::stat(path.c_str(), &st) == 0);
+    CHECK(static_cast<size_t>(st.st_size) == 0x4000);
+  }
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("Writes through the span are visible to a separate mmap of the file")
+{
+  const auto path = unique_tmp_path("share");
+  MmapBacking backing(path, 0x1000);
+  backing.span()[0x10] = 0xab;
+  backing.span()[0x11] = 0xcd;
+
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  REQUIRE(fd >= 0);
+  void* p = ::mmap(nullptr, 0x1000, PROT_READ, MAP_SHARED, fd, 0);
+  REQUIRE(p != MAP_FAILED);
+  auto* bytes = static_cast<const uint8_t*>(p);
+  CHECK(bytes[0x10] == 0xab);
+  CHECK(bytes[0x11] == 0xcd);
+  ::munmap(p, 0x1000);
+  ::close(fd);
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("MmapBacking releases its mapping on destruction")
+{
+  const auto path = unique_tmp_path("close");
+  {
+    MmapBacking backing(path, 0x1000);
+    backing.span()[0] = 0x77;
+  }
+  // After dtor, the file must still hold the byte; the mapping is gone.
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  REQUIRE(fd >= 0);
+  uint8_t b = 0;
+  REQUIRE(::read(fd, &b, 1) == 1);
+  CHECK(b == 0x77);
+  ::close(fd);
+  std::filesystem::remove(path);
+}
