@@ -1,0 +1,105 @@
+#pragma once
+
+#include "custom_master.hpp"
+#include "interconnect.hpp"
+#include "jtag_dtm.hpp"
+#include "memory_map.h"
+#include "sim_control.hpp"
+#include "simple_memory.hpp"
+#include "smu.hpp"
+#include "uart.hpp"
+#include "utils/ahb.hpp"
+
+#include <systemc>
+#include <tlm>
+
+#include <array>
+
+template<typename CPU>
+struct platform_config
+{
+  static constexpr size_t data_width = CPU::NDS_BIU_DATA_WIDTH;
+  static constexpr size_t dmi_addr_width = CPU::dmi_addr_width;
+  static constexpr size_t dmi_data_width = CPU::dmi_data_width;
+  static constexpr size_t num_cores = CPU::NDS_NHART;
+  static constexpr bool has_shared_cache = CPU::has_shared_cache;
+  static constexpr size_t valen = CPU::NDS_VALEN;
+};
+
+template<typename CONFIG>
+class Platform : public sc_core::sc_module
+{
+public:
+  static constexpr size_t data_width = CONFIG::data_width;
+
+private:
+  ahb::manager<CONFIG::dmi_addr_width, CONFIG::dmi_data_width> dmi{"dmi"};
+
+public:
+  // CPU signals
+  sc_core::sc_clock clk{"clk", sc_core::sc_time{1, sc_core::SC_NS}};
+  sc_core::sc_signal<sc_dt::sc_uint<CONFIG::num_cores>> resetn;
+  std::array<sc_core::sc_signal<vlpin<CONFIG::valen>>, CONFIG::num_cores>
+    reset_vector;
+  sc_core::sc_signal<bool> wfi_signal;
+  sc_core::sc_signal<sc_dt::sc_uint<31>> int_trigger;
+
+  ahb::signals<CONFIG::dmi_addr_width, CONFIG::dmi_data_width> dmi_signals{};
+
+  jtag_dtm dtm{"dtm", dmi};
+
+  Interconnect<data_width> interconnect{"interconnect"};
+
+  SimpleMemory<data_width> main_memory{
+    "main_memory", {RAM_BASE, RAM_END}, {RAM_ALIAS_BASE, RAM_ALIAS_END}};
+
+  SMU<data_width> smu{
+    "smu", {SMU_BASE, SMU_END}, CONFIG::num_cores, CONFIG::has_shared_cache};
+
+  UART<data_width> uart1{"uart1", {UART1_BASE, UART1_END}};
+  UART<data_width> uart2{"uart2", {UART2_BASE, UART2_END}};
+
+  SimControl<data_width> sim_control{"sim_control",
+                                     {SIM_CONTROL_BASE, SIM_CONTROL_END},
+                                     main_memory,
+                                     int_trigger,
+                                     clk};
+
+  CustomMaster<data_width> custom_master{"custom_master"};
+
+public:
+  Platform(const sc_core::sc_module_name& name = "platform")
+      : sc_core::sc_module{name}
+  {
+    // default memory mapping, DONT USE these regions
+    this->interconnect.reserve_region("PLDM", {PLDM_BASE, PLDM_END});
+
+    // set up debug module
+    this->dmi.clk.bind(this->clk);
+    this->dtm.clk.bind(this->clk);
+
+#define X(name) this->dmi.name.bind(this->dmi_signals.name);
+    EXPAND_AHB_SIGNALS
+#undef X
+
+    // set up main memory
+    this->interconnect.bind_target(this->main_memory.socket,
+                                   this->main_memory.region);
+    this->interconnect.bind_target(this->main_memory.socket,
+                                   this->main_memory.alias_region);
+    // bind sim_control
+    this->interconnect.bind_target(this->sim_control.socket,
+                                   this->sim_control.region);
+
+    // bind SMU
+    this->interconnect.bind_target(this->smu.socket, this->smu.region);
+
+    // bind UARTs
+    this->interconnect.bind_target(this->uart1.socket, this->uart1.region);
+    this->interconnect.bind_target(this->uart2.socket, this->uart2.region);
+
+    // bind custom_master
+    this->custom_master.clk.bind(this->clk);
+    this->interconnect.bind_initiator(this->custom_master.socket);
+  }
+};

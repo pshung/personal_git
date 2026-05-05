@@ -1,0 +1,122 @@
+// Phase 0.1 RED: ABI contract for hybrid handoff state.
+// Locks magic/version constants, struct layout, and byte-level roundtrip.
+// state_abi.h does not exist yet -- this file MUST fail to compile until it does.
+
+#include "hybrid/state_abi.h"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <cstdint>
+#include <cstring>
+#include <type_traits>
+
+TEST_CASE("magic and version are stable wire constants")
+{
+  // 'AHYB' read little-endian: 'A'=0x41 'H'=0x48 'Y'=0x59 'B'=0x42
+  CHECK(HYBRID_STATE_MAGIC == 0x42594841u);
+  CHECK(HYBRID_STATE_VERSION == 1u);
+}
+
+TEST_CASE("struct is standard-layout, trivially copyable, packed")
+{
+  CHECK(std::is_standard_layout_v<hybrid_state_v1>);
+  CHECK(std::is_trivially_copyable_v<hybrid_state_v1>);
+  // packed: fields are 8-byte aligned naturally, so packing should not shrink
+  // sizeof. We assert no implicit tail padding either.
+  CHECK(sizeof(hybrid_state_v1) % 8 == 0);
+}
+
+TEST_CASE("header field offsets")
+{
+  CHECK(offsetof(hybrid_state_v1, magic) == 0);
+  CHECK(offsetof(hybrid_state_v1, version) == 4);
+  CHECK(offsetof(hybrid_state_v1, flags) == 8);
+  CHECK(offsetof(hybrid_state_v1, hart_id) == 12);
+  CHECK(offsetof(hybrid_state_v1, pc) == 16);
+  CHECK(offsetof(hybrid_state_v1, priv) == 24);
+}
+
+TEST_CASE("GPR and FPR are 32 * uint64_t each, contiguous")
+{
+  CHECK(offsetof(hybrid_state_v1, gpr) == 32);
+  CHECK(sizeof(((hybrid_state_v1*) 0)->gpr) == 32 * sizeof(uint64_t));
+  CHECK(offsetof(hybrid_state_v1, fpr) == 32 + 32 * 8);
+  CHECK(sizeof(((hybrid_state_v1*) 0)->fpr) == 32 * sizeof(uint64_t));
+}
+
+TEST_CASE("V-extension fields use compile-time MAX_VLEN constant")
+{
+  CHECK(HYBRID_VLEN_BYTES_MAX >= 16);  // RVV minimum VLEN=128 -> 16 bytes
+  CHECK((HYBRID_VLEN_BYTES_MAX & (HYBRID_VLEN_BYTES_MAX - 1)) == 0);  // power of 2
+  CHECK(sizeof(((hybrid_state_v1*) 0)->vreg) == 32u * HYBRID_VLEN_BYTES_MAX);
+}
+
+TEST_CASE("PMP arrays are sized per spec")
+{
+  CHECK(sizeof(((hybrid_state_v1*) 0)->pmpcfg) == HYBRID_PMP_CFG_NUM * sizeof(uint64_t));
+  CHECK(sizeof(((hybrid_state_v1*) 0)->pmpaddr) == HYBRID_PMP_ADDR_NUM * sizeof(uint64_t));
+  CHECK(HYBRID_PMP_ADDR_NUM == 64);
+  CHECK(HYBRID_PMP_CFG_NUM == 16);
+}
+
+TEST_CASE("trailing reserved padding is at least 256 bytes")
+{
+  CHECK(sizeof(((hybrid_state_v1*) 0)->reserved) >= 256);
+}
+
+TEST_CASE("byte-level roundtrip via memcpy preserves all fields")
+{
+  hybrid_state_v1 src{};
+  src.magic = HYBRID_STATE_MAGIC;
+  src.version = HYBRID_STATE_VERSION;
+  src.flags = HYBRID_FLAG_RV64 | HYBRID_FLAG_FP | HYBRID_FLAG_V;
+  src.hart_id = 1;
+  src.pc = 0x80001234ULL;
+  src.priv = 3;  // M-mode
+
+  for (int i = 0; i < 32; ++i) {
+    src.gpr[i] = 0xCAFE0000ULL + i;
+    src.fpr[i] = 0xF00D0000ULL + i;
+  }
+  src.mstatus = 0xa00040080ULL;
+  src.mepc    = 0x80002000ULL;
+  src.mtvec   = 0x80000000ULL;
+  src.satp    = 0x8000000000080000ULL;
+  src.vstart  = 0;
+  src.vtype   = 0xc0;
+  src.vl      = 4;
+  src.vlenb   = 16;
+  for (size_t i = 0; i < sizeof(src.vreg); ++i) src.vreg[i] = (uint8_t) i;
+
+  alignas(hybrid_state_v1) unsigned char buf[sizeof(hybrid_state_v1)];
+  std::memcpy(buf, &src, sizeof(src));
+  hybrid_state_v1 dst{};
+  std::memcpy(&dst, buf, sizeof(dst));
+
+  CHECK(dst.magic == HYBRID_STATE_MAGIC);
+  CHECK(dst.version == HYBRID_STATE_VERSION);
+  CHECK(dst.flags == src.flags);
+  CHECK(dst.hart_id == 1);
+  CHECK(dst.pc == 0x80001234ULL);
+  CHECK(dst.priv == 3);
+  for (int i = 0; i < 32; ++i) {
+    CHECK(dst.gpr[i] == 0xCAFE0000ULL + i);
+    CHECK(dst.fpr[i] == 0xF00D0000ULL + i);
+  }
+  CHECK(dst.mstatus == 0xa00040080ULL);
+  CHECK(dst.mepc == 0x80002000ULL);
+  CHECK(dst.mtvec == 0x80000000ULL);
+  CHECK(dst.satp == 0x8000000000080000ULL);
+  CHECK(dst.vtype == 0xc0);
+  CHECK(dst.vl == 4);
+  CHECK(dst.vlenb == 16);
+  CHECK(std::memcmp(dst.vreg, src.vreg, sizeof(src.vreg)) == 0);
+}
+
+TEST_CASE("flag bits are stable wire constants")
+{
+  CHECK(HYBRID_FLAG_RV64 == (1u << 0));
+  CHECK(HYBRID_FLAG_FP   == (1u << 1));
+  CHECK(HYBRID_FLAG_V    == (1u << 2));
+}

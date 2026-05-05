@@ -1,0 +1,115 @@
+# OpenOCD probe: which RISC-V Debug Module Abstract-Command regnos are reachable
+# on the running vsim DM? Phase 0 risk-buster -- if anything we need for the
+# hybrid handoff is unreachable here, Phase 5 must add a Program Buffer or DPI
+# fallback before Phase 2 ships.
+#
+# Usage:
+#   1. Start vsim with --jtag-port 9104 and the smallest hello.elf.
+#   2. openocd -f hybrid/scripts/test_dm_coverage.tcl 2>&1 | tee hybrid/docs/dm_coverage.log
+#   3. Translate the log into a tickbox table at hybrid/docs/dm_coverage.md.
+#
+# Spec ref: RISC-V External Debug Support 1.0, table "Abstract Register Numbers".
+
+# --- vsim DM transport ---------------------------------------------------------
+adapter driver remote_bitbang
+remote_bitbang_host localhost
+remote_bitbang_port 9104
+
+# vsim's DM uses the standard riscv DTM + DM. AX45MPV exposes one hart per core.
+set _CHIPNAME riscv
+jtag newtap $_CHIPNAME cpu -irlen 5 -expected-id 0x10e31913
+set _TARGETNAME $_CHIPNAME.cpu
+target create $_TARGETNAME riscv -chain-position $_TARGETNAME
+
+riscv set_command_timeout_sec 5
+
+init
+halt
+
+# --- helpers -------------------------------------------------------------------
+proc probe_reg {label regno} {
+    # 'reg' addresses GPRs/CSRs by symbolic name on OpenOCD; for raw regno we
+    # use the abstract command directly via 'riscv dmi_read/write' helpers.
+    if {[catch {set v [riscv dm_read $regno]} err]} {
+        puts "MISS  $label (regno=[format 0x%04x $regno]) : $err"
+        return 0
+    } else {
+        puts "OK    $label (regno=[format 0x%04x $regno]) = $v"
+        return 1
+    }
+}
+
+# --- coverage matrix -----------------------------------------------------------
+puts "=== GPR x0..x31 (regno 0x1000-0x101F) ==="
+set gpr_ok 0
+for {set i 0} {$i < 32} {incr i} {
+    set gpr_ok [expr {$gpr_ok + [probe_reg "x$i" [expr {0x1000 + $i}]]}]
+}
+puts "GPR reachable: $gpr_ok / 32"
+
+puts "\n=== FPR f0..f31 (regno 0x1020-0x103F) ==="
+set fpr_ok 0
+for {set i 0} {$i < 32} {incr i} {
+    set fpr_ok [expr {$fpr_ok + [probe_reg "f$i" [expr {0x1020 + $i}]]}]
+}
+puts "FPR reachable: $fpr_ok / 32"
+
+puts "\n=== Standard M-mode CSRs (regno = csr address) ==="
+foreach {name addr} {
+    mstatus  0x300
+    misa     0x301
+    medeleg  0x302
+    mideleg  0x303
+    mie      0x304
+    mtvec    0x305
+    mscratch 0x340
+    mepc     0x341
+    mcause   0x342
+    mtval    0x343
+    mip      0x344
+    satp     0x180
+    mcycle   0xb00
+    minstret 0xb02
+} {
+    probe_reg $name $addr
+}
+
+puts "\n=== PMP (16 cfg + 64 addr CSRs) ==="
+for {set i 0} {$i < 16} {incr i} {
+    probe_reg "pmpcfg$i"  [expr {0x3a0 + $i}]
+}
+for {set i 0} {$i < 64} {incr i} {
+    probe_reg "pmpaddr$i" [expr {0x3b0 + $i}]
+}
+
+puts "\n=== V-extension scalar CSRs ==="
+foreach {name addr} {
+    vstart 0x008
+    vxsat  0x009
+    vxrm   0x00a
+    vcsr   0x00f
+    vl     0xc20
+    vtype  0xc21
+    vlenb  0xc22
+} {
+    probe_reg $name $addr
+}
+
+puts "\n=== Andes-custom CSRs (sample; full list lives in andes-v5-priv-spec) ==="
+foreach {name addr} {
+    mmsc_cfg  0xfc2
+    mmisc_ctl 0x7d0
+    mcache_ctl 0x7ca
+    mcctlbeginaddr 0x7cb
+    mcctlcommand   0x7cc
+    mcctldata      0x7cd
+} {
+    probe_reg $name $addr
+}
+
+puts "\n=== Vector regfile via Abstract Commands? (regno 0x1020 + offset is FPR; ==="
+puts "===  V regs typically need Program Buffer load/store - testing scratch. ==="
+# RISC-V Debug Spec does not assign abstract regnos to V regs; the path is
+# Program Buffer. We only note the absence here; Phase 5 measures the cost.
+
+shutdown
