@@ -1,0 +1,246 @@
+// ResumeDriver translates a hybrid_state_v1 into a sequence of DMI register
+// ops against the RISC-V Debug Module. The orchestration is testable in
+// isolation by injecting a recording bus.
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/resume_driver.hpp"
+#include "hybrid/state_abi.h"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <cstdint>
+#include <optional>
+#include <vector>
+
+namespace {
+
+// DMI register addresses from RISC-V Debug Spec 1.0.
+constexpr uint8_t kDmcontrol  = 0x10;
+constexpr uint8_t kDmstatus   = 0x11;
+constexpr uint8_t kAbstractcs = 0x16;
+constexpr uint8_t kCommand    = 0x17;
+constexpr uint8_t kData0      = 0x04;
+constexpr uint8_t kData1      = 0x05;
+
+// CSR numbers from Debug Spec.
+constexpr uint16_t kCsrDpc = 0x7B1;
+
+struct DmiOp
+{
+  enum class Kind
+  {
+    Write,
+    Read,
+  };
+  Kind kind;
+  uint8_t reg;
+  uint32_t value;  // for writes only
+};
+
+struct RecordingBus final : hybrid::DmiBus
+{
+  std::vector<DmiOp> ops;
+
+  // Test-controlled response values for reads.
+  uint32_t dmstatus_value = 0;     // bit 9: allhalted, bit 17: allresumeack
+  uint32_t abstractcs_value = 0;   // [12:8]: cmderr, [12]: busy
+
+  void write(uint8_t reg, uint32_t value) override
+  {
+    ops.push_back({DmiOp::Kind::Write, reg, value});
+  }
+
+  auto read(uint8_t reg) -> uint32_t override
+  {
+    ops.push_back({DmiOp::Kind::Read, reg, 0});
+    if (reg == kDmstatus) return dmstatus_value;
+    if (reg == kAbstractcs) return abstractcs_value;
+    return 0;
+  }
+};
+
+auto rv64_state(uint64_t pc, uint64_t x10) -> hybrid_state_v1
+{
+  hybrid_state_v1 s{};
+  s.magic = HYBRID_STATE_MAGIC;
+  s.version = HYBRID_STATE_VERSION;
+  s.flags = HYBRID_FLAG_RV64;
+  s.pc = pc;
+  s.priv = 3;
+  s.gpr[10] = x10;
+  return s;
+}
+
+auto find_write(const std::vector<DmiOp>& ops, uint8_t reg)
+  -> std::vector<uint32_t>
+{
+  std::vector<uint32_t> values;
+  for (const auto& op : ops)
+    if (op.kind == DmiOp::Kind::Write && op.reg == reg)
+      values.push_back(op.value);
+  return values;
+}
+
+auto count_writes_to(const std::vector<DmiOp>& ops, uint8_t reg) -> std::size_t
+{
+  std::size_t n = 0;
+  for (const auto& op : ops)
+    if (op.kind == DmiOp::Kind::Write && op.reg == reg) ++n;
+  return n;
+}
+
+}  // namespace
+
+TEST_CASE("resume halts the hart before any abstract command")
+{
+  RecordingBus bus;
+  // dmstatus answers halted+resumeack so poll loops finish on the first read.
+  bus.dmstatus_value = (1u << 9) | (1u << 17);
+
+  hybrid::ResumeDriver driver(bus);
+  driver.resume(rv64_state(/*pc=*/0x80001000, /*x10=*/0xdeadbeef));
+
+  // The first write must prime dmactive (DM out of reset) BEFORE haltreq is
+  // accepted; the second write must add haltreq while keeping dmactive set.
+  REQUIRE(bus.ops.size() >= 2);
+
+  const auto& prime = bus.ops[0];
+  CHECK(prime.kind == DmiOp::Kind::Write);
+  CHECK(prime.reg == kDmcontrol);
+  CHECK((prime.value & 1u) == 1u);                  // dmactive
+  CHECK(((prime.value >> 31) & 1u) == 0u);          // haltreq NOT yet set
+
+  const auto& halt = bus.ops[1];
+  CHECK(halt.kind == DmiOp::Kind::Write);
+  CHECK(halt.reg == kDmcontrol);
+  CHECK((halt.value & 1u) == 1u);                   // dmactive still set
+  CHECK(((halt.value >> 31) & 1u) == 1u);           // haltreq
+}
+
+TEST_CASE("resume programs every GPR via DATA0/DATA1 + COMMAND")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = (1u << 9) | (1u << 17);  // halted + resumeack
+
+  auto s = rv64_state(0x80001000, 0xdeadbeef);
+  for (int i = 0; i < 32; ++i) s.gpr[i] = 0xa00000000ULL + i;
+
+  hybrid::ResumeDriver driver(bus);
+  driver.resume(s);
+
+  // 32 commands targeting regnos 0x1000..0x101F, each preceded by DATA0/DATA1.
+  std::vector<uint32_t> cmds;
+  for (const auto& op : bus.ops)
+    if (op.kind == DmiOp::Kind::Write && op.reg == kCommand)
+      cmds.push_back(op.value);
+
+  // At least 32 GPR commands (more if FP/CSR are also written).
+  CHECK(cmds.size() >= 32);
+
+  // First 32 commands cover GPRs in order, 64-bit, transfer=1, write=1.
+  for (int i = 0; i < 32; ++i) {
+    const auto expect =
+      hybrid::access_register_command(hybrid::regno_gpr(i),
+                                      hybrid::AarSize::Bits64, /*write=*/true);
+    CHECK(cmds[i] == expect);
+  }
+}
+
+TEST_CASE("resume writes DPC = state.pc")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = (1u << 9) | (1u << 17);
+
+  constexpr uint64_t pc = 0x12345678'9ABCDEF0ULL;
+  hybrid::ResumeDriver driver(bus);
+  driver.resume(rv64_state(pc, 0));
+
+  // Look for the COMMAND write that targets CSR DPC (regno=0x7B1).
+  std::vector<std::size_t> dpc_cmd_indices;
+  for (std::size_t i = 0; i < bus.ops.size(); ++i) {
+    const auto& op = bus.ops[i];
+    if (op.kind == DmiOp::Kind::Write && op.reg == kCommand
+        && (op.value & 0xffffu) == kCsrDpc) {
+      dpc_cmd_indices.push_back(i);
+    }
+  }
+  REQUIRE(dpc_cmd_indices.size() == 1);
+
+  // Immediately preceding writes must set DATA0=low32(pc), DATA1=high32(pc).
+  const auto cmd_idx = dpc_cmd_indices[0];
+  REQUIRE(cmd_idx >= 2);
+  const auto& d0 = bus.ops[cmd_idx - 2];
+  const auto& d1 = bus.ops[cmd_idx - 1];
+  CHECK(d0.kind == DmiOp::Kind::Write);
+  CHECK(d0.reg == kData0);
+  CHECK(d0.value == uint32_t(pc & 0xffffffffu));
+  CHECK(d1.kind == DmiOp::Kind::Write);
+  CHECK(d1.reg == kData1);
+  CHECK(d1.value == uint32_t((pc >> 32) & 0xffffffffu));
+}
+
+TEST_CASE("resume issues resumereq after register programming")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = (1u << 9) | (1u << 17);
+
+  hybrid::ResumeDriver driver(bus);
+  driver.resume(rv64_state(0x80001000, 0));
+
+  // The last DMCONTROL write must clear haltreq and set resumereq.
+  const auto dmctl_writes = find_write(bus.ops, kDmcontrol);
+  REQUIRE(dmctl_writes.size() >= 2);
+  const auto last = dmctl_writes.back();
+  CHECK((last & 1u) == 1u);                  // dmactive still on
+  CHECK(((last >> 31) & 1u) == 0u);          // haltreq cleared
+  CHECK(((last >> 30) & 1u) == 1u);          // resumereq set
+}
+
+TEST_CASE("resume polls DMSTATUS for halted before programming registers")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = (1u << 9) | (1u << 17);
+
+  hybrid::ResumeDriver driver(bus);
+  driver.resume(rv64_state(0x80001000, 0));
+
+  // At least one DMSTATUS read happened, and it occurred before the first
+  // DATA0/DATA1 write.
+  std::optional<std::size_t> first_dmstatus_read;
+  std::optional<std::size_t> first_data_write;
+  for (std::size_t i = 0; i < bus.ops.size(); ++i) {
+    const auto& op = bus.ops[i];
+    if (op.kind == DmiOp::Kind::Read && op.reg == kDmstatus
+        && !first_dmstatus_read)
+      first_dmstatus_read = i;
+    if (op.kind == DmiOp::Kind::Write && op.reg == kData0 && !first_data_write)
+      first_data_write = i;
+  }
+  REQUIRE(first_dmstatus_read);
+  REQUIRE(first_data_write);
+  CHECK(*first_dmstatus_read < *first_data_write);
+}
+
+TEST_CASE("resume rejects a state with wrong magic")
+{
+  RecordingBus bus;
+  hybrid::ResumeDriver driver(bus);
+
+  hybrid_state_v1 bad{};
+  bad.version = HYBRID_STATE_VERSION;
+  bad.magic = 0xDEADBEEFu;
+  CHECK_THROWS(driver.resume(bad));
+}
+
+TEST_CASE("resume issues exactly one COMMAND per programmed register")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = (1u << 9) | (1u << 17);
+
+  hybrid::ResumeDriver driver(bus);
+  driver.resume(rv64_state(0x80001000, 0));
+
+  // 32 GPRs + DPC at minimum. We do not yet program FPR/CSR/V; bound below.
+  CHECK(count_writes_to(bus.ops, kCommand) >= 33u);
+}

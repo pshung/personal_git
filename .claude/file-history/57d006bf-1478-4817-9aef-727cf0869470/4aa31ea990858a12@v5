@@ -1,0 +1,130 @@
+#include "cpu_config.hpp"
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/resume_driver.hpp"
+#include "hybrid/systemc_dmi_bus.hpp"
+#include "platform/platform.hpp"
+#include "simulator.hpp"
+
+#include <cci_configuration>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
+#include <systemc>
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
+
+namespace {
+
+using RD = hybrid::ResumeDriver;
+
+template<typename Bus>
+auto poll_until(Bus& bus, uint8_t reg, uint32_t mask, bool want_set) -> bool
+{
+  for (unsigned i = 0; i < RD::kPollIterations; ++i) {
+    const auto v = bus.read(reg);
+    const bool is_set = (v & mask) == mask;
+    if (is_set == want_set) return true;
+  }
+  return false;
+}
+
+template<typename Cpu>
+auto run_smoke(const std::string& elf_path) -> int
+{
+  Simulator<Cpu> sim{"sim"};
+  sim.load_elf(elf_path);
+
+  sc_core::sc_start(sc_core::SC_ZERO_TIME);
+  sim.reset();
+
+  using PLATFORM = ::Platform<platform_config<Cpu>>;
+  hybrid::SystemCDmiBus<PLATFORM::dmi_addr_width, PLATFORM::dmi_data_width> bus{
+    sim.platform.dmi, sim.platform.clk.period()};
+
+  spdlog::info("dmi_smoke: probing DMCONTROL.dmactive");
+  bus.write(RD::kDmcontrol, RD::kDmcontrolDmactive);
+  const auto dmcontrol = bus.read(RD::kDmcontrol);
+  if ((dmcontrol & RD::kDmcontrolDmactive) == 0) {
+    spdlog::error("dmi_smoke FAIL: dmactive did not stick (dmcontrol=0x{:08x})",
+                  dmcontrol);
+    return 1;
+  }
+
+  spdlog::info("dmi_smoke: requesting halt");
+  bus.write(RD::kDmcontrol, RD::kDmcontrolDmactive | RD::kDmcontrolHaltreq);
+  if (!poll_until(bus, RD::kDmstatus, RD::kDmstatusAllhalted, /*want_set=*/true))
+  {
+    spdlog::error("dmi_smoke FAIL: did not reach allhalted within budget");
+    return 2;
+  }
+  spdlog::info("dmi_smoke: halted");
+
+  constexpr uint16_t kTestGpr = 10;  // a0
+  constexpr uint64_t kPattern = 0xDEADBEEFCAFEBABEULL;
+  const auto cmd_write =
+    hybrid::access_register_command(hybrid::regno_gpr(kTestGpr),
+                                    hybrid::AarSize::Bits64,
+                                    /*write=*/true);
+  const auto cmd_read =
+    hybrid::access_register_command(hybrid::regno_gpr(kTestGpr),
+                                    hybrid::AarSize::Bits64,
+                                    /*write=*/false);
+
+  bus.write(RD::kData0, uint32_t(kPattern & 0xFFFFFFFFu));
+  bus.write(RD::kData1, uint32_t((kPattern >> 32) & 0xFFFFFFFFu));
+  bus.write(RD::kCommand, cmd_write);
+  if (!poll_until(bus, RD::kAbstractcs, RD::kAbstractcsBusy, /*want_set=*/false))
+  {
+    spdlog::error("dmi_smoke FAIL: abstract write busy did not clear");
+    return 3;
+  }
+
+  bus.write(RD::kCommand, cmd_read);
+  if (!poll_until(bus, RD::kAbstractcs, RD::kAbstractcsBusy, /*want_set=*/false))
+  {
+    spdlog::error("dmi_smoke FAIL: abstract read busy did not clear");
+    return 4;
+  }
+  const uint64_t lo = bus.read(RD::kData0);
+  const uint64_t hi = bus.read(RD::kData1);
+  const uint64_t round = lo | (hi << 32);
+  if (round != kPattern) {
+    spdlog::error("dmi_smoke FAIL: x{} readback 0x{:016x} != 0x{:016x}",
+                  kTestGpr, round, kPattern);
+    return 5;
+  }
+  spdlog::info("dmi_smoke: x{} round-trip OK", kTestGpr);
+
+  spdlog::info("dmi_smoke: requesting resume");
+  bus.write(RD::kDmcontrol, RD::kDmcontrolDmactive | RD::kDmcontrolResumereq);
+  if (!poll_until(bus, RD::kDmstatus, RD::kDmstatusAllresumeack,
+                  /*want_set=*/true)) {
+    spdlog::error("dmi_smoke FAIL: did not reach allresumeack within budget");
+    return 6;
+  }
+
+  spdlog::info("dmi_smoke PASS");
+  return 0;
+}
+
+}  // namespace
+
+extern "C" auto sc_main(int argc, char* argv[]) -> int
+try {
+  spdlog::set_default_logger(spdlog::stderr_color_mt("stderr_logger"));
+  spdlog::set_pattern("[%^%l%$] %v");
+
+  if (argc < 2) {
+    std::fprintf(stderr, "usage: %s <elf>\n", argv[0]);
+    return EXIT_FAILURE;
+  }
+  auto broker = cci_utils::broker{"global_broker"};
+  cci::cci_register_broker(broker);
+  return run_smoke<VSIM_CPU_INTERFACE_CLASS>(argv[1]);
+} catch (const std::exception& e) {
+  spdlog::error("dmi_smoke FAIL: exception: {}", e.what());
+  return 99;
+}

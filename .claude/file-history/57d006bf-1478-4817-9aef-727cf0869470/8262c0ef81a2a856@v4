@@ -1,0 +1,106 @@
+#pragma once
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/state_abi.h"
+
+#include <cstdint>
+#include <stdexcept>
+
+namespace hybrid {
+
+struct DmiBus
+{
+  virtual ~DmiBus() = default;
+  virtual void write(uint8_t reg, uint32_t value) = 0;
+  virtual auto read(uint8_t reg) -> uint32_t = 0;
+};
+
+class ResumeDriver
+{
+public:
+  static constexpr uint8_t kData0      = 0x04;
+  static constexpr uint8_t kData1      = 0x05;
+  static constexpr uint8_t kDmcontrol  = 0x10;
+  static constexpr uint8_t kDmstatus   = 0x11;
+  static constexpr uint8_t kAbstractcs = 0x16;
+  static constexpr uint8_t kCommand    = 0x17;
+
+  static constexpr uint16_t kCsrDpc = 0x7B1;
+
+  static constexpr uint32_t kDmcontrolDmactive  = 1u << 0;
+  static constexpr uint32_t kDmcontrolResumereq = 1u << 30;
+  static constexpr uint32_t kDmcontrolHaltreq   = 1u << 31;
+
+  static constexpr uint32_t kDmstatusAllhalted    = 1u << 9;
+  static constexpr uint32_t kDmstatusAllresumeack = 1u << 17;
+
+  static constexpr uint32_t kAbstractcsBusy = 1u << 12;
+
+  // Bounded so a buggy DM cannot hang the host.
+  static constexpr unsigned kPollIterations = 1024;
+
+  explicit ResumeDriver(DmiBus& bus)
+      : bus_{bus}
+  {}
+
+  void resume(const hybrid_state_v1& state)
+  {
+    if (state.magic != HYBRID_STATE_MAGIC)
+      throw std::runtime_error("ResumeDriver::resume: bad magic");
+    if (state.version != HYBRID_STATE_VERSION)
+      throw std::runtime_error("ResumeDriver::resume: unsupported version");
+
+    // dmactive must transition 0->1 in its own write before any other
+    // DMCONTROL bit is honored (RISC-V Debug Spec).
+    bus_.write(kDmcontrol, kDmcontrolDmactive);
+    request_halt();
+    poll_until_set(kDmstatus, kDmstatusAllhalted);
+
+    // x0 is hard-wired zero; skip it.
+    for (uint16_t i = 1; i < 32; ++i)
+      write_64bit_register(regno_gpr(i), state.gpr[i]);
+
+    write_64bit_register(regno_csr(kCsrDpc), state.pc);
+
+    request_resume();
+    poll_until_set(kDmstatus, kDmstatusAllresumeack);
+  }
+
+private:
+  void request_halt()
+  {
+    bus_.write(kDmcontrol, kDmcontrolDmactive | kDmcontrolHaltreq);
+  }
+
+  void request_resume()
+  {
+    bus_.write(kDmcontrol, kDmcontrolDmactive | kDmcontrolResumereq);
+  }
+
+  void write_64bit_register(uint16_t regno, uint64_t value)
+  {
+    bus_.write(kData0, uint32_t(value & 0xffffffffu));
+    bus_.write(kData1, uint32_t((value >> 32) & 0xffffffffu));
+    bus_.write(kCommand,
+               access_register_command(regno, AarSize::Bits64, /*write=*/true));
+    poll_until_clear(kAbstractcs, kAbstractcsBusy);
+  }
+
+  void poll_until_set(uint8_t reg, uint32_t mask)
+  {
+    for (unsigned i = 0; i < kPollIterations; ++i)
+      if ((bus_.read(reg) & mask) == mask) return;
+    throw std::runtime_error("ResumeDriver: poll_until_set timed out");
+  }
+
+  void poll_until_clear(uint8_t reg, uint32_t mask)
+  {
+    for (unsigned i = 0; i < kPollIterations; ++i)
+      if ((bus_.read(reg) & mask) == 0) return;
+    throw std::runtime_error("ResumeDriver: poll_until_clear timed out");
+  }
+
+  DmiBus& bus_;
+};
+
+}  // namespace hybrid
