@@ -454,3 +454,134 @@ To reuse without modification:
 6. Regression detection: deliberately break `state_drain.hpp` (e.g., skip x5 in the loop) and verify `rt_all_gprs` fails with `t2` bit 5 set, identifying the exact register at fault.
 
 Each new fixture follows TDD as before: write the fixture (RED — checksum nonzero), then if needed adjust the simulator code (GREEN), then refactor. Most Tier-1 fixtures should be GREEN immediately if Phase 3 is correct; failures here are bugs the existing single-fixture test couldn't catch.
+
+---
+
+## 9. Cross-Simulator Shared Memory Redesign (Tier-2 Unblocking)
+
+### 9.1 Context (why we are redesigning)
+
+Section 8.5 promised a Tier-2 e2e that maps the same backing file across QEMU 1, vsim, and QEMU 2. The structural plumbing landed (`spawn_qemu` accepts `shared_mem_path`/`shared_mem_size`, `main.cpp` forwards both) but the test fails at vsim startup with:
+
+```
+[critical] fatal exception: SimpleMemory external_buffer smaller than region size
+```
+
+Root cause is a layout mismatch between vsim's "RAM is everything from 0" model and QEMU's "RAM starts at 0x80000000" model:
+
+| | RAM region | data[0] = GPA | GPA 0x80010000 lands at file offset |
+|---|---|---|---|
+| vsim main_memory (today) | [0x0, 0x8FFFFFFF] = 2.25 GB (`memory_map.h:8-9`, `platform.hpp:74`) | 0x0 | 0x80010000 |
+| QEMU virt machine | [0x80000000, 0x80000000+N) (`qemu_v5/hw/riscv/virt.c` VIRT_DRAM=0x80000000) | 0x80000000 | 0x10000 |
+
+Two derived symptoms:
+- `simple_memory.hpp:60-70` rejects external buffers smaller than the full 2.25 GB region, so any non-trivial mmap size fails before bytes are exchanged.
+- `simulator.hpp:246` calls `read_elf_into_memory(*elf, xlen_t{0}, ...)` with a hardcoded base of 0; correctness depends on `region.base_address == 0`.
+
+The intended outcome of this redesign: vsim and QEMU agree on which file byte backs which GPA, with no extra owned storage, and with the cycle-accurate path unchanged in non-hybrid mode.
+
+### 9.2 Design (correctness first, then configurable)
+
+**Principle**: in hybrid mode the mmap window IS the addressable RAM. The vsim `main_memory` region is narrowed at construction time to `[base_gpa, base_gpa + size)` where `base_gpa` matches QEMU virt's RAM base (0x80000000). No new "data origin within a wider region" abstraction; the region itself moves.
+
+```
+NON-HYBRID (preserved verbatim - default constructor path)
+  Platform(ram_buffer = {})
+    region        = [RAM_BASE = 0x0, RAM_END = 0x8FFFFFFF]   // 2.25 GB
+    storage       = owned vector, 2.25 GB
+    ELF load base = region.base_address = 0x0
+    ELF segment at 0x80000000 -> data[0x80000000]            // works as today
+
+HYBRID (--shared-mem-path P --shared-mem-size N [--shared-mem-base B = 0x80000000])
+  MmapBacking mmap(P, N, base_gpa = B)
+  Platform(ram_buffer = mmap.span(), ram_region = [B, B + N - 1])
+    region        = [B, B + N - 1]                            // narrow window
+    storage       = external mmap span, exactly N bytes       // size check passes
+    ELF load base = region.base_address = B = 0x80000000
+    ELF segment at 0x80000000 -> data[0]                      // file offset 0
+    GPA 0x80010000 -> data[0x10000] = file offset 0x10000     // matches QEMU
+    Alias region narrowed to {0,0} (degenerate -> contains() always false)
+```
+
+`--shared-mem-base` defaults to 0x80000000 so plain `--shared-mem-path X --shared-mem-size N` Just Works. The flag exists so that future QEMU machine types or alternate test harnesses can override without code changes — this is the "configurable" half of the requirement.
+
+**Alternative considered and rejected**: keep the wide [0, 2.25 GB) region and add a `data_origin` field plus owned-fallback for non-mapped GPAs. Rejected because (a) hybrid mode never needs RAM outside the mmap window — anything below 0x80000000 in QEMU virt is MMIO/ROM, not RAM, and accessing it from vsim while purporting to share with QEMU is already undefined; (b) a sub-range data window doubles the SimpleMemory state machine (mapped vs owned per access); (c) it conflicts with the existing "external_buffer must cover the whole region" contract that other call sites rely on.
+
+### 9.3 Code changes
+
+**Modify**:
+
+| File | Change | TDD phase |
+|---|---|---|
+| `src/platform/mmap_backing.hpp` | Add `uint64_t base_gpa_` field, constructor param `base_gpa = 0x80000000`, getter `base_gpa()`. Storage and span() unchanged. | structural |
+| `src/platform/platform.hpp:71-75` | Platform constructor adds optional `MemoryRegion ram_region` (default `{RAM_BASE, RAM_END}`) and optional `MemoryRegion ram_alias_region` (default `{RAM_ALIAS_BASE, RAM_ALIAS_END}`). Used in main_memory construction. | structural |
+| `src/simulator.hpp` (constructor, ~line 106) | Forward optional `ram_region` / `ram_alias_region` to Platform. | structural |
+| `src/simulator.hpp:246` | `read_elf_into_memory(*elf, xlen_t{0}, ...)` -> `read_elf_into_memory(*elf, platform.main_memory.region.base_address, ...)`. | behavioral |
+| `src/main.cpp` | New CLI flag `--shared-mem-base <hex>` (default 0x80000000). When `--shared-mem-path` is set, construct `MmapBacking(path, size, base_gpa)`, derive `ram_region = {base_gpa, base_gpa + size - 1}` and `ram_alias_region = {0, 0}`, pass to Simulator. | behavioral |
+
+**Reuse without modification**:
+- `src/platform/simple_memory.hpp` — translation `addr - region.base_address` already works for any region base; no change.
+- `src/platform/memory_region.hpp` — `contains()` already exclusive-end aware; degenerate `{0,0}` (stored as [0,1)) contains nothing useful but never matches a real GPA.
+- `src/utils/elf_loader.hpp` — already takes `base_addr` as a parameter; just gets a different value from the call site.
+- `src/hybrid/qemu_handback.hpp` — `spawn_qemu` already builds `-object memory-backend-file,id=mem,share=on,mem-path=...,size=...` plus `-machine virt,memory-backend=mem`; no further change.
+- `hybrid/test/rt_shared_mem.S`, `tests/hybrid/rt_shared_mem.sh`, `hybrid/test/Makefile`, `cmake/HybridConfig.cmake` — already in tree from prior session.
+
+**Create**:
+- `tests/hybrid/shared_mem_offset.test.cpp` — RED unit test for the redesigned path (see 9.4).
+
+### 9.4 TDD sequence
+
+Each step is one commit; commit messages start with `structural:` or `behavioral:` per `~/personal_git/.claude/TDD.md`.
+
+**Step 1 — STRUCTURAL** (`structural: parameterize Platform RAM region for shared-mem mode`):
+- Add `base_gpa_` to MmapBacking with default 0x80000000.
+- Plumb optional `ram_region` / `ram_alias_region` through Simulator -> Platform.
+- All defaults preserve existing behavior. `simulator.hpp:246` still uses hardcoded 0 in this commit.
+- Run full `ctest`: every existing test passes (no behavioral change yet).
+
+**Step 2 — RED** (`tests/hybrid/shared_mem_offset.test.cpp`):
+- Allocate a temp 8 MB file (smaller than current 2.25 GB region; this alone proves the size-check breaks today).
+- Construct Platform via `Simulator` with `ram_region = {0x80000000, 0x807FFFFF}`, `ram_buffer = mmap.span()`.
+- Issue a SimpleMemory write via the SystemC TLM path at GPA 0x80010000 with a known 8-byte pattern.
+- mmap the same file independently (read-only) and assert byte-at-file-offset 0x10000 equals the pattern.
+- Test must FAIL on `main` (size-check) and FAIL after Step 1 alone (ELF loader not used in this unit test, but the size-check will already pass after Step 1; the assert that 0x80010000 lands at file offset 0x10000 is what genuinely fails until Step 3).
+
+**Step 3 — GREEN / BEHAVIORAL** (`behavioral: load ELF at region.base_address; honor shared-mem-base in CLI`):
+- Change `simulator.hpp:246` to use `platform.main_memory.region.base_address`.
+- Add `--shared-mem-base` CLI flag in `main.cpp`, derive `ram_region` from MmapBacking when shared mode is active, narrow alias region to `{0,0}`.
+- Step 2's unit test now passes.
+- Run `bash tests/hybrid/rt_shared_mem.sh`: Phase A fills 4 KB, Phase B verifies + XORs to 0xFF, Phase C confirms via shared mmap, exit 0.
+
+**Step 4 — REGRESSION**:
+- `ctest -L hybrid-e2e --output-on-failure`: 8 existing Tier-1 round-trip fixtures still PASS (they don't use `--shared-mem-path`, so they exercise the unchanged non-hybrid path); `test_e2e_rt_shared_mem` now PASSES.
+- Full non-hybrid `ctest`: bare-metal tests linked at low addresses (`spin.ld` at 0x80, `handoff.ld` at 0x10000) still load and run because the default RAM region remains [0x0, 0x90000000).
+- `tests/hybrid/memory_map.test.cpp`: passes (constants in `memory_map.h` unchanged).
+
+### 9.5 Critical files
+
+| File | Action |
+|---|---|
+| `src/platform/mmap_backing.hpp` | modify (add base_gpa) |
+| `src/platform/platform.hpp` | modify (constructor accepts optional ram_region) |
+| `src/simulator.hpp` | modify (forward ram_region; use region.base_address as ELF load base) |
+| `src/main.cpp` | modify (--shared-mem-base flag; derive ram_region in hybrid mode) |
+| `tests/hybrid/shared_mem_offset.test.cpp` | create (RED then GREEN unit test) |
+| `cmake/HybridConfig.cmake` | already wires `test_e2e_rt_shared_mem`; no change |
+| `tests/hybrid/rt_shared_mem.sh`, `hybrid/test/rt_shared_mem.S`, `hybrid/test/Makefile` | already in tree; no change |
+
+### 9.6 Verification
+
+End-to-end ladder (each step requires the previous):
+
+1. **Unit (RED -> GREEN)**: `tests/hybrid/shared_mem_offset.test.cpp` — write at GPA 0x80010000 via SimpleMemory, observe at file offset 0x10000 via independent mmap.
+2. **Tier-2 e2e**: `ctest -R test_e2e_rt_shared_mem` — round-trip exits 0; QEMU 1 fills 4 KB with 0xA5..., vsim verifies + XORs to 0xFF..., QEMU 2 confirms.
+3. **Tier-1 regression**: `ctest -L hybrid-e2e` — all 8 existing rt_* fixtures still PASS.
+4. **Non-hybrid regression**: full `ctest` (no `--shared-mem-path`) — `spin`, `handoff`, `handoff_exit`, kanata, pipeview, all unit tests pass.
+5. **Diagnostic**: deliberately set `--shared-mem-base 0x90000000` (wrong); rt_shared_mem.sh fails with a clear "ELF segment at 0x80000000 outside region" error rather than silent corruption.
+
+### 9.7 Out of scope (documented, not blocked-on)
+
+- The 64-bit alias region [0x800000000, 0x880000000): QEMU virt has no alias mirror. In hybrid mode the alias is degenerate; any access to it is undefined behavior, consistent with the existing "MMIO inside ROI" rule in Section 5 / Phase 5.
+- Sharing ILM/DLM across simulators: separate regions, separate mmap, separate plan.
+- Alternative QEMU machine types with non-0x80000000 RAM bases: enabled by `--shared-mem-base` flag but not exercised by Tier-2.
+- mcycle/minstret continuity across the handoff: already documented as a known discontinuity in Section 5.
