@@ -267,3 +267,190 @@ End-to-end ladder, each level requires the previous:
 Speed measurement at each phase: capture wall-clock for a representative workload (e.g., dhrystone, an existing testbench in `external/`). Target after Phase 4: **>=100x** speedup on workloads where the ROI is <1% of dynamic instructions.
 
 Each phase commit follows the project's TDD discipline (see `~/personal_git/.claude/TDD.md`): a failing test first, then the smallest code to pass, then refactor. Commits prefixed `structural:` or `behavioral:`.
+
+---
+
+## 8. Phase 3 E2E Test Expansion
+
+### 8.1 Context
+
+Phase 3 landed the round-trip mechanism. The existing e2e harness `tests/hybrid/roundtrip_e2e.sh` exercises the full QEMU1 -> vsim -> QEMU2 path but with a single fixture (`handoff_roundtrip.S`) that only validates ONE GPR (`a2 == 3`) via the semihosting exit code. The plumbing works, but two large coverage gaps remain before we move on to Phase 4:
+
+- **Register coverage**: 1 of 31 GPRs is observed; ABI-special regs (`sp`/`gp`/`tp`/`ra`/`fp`) are never touched; sign-bit and full-64-bit values are not exercised; the `HYBRID_HANDOFF_RUNTIME` trigger form (`csrrw rd,0x7C0,rs1`) is never fired in e2e.
+- **Memory coverage**: zero tests today. Vsim never executes a load/store between the entry and exit triggers, so the integration of the cache/memory subsystem with the resumed state is unverified. Cross-simulator memory survival via shared mmap is also untested at e2e level (Phase 1 isolated unit test only).
+
+### 8.2 What's actually transferable today (constraints on fixture design)
+
+From `state_drain.hpp:28-45`, `resume_driver.hpp:46-68`, `qemu_handback.hpp:122-144`, `gdbstub_client.hpp:66-82`, and `hybrid_handoff.c:101-124`:
+
+| State class | Fully round-tripped? |
+|---|---|
+| `x1..x31`, `pc` | yes |
+| `priv` | hardcoded to 3 in both directions |
+| `f0..f31`, all CSRs (mstatus/mepc/mtvec/...), V regs, PMP | NOT transferred (Phase 5) |
+| Memory written in vsim, read in QEMU 2 | NOT transferred unless `--shared-mem-path` is wired into `qemu_handback.hpp` (currently it isn't) |
+
+Implication: every Tier-1 fixture must encode pass/fail into a **GPR before the exit csrwi**, then in the QEMU 2 phase (after the csrwi, where DPC lands) verify and ship the result through `SYS_EXIT_EXTENDED`. We cannot use FP/CSR/V state as test channels yet.
+
+### 8.3 Fixture three-phase template
+
+Every new fixture follows this layout (text base `0x80000000`, semihosting param block at `0x80001000` per the existing convention):
+
+```
+_start:                          // PHASE A: runs in QEMU 1 (functional)
+    <set up initial state>
+    csrwi   0x7C0, 0             // QEMU drains x1..x31+pc, exits
+
+phase_b:                         // PHASE B: runs in vsim (RTL, cycle-accurate)
+    <transform state under test>
+    csrwi   0x7C0, 1             // vsim drains, exits 200
+                                 //   on the way out, main spawns QEMU 2
+                                 //   gdbstub restores x1..x31+pc, sends c
+phase_c:                         // PHASE C: runs in QEMU 2 (functional)
+    <fold result into checksum/bitmask in t2>
+    li      t0, 0x80001000       // semihosting param block
+    li      t1, 0x20026          // ADP_Stopped_ApplicationExit
+    sd      t1, 0(t0)
+    sd      t2, 8(t0)            // exit_code = checksum (0 == pass)
+    li      a0, 0x20             // SYS_EXIT_EXTENDED
+    mv      a1, t0
+    .option push; .option norvc
+    slli x0,x0,0x1f; ebreak; srai x0,x0,0x7
+    .option pop
+1:  j 1b
+```
+
+The single observable signal remains the QEMU 2 process exit code. Per fixture, the bash driver asserts that code matches an expected value (usually 0).
+
+### 8.4 Tier-1 test inventory (no infrastructure changes beyond fixtures)
+
+| Fixture | What it verifies | Pass criterion |
+|---|---|---|
+| `rt_all_gprs.S` | All 31 GPRs survive QEMU1->vsim->QEMU2. Phase A loads `x_i = 0xA000_0000_0000_0000 + i` for `i=1..31`. Phase B XORs every `x_i` with mask `K=0xDEADBEEFCAFEBABE`. Phase C checks each `x_i == (0xA000_0000_0000_0000+i) ^ K` and sets bit `i` in `t2` on mismatch. | exit 0 (no failed register) |
+| `rt_abi_aliases.S` | Pass-through fidelity for `ra(x1)`, `sp(x2)`, `gp(x3)`, `tp(x4)`, `fp(x8)`. Phase A sets each to a distinct page-aligned constant in [0x8010_0000..0x8050_0000]. Phase B does NOT touch them (only csrwi entry+exit). Phase C verifies every alias unchanged; exit-code = first-mismatch index or 0. | exit 0 |
+| `rt_sign_bits.S` | 64-bit width fidelity through DM Abstract Commands. Phase A loads `x10..x14` with `0`, `-1`, `0x8000_0000_0000_0000`, `0x7FFF_FFFF_FFFF_FFFF`, `0x0000_0000_FFFF_FFFF`. Phase B is a single nop. Phase C compares element-wise. | exit 0 (no truncation/sign-ext bug) |
+| `rt_pc_jump.S` | PC fidelity at the exit boundary. Phase B does `j .+0x40` so the exit csrwi sits 64 bytes ahead of where Phase B started; verifies DPC captured by `state_drain` reflects the post-jump PC, and QEMU 2 lands on Phase C at the right offset. Phase C just exits 0. Wrong PC -> illegal insn / hang -> bash timeout fails the test. | exit 0 |
+| `rt_runtime_kind.S` | The `HYBRID_HANDOFF_RUNTIME` trigger path (`csrrw zero,0x7C0,x10` where `x10=1`). Phase A: `li x10, 1`, then `csrrw zero, 0x7C0, x10` (exit-via-runtime form). Wait - this fires at QEMU first, not vsim. Better split: Phase A uses `csrwi 0x7C0, 0` to enter; Phase B has `li x10,1; csrrw x0,0x7C0,x10` to exit through the runtime decode in `handoff_controller.hpp:42-44`. Verifies `decode_csrrw_rs1` + GPR-read-by-rs1 path. | exit 0 |
+| `rt_long_roi.S` | Vsim runs a non-trivial ROI: 100-iteration counted loop summing `1..100` into `x10` (expected 5050). Phase B is the loop; Phase C verifies `x10 == 5050`. Catches resume-state corruption only visible after many cycles, and exercises branch/decode through the cycle-accurate pipeline. | exit 0 |
+| `rt_mem_loadstore.S` | Vsim memory subsystem under load while resumed from foreign state. Phase A initializes a 64-byte buffer at `0x8000_2000` to a known pattern via `sd` from x10. Phase B reads the buffer back word-by-word, XORs with a constant, writes back, then re-reads and folds into x10 (final checksum). Phase C compares x10 to the pre-computed expected. Exercises load-after-store, RAW within vsim. | exit 0 |
+| `rt_unaligned_lh.S` | Halfword/byte loads at unaligned addresses inside vsim ROI. Phase A stores 0xCAFEBABEDEADBEEF at 0x8000_3000 and 0xCAFEBABEDEADBEEF at 0x8000_3008. Phase B does `lh x10, 1(t0)`, `lb x11, 3(t0)`, `lhu x12, 5(t0)`, accumulates into x10. Phase C compares against expected. | exit 0 |
+
+### 8.5 Tier-2 test (requires Phase 1 wiring into handback)
+
+**`rt_shared_mem.sh`**: cross-simulator memory survival via mmap. This is the only test that detects regressions in "memory written in vsim is visible to QEMU 2" - the key promise of the hybrid architecture beyond Phase 3.
+
+Required code change (small, but a real change beyond test scaffolding):
+- `src/hybrid/qemu_handback.hpp:84-116` (`detail::spawn_qemu`) accepts an optional `shared_mem_path`. When set, `argv` is rebuilt to add `-object memory-backend-file,id=mem,share=on,mem-path=<path>,size=<size>` and `-machine virt,memory-backend=mem` (replacing `-M virt`).
+- `src/main.cpp` plumbs the existing `--shared-mem-path` / `--shared-mem-size` flags into `run_qemu_handback`.
+- Bash driver creates `/dev/shm/vsim-rt-shared` of the right size, launches QEMU 1 with `-object memory-backend-file,...,share=on`, vsim with `--shared-mem-path`, and asserts.
+
+Fixture (`rt_shared_mem.S`):
+- Phase A: write magic byte pattern (e.g., `0xA5` x 4096) to `0x8001_0000` from x10, csrwi entry.
+- Phase B: vsim verifies pattern is intact (loop reading 4 KB into checksum), XORs page in place with `0x5A`, stores result of mask check to x10, csrwi exit.
+- Phase C: QEMU 2 reads the same 4 KB through the shared mmap, recomputes checksum (should match `0xA5 ^ 0x5A` = `0xFF` everywhere), folds mismatch count into exit code.
+
+Pass criterion: exit 0 AND wall-clock confirms two-sided visibility (page must be modified by both simulators).
+
+### 8.6 Negative / robustness tests (one-shot, sanity)
+
+| Fixture / driver | What it verifies | Pass criterion |
+|---|---|---|
+| `rt_corrupt_state.sh` | Reuses a Tier-1 ELF but feeds vsim a truncated `state.bin`. Vsim must fail-fast with a non-200, non-zero exit and a recognizable log line, not segfault or hang. | vsim exit != 200, != 0; stderr matches `state file too small\|invalid magic` |
+| `rt_no_qemu_binary.sh` | Same ELF; pass `--qemu-binary /nonexistent`. Vsim's drain still fires; the spawn fails. Verify exit code is propagated as `127` (exec failure), not a hang. | exit 127, no zombie left |
+| `rt_gdbstub_timeout.sh` | Provide a stub binary that opens the gdb port but never responds. Vsim's `connect_loopback`+session reads must time out within 5 seconds and exit non-zero, not hang the CTest run. | exit != 0, runtime < 30 s |
+
+These guard against quietly-degrading paths that the happy-path tests can't see.
+
+### 8.7 Infrastructure changes
+
+**`hybrid/test/Makefile`** - add per-fixture build rules. The pattern is mechanical:
+
+```make
+RT_FIXTURES := rt_all_gprs rt_abi_aliases rt_sign_bits rt_pc_jump \
+               rt_runtime_kind rt_long_roi rt_mem_loadstore \
+               rt_unaligned_lh rt_shared_mem
+
+all: spin.elf handoff.elf handoff_exit.elf handoff_roundtrip.elf \
+     $(RT_FIXTURES:%=%.elf)
+
+%.elf: %.S handoff_roundtrip.ld     # all fixtures share the existing linker
+	$(CC) $(CFLAGS) -c $< -o $*.o
+	$(LD) -T handoff_roundtrip.ld -nostdlib -static $*.o -o $@
+```
+
+The shared linker script `handoff_roundtrip.ld` is fine for every fixture (one .text at 0x80000000); no per-fixture .ld needed.
+
+**`tests/hybrid/roundtrip_e2e.sh`** - generalize to take a fixture name and an expected exit code. The script keeps its current layout but reads `FIXTURE` and `EXPECT_RC` from env. The single-fixture invocation today becomes `FIXTURE=handoff_roundtrip EXPECT_RC=3 roundtrip_e2e.sh`.
+
+**`cmake/HybridConfig.cmake`** - replace the single `add_test(test_roundtrip_e2e ...)` with a `foreach` over a list of `(name, expect_rc)` pairs:
+
+```cmake
+set(VSIM_RT_FIXTURES
+  "handoff_roundtrip:3"      # existing
+  "rt_all_gprs:0"
+  "rt_abi_aliases:0"
+  "rt_sign_bits:0"
+  "rt_pc_jump:0"
+  "rt_runtime_kind:0"
+  "rt_long_roi:0"
+  "rt_mem_loadstore:0"
+  "rt_unaligned_lh:0"
+)
+foreach(entry ${VSIM_RT_FIXTURES})
+  string(REPLACE ":" ";" parts ${entry})
+  list(GET parts 0 fname)
+  list(GET parts 1 erc)
+  add_test(
+    NAME test_e2e_${fname}
+    COMMAND bash -c "FIXTURE=${fname} EXPECT_RC=${erc} bash ../tests/hybrid/roundtrip_e2e.sh"
+  )
+  set_tests_properties(test_e2e_${fname} PROPERTIES
+    SKIP_RETURN_CODE 77
+    LABELS "hybrid-e2e"
+  )
+endforeach()
+
+# Tier-2 (separate driver because it sets up /dev/shm and adds CLI flags)
+add_test(NAME test_e2e_rt_shared_mem
+  COMMAND bash ../tests/hybrid/rt_shared_mem.sh)
+set_tests_properties(test_e2e_rt_shared_mem PROPERTIES
+  SKIP_RETURN_CODE 77 LABELS "hybrid-e2e")
+
+# Negative/robustness
+foreach(neg corrupt_state no_qemu_binary gdbstub_timeout)
+  add_test(NAME test_e2e_rt_${neg}
+    COMMAND bash ../tests/hybrid/rt_${neg}.sh)
+  set_tests_properties(test_e2e_rt_${neg} PROPERTIES
+    SKIP_RETURN_CODE 77 LABELS "hybrid-e2e")
+endforeach()
+```
+
+This gives one CTest entry per fixture, individually pass/fail/skip, all under the `hybrid-e2e` label so `ctest -L hybrid-e2e` runs the suite as one unit.
+
+### 8.8 Critical files for this section
+
+To create:
+- `hybrid/test/rt_all_gprs.S`, `rt_abi_aliases.S`, `rt_sign_bits.S`, `rt_pc_jump.S`, `rt_runtime_kind.S`, `rt_long_roi.S`, `rt_mem_loadstore.S`, `rt_unaligned_lh.S`, `rt_shared_mem.S`
+- `tests/hybrid/rt_shared_mem.sh`, `rt_corrupt_state.sh`, `rt_no_qemu_binary.sh`, `rt_gdbstub_timeout.sh`
+
+To modify:
+- `hybrid/test/Makefile` - generalize fixture rule
+- `tests/hybrid/roundtrip_e2e.sh` - read `FIXTURE` and `EXPECT_RC` from env
+- `cmake/HybridConfig.cmake` - foreach over fixtures
+- `src/hybrid/qemu_handback.hpp` - optional `-object memory-backend-file,share=on` in `detail::spawn_qemu` (Tier-2 only)
+- `src/main.cpp` - plumb `--shared-mem-path` into `run_qemu_handback` (Tier-2 only)
+
+To reuse without modification:
+- `hybrid/test/handoff_roundtrip.ld` - linker script is fixture-agnostic
+- `src/hybrid/csr_trigger.hpp`, `handoff_controller.hpp`, `state_drain.hpp`, `qemu_handback.hpp` (except handback's spawn args for Tier-2)
+
+### 8.9 Verification ladder
+
+1. Tier-1 fixtures build under `make -C hybrid/test all`, no toolchain errors.
+2. `ctest -L hybrid-e2e --output-on-failure` from the host build dir: existing `test_e2e_handoff_roundtrip` still PASS; each new Tier-1 fixture PASS with exit 0.
+3. With QEMU/plugin/ELFs absent (clean container), all e2e tests SKIP (return 77), none FAIL.
+4. Tier-2 `rt_shared_mem` PASS after Phase 1 wiring lands; before wiring, it must fail with a clear error rather than silently passing on stale state.
+5. Negative tests: `rt_corrupt_state` exits non-zero with the expected log; `rt_no_qemu_binary` and `rt_gdbstub_timeout` complete in under 30 s and propagate non-zero exit codes.
+6. Regression detection: deliberately break `state_drain.hpp` (e.g., skip x5 in the loop) and verify `rt_all_gprs` fails with `t2` bit 5 set, identifying the exact register at fault.
+
+Each new fixture follows TDD as before: write the fixture (RED — checksum nonzero), then if needed adjust the simulator code (GREEN), then refactor. Most Tier-1 fixtures should be GREEN immediately if Phase 3 is correct; failures here are bugs the existing single-fixture test couldn't catch.
