@@ -1,0 +1,171 @@
+// Pure-logic tests for the GDB Remote Serial Protocol encoders/parsers.
+// The TCP transport is exercised by the round-trip e2e test.
+
+#include "hybrid/gdbstub_client.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <cstdint>
+#include <string>
+
+TEST_CASE("compute_checksum: mod-256 sum of ASCII bytes")
+{
+  // 'O'=0x4F, 'K'=0x4B; sum = 0x9A.
+  CHECK(hybrid::gdbstub::compute_checksum("OK") == 0x9Au);
+  CHECK(hybrid::gdbstub::compute_checksum("") == 0x00u);
+  // 'c'=0x63.
+  CHECK(hybrid::gdbstub::compute_checksum("c") == 0x63u);
+}
+
+TEST_CASE("encode_packet wraps body with $...#cksum")
+{
+  CHECK(hybrid::gdbstub::encode_packet("OK") == "$OK#9a");
+  CHECK(hybrid::gdbstub::encode_packet("c") == "$c#63");
+}
+
+TEST_CASE("encode_p_packet writes reg_num in lowercase hex, value little-endian")
+{
+  // x1 = 0 -> "P1=" + 16 zeros.
+  // 'P'=0x50, '1'=0x31, '='=0x3D, '0'×16 = 16*0x30 = 0x300.
+  // 0x50 + 0x31 + 0x3D + 0x300 = 0x3BE -> 0xBE mod 256.
+  CHECK(hybrid::gdbstub::encode_p_packet(1, 0u)
+        == "$P1=0000000000000000#be");
+}
+
+TEST_CASE("encode_p_packet emits little-endian byte order for 64-bit value")
+{
+  // 0xDEADBEEFCAFEBABE little-endian byte hex: be ba fe ca ef be ad de
+  const auto pkt = hybrid::gdbstub::encode_p_packet(10, 0xDEADBEEFCAFEBABEULL);
+  // Body looks like "Pa=bebafecaefbeadde"; just check the value substring.
+  CHECK(pkt.find("Pa=bebafecaefbeadde") != std::string::npos);
+  CHECK(pkt.starts_with("$"));
+  CHECK(pkt.find("#") != std::string::npos);
+}
+
+TEST_CASE("encode_p_packet uses two-digit hex for reg_num >= 16")
+{
+  // x16 -> "P10" (hex 0x10).
+  const auto pkt = hybrid::gdbstub::encode_p_packet(16, 0u);
+  CHECK(pkt.find("P10=") != std::string::npos);
+}
+
+TEST_CASE("encode_p_packet uses three-digit hex for reg_num >= 256 - "
+          "the previous two-nibble encoding silently aliased pmpaddr15 "
+          "(reg 1025) onto reg 1 (ra) and corrupted the round-trip")
+{
+  const auto pkt = hybrid::gdbstub::encode_p_packet(1025, 0u);
+  CHECK(pkt.find("P401=") != std::string::npos);
+
+  const auto pkt834 = hybrid::gdbstub::encode_p_packet(834, 0u);
+  CHECK(pkt834.find("P342=") != std::string::npos);
+}
+
+TEST_CASE("encode_continue is exactly $c#63")
+{
+  CHECK(hybrid::gdbstub::encode_continue() == "$c#63");
+}
+
+TEST_CASE("parse_packet extracts body from $body#cksum framing")
+{
+  CHECK(hybrid::gdbstub::parse_packet("$OK#9a") == "OK");
+  CHECK(hybrid::gdbstub::parse_packet("$#00") == "");
+}
+
+TEST_CASE("parse_packet rejects malformed framing")
+{
+  CHECK_FALSE(hybrid::gdbstub::parse_packet("OK").has_value());
+  CHECK_FALSE(hybrid::gdbstub::parse_packet("$OK").has_value());
+  CHECK_FALSE(hybrid::gdbstub::parse_packet("$OK#").has_value());
+}
+
+TEST_CASE("parse_packet rejects mismatched checksum")
+{
+  CHECK_FALSE(hybrid::gdbstub::parse_packet("$OK#00").has_value());
+}
+
+TEST_CASE("parse_feature_xml: unnumbered <reg> entries get sequential ids")
+{
+  using hybrid::gdbstub::parse_feature_xml;
+
+  hybrid::gdbstub::RegMap map;
+  unsigned next = 0;
+  parse_feature_xml(
+    R"(<feature name="org.gnu.gdb.riscv.cpu">)"
+    R"(<reg name="zero" bitsize="64"/>)"
+    R"(<reg name="ra" bitsize="64"/>)"
+    R"(<reg name="sp" bitsize="64"/>)"
+    R"(</feature>)",
+    map, next);
+  CHECK(map.name_to_num.at("zero") == 0u);
+  CHECK(map.name_to_num.at("ra")   == 1u);
+  CHECK(map.name_to_num.at("sp")   == 2u);
+  CHECK(next == 3u);
+}
+
+TEST_CASE("parse_feature_xml: explicit regnum overrides sequential counter "
+          "but resumes after the last seen entry")
+{
+  using hybrid::gdbstub::parse_feature_xml;
+
+  hybrid::gdbstub::RegMap map;
+  unsigned next = 66;
+  parse_feature_xml(
+    R"(<feature name="org.gnu.gdb.riscv.csr">)"
+    R"(<reg name="mstatus" bitsize="64" regnum="834" type="int"/>)"
+    R"(<reg name="mepc" bitsize="64" regnum="897" type="int"/>)"
+    R"(</feature>)",
+    map, next);
+  CHECK(map.name_to_num.at("mstatus") == 834u);
+  CHECK(map.name_to_num.at("mepc")    == 897u);
+}
+
+TEST_CASE("parse_feature_xml: ignores elements other than <reg>")
+{
+  using hybrid::gdbstub::parse_feature_xml;
+
+  hybrid::gdbstub::RegMap map;
+  unsigned next = 0;
+  parse_feature_xml(
+    R"(<feature name="x">)"
+    R"(<union id="riscv_double">)"
+    R"(<field name="float" type="ieee_single"/>)"
+    R"(</union>)"
+    R"(<reg name="ft0" bitsize="64"/>)"
+    R"(</feature>)",
+    map, next);
+  CHECK(map.name_to_num.size() == 1u);
+  CHECK(map.name_to_num.at("ft0") == 0u);
+}
+
+TEST_CASE("parse_target_xml extracts annex hrefs in declaration order")
+{
+  using hybrid::gdbstub::parse_target_xml;
+  auto annexes = parse_target_xml(
+    R"(<?xml version="1.0"?><target>)"
+    R"(<architecture>riscv:rv64</architecture>)"
+    R"(<xi:include href="riscv-64bit-cpu.xml"/>)"
+    R"(<xi:include href="riscv-64bit-fpu.xml"/>)"
+    R"(<xi:include href="riscv-csr.xml"/>)"
+    R"(</target>)");
+  REQUIRE(annexes.size() == 3u);
+  CHECK(annexes[0] == "riscv-64bit-cpu.xml");
+  CHECK(annexes[1] == "riscv-64bit-fpu.xml");
+  CHECK(annexes[2] == "riscv-csr.xml");
+}
+
+TEST_CASE("encode_p_body_bytes encodes variable-width payload "
+          "in little-endian hex")
+{
+  // 4-byte payload {0xDE, 0xAD, 0xBE, 0xEF} at reg 5 -> "P5=deadbeef".
+  const uint8_t bytes[] = {0xDE, 0xAD, 0xBE, 0xEF};
+  const auto body = hybrid::gdbstub::encode_p_body_bytes(5, bytes, 4);
+  CHECK(body == "P5=deadbeef");
+}
+
+TEST_CASE("encode_p_body_bytes handles two-digit reg numbers")
+{
+  const uint8_t one[] = {0xAB};
+  const auto body = hybrid::gdbstub::encode_p_body_bytes(255, one, 1);
+  CHECK(body == "Pff=ab");
+}

@@ -1,0 +1,125 @@
+// StateDrain is the dual of ResumeDriver: halt the hart via the Debug Module,
+// read x1..x31 + DPC + FPR + M-mode CSRs + PMP + vector CSRs via Abstract
+// Commands, populate hybrid_state_v1. Vector data registers (v0..v31) are
+// not yet read because the Debug Module's coverage of vector regs depends
+// on the implementation; the slot stays zero until Phase 5 wires it up.
+//
+// Reuses ResumeDriver's DM register constants and DmiBus interface.
+
+#pragma once
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/dmi_poll.hpp"
+#include "hybrid/resume_driver.hpp"
+#include "hybrid/state_abi.h"
+
+#include <cstdint>
+
+namespace hybrid
+{
+
+class StateDrain
+{
+public:
+  using RD = ResumeDriver;
+
+  static constexpr uint16_t kCsrVl    = 0xc20;
+  static constexpr uint16_t kCsrVtype = 0xc21;
+  static constexpr uint16_t kCsrVlenb = 0xc22;
+
+  explicit StateDrain(DmiBus& bus)
+      : bus_{bus}
+  {}
+
+  // Drain GPRs (x1..x31) + PC into a fresh state. FP/CSR/V slots are zero;
+  // the caller is expected to fill them via merge_pass_through() if it has
+  // the original input state from QEMU 1.
+  auto drain() -> hybrid_state_v1
+  {
+    bus_.write(RD::kDmcontrol, RD::kDmcontrolDmactive);
+    bus_.write(RD::kDmcontrol, RD::kDmcontrolDmactive | RD::kDmcontrolHaltreq);
+    poll_until_set(bus_, RD::kDmstatus, RD::kDmstatusAllhalted,
+                   "StateDrain halt");
+
+    hybrid_state_v1 state{};
+    state.magic   = HYBRID_STATE_MAGIC;
+    state.version = HYBRID_STATE_VERSION;
+    state.flags   = HYBRID_FLAG_RV64;
+    state.priv    = 3;
+
+    for (uint16_t i = 1; i < 32; ++i)
+      state.gpr[i] = read_64bit_register(regno_gpr(i));
+
+    state.pc = read_64bit_register(regno_csr(RD::kCsrDpc));
+    return state;
+  }
+
+  // Returns a state where GPRs (x1..x31) + PC are freshly drained from the
+  // hart but FP, M-mode CSRs, PMP, and vector state are copied from the
+  // input snapshot. Used by HandoffController to round-trip QEMU 1's full
+  // architectural state through vsim without paying the ~100x DM Abstract
+  // Command overhead for fields the ROI did not modify.
+  auto drain_with_passthrough(const hybrid_state_v1& input) -> hybrid_state_v1
+  {
+    auto state    = drain();
+    state.flags   = input.flags;
+    state.priv    = input.priv;
+    state.hart_id = input.hart_id;
+
+    for (int i = 0; i < 32; ++i) state.fpr[i] = input.fpr[i];
+
+    state.mstatus  = input.mstatus;
+    state.mepc     = input.mepc;
+    state.mtvec    = input.mtvec;
+    state.mcause   = input.mcause;
+    state.mtval    = input.mtval;
+    state.mscratch = input.mscratch;
+    state.medeleg  = input.medeleg;
+    state.mideleg  = input.mideleg;
+    state.mip      = input.mip;
+    state.mie      = input.mie;
+    state.mcycle   = input.mcycle;
+    state.minstret = input.minstret;
+    state.satp     = input.satp;
+
+    for (int i = 0; i < HYBRID_PMP_CFG_NUM; ++i)
+      state.pmpcfg[i]  = input.pmpcfg[i];
+    for (int i = 0; i < HYBRID_PMP_ADDR_NUM; ++i)
+      state.pmpaddr[i] = input.pmpaddr[i];
+
+    state.vstart = input.vstart;
+    state.vtype  = input.vtype;
+    state.vl     = input.vl;
+    state.vlenb  = input.vlenb;
+    for (std::size_t i = 0; i < sizeof(state.vreg); ++i)
+      state.vreg[i] = input.vreg[i];
+
+    return state;
+  }
+
+private:
+  auto read_64bit_register(uint16_t regno) -> uint64_t
+  {
+    bus_.write(RD::kCommand, access_register_command(regno, AarSize::Bits64,
+                                                     /*write=*/false));
+    poll_until_clear(bus_, RD::kAbstractcs, RD::kAbstractcsBusy,
+                     "StateDrain read_register");
+    // If the hardware DM does not implement Abstract access for this
+    // register, cmderr is set sticky and DATA0/DATA1 hold stale bytes.
+    // Clear the error and report 0 for that field so the next read can
+    // proceed - a missing CSR mirrors as zero rather than corrupting the
+    // adjacent slot.
+    const auto status = bus_.read(RD::kAbstractcs);
+    if ((status & RD::kAbstractcsCmderrMask) != 0u) {
+      bus_.write(RD::kAbstractcs, RD::kAbstractcsCmderrMask);
+      return 0u;
+    }
+    const uint64_t lo = bus_.read(RD::kData0);
+    const uint64_t hi = bus_.read(RD::kData1);
+    return lo | (hi << 32);
+  }
+
+  DmiBus& bus_;
+};
+
+}  // namespace hybrid
