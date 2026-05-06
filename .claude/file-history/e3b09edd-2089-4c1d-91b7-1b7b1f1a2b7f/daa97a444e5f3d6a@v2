@@ -1,0 +1,139 @@
+# How the Hybrid Simulator Works
+
+A friendly tour for engineers new to this codebase.
+
+## The Problem in One Paragraph
+
+A pure RTL simulator (`vsim`, built on Verilator + SystemC) is **cycle-accurate**: it tells you exactly how many cycles every instruction takes inside the CPU pipeline. The price is speed: it runs at ~5-9 KHz. Booting Linux, running libc init, and warming up before reaching the actual code you care about can take hours. Meanwhile, QEMU runs the same program **functionally** at MHz speed, but it has no notion of pipeline cycles.
+
+The hybrid simulator combines them: run the boring parts in QEMU, switch to vsim for the small region of interest (ROI) you actually want to measure, and (optionally) hand back to QEMU to finish.
+
+## High-Level Concept
+
+Three big ideas make this possible:
+
+1. **Memory is shared, not copied.** Both simulators `mmap` the same backing file (`/dev/shm/...`) as their RAM. When QEMU writes a byte at address `0x80001000`, vsim sees it instantly, and vice versa. RAM size becomes irrelevant - no transfer cost.
+
+2. **CPU state is small enough to copy.** The architectural registers (32 GPRs + 32 FPRs + a few CSRs) are only a few KB. We define a packed C struct (`struct hybrid_state_v1` in `include/hybrid/state_abi.h`) that both sides agree on. At a handoff, one side writes the struct to a file; the other side reads it.
+
+3. **Microarchitectural state is thrown away.** Caches, TLB, branch predictor, store buffer - none of it transfers. We accept cold caches at handoff and rely on a "warm-up window" before recording any measurements.
+
+The trigger for a handoff is a **magic CSR write**: `csrwi 0x7C0, 0` means "QEMU, hand off to vsim", and `csrwi 0x7C0, 1` means "vsim, hand back to QEMU". The CSR address `0x7C0` is in the user-defined range, so it does not collide with anything real.
+
+The write-back path on the vsim side reuses the existing **JTAG Debug Module** that the RTL already implements. Vsim drives the DM in-process (no socket, no OpenOCD) to halt the core, write all 32 GPRs, set the PC, and resume. The QEMU side uses a TCG plugin that drains state through the plugin API and exits cleanly. Hand-back from vsim to QEMU spawns a fresh QEMU process and restores state via QEMU's `gdbstub`.
+
+## Architecture Flowchart
+
+```mermaid
+flowchart LR
+    subgraph DISK["Shared State (on disk / shm)"]
+        SHM[("/dev/shm RAM<br/>(mmap shared)")]
+        STATE_Q["state_qemu.bin<br/>(packed struct)"]
+        STATE_V["state_vsim.bin<br/>(packed struct)"]
+    end
+
+    subgraph QEMU1["QEMU 1 (functional, MHz)"]
+        Q1_TCG["TCG instruction loop"]
+        Q1_PLUGIN["hybrid_handoff.so<br/>watches for csrwi 0x7C0,0"]
+        Q1_TCG --> Q1_PLUGIN
+    end
+
+    subgraph VSIM["vsim (cycle-accurate, KHz)"]
+        V_PIPE["RTL pipeline<br/>(Verilator + SystemC)"]
+        V_DM["JTAG DM driver<br/>(in-process)"]
+        V_TRIG["csr_trigger<br/>watches retire of csrwi 0x7C0,1"]
+        V_DM -.resumes regs.-> V_PIPE
+        V_PIPE -.retire signals.-> V_TRIG
+    end
+
+    subgraph QEMU2["QEMU 2 (functional, MHz)"]
+        Q2_GDB["gdbstub -gdb -S"]
+        Q2_TCG["TCG instruction loop"]
+        Q2_GDB -.restores regs.-> Q2_TCG
+    end
+
+    Q1_PLUGIN -- "drain GPR/FPR/CSR" --> STATE_Q
+    Q1_PLUGIN -- "qemu_plugin_request_exit" --> VSIM
+    STATE_Q -- "--resume-from-qemu" --> V_DM
+
+    V_TRIG -- "drain via DM" --> STATE_V
+    V_TRIG -- "exit code 200" --> QEMU2
+    STATE_V -- "gdb 'G' packet" --> Q2_GDB
+
+    Q1_TCG <-->|"every load/store"| SHM
+    V_PIPE <-->|"every load/store"| SHM
+    Q2_TCG <-->|"every load/store"| SHM
+```
+
+## Walk-Through: `handoff_roundtrip` E2E Test
+
+This is the simplest end-to-end test; it exercises the full QEMU1 -> vsim -> QEMU2 path.
+
+### The test program (`hybrid_vsim/hybrid/test/handoff_roundtrip.S`)
+
+```asm
+_start:
+    csrwi   0x7C0, 0          // entry: QEMU drains state, exits
+    li      a0, 1
+    li      a1, 2
+    add     a2, a0, a1        // a2 = 3, computed inside vsim
+    csrwi   0x7C0, 1          // exit: vsim drains state, exits 200
+    SEMIHOST_EXIT a2          // QEMU 2 exits with code = a2 = 3
+```
+
+Three "phases" are visible in the assembly:
+- **Phase A** (runs in QEMU 1): everything before the first `csrwi`.
+- **Phase B** (runs in vsim): the `add a2, a0, a1`. This is the only instruction whose cycle behavior matters.
+- **Phase C** (runs in QEMU 2): the semihosting exit, which reports `a2` back to the host as the process exit code.
+
+### The driver (`hybrid_vsim/tests/hybrid/roundtrip_e2e.sh`)
+
+The driver script orchestrates three processes:
+
+```mermaid
+sequenceDiagram
+    participant SH as roundtrip_e2e.sh
+    participant Q1 as QEMU 1 + plugin
+    participant VS as vsim
+    participant Q2 as QEMU 2 (spawned by vsim)
+
+    SH->>Q1: launch with -plugin libhybrid_handoff.so,outfile=state_qemu.bin
+    Note over Q1: runs Phase A
+    Q1->>Q1: hits csrwi 0x7C0, 0
+    Q1->>SH: writes state_qemu.bin, exits cleanly
+
+    SH->>VS: launch with --resume-from-qemu state_qemu.bin --qemu-binary qemu...
+    Note over VS: DM halts core, writes regs from state_qemu.bin, sets PC, resumes
+    Note over VS: runs Phase B (a2 = 1 + 2 = 3)
+    VS->>VS: csr_trigger sees retire of csrwi 0x7C0, 1
+    VS->>VS: drains state via DM into state_vsim.bin
+    VS->>Q2: spawns qemu-system-riscv64 -gdb tcp:... -S -semihosting
+    VS->>Q2: connects to gdbstub, sends 'G' packet with regs, sends 'c'
+    Note over Q2: runs Phase C (semihosting exit with a2)
+    Q2->>VS: process exits with code 3
+    VS->>SH: vsim process exits with code 3
+    SH->>SH: assert exit code == EXPECT_RC (3) -> PASS
+```
+
+### What each step proves
+
+| Step | What it tests |
+|---|---|
+| QEMU 1 produces `state_qemu.bin` | The TCG plugin correctly identifies `csrwi 0x7C0, 0`, drains all GPRs/CSRs, and exits. |
+| vsim resumes and computes `a2 = 3` | The JTAG DM in-process driver correctly writes 32 GPRs and sets the PC. |
+| vsim drains and exits with code 200 | The retire-PC trigger fires, and the symmetric drain path works. |
+| QEMU 2 exits with code 3 | The handback path (spawn QEMU + gdbstub register restore) round-trips state correctly. The test passes because the `a2` value computed inside vsim survived back into QEMU. |
+
+If any link in the chain breaks, the final exit code will not equal 3 (the value `EXPECT_RC` the driver compares against).
+
+## Where to Look Next
+
+- `include/hybrid/state_abi.h` - the wire contract; both QEMU plugin and vsim include this exact header.
+- `qemu_plugin/hybrid_handoff.c` - the QEMU side. Look at `resolve_handles` and the entry-trigger callback.
+- `hybrid_vsim/src/hybrid/` - the vsim side: `qemu_resume.hpp`, `state_drain.hpp`, `csr_trigger.hpp`, `qemu_handback.hpp`.
+- `hybrid_vsim/hybrid_plan.md` - the original design document, with full rationale for every decision.
+- `run_e2e.sh` - run all e2e tests locally without going through CMake/CTest.
+
+## Mental Model in One Sentence
+
+> Two simulators agree on a memory map and a register struct, take turns running the same program, and use a magic CSR write as the baton-pass.

@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Reproduces the SIGTTIN hang of QEMU 2 when vsim is launched from a
+# non-foreground process group under a real pty.
+#
+# Without the spawn_qemu stdin redirect:
+#   - timeout(1) places vsim+QEMU 2 in a new pgid that is NOT the pty's
+#     foreground group.
+#   - QEMU 2's -nographic stdio reads the pty, the kernel delivers SIGTTIN,
+#     QEMU 2 stops, vsim's waitpid blocks, the outer timeout fires (rc=124).
+#
+# With the fix (child stdin -> /dev/null in spawn_qemu): no tty access,
+# no SIGTTIN, vsim completes the round-trip normally (rc=3).
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+
+VSIM_BIN="${VSIM_BIN:-$REPO_ROOT/build/sim_ax45mpv_premium}"
+VSIM_QEMU="${VSIM_QEMU:-/local/nick/qemu_v5/build/qemu-system-riscv64}"
+VSIM_PLUGIN="${VSIM_PLUGIN:-$REPO_ROOT/hybrid/qemu_plugin/libhybrid_handoff.so}"
+VSIM_ELF="${VSIM_ELF:-$REPO_ROOT/hybrid/test/handoff_roundtrip.elf}"
+
+for f in "$VSIM_BIN" "$VSIM_QEMU" "$VSIM_PLUGIN" "$VSIM_ELF"; do
+  if [ ! -e "$f" ]; then
+    echo "skip: $f not built"
+    exit 77
+  fi
+done
+
+if ! command -v script >/dev/null 2>&1; then
+  echo "skip: script(1) not available"
+  exit 77
+fi
+
+STATE_QEMU=$(mktemp)
+STATE_VSIM=$(mktemp)
+SIM_LOG=$(mktemp)
+RCFILE=$(mktemp)
+WRAPPER=$(mktemp --suffix=.sh)
+chmod +x "$WRAPPER"
+trap 'rm -f "$STATE_QEMU" "$STATE_VSIM" "$SIM_LOG" "$RCFILE" "$WRAPPER"' EXIT
+
+"$VSIM_QEMU" -M virt -bios none -nographic \
+  -kernel "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_QEMU" >/dev/null 2>&1
+
+if [ ! -s "$STATE_QEMU" ]; then
+  echo "FAIL[rt_pty_handback]: QEMU 1 did not produce state"
+  exit 1
+fi
+
+# WRAPPER captures vsim's own exit into RCFILE so the test does not depend
+# on script(1) propagating it. timeout(1) puts vsim+QEMU 2 in a fresh pgid
+# that is NOT the pty's foreground group, which is the exact configuration
+# that triggers the SIGTTIN/SIGTTOU stop on QEMU 2's tty access.
+cat >"$WRAPPER" <<EOF
+#!/usr/bin/env bash
+set +e
+timeout 20 "$VSIM_BIN" "$VSIM_ELF" \\
+  --resume-from-qemu "$STATE_QEMU" \\
+  --handoff-out "$STATE_VSIM" \\
+  --qemu-binary "$VSIM_QEMU" >"$SIM_LOG" 2>&1
+echo \$? >"$RCFILE"
+EOF
+
+START=$(date +%s)
+script -qc "$WRAPPER" /dev/null >/dev/null
+ELAPSED=$(($(date +%s) - START))
+
+VSIM_RC=$(cat "$RCFILE" 2>/dev/null || echo "")
+if [ "$VSIM_RC" != "3" ]; then
+  echo "FAIL[rt_pty_handback]: expected vsim exit 3, got '$VSIM_RC' (elapsed ${ELAPSED}s)"
+  echo "--- sim log ---"
+  cat "$SIM_LOG"
+  exit 1
+fi
+
+echo "[rt_pty_handback] PASS: vsim exit=$VSIM_RC under pty (elapsed ${ELAPSED}s)"
