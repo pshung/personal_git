@@ -1,0 +1,150 @@
+// CsrTrigger pre-scans the ELF for `csrw 0x7C0, *` instructions and provides
+// O(1) lookup-by-PC at retire time. Pure logic; no SystemC, no DMI bus.
+
+#include "hybrid/csr_trigger.hpp"
+#include "hybrid/insn_match.h"
+#include "insn_encoders.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <span>
+
+using hybrid::test::as_bytes;
+using hybrid::test::encode_csrrw;
+using hybrid::test::encode_csrrwi;
+
+namespace {
+
+constexpr auto encode_addi(uint32_t rd, uint32_t rs1, uint32_t imm) -> uint32_t
+{
+  return (imm << 20) | (rs1 << 15) | (0u << 12) | (rd << 7) | 0x13u;
+}
+
+}  // namespace
+
+TEST_CASE("csr_trigger: scan_buffer records csrwi 0x7C0, 1 as EXIT")
+{
+  hybrid::CsrTrigger trig;
+  const std::array<uint32_t, 1> code{encode_csrrwi(0, 0x7C0, 1)};
+  trig.scan_buffer(as_bytes(code), /*base_pc=*/0x80000000);
+
+  const auto hit = trig.lookup(0x80000000);
+  REQUIRE(hit);
+  CHECK(hit->kind == HYBRID_HANDOFF_EXIT);
+}
+
+TEST_CASE("csr_trigger: scan_buffer records csrwi 0x7C0, 0 as ENTER")
+{
+  hybrid::CsrTrigger trig;
+  const std::array<uint32_t, 1> code{encode_csrrwi(0, 0x7C0, 0)};
+  trig.scan_buffer(as_bytes(code), /*base_pc=*/0x80000004);
+
+  const auto hit = trig.lookup(0x80000004);
+  REQUIRE(hit);
+  CHECK(hit->kind == HYBRID_HANDOFF_ENTER);
+}
+
+TEST_CASE("csr_trigger: csrrw 0x7C0, x10 is RUNTIME and rs1 is decodable")
+{
+  hybrid::CsrTrigger trig;
+  const std::array<uint32_t, 1> code{encode_csrrw(0, 0x7C0, /*rs1=*/10)};
+  trig.scan_buffer(as_bytes(code), /*base_pc=*/0x80001000);
+
+  const auto hit = trig.lookup(0x80001000);
+  REQUIRE(hit);
+  CHECK(hit->kind == HYBRID_HANDOFF_RUNTIME);
+  CHECK(hybrid::decode_csrrw_rs1(hit->insn) == 10);
+}
+
+TEST_CASE("csr_trigger: lookup returns nullopt for non-matching PC")
+{
+  hybrid::CsrTrigger trig;
+  const std::array<uint32_t, 1> code{encode_addi(1, 0, 1)};
+  trig.scan_buffer(as_bytes(code), /*base_pc=*/0x80000000);
+
+  CHECK_FALSE(trig.lookup(0x80000000).has_value());
+  CHECK_FALSE(trig.lookup(0xDEADBEEF).has_value());
+}
+
+TEST_CASE("csr_trigger: scan over a multi-insn block records only matches")
+{
+  hybrid::CsrTrigger trig;
+  const std::array<uint32_t, 4> code{
+    /*0x80000000*/ encode_addi(1, 0, 1),
+    /*0x80000004*/ encode_csrrwi(0, 0x7C0, 0),  // ENTER
+    /*0x80000008*/ encode_addi(2, 0, 2),
+    /*0x8000000C*/ encode_csrrwi(0, 0x7C0, 1),  // EXIT
+  };
+  trig.scan_buffer(as_bytes(code), /*base_pc=*/0x80000000);
+
+  CHECK_FALSE(trig.lookup(0x80000000).has_value());
+  REQUIRE(trig.lookup(0x80000004));
+  CHECK(trig.lookup(0x80000004)->kind == HYBRID_HANDOFF_ENTER);
+  CHECK_FALSE(trig.lookup(0x80000008).has_value());
+  REQUIRE(trig.lookup(0x8000000C));
+  CHECK(trig.lookup(0x8000000C)->kind == HYBRID_HANDOFF_EXIT);
+}
+
+TEST_CASE("csr_trigger: add_pc_hit inserts a synthetic EXIT entry for PC mode")
+{
+  hybrid::CsrTrigger trig;
+  CHECK(trig.empty());
+
+  trig.add_pc_hit(0x80000042, HYBRID_HANDOFF_EXIT);
+
+  const auto hit = trig.lookup(0x80000042);
+  REQUIRE(hit);
+  CHECK(hit->kind == HYBRID_HANDOFF_EXIT);
+  CHECK(hit->insn == 0u);  // PC mode: insn is unused; sentinel zero
+  CHECK_FALSE(trig.empty());
+  CHECK_FALSE(trig.lookup(0x80000040).has_value());
+}
+
+TEST_CASE("csr_trigger: add_pc_hit overwrites a prior scan_buffer match at same PC")
+{
+  hybrid::CsrTrigger trig;
+  const std::array<uint32_t, 1> code{encode_csrrwi(0, 0x7C0, 1)};
+  trig.scan_buffer(as_bytes(code), /*base_pc=*/0x80000100);
+  REQUIRE(trig.lookup(0x80000100));
+  REQUIRE(trig.lookup(0x80000100)->insn != 0u);
+
+  trig.add_pc_hit(0x80000100, HYBRID_HANDOFF_EXIT);
+
+  const auto hit = trig.lookup(0x80000100);
+  REQUIRE(hit);
+  CHECK(hit->kind == HYBRID_HANDOFF_EXIT);
+  CHECK(hit->insn == 0u);  // overwrite cleared the recorded insn
+}
+
+TEST_CASE("csr_trigger: 2-byte stride skips compressed insns and aligns 4-byte insns")
+{
+  // Layout:
+  //   0x80000000: c.addi x1, 1     (2 bytes, RVC: bits[1:0] != 0b11)
+  //   0x80000002: csrwi 0x7C0, 1   (4 bytes)
+  //   0x80000006: c.nop            (2 bytes)
+  hybrid::CsrTrigger trig;
+  alignas(uint32_t) std::array<uint8_t, 8> bytes{};
+  // c.addi x1, 1 = 0x0085 (op=01, funct3=000, rd=x1, imm=1) -- rvc bits[1:0]=01
+  // Use a placeholder 16-bit RVC pattern: 0x0085
+  bytes[0] = 0x85;
+  bytes[1] = 0x00;
+  // csrwi 0x7C0, 1 = 0x7C00D073 (little-endian: 73 D0 00 7C)
+  const uint32_t exit_insn = encode_csrrwi(0, 0x7C0, 1);
+  std::memcpy(&bytes[2], &exit_insn, sizeof(exit_insn));
+  // c.nop = 0x0001 (rvc bits[1:0]=01)
+  bytes[6] = 0x01;
+  bytes[7] = 0x00;
+
+  trig.scan_buffer(std::span<const uint8_t>{bytes.data(), bytes.size()},
+                   /*base_pc=*/0x80000000);
+
+  // Only the 4-byte csrwi at 0x80000002 should match.
+  CHECK_FALSE(trig.lookup(0x80000000).has_value());
+  REQUIRE(trig.lookup(0x80000002));
+  CHECK(trig.lookup(0x80000002)->kind == HYBRID_HANDOFF_EXIT);
+  CHECK_FALSE(trig.lookup(0x80000006).has_value());
+}

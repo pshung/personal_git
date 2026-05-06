@@ -1,0 +1,73 @@
+/* Drain markers and fail-fast helper shared by all C-level round-trip
+ * fixtures (rt_c_hello.c, rt_c_printf.c, rt_c_file_io.c).
+ *
+ * The fixtures are timing-aware: only the span between rt_phase_qemu1_drain()
+ * and rt_phase_vsim_drain() may touch libgloss / sim_control MMIO. Outside
+ * that window the program runs on QEMU virt, which has no peripheral at
+ * 0xE0080000.
+ */
+
+#ifndef RT_C_HELPERS_H
+#define RT_C_HELPERS_H
+
+#include <stdint.h>
+#include <stdio.h>
+
+/* Matches src/platform/sim_control.hpp:32 SimCommand::FAILED. */
+#define SIM_CONTROL_REG (*(volatile uint32_t*) 0xE0080000)
+#define SIM_FAILED 0x01234569u
+
+/* Plugin- / handoff-controller-recognized drain markers (CSR 0x7C0,
+ * uimm 0 = ENTER, uimm 1 = EXIT). Match insn_match.h.
+ *
+ * Each helper exposes a global `_hybrid_{enter,exit}_pc` label co-located
+ * with the csrwi insn. The labels are inert in CSR mode and consumed by
+ * the PC-trigger mode driver (resolved via `nm --defined-only`). Because
+ * each fixture calls each helper exactly once, the labels stay unique. */
+static inline void rt_phase_qemu1_drain(void)
+{
+  __asm__ __volatile__(".globl _hybrid_enter_pc\n"
+                       "_hybrid_enter_pc:\n"
+                       "csrwi 0x7C0, 0\n");
+}
+static inline void rt_phase_vsim_drain(void)
+{
+  __asm__ __volatile__(".globl _hybrid_exit_pc\n"
+                       "_hybrid_exit_pc:\n"
+                       "csrwi 0x7C0, 1\n");
+}
+
+/* Vsim-only failure path: writes SimCommand::FAILED so vsim's
+ * handle_sim_command (sim_control.hpp:188) sets exits=1 and the simulator
+ * loop returns 1 before the handoff fires. The harness sees RC=1 vs
+ * EXPECT_RC=0 and reports a failure. Bypasses QEMU2 entirely. */
+__attribute__((noreturn)) static inline void rt_fail(void)
+{
+  fflush(stdout);
+  SIM_CONTROL_REG = SIM_FAILED;
+  for (;;) {
+  }
+}
+
+/* RISC-V semihosting calls. Only safe in the QEMU2 phase (after
+ * rt_phase_vsim_drain): QEMU is spawned with -semihosting-config
+ * enable=on,target=native (qemu_handback.hpp:131-132) so the magic
+ * slli/ebreak/srai triple is intercepted before reaching mtvec. vsim
+ * does NOT implement semihosting, so executing these inside the vsim
+ * span would route to m_trap_entry -> exception_handler and loop. */
+static inline void rt_semihost_writes(const char* s)
+{
+  register long a0 __asm__("a0") = 0x04; /* SYS_WRITE0 */
+  register long a1 __asm__("a1") = (long) (uintptr_t) s;
+  __asm__ __volatile__(".option push\n"
+                       ".option norvc\n"
+                       "slli x0, x0, 0x1f\n"
+                       "ebreak\n"
+                       "srai x0, x0, 0x7\n"
+                       ".option pop\n"
+                       :
+                       : "r"(a0), "r"(a1)
+                       : "memory");
+}
+
+#endif /* RT_C_HELPERS_H */
