@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Orchestrates the hybrid simulator build: QEMU 9.x + vsim + TCG plugin.
+# Run subcommands individually, or run with no args to build everything.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+QEMU_DIR="$ROOT/hybrid_qemu"
+VSIM_DIR="$ROOT/hybrid_vsim"
+PLUGIN_DIR="$VSIM_DIR/hybrid/qemu_plugin"
+QEMU_BUILD="$QEMU_DIR/build"
+VSIM_BUILD="$VSIM_DIR/build"
+
+JOBS="$(nproc)"
+
+c_step()  { printf '\033[1;34m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
+c_ok()    { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
+c_err()   { printf '\033[1;31m[err]\033[0m %s\n' "$*" >&2; }
+
+require_dir() {
+  if [[ ! -d "$1" ]]; then
+    c_err "missing $1 - did you run \`git submodule update --init --recursive\`?"
+    exit 1
+  fi
+}
+
+build_qemu() {
+  require_dir "$QEMU_DIR"
+  c_step "QEMU: configure (if needed)"
+  if [[ ! -f "$QEMU_BUILD/build.ninja" && ! -f "$QEMU_BUILD/Makefile" ]]; then
+    mkdir -p "$QEMU_BUILD"
+    (cd "$QEMU_BUILD" && ../configure \
+      --target-list=riscv64-softmmu \
+      --enable-plugins \
+      --disable-werror)
+  fi
+  c_step "QEMU: build qemu-system-riscv64"
+  if [[ -f "$QEMU_BUILD/build.ninja" ]]; then
+    ninja -C "$QEMU_BUILD" qemu-system-riscv64
+  else
+    make -C "$QEMU_BUILD" -j"$JOBS" qemu-system-riscv64
+  fi
+  c_ok "QEMU built: $QEMU_BUILD/qemu-system-riscv64"
+}
+
+build_vsim() {
+  require_dir "$VSIM_DIR"
+  c_step "vsim: configure (if needed)"
+  if [[ ! -f "$VSIM_BUILD/CMakeCache.txt" ]]; then
+    cmake -S "$VSIM_DIR" -B "$VSIM_BUILD" -G Ninja \
+      -DVSIM_ENABLE_HYBRID=ON \
+      -DVSIM_QEMU_ROOT="$QEMU_DIR"
+  fi
+  c_step "vsim: build"
+  cmake --build "$VSIM_BUILD" -j"$JOBS"
+  c_ok "vsim built: $VSIM_BUILD/vsim"
+}
+
+build_plugin() {
+  require_dir "$PLUGIN_DIR"
+  c_step "plugin: build libhybrid_handoff.so"
+  make -C "$PLUGIN_DIR" QEMU_ROOT="$QEMU_DIR"
+  c_ok "plugin built: $PLUGIN_DIR/libhybrid_handoff.so"
+}
+
+run_tests() {
+  require_dir "$VSIM_BUILD"
+  c_step "ctest: hybrid-e2e label"
+  (cd "$VSIM_BUILD" && ctest -L hybrid-e2e --output-on-failure)
+}
+
+clean_all() {
+  c_step "clean: remove build artifacts"
+  rm -rf "$QEMU_BUILD" "$VSIM_BUILD"
+  rm -f  "$PLUGIN_DIR/libhybrid_handoff.so"
+  c_ok "cleaned"
+}
+
+usage() {
+  cat <<EOF
+usage: $(basename "$0") [qemu|vsim|plugin|test|clean|all]
+
+  (no args)  same as 'all'
+  qemu       configure + build hybrid_qemu/build/qemu-system-riscv64
+  vsim       configure + build hybrid_vsim/build/vsim (VSIM_ENABLE_HYBRID=ON)
+  plugin     build hybrid_vsim/hybrid/qemu_plugin/libhybrid_handoff.so
+  test       ctest -L hybrid-e2e (in vsim build dir)
+  clean      remove both build dirs and the plugin .so
+  all        qemu, then vsim, then plugin (in this order)
+EOF
+}
+
+cmd="${1:-all}"
+case "$cmd" in
+  qemu)   build_qemu ;;
+  vsim)   build_vsim ;;
+  plugin) build_plugin ;;
+  test)   run_tests ;;
+  clean)  clean_all ;;
+  all)    build_qemu; build_vsim; build_plugin ;;
+  -h|--help|help) usage ;;
+  *)      c_err "unknown command: $cmd"; usage; exit 2 ;;
+esac
