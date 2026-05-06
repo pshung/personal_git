@@ -1,0 +1,82 @@
+// rt_shared_mem.S
+//
+// Tier-2 fixture: cross-simulator memory survival via shared mmap.
+// Unlike Tier-1 fixtures, all three phases see the same backing file via
+// QEMU's `-object memory-backend-file,share=on` and vsim's
+// `--shared-mem-path`. Memory written in Phase A is visible in Phase B; the
+// page Phase B mutates is visible in Phase C.
+//
+// Phase A (QEMU1, shared mmap): fill 4 KB at 0x80010000 with 0xA5A5..A5.
+// Phase B (vsim, same mmap):
+//   1. read back; first mismatch -> exit 50.
+//   2. XOR every word with 0x5A5A..5A in place; result is all-FF.
+// Phase C (QEMU2, same mmap):
+//   1. verify all 4 KB == 0xFF; first mismatch -> exit 51.
+//   2. exit 0 on PASS.
+//
+// Distinct exit codes (50, 51) avoid the silent-pass aliasing that a
+// running mismatch counter would have when (count mod 256) lands on 0.
+
+#include "semihost_exit.inc"
+
+.section .text
+.globl _start
+_start:
+    // Phase A: fill 512 doublewords at 0x80010000 with 0xA5A5...A5.
+    li      t0, 0x80010000
+    li      t3, 0xA5A5A5A5A5A5A5A5
+    li      t1, 512
+1:
+    sd      t3, 0(t0)
+    addi    t0, t0, 8
+    addi    t1, t1, -1
+    bnez    t1, 1b
+
+    csrwi   0x7C0, 0                        // QEMU1 drains, exits
+
+    // Phase B: verify Phase A pattern, XOR with 0x5A...5A in place.
+    li      t0, 0x80010000
+    li      t3, 0xA5A5A5A5A5A5A5A5
+    li      t4, 0x5A5A5A5A5A5A5A5A
+    li      t1, 512
+verify_a:
+    ld      t2, 0(t0)
+    bne     t2, t3, fail_b
+    addi    t0, t0, 8
+    addi    t1, t1, -1
+    bnez    t1, verify_a
+
+    li      t0, 0x80010000
+    li      t1, 512
+xor_loop:
+    ld      t2, 0(t0)
+    xor     t2, t2, t4
+    sd      t2, 0(t0)
+    addi    t0, t0, 8
+    addi    t1, t1, -1
+    bnez    t1, xor_loop
+
+    csrwi   0x7C0, 1                        // vsim drains, exits 200
+
+phase_c:
+    // Phase C: verify all 4 KB == 0xFFFF...FF through the shared mmap.
+    li      t0, 0x80010000
+    li      t5, -1                          // sign-extends to 0xFFFF...FF
+    li      t1, 512
+verify_c:
+    ld      t2, 0(t0)
+    bne     t2, t5, fail_c
+    addi    t0, t0, 8
+    addi    t1, t1, -1
+    bnez    t1, verify_c
+
+    li      a2, 0
+    SEMIHOST_EXIT a2
+
+fail_b:
+    li      a2, 50
+    SEMIHOST_EXIT a2
+
+fail_c:
+    li      a2, 51
+    SEMIHOST_EXIT a2
