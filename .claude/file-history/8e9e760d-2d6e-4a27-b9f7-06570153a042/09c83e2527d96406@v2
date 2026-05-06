@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Negative test: --qemu-binary points at a missing file. Vsim's drain must
+# still fire and the spawn-fail must propagate as exit 127 (the standard
+# exec-failure code), not as a 5 s connect_loopback timeout that masquerades
+# as something else, and not as a hang that ties up CTest.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+
+VSIM_BIN="${VSIM_BIN:-$REPO_ROOT/build/hybrid_vsim/sim_ax45mpv_premium}"
+VSIM_QEMU="${VSIM_QEMU:-$REPO_ROOT/hybrid_qemu/build/qemu-system-riscv64}"
+VSIM_PLUGIN="${VSIM_PLUGIN:-$REPO_ROOT/qemu_plugin/libhybrid_handoff.so}"
+VSIM_ELF="${VSIM_ELF:-$REPO_ROOT/fixtures/handoff_roundtrip.elf}"
+
+for f in "$VSIM_BIN" "$VSIM_QEMU" "$VSIM_PLUGIN" "$VSIM_ELF"; do
+  if [ ! -e "$f" ]; then
+    echo "skip: $f not built"
+    exit 77
+  fi
+done
+
+STATE_QEMU=$(mktemp)
+STATE_VSIM=$(mktemp)
+SIM_LOG=$(mktemp)
+trap 'rm -f "$STATE_QEMU" "$STATE_VSIM" "$SIM_LOG"' EXIT
+
+# Phase A: real QEMU 1 produces a valid entry-state snapshot so vsim has
+# something to resume from and will reach the exit-csrwi drain.
+"$VSIM_QEMU" -M virt -bios none -nographic \
+  -kernel "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_QEMU" >/dev/null 2>&1
+
+if [ ! -s "$STATE_QEMU" ]; then
+  echo "FAIL[rt_no_qemu_binary]: QEMU 1 did not produce state"
+  exit 1
+fi
+
+START=$(date +%s)
+set +e
+timeout 30 "$VSIM_BIN" "$VSIM_ELF" \
+  --resume-from-qemu "$STATE_QEMU" \
+  --handoff-out "$STATE_VSIM" \
+  --qemu-binary /nonexistent/qemu-system-riscv64 >"$SIM_LOG" 2>&1
+RC=$?
+set -e
+ELAPSED=$(($(date +%s) - START))
+
+if [ "$RC" -ne 127 ]; then
+  echo "FAIL[rt_no_qemu_binary]: expected exit 127 (exec failure), got $RC"
+  echo "elapsed=${ELAPSED}s"
+  echo "--- sim log ---"
+  cat "$SIM_LOG"
+  exit 1
+fi
+
+if [ "$ELAPSED" -gt 15 ]; then
+  echo "FAIL[rt_no_qemu_binary]: vsim took ${ELAPSED}s (>15s suggests a hang)"
+  exit 1
+fi
+
+# No zombie left: any leftover child of this shell would show up here.
+if jobs -r | grep -q .; then
+  echo "FAIL[rt_no_qemu_binary]: background jobs still running"
+  exit 1
+fi
+
+echo "[rt_no_qemu_binary] PASS: vsim exit=$RC elapsed=${ELAPSED}s"

@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Tier-2 round-trip e2e: cross-simulator memory survival via shared mmap.
+#
+# QEMU 1, vsim, and QEMU 2 all map the same backing file. Phase A writes a
+# pattern in QEMU 1; Phase B verifies + mutates in vsim; Phase C re-reads
+# in QEMU 2. Memory must survive both handoffs.
+#
+# Required environment:
+#   VSIM_BIN     path to sim_<cpu> binary (host-runnable)
+#   VSIM_QEMU    path to qemu-system-riscv64
+#   VSIM_PLUGIN  path to libhybrid_handoff.so
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+
+FIXTURE=rt_shared_mem
+EXPECT_RC=0
+
+VSIM_BIN="${VSIM_BIN:-$REPO_ROOT/build/hybrid_vsim/sim_ax45mpv_premium}"
+VSIM_QEMU="${VSIM_QEMU:-$REPO_ROOT/hybrid_qemu/build/qemu-system-riscv64}"
+VSIM_PLUGIN="${VSIM_PLUGIN:-$REPO_ROOT/qemu_plugin/libhybrid_handoff.so}"
+VSIM_ELF="${VSIM_ELF:-$REPO_ROOT/fixtures/${FIXTURE}.elf}"
+
+for f in "$VSIM_BIN" "$VSIM_QEMU" "$VSIM_PLUGIN" "$VSIM_ELF"; do
+  if [ ! -e "$f" ]; then
+    echo "skip: $f not built; run './build.sh' from the workspace root"
+    exit 77
+  fi
+done
+
+# 128 MB matches the QEMU virt machine default; vsim must use the same size.
+SHARED_SIZE=$((128 * 1024 * 1024))
+SHARED_MEM=$(mktemp -p /dev/shm vsim-rt-shared.XXXXXX)
+STATE_QEMU=$(mktemp)
+STATE_VSIM=$(mktemp)
+SIM_LOG=$(mktemp)
+trap 'rm -f "$SHARED_MEM" "$STATE_QEMU" "$STATE_VSIM" "$SIM_LOG"' EXIT
+
+truncate -s "$SHARED_SIZE" "$SHARED_MEM"
+
+echo "[$FIXTURE 1/3] QEMU 1 (shared mmap): drain entry state"
+"$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHARED_MEM,size=$SHARED_SIZE" \
+  -machine virt,memory-backend=mem \
+  -bios none -nographic \
+  -kernel "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_QEMU" >/dev/null 2>&1
+
+if [ ! -s "$STATE_QEMU" ]; then
+  echo "FAIL[$FIXTURE]: QEMU 1 did not produce state"
+  exit 1
+fi
+
+echo "[$FIXTURE 2/3] vsim (shared mmap): resume + drain + spawn QEMU 2"
+set +e
+timeout 60 "$VSIM_BIN" "$VSIM_ELF" \
+  --resume-from-qemu "$STATE_QEMU" \
+  --handoff-out "$STATE_VSIM" \
+  --shared-mem-path "$SHARED_MEM" \
+  --shared-mem-size "$SHARED_SIZE" \
+  --qemu-binary "$VSIM_QEMU" >"$SIM_LOG" 2>&1
+RC=$?
+set -e
+
+if [ "$RC" != "$EXPECT_RC" ]; then
+  echo "FAIL[$FIXTURE]: expected exit $EXPECT_RC, got $RC"
+  echo "--- sim log ---"
+  cat "$SIM_LOG"
+  exit 1
+fi
+
+echo "[$FIXTURE 3/3] PASS: round-trip exit code $RC"

@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Negative test: --qemu-binary opens the gdbstub port but never responds to
+# packets. Vsim's gdbstub Session must time out on the read side and exit
+# non-zero promptly, not block forever waiting for an ack that never comes.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+STUB="$SCRIPT_DIR/qemu_silent_stub.py"
+
+VSIM_BIN="${VSIM_BIN:-$REPO_ROOT/build/hybrid_vsim/sim_ax45mpv_premium}"
+VSIM_QEMU="${VSIM_QEMU:-$REPO_ROOT/hybrid_qemu/build/qemu-system-riscv64}"
+VSIM_PLUGIN="${VSIM_PLUGIN:-$REPO_ROOT/qemu_plugin/libhybrid_handoff.so}"
+VSIM_ELF="${VSIM_ELF:-$REPO_ROOT/fixtures/handoff_roundtrip.elf}"
+
+for f in "$VSIM_BIN" "$VSIM_QEMU" "$VSIM_PLUGIN" "$VSIM_ELF" "$STUB"; do
+  if [ ! -e "$f" ]; then
+    echo "skip: $f not built"
+    exit 77
+  fi
+done
+
+STATE_QEMU=$(mktemp)
+STATE_VSIM=$(mktemp)
+SIM_LOG=$(mktemp)
+trap 'rm -f "$STATE_QEMU" "$STATE_VSIM" "$SIM_LOG"' EXIT
+
+# Real QEMU 1 produces a valid entry-state snapshot so vsim reaches the
+# exit-csrwi drain and tries to spawn the (silent) handback peer.
+"$VSIM_QEMU" -M virt -bios none -nographic \
+  -kernel "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_QEMU" >/dev/null 2>&1
+
+if [ ! -s "$STATE_QEMU" ]; then
+  echo "FAIL[rt_gdbstub_timeout]: QEMU 1 did not produce state"
+  exit 1
+fi
+
+START=$(date +%s)
+set +e
+timeout 30 "$VSIM_BIN" "$VSIM_ELF" \
+  --resume-from-qemu "$STATE_QEMU" \
+  --handoff-out "$STATE_VSIM" \
+  --qemu-binary "$STUB" >"$SIM_LOG" 2>&1
+RC=$?
+set -e
+ELAPSED=$(($(date +%s) - START))
+
+if [ "$RC" -eq 0 ] || [ "$RC" -eq 200 ]; then
+  echo "FAIL[rt_gdbstub_timeout]: expected non-zero non-200 exit, got $RC"
+  cat "$SIM_LOG"
+  exit 1
+fi
+
+if [ "$RC" -eq 124 ]; then
+  echo "FAIL[rt_gdbstub_timeout]: bash 30 s timeout fired -> vsim hung"
+  cat "$SIM_LOG"
+  exit 1
+fi
+
+if [ "$ELAPSED" -gt 25 ]; then
+  echo "FAIL[rt_gdbstub_timeout]: elapsed=${ELAPSED}s (>25s suggests hang)"
+  cat "$SIM_LOG"
+  exit 1
+fi
+
+echo "[rt_gdbstub_timeout] PASS: vsim exit=$RC elapsed=${ELAPSED}s"

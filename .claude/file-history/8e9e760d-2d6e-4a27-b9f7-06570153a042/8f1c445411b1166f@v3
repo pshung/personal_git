@@ -1,0 +1,80 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Repository purpose
+
+Workspace for the **Andes hybrid simulator**: QEMU 9.x (functional, MHz) + vsim (SystemC + Verilator, cycle-accurate) sharing memory and architectural state across a magic-CSR boundary. The intent is to run boot/libc/warm-up in QEMU at MHz, then hand off to vsim for the cycle-accurate region of interest (ROI), with optional hand-back to QEMU.
+
+This top-level repo **owns the hybrid co-sim driver itself** (the wire ABI, the QEMU plugin, the bare-metal fixtures, and the e2e harness). Two submodules pinned to branch `hybrid` provide the underlying simulators:
+
+- `hybrid_qemu/` - QEMU 9.x fork; built outside CMake (autotools/meson). The TCG plugin in `qemu_plugin/` links against its headers.
+- `hybrid_vsim/` - vsim source tree, built via the top-level CMake project (`add_subdirectory(hybrid_vsim)` from `CMakeLists.txt`). The vsim-internal hybrid integration adapter lives at `hybrid_vsim/src/hybrid/` and includes the wire-ABI headers from this workspace's `include/hybrid/` via the `HYBRID_DRIVER_DIR` cache variable. The detailed design doc is `hybrid_vsim/hybrid_plan.md` (read this for any non-trivial change to the handoff path).
+
+## Common commands
+
+`build.sh` is the convenience entry point. Internally everything except QEMU goes through the top-level CMake project:
+
+```sh
+./build.sh            # qemu, then full top-level cmake --build (vsim + plugin + fixtures)
+./build.sh qemu       # just QEMU (configure if needed, then ninja qemu-system-riscv64)
+./build.sh vsim       # cmake --build (vsim binaries land under build/hybrid_vsim/)
+./build.sh plugin     # cmake --build hybrid_handoff_plugin
+./build.sh fixtures   # cmake --build hybrid_fixtures
+./build.sh test       # ctest --test-dir build -L hybrid-e2e
+./build.sh clean      # rm -rf hybrid_qemu/build, build/, plugin .so, fixture artifacts
+```
+
+Equivalent direct CMake invocation (after one-time `./build.sh qemu`):
+
+```sh
+cmake -S . -B build -GNinja
+cmake --build build -j$(nproc)
+ctest --test-dir build -L hybrid-e2e --output-on-failure
+```
+
+Run a single e2e fixture: `ctest --test-dir build -R test_e2e_rt_all_gprs --output-on-failure`.
+
+Iterate on fixtures or plugin without re-running cmake: `make -C fixtures` and `make -C qemu_plugin QEMU_ROOT=$PWD/hybrid_qemu`.
+
+## Architecture: how a hybrid run flows
+
+A round-trip exercises three processes sharing a single packed `struct hybrid_state_v1` (defined in `include/hybrid/state_abi.h`, with `static_assert` offsets in `state_abi_check.h`):
+
+1. **QEMU 1** runs with `qemu_plugin/libhybrid_handoff.so` loaded via `-plugin`. The plugin matches `csrrw rd,0x7C0,rs1` (mask `0xfff03073`); on `csrwi 0x7C0, 0` it drains GPR/FP/CSR via `qemu_plugin_read_register()`, writes the ABI struct to `outfile=`, and calls `qemu_plugin_request_exit()`.
+2. **vsim** starts with `--resume-from-qemu <state.bin>`. Resume is driven **in-process** through the existing JTAG/DTM (`hybrid_vsim/src/platform/jtag_dtm.hpp`): halt -> Abstract Commands write x1..x31 + DPC -> `dret`. No DPI shim, no OpenOCD socket. vsim then runs cycle-accurately until a retire of a pre-scanned `csrw 0x7C0, 1` PC fires `CsrTrigger`, drains state again via DM, writes `--handoff-out`, and exits with `EXIT_HANDOFF_TO_QEMU = 200`.
+3. **vsim's main** (on exit-200, when `--qemu-binary` is set) spawns **QEMU 2** with `-gdb -S -semihosting`. `qemu_handback.hpp` connects to the gdbstub, restores GPRs+PC, sends `c`, and the program completes via the RISC-V semihosting `ebreak`-triple.
+
+Memory is **shared, not copied**: when `--shared-mem-path` is given, vsim's `SimpleMemory` is backed by an mmap of `/dev/shm/...` and QEMU is launched with `-object memory-backend-file,share=on,mem-path=...`. To make the file offsets agree, vsim's RAM region is **narrowed** in hybrid mode to `[0x80000000, 0x80000000+N)` (matching QEMU virt's `VIRT_DRAM`) instead of the default `[0x0, 0x8FFFFFFF]`. See `hybrid_plan.md` Section 9 - touching `simple_memory.hpp` / `platform.hpp` / `mmap_backing.hpp` without re-reading that section will likely re-break the offset contract.
+
+Microarchitectural state (TLB, caches, BPU, store buffer) is **discarded** at handoff; the existing `--kanata-loop-skip N` mechanism warms up before recording.
+
+## Critical files (most changes touch these)
+
+Top-level driver assets:
+
+- `include/hybrid/{state_abi.h,state_abi_check.h,insn_match.h,reg_names.h}` - shared wire-ABI; one source of truth for the QEMU plugin and vsim.
+- `qemu_plugin/{hybrid_handoff.c,Makefile}` - QEMU TCG plugin. Standalone Make build; `-I../include` resolves to `include/hybrid/`.
+- `fixtures/*.S` + `handoff*.ld` + `Makefile` - bare-metal RV64 fixtures using the three-phase template (Phase A in QEMU 1 -> `csrwi 0x7C0, 0` -> Phase B in vsim -> `csrwi 0x7C0, 1` -> Phase C in QEMU 2 -> semihosting `SYS_EXIT_EXTENDED`). Pass/fail signal is the QEMU 2 exit code.
+- `tests/{roundtrip_e2e,rt_*}.sh` + `qemu_silent_stub.py` - end-to-end shell drivers that orchestrate QEMU+vsim+QEMU. `REPO_ROOT=$SCRIPT_DIR/..` resolves to this workspace root; defaults look under `build/hybrid_vsim/sim_<cpu>`, `qemu_plugin/libhybrid_handoff.so`, `fixtures/<name>.elf`.
+- `cmake/{HybridPlugin,HybridFixtures,HybridE2E}.cmake` - top-level CTest registrations and `add_custom_target` wrappers around the standalone Makefiles.
+
+Vsim-internal integration (stays in the submodule):
+
+- `hybrid_vsim/src/hybrid/`:
+  - `csr_trigger.hpp` - retire-PC watcher; pre-scans the ELF for `csrw 0x7C0, *` PCs.
+  - `handoff_controller.hpp` - decodes `csrrw` form, dispatches enter (rs1==0) vs runtime-exit (rs1==1).
+  - `state_drain.hpp` / `resume_driver.hpp` - DM Abstract-Command read/write of GPRs+DPC.
+  - `qemu_handback.hpp` - spawns QEMU 2; builds `-object memory-backend-file` argv when `shared_mem_path` is set.
+  - `gdbstub_client.hpp` / `gdbstub_session.hpp` - in-process gdbstub used to push state into QEMU 2.
+  - `resume_from_qemu.hpp`, `state_loader.hpp` - ABI-struct ingest on the vsim side.
+  - `exit_codes.hpp` - `EXIT_HANDOFF_TO_QEMU = 200` and friends.
+- `hybrid_vsim/cmake/HybridConfig.cmake` - registers vsim-linked hybrid unit tests; reads `${HYBRID_DRIVER_DIR}/include` for the wire-ABI include path.
+
+## Conventions specific to this repo
+
+- **Hybrid is baked into vsim's main.cpp** (not gated by `VSIM_ENABLE_HYBRID`). vsim therefore requires `HYBRID_DRIVER_DIR` to be set to a directory containing `include/hybrid/state_abi.h`. The top-level CMake project does this automatically (`add_subdirectory(hybrid_vsim)` forwards `HYBRID_DRIVER_DIR=${CMAKE_SOURCE_DIR}`). Standalone `cmake -S hybrid_vsim ...` invocations need `-DHYBRID_DRIVER_DIR=/path/to/hybrid_sim` explicitly.
+- **Submodules pinned to `hybrid` branch**: never push submodule changes from this superproject without first pushing the corresponding branch in the submodule's own remote.
+- **Three-phase fixture template**: every new `rt_*.S` fixture must encode pass/fail into a GPR before `csrwi 0x7C0, 1`, then verify in Phase C and ship the result through semihosting `SYS_EXIT_EXTENDED`. FP/CSR/V state cannot be used as test channels - they are not yet round-tripped (Phase 5 work).
+- **Hybrid state ABI is versioned**: `state_abi.h` carries magic `'AHYB'` + version; offsets are `static_assert`-checked in `state_abi_check.h`. Any layout change requires bumping the version and updating both the C plugin and C++ loaders in the same commit.
+- **What is intentionally out of scope inside a ROI**: MMIO, lr/sc reservations across handoff, self-modifying code, and `mcycle`/`minstret` continuity. Don't add fallback paths for these without a Phase-5 plan.

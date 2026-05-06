@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Orchestrates the hybrid simulator build: QEMU 9.x + vsim + TCG plugin +
+# fixtures, plus the e2e ctest suite.
+#
+# QEMU is built outside CMake (its own meson/autotools system); everything
+# else is driven through the top-level CMake project rooted here.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+QEMU_DIR="$ROOT/hybrid_qemu"
+QEMU_BUILD="$QEMU_DIR/build"
+BUILD_DIR="$ROOT/build"
+
+JOBS="$(nproc)"
+
+c_step()  { printf '\033[1;34m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
+c_ok()    { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
+c_err()   { printf '\033[1;31m[err]\033[0m %s\n' "$*" >&2; }
+
+require_dir() {
+  if [[ ! -d "$1" ]]; then
+    c_err "missing $1 - did you run \`git submodule update --init --recursive\`?"
+    exit 1
+  fi
+}
+
+build_qemu() {
+  require_dir "$QEMU_DIR"
+  c_step "QEMU: configure (if needed)"
+  if [[ ! -f "$QEMU_BUILD/build.ninja" && ! -f "$QEMU_BUILD/Makefile" ]]; then
+    mkdir -p "$QEMU_BUILD"
+    (cd "$QEMU_BUILD" && ../configure \
+      --target-list=riscv64-softmmu,riscv64-linux-user \
+      --disable-werror \
+      --disable-libnfs)
+  fi
+  c_step "QEMU: build qemu-system-riscv64"
+  if [[ -f "$QEMU_BUILD/build.ninja" ]]; then
+    ninja -C "$QEMU_BUILD" qemu-system-riscv64
+  else
+    make -C "$QEMU_BUILD" -j"$JOBS" qemu-system-riscv64
+  fi
+  c_ok "QEMU built: $QEMU_BUILD/qemu-system-riscv64"
+}
+
+configure_top() {
+  require_dir "$ROOT/hybrid_vsim"
+  if [[ ! -f "$BUILD_DIR/CMakeCache.txt" ]]; then
+    c_step "configure: top-level CMake"
+    cmake -S "$ROOT" -B "$BUILD_DIR" -G Ninja
+  fi
+}
+
+build_vsim() {
+  configure_top
+  c_step "vsim: build (via top-level CMake)"
+  cmake --build "$BUILD_DIR" -j"$JOBS"
+  c_ok "vsim build artifacts under: $BUILD_DIR/hybrid_vsim/"
+}
+
+build_plugin() {
+  configure_top
+  c_step "plugin: build libhybrid_handoff.so"
+  cmake --build "$BUILD_DIR" --target hybrid_handoff_plugin -j"$JOBS"
+  c_ok "plugin built: $ROOT/qemu_plugin/libhybrid_handoff.so"
+}
+
+build_fixtures() {
+  configure_top
+  c_step "fixtures: build RV64 ELFs"
+  cmake --build "$BUILD_DIR" --target hybrid_fixtures -j"$JOBS"
+  c_ok "fixtures built under: $ROOT/fixtures/"
+}
+
+run_tests() {
+  configure_top
+  c_step "ctest: hybrid-e2e label"
+  ctest --test-dir "$BUILD_DIR" -L hybrid-e2e --output-on-failure
+}
+
+clean_all() {
+  c_step "clean: remove build artifacts"
+  rm -rf "$QEMU_BUILD" "$BUILD_DIR"
+  rm -f  "$ROOT/qemu_plugin/libhybrid_handoff.so"
+  make -C "$ROOT/fixtures" clean >/dev/null 2>&1 || true
+  c_ok "cleaned"
+}
+
+usage() {
+  cat <<EOF
+usage: $(basename "$0") [qemu|vsim|plugin|fixtures|test|clean|all]
+
+  (no args)  same as 'all'
+  qemu       configure + build hybrid_qemu/build/qemu-system-riscv64
+  vsim       cmake --build (vsim binaries land under build/hybrid_vsim/)
+  plugin     cmake --build hybrid_handoff_plugin (qemu_plugin/libhybrid_handoff.so)
+  fixtures   cmake --build hybrid_fixtures (fixtures/*.elf via fixtures/Makefile)
+  test       ctest -L hybrid-e2e (top-level build)
+  clean      remove qemu/build, top-level build/, plugin .so, fixture artifacts
+  all        qemu, then full top-level cmake --build (vsim + plugin + fixtures)
+EOF
+}
+
+cmd="${1:-all}"
+case "$cmd" in
+  qemu)     build_qemu ;;
+  vsim)     build_vsim ;;
+  plugin)   build_plugin ;;
+  fixtures) build_fixtures ;;
+  test)     run_tests ;;
+  clean)    clean_all ;;
+  all)      build_qemu; configure_top; cmake --build "$BUILD_DIR" -j"$JOBS" ;;
+  -h|--help|help) usage ;;
+  *)        c_err "unknown command: $cmd"; usage; exit 2 ;;
+esac
