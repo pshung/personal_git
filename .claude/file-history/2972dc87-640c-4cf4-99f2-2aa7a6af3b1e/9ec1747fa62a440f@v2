@@ -1,0 +1,416 @@
+#ifndef SYS_CALL_HPP
+#define SYS_CALL_HPP
+
+#include "picolib.hpp"
+
+#include <fcntl.h>
+#include <spdlog/spdlog.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstdint>
+#include <cstring>
+
+#include <algorithm>
+#include <vector>
+
+// NOTE: this header is #include'd inside the SimControl class body
+// (sim_control.hpp), so the functions here are member functions with implicit
+// `this`. The helpers below are member functions for the same reason -- they
+// reach `data_region`, which is a private SimControl member.
+
+// Convert a guest VA to a host-pointer into data_region.data. Subtracts
+// region.base_address so the index lands at the correct offset whether the
+// region starts at 0x0 (Tier-1, no shared mem) or at 0x80000000 (Tier-2,
+// --shared-mem-base, narrowed RAM). Without this, a guest stack VA like
+// 0x80700000 indexes 2 GiB into the data span, which is in-bounds for the
+// 0x90000000-byte owned buffer but OOB for a 128 MiB shared mmap.
+template<typename T = uint8_t>
+inline T* guest_va_to_host(uint64_t va)
+{
+  const uint64_t off = va - data_region.region.base_address;
+  return reinterpret_cast<T*>(data_region.data.data() + off);
+}
+
+// Newlib's <sys/_default_fcntl.h> uses BSD-derived O_* values that differ
+// from the Linux ABI -- e.g. O_CREAT=0x200 in newlib vs 0x40 in Linux,
+// O_TRUNC=0x400 vs 0x200. Pass-through to host open() with newlib values
+// would clear O_CREAT/O_EXCL and silently accept O_APPEND, so a fopen("w+")
+// for a non-existent file fails with ENOENT. Translate flag-by-flag.
+inline int newlib_to_linux_open_flags(uint64_t newlib_flags)
+{
+  constexpr uint64_t NL_RDONLY  = 0;
+  constexpr uint64_t NL_WRONLY  = 1;
+  constexpr uint64_t NL_RDWR    = 2;
+  constexpr uint64_t NL_APPEND  = 0x0008;
+  constexpr uint64_t NL_CREAT   = 0x0200;
+  constexpr uint64_t NL_TRUNC   = 0x0400;
+  constexpr uint64_t NL_EXCL    = 0x0800;
+  constexpr uint64_t NL_NONBLOCK = 0x4000;
+  constexpr uint64_t NL_NOCTTY  = 0x8000;
+
+  int linux_flags = 0;
+  switch (newlib_flags & 3) {
+    case NL_RDONLY: linux_flags |= O_RDONLY; break;
+    case NL_WRONLY: linux_flags |= O_WRONLY; break;
+    case NL_RDWR:   linux_flags |= O_RDWR;   break;
+  }
+  if (newlib_flags & NL_APPEND)   linux_flags |= O_APPEND;
+  if (newlib_flags & NL_CREAT)    linux_flags |= O_CREAT;
+  if (newlib_flags & NL_TRUNC)    linux_flags |= O_TRUNC;
+  if (newlib_flags & NL_EXCL)     linux_flags |= O_EXCL;
+  if (newlib_flags & NL_NONBLOCK) linux_flags |= O_NONBLOCK;
+  if (newlib_flags & NL_NOCTTY)   linux_flags |= O_NOCTTY;
+  return linux_flags;
+}
+
+uint64_t handle_gettimeofday(uint64_t a0 __attribute__((unused)),
+                             uint64_t a1 __attribute__((unused)),
+                             uint64_t a2 __attribute__((unused)),
+                             uint64_t a3 __attribute__((unused)),
+                             uint64_t a4 __attribute__((unused)),
+                             uint64_t a5 __attribute__((unused)),
+                             uint64_t a6 __attribute__((unused)))
+{
+  struct timeval tv;
+  struct timezone tz;
+  int ret = gettimeofday(&tv, &tz);
+  if (ret == -1) {
+    spdlog::error("sys_call: gettimeofday failed: {}", std::strerror(errno));
+    return -1;
+  }
+
+  void* target_tv = guest_va_to_host<void>(a0);
+
+  if (riscv_xlen == 32) {
+    ((struct timeval_32*) target_tv)->tv_sec = (uint32_t) tv.tv_sec;
+    ((struct timeval_32*) target_tv)->tv_usec = (uint32_t) tv.tv_usec;
+  } else {
+    ((struct timeval_64*) target_tv)->tv_sec = tv.tv_sec;
+    ((struct timeval_64*) target_tv)->tv_usec = tv.tv_usec;
+  }
+
+  return 0;
+};
+
+uint64_t handle_open(uint64_t a0 __attribute__((unused)),
+                     uint64_t a1 __attribute__((unused)),
+                     uint64_t a2 __attribute__((unused)),
+                     uint64_t a3 __attribute__((unused)),
+                     uint64_t a4 __attribute__((unused)),
+                     uint64_t a5 __attribute__((unused)),
+                     uint64_t a6 __attribute__((unused)))
+{
+  const char* name = guest_va_to_host<const char>(a0);
+  const int linux_flags = newlib_to_linux_open_flags(a1);
+  int fd = open(name, linux_flags, a2);
+  if (fd == -1) {
+    spdlog::error("sys_call: open failed: file='{}', flags={:#x} (linux={:#x}),"
+                  " mode={:#o}: {}",
+                  name, a1, linux_flags, a2, std::strerror(errno));
+  }
+  return fd;
+};
+
+uint64_t handle_lseek(uint64_t a0 __attribute__((unused)),
+                      uint64_t a1 __attribute__((unused)),
+                      uint64_t a2 __attribute__((unused)),
+                      uint64_t a3 __attribute__((unused)),
+                      uint64_t a4 __attribute__((unused)),
+                      uint64_t a5 __attribute__((unused)),
+                      uint64_t a6 __attribute__((unused)))
+{
+  off_t ret = lseek(a0, a1, a2);
+  if (ret == -1) {
+    spdlog::error("sys_call: lseek failed: fd={}, offset={}, whence={}: {}", a0,
+                  a1, a2, std::strerror(errno));
+  }
+  return ret;
+};
+
+uint64_t handle_flen(uint64_t a0 __attribute__((unused)),
+                     uint64_t a1 __attribute__((unused)),
+                     uint64_t a2 __attribute__((unused)),
+                     uint64_t a3 __attribute__((unused)),
+                     uint64_t a4 __attribute__((unused)),
+                     uint64_t a5 __attribute__((unused)),
+                     uint64_t a6 __attribute__((unused)))
+{
+  struct stat filestat;
+  int ret = fstat(a0, &filestat);
+  if (ret == -1) {
+    spdlog::error("sys_call: fstat failed: fd={}: {}", a0,
+                  std::strerror(errno));
+    return -1;
+  }
+  return filestat.st_size;
+};
+
+uint64_t handle_read(uint64_t a0 __attribute__((unused)),
+                     uint64_t a1 __attribute__((unused)),
+                     uint64_t a2 __attribute__((unused)),
+                     uint64_t a3 __attribute__((unused)),
+                     uint64_t a4 __attribute__((unused)),
+                     uint64_t a5 __attribute__((unused)),
+                     uint64_t a6 __attribute__((unused)))
+{
+  auto buf = guest_va_to_host<>(a1);
+  ssize_t ret = read(a0, buf, a2);
+  if (ret == -1) {
+    spdlog::error("sys_call: read failed: fd={}, len={}: {}", a0, a2,
+                  std::strerror(errno));
+  }
+  return ret;
+};
+
+uint64_t handle_write(uint64_t a0 __attribute__((unused)),
+                      uint64_t a1 __attribute__((unused)),
+                      uint64_t a2 __attribute__((unused)),
+                      uint64_t a3 __attribute__((unused)),
+                      uint64_t a4 __attribute__((unused)),
+                      uint64_t a5 __attribute__((unused)),
+                      uint64_t a6 __attribute__((unused)))
+{
+  auto data_start = guest_va_to_host<>(a1);
+  std::vector<uint8_t> buf(a2, 0);
+  std::copy(data_start, data_start + a2, buf.begin());
+  ssize_t ret = write(a0, buf.data(), a2);
+  if (ret == -1) {
+    spdlog::error("sys_call: write failed: fd={}, len={}: {}", a0, a2,
+                  std::strerror(errno));
+  }
+  return ret;
+};
+
+uint64_t handle_getcwd(uint64_t a0 __attribute__((unused)),
+                       uint64_t a1 __attribute__((unused)),
+                       uint64_t a2 __attribute__((unused)),
+                       uint64_t a3 __attribute__((unused)),
+                       uint64_t a4 __attribute__((unused)),
+                       uint64_t a5 __attribute__((unused)),
+                       uint64_t a6 __attribute__((unused)))
+{
+  auto data_start = guest_va_to_host<char>(a0);
+  std::vector<char> buf(a1, 0);
+  char* ret = getcwd(buf.data(), a1);
+  if (ret == nullptr) {
+    spdlog::error("sys_call: getcwd failed: size={}: {}", a1,
+                  std::strerror(errno));
+    return (uint64_t) nullptr;
+  }
+  std::copy(buf.begin(), buf.begin() + a1, data_start);
+  return (uint64_t) ret;
+};
+
+uint64_t handle_close(uint64_t a0 __attribute__((unused)),
+                      uint64_t a1 __attribute__((unused)),
+                      uint64_t a2 __attribute__((unused)),
+                      uint64_t a3 __attribute__((unused)),
+                      uint64_t a4 __attribute__((unused)),
+                      uint64_t a5 __attribute__((unused)),
+                      uint64_t a6 __attribute__((unused)))
+{
+  int ret = close(a0);
+  if (ret == -1) {
+    spdlog::error("sys_call: close failed: fd={}: {}", a0,
+                  std::strerror(errno));
+  }
+  return ret;
+};
+
+uint64_t handle_access(uint64_t a0 __attribute__((unused)),
+                       uint64_t a1 __attribute__((unused)),
+                       uint64_t a2 __attribute__((unused)),
+                       uint64_t a3 __attribute__((unused)),
+                       uint64_t a4 __attribute__((unused)),
+                       uint64_t a5 __attribute__((unused)),
+                       uint64_t a6 __attribute__((unused)))
+{
+  const char* data_start = guest_va_to_host<const char>(a0);
+  int ret = access(data_start, a1);
+  if (ret == -1) {
+    spdlog::error("sys_call: access failed: path='{}', mode={}: {}", data_start,
+                  a1, std::strerror(errno));
+  }
+  return ret;
+};
+
+uint64_t handle_faccessat(uint64_t a0 __attribute__((unused)),
+                          uint64_t a1 __attribute__((unused)),
+                          uint64_t a2 __attribute__((unused)),
+                          uint64_t a3 __attribute__((unused)),
+                          uint64_t a4 __attribute__((unused)),
+                          uint64_t a5 __attribute__((unused)),
+                          uint64_t a6 __attribute__((unused)))
+{
+  const char* data_start = guest_va_to_host<const char>(a1);
+  int ret = faccessat(a0, data_start, a2, a3);
+  if (ret == -1) {
+    spdlog::error(
+      "sys_call: faccessat failed: dirfd={}, path='{}', mode={}, flags={}: {}",
+      a0, data_start, a2, a3, std::strerror(errno));
+  }
+  return ret;
+};
+
+// TODO: struct stat need to be handle between different platform
+uint64_t handle_fstat(uint64_t a0 __attribute__((unused)),
+                      uint64_t a1 __attribute__((unused)),
+                      uint64_t a2 __attribute__((unused)),
+                      uint64_t a3 __attribute__((unused)),
+                      uint64_t a4 __attribute__((unused)),
+                      uint64_t a5 __attribute__((unused)),
+                      uint64_t a6 __attribute__((unused)))
+{
+  struct pico_stat* stat = guest_va_to_host<struct pico_stat>(a1);
+  struct stat temp_stat;
+  int ret = fstat(a0, &temp_stat);
+  if (ret == -1) {
+    spdlog::error("sys_call: fstat failed: fd={}: {}", a0,
+                  std::strerror(errno));
+  } else {
+    stat->st_size = temp_stat.st_size;
+    stat->st_mode = temp_stat.st_mode;
+  }
+
+  return ret;
+};
+// TODO: struct stat need to be handle between different platform
+uint64_t handle_fstatat(uint64_t a0 __attribute__((unused)),
+                        uint64_t a1 __attribute__((unused)),
+                        uint64_t a2 __attribute__((unused)),
+                        uint64_t a3 __attribute__((unused)),
+                        uint64_t a4 __attribute__((unused)),
+                        uint64_t a5 __attribute__((unused)),
+                        uint64_t a6 __attribute__((unused)))
+{
+  const char* filename = guest_va_to_host<const char>(a1);
+  struct pico_stat* stat = guest_va_to_host<struct pico_stat>(a2);
+  struct stat temp_stat;
+  int ret = fstatat(a0, filename, &temp_stat, a3);
+  if (ret == -1) {
+    spdlog::error("sys_call: fstatat failed: dirfd={}, path='{}', flags={}: {}",
+                  a0, filename, a3, std::strerror(errno));
+  } else {
+    stat->st_size = temp_stat.st_size;
+    stat->st_mode = temp_stat.st_mode;
+  }
+  return ret;
+};
+
+uint64_t handle_link(uint64_t a0 __attribute__((unused)),
+                     uint64_t a1 __attribute__((unused)),
+                     uint64_t a2 __attribute__((unused)),
+                     uint64_t a3 __attribute__((unused)),
+                     uint64_t a4 __attribute__((unused)),
+                     uint64_t a5 __attribute__((unused)),
+                     uint64_t a6 __attribute__((unused)))
+{
+  const char* old_name = guest_va_to_host<const char>(a0);
+  const char* new_name = guest_va_to_host<const char>(a1);
+  int ret = link(old_name, new_name);
+  if (ret == -1) {
+    spdlog::error("sys_call: link failed: oldpath='{}', newpath='{}': {}",
+                  old_name, new_name, std::strerror(errno));
+  }
+  return ret;
+}
+uint64_t handle_lstat(uint64_t a0 __attribute__((unused)),
+                      uint64_t a1 __attribute__((unused)),
+                      uint64_t a2 __attribute__((unused)),
+                      uint64_t a3 __attribute__((unused)),
+                      uint64_t a4 __attribute__((unused)),
+                      uint64_t a5 __attribute__((unused)),
+                      uint64_t a6 __attribute__((unused)))
+{
+  const char* filename = guest_va_to_host<const char>(a0);
+  struct pico_stat* stat = guest_va_to_host<struct pico_stat>(a1);
+  struct stat temp_stat;
+  int ret = lstat(filename, &temp_stat);
+  if (ret == -1) {
+    spdlog::error("sys_call: lstat failed: path='{}': {}", filename,
+                  std::strerror(errno));
+  } else {
+    stat->st_size = temp_stat.st_size;
+    stat->st_mode = temp_stat.st_mode;
+  }
+  return ret;
+};
+
+// TODO: struct stat need to be handle between different platform
+uint64_t handle_stat(uint64_t a0 __attribute__((unused)),
+                     uint64_t a1 __attribute__((unused)),
+                     uint64_t a2 __attribute__((unused)),
+                     uint64_t a3 __attribute__((unused)),
+                     uint64_t a4 __attribute__((unused)),
+                     uint64_t a5 __attribute__((unused)),
+                     uint64_t a6 __attribute__((unused)))
+{
+  const char* filename = guest_va_to_host<const char>(a0);
+  struct pico_stat* target_stat = guest_va_to_host<struct pico_stat>(a1);
+  struct stat temp_stat;
+  int ret = stat(filename, &temp_stat);
+  if (ret == -1) {
+    spdlog::error("sys_call: stat failed: path='{}': {}", filename,
+                  std::strerror(errno));
+  } else {
+    target_stat->st_size = temp_stat.st_size;
+    target_stat->st_mode = temp_stat.st_mode;
+  }
+  return ret;
+};
+uint64_t handle_openat(uint64_t a0 __attribute__((unused)),
+                       uint64_t a1 __attribute__((unused)),
+                       uint64_t a2 __attribute__((unused)),
+                       uint64_t a3 __attribute__((unused)),
+                       uint64_t a4 __attribute__((unused)),
+                       uint64_t a5 __attribute__((unused)),
+                       uint64_t a6 __attribute__((unused)))
+{
+  const char* name = guest_va_to_host<const char>(a1);
+  const int linux_flags = newlib_to_linux_open_flags(a2);
+  int fd = openat(a0, name, linux_flags);
+  if (fd == -1) {
+    spdlog::error("sys_call: openat failed: dirfd={}, path='{}', flags={:#x}"
+                  " (linux={:#x}): {}",
+                  a0, name, a2, linux_flags, std::strerror(errno));
+  }
+  return fd;
+};
+uint64_t handle_rename(uint64_t a0 __attribute__((unused)),
+                       uint64_t a1 __attribute__((unused)),
+                       uint64_t a2 __attribute__((unused)),
+                       uint64_t a3 __attribute__((unused)),
+                       uint64_t a4 __attribute__((unused)),
+                       uint64_t a5 __attribute__((unused)),
+                       uint64_t a6 __attribute__((unused)))
+{
+  const char* old_name = guest_va_to_host<const char>(a0);
+  const char* new_name = guest_va_to_host<const char>(a1);
+  int ret = rename(old_name, new_name);
+  if (ret == -1) {
+    spdlog::error("sys_call: rename failed: oldpath='{}', newpath='{}': {}",
+                  old_name, new_name, std::strerror(errno));
+  }
+  return ret;
+}
+
+uint64_t handle_unlink(uint64_t a0 __attribute__((unused)),
+                       uint64_t a1 __attribute__((unused)),
+                       uint64_t a2 __attribute__((unused)),
+                       uint64_t a3 __attribute__((unused)),
+                       uint64_t a4 __attribute__((unused)),
+                       uint64_t a5 __attribute__((unused)),
+                       uint64_t a6 __attribute__((unused)))
+{
+  const char* file_name = guest_va_to_host<const char>(a0);
+  int ret = unlink(file_name);
+  if (ret == -1) {
+    spdlog::error("sys_call: unlink failed: path='{}': {}", file_name,
+                  std::strerror(errno));
+  }
+  return ret;
+}
+#endif // SYS_CALL_HPP
