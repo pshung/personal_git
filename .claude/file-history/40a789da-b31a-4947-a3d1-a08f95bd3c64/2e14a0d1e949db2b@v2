@@ -1,0 +1,102 @@
+// Program Buffer execution helpers for the RISC-V Debug Module.
+//
+// Follows the same duck-typed template pattern as dmi_poll.hpp so that
+// resume_driver.hpp can include this header without a circular dependency.
+// Bus type requirement: write(uint8_t reg, uint32_t val) and
+//                       read(uint8_t reg) -> uint32_t.
+//
+// Debug Spec references: section 3.6 (Program Buffer), table 3.1 (DMI),
+// section 3.7.1.3 (Abstract Command - Access Register).
+
+#pragma once
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/dmi_poll.hpp"
+
+#include <cstdint>
+#include <span>
+#include <stdexcept>
+#include <string>
+
+namespace hybrid {
+
+// DMI address of the first Program Buffer register (progbuf0..progbuf15).
+inline constexpr uint8_t kProgbuf0 = 0x20u;
+
+// Max payload instructions: 16 total slots minus 1 reserved for the
+// mandatory ebreak that terminates execution.
+inline constexpr std::size_t kProgbufMaxInsns = 15u;
+
+// Standard ebreak encoding (funct12=1, opcode=SYSTEM).
+inline constexpr uint32_t kEbreak = 0x00100073u;
+
+// "Execute Program Buffer only" command (Debug Spec table 3.1):
+//   cmdtype  = 0 (Access Register)
+//   aarsize  = Bits64 (3) - ignored by DM when transfer=0, set for consistency
+//   postexec = 1 (bit 18)
+//   transfer = 0 (bit 17 NOT set) - skip register I/O, only run progbuf
+//   write    = 0 (irrelevant when transfer=0)
+//   regno    = 0 (irrelevant when transfer=0)
+inline constexpr uint32_t kExecProgbufCmd =
+    (uint32_t(AarSize::Bits64) & 0x7u) << 20 | (1u << 18);
+
+// Encode `vsetvl rd, rs1, rs2` (RVV 1.0 section 6.2, funct7=1000000).
+// Tier-B restore: stage vl in rs1 and vtype in rs2 via Abstract Commands,
+// then branch-free-restore both in one Program Buffer execution.
+inline constexpr uint32_t encode_vsetvl(uint8_t rd, uint8_t rs1, uint8_t rs2)
+{
+    return (0b1000000u << 25)
+         | ((uint32_t(rs2) & 0x1Fu) << 20)
+         | ((uint32_t(rs1) & 0x1Fu) << 15)
+         | (0b111u << 12)
+         | ((uint32_t(rd)  & 0x1Fu) << 7)
+         | 0x57u;  // OP-V opcode
+}
+
+// Encode `csrrw rd, csr, rs1` (SYSTEM opcode, funct3=001).
+// Tier-A PB fallback: stage the CSR value in rs1 via Abstract Command,
+// then write it to a CSR that the DM cannot reach via abstract access.
+inline constexpr uint32_t encode_csrrw(uint8_t rd, uint16_t csr, uint8_t rs1)
+{
+    return ((uint32_t(csr) & 0xFFFu) << 20)
+         | ((uint32_t(rs1) & 0x1Fu) << 15)
+         | (0b001u << 12)
+         | ((uint32_t(rd)  & 0x1Fu) << 7)
+         | 0x73u;  // SYSTEM opcode
+}
+
+// Write insns[0..n-1] to progbuf0..n-1 and kEbreak to progbuf[n].
+// Clears any sticky abstractcs.cmderr (W1C), issues kExecProgbufCmd, polls
+// until abstractcs.busy clears, then returns whether cmderr stayed clear.
+//
+// Returns true on success; false if the DM set cmderr during execution.
+// Throws std::runtime_error if insns.size() > kProgbufMaxInsns or poll
+// times out.
+template<typename Bus>
+inline bool exec_progbuf(Bus& bus, std::span<const uint32_t> insns)
+{
+    constexpr uint8_t  kAbstractcs   = 0x16u;
+    constexpr uint8_t  kCommand      = 0x17u;
+    constexpr uint32_t kBusy         = 1u << 12;
+    constexpr uint32_t kCmderrMask   = 0x7u << 8;
+
+    if (insns.size() > kProgbufMaxInsns)
+        throw std::runtime_error(
+            "exec_progbuf: too many instructions ("
+            + std::to_string(insns.size()) + " > "
+            + std::to_string(kProgbufMaxInsns) + ")");
+
+    for (std::size_t i = 0; i < insns.size(); ++i)
+        bus.write(static_cast<uint8_t>(kProgbuf0 + i), insns[i]);
+    bus.write(static_cast<uint8_t>(kProgbuf0 + insns.size()), kEbreak);
+
+    if ((bus.read(kAbstractcs) & kCmderrMask) != 0u)
+        bus.write(kAbstractcs, kCmderrMask);
+
+    bus.write(kCommand, kExecProgbufCmd);
+    poll_until_clear(bus, kAbstractcs, kBusy, "exec_progbuf busy");
+
+    return (bus.read(kAbstractcs) & kCmderrMask) == 0u;
+}
+
+}  // namespace hybrid
