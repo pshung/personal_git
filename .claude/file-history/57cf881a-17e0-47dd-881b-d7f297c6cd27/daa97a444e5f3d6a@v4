@@ -1,0 +1,273 @@
+# How the Hybrid Simulator Works
+
+A friendly tour for engineers new to this codebase.
+
+## The Problem in One Paragraph
+
+A pure RTL simulator (`vsim`, built on Verilator + SystemC) is **cycle-accurate**: it tells you exactly how many cycles every instruction takes inside the CPU pipeline. The price is speed: it runs at ~5-9 KHz. Booting Linux, running libc init, and warming up before reaching the actual code you care about can take hours. Meanwhile, QEMU runs the same program **functionally** at MHz speed, but it has no notion of pipeline cycles.
+
+The hybrid simulator combines them: run the boring parts in QEMU, switch to vsim for the small region of interest (ROI) you actually want to measure, and (optionally) hand back to QEMU to finish.
+
+## High-Level Concept
+
+Five big ideas make this possible:
+
+1. **Memory is shared, not copied.** Both simulators `mmap` the same backing file (`/dev/shm/...`) as their RAM. When QEMU writes a byte at `0x80001000`, vsim sees it instantly, and vice versa. RAM size becomes irrelevant.
+
+2. **All architectural state fits in one packed struct.** GPRs, FPRs, M-mode CSRs (mstatus, mepc, mtvec, ...), PMP (16 cfg + 64 addr), V scalar CSRs (vtype, vl, vstart, vxsat, vxrm, vcsr, vlenb), and the full V regfile (`v0..v31`, up to 2 KB) all live in `struct hybrid_state_v1` (`include/hybrid/state_abi.h`). That struct is the wire contract every component agrees on.
+
+3. **vsim only refreshes what the ROI can mutate.** vsim restores into the hart only what it needs to run (GPRs + PC + V state); on the way out it drains back only what could have changed (GPRs + PC + V state). Everything else (FP, M-mode CSRs, PMP, V regfile bytes when the ROI doesn't touch them) **passes through unchanged** from the QEMU 1 snapshot to the QEMU 2 restore. This skips ~85+ DMI transactions per handoff.
+
+4. **The trigger is a magic CSR write or a PC match.** `csrwi 0x7C0, 0` enters vsim; `csrwi 0x7C0, 1` exits it. CSR `0x7C0` is in the user-defined range. A third form, `csrrw rd, 0x7C0, rs1`, decides at runtime based on `rs1`'s value (1 = exit). PC-trigger mode skips the magic CSR entirely - the orchestrator names entry/exit PCs on the CLI.
+
+5. **Microarchitectural state is thrown away.** Caches, TLB, branch predictor, store buffer - none of it transfers. We accept cold caches at handoff and rely on a "warm-up window" before recording.
+
+## State Categories and Their Transport
+
+The wire struct is uniform; transport per category depends on what QEMU's plugin API and the AX45MPV Debug Module are willing to expose.
+
+| Category                                          | QEMU 1 -> snapshot   | snapshot -> vsim hart                                | vsim hart -> snapshot                       | snapshot -> QEMU 2 |
+|---------------------------------------------------|----------------------|------------------------------------------------------|---------------------------------------------|--------------------|
+| GPRs `x1..x31`, PC                                | TCG plugin reads     | DM Abstract Commands (DPC for PC)                    | DM Abstract Commands (fresh read)           | gdbstub `G` packet |
+| `mtvec`                                           | TCG plugin           | DM Abstract Command                                  | passthrough (not re-read)                   | gdbstub `P`        |
+| Other M-mode CSRs (`mstatus`, `mepc`, `mscratch`, `medeleg`, `mideleg`, `mip`, `mie`, `mcycle`, `minstret`, `mcause`, `mtval`, `satp`) | TCG plugin | passthrough (not written)                            | passthrough                                 | gdbstub `P` (per `kCsrByName`) |
+| FPRs `f0..f31`                                    | TCG plugin           | passthrough                                          | passthrough                                 | gdbstub `P` (per `hybrid_fpr_names`) |
+| PMP (16 cfg + 64 addr)                            | TCG plugin           | passthrough                                          | passthrough                                 | gdbstub `P` (each slot) |
+| V scalar CSRs - `vtype`, `vl`                     | TCG plugin           | DM Program Buffer running `vsetvl x0, x5, x6`        | DM Abstract Command (fresh read)            | gdbstub `P`        |
+| V scalar CSRs - `vstart`, `vxsat`, `vxrm`, `vcsr`, `mstatus.VS` | TCG plugin | DM Abstract Command, **with Program-Buffer fallback** if the DM rejects | DM Abstract Command (fresh read)            | gdbstub `P`        |
+| V regfile `v0..v31` (up to 2 KB)                  | TCG plugin           | shared-mmap scratch region (`hybrid::kVScratchGpa = 0x80FF0000`); fixture executes `vle8.v` to load | fixture executes `vse8.v` back to scratch; vsim memcpys those bytes into `state.vreg[]` | gdbstub `P` (per V-reg index) |
+| `vlenb`                                           | TCG plugin           | not restored (read-only, fixed by NDS_VLEN)          | passthrough (verified, not re-read)         | not sent           |
+| Guest memory                                      | -- (in shared mmap)  | -- (in shared mmap)                                  | -- (in shared mmap)                         | -- (in shared mmap) |
+
+"Passthrough" means: vsim copies the field from the inbound snapshot into the outbound snapshot unchanged. The hart never sees it; the field rides from QEMU 1 directly to QEMU 2.
+
+## Trigger Modes
+
+Two ways to delimit the ROI; pick at runtime via `TRIGGER_MODE=csr|pc`.
+
+| Mode | Entry into vsim                                | Exit out of vsim                              | Source of truth |
+|------|------------------------------------------------|-----------------------------------------------|-----------------|
+| CSR  | `csrwi 0x7C0, 0` (or `csrrw rd, 0x7C0, rs1` with `rs1==0`) | `csrwi 0x7C0, 1` (or `csrrw rd, 0x7C0, rs1` with `rs1==1`) | the binary itself |
+| PC   | plugin arg `enter_pc=0x...` (no insn match)    | vsim CLI `--hybrid-exit-pc 0x...` (synthetic hit added via `CsrTrigger::add_pc_hit`) | the orchestrator/CLI; binary is unchanged |
+
+Three handoff kinds (`hybrid_handoff_kind` in `include/hybrid/insn_match.h`):
+
+- `HYBRID_HANDOFF_ENTER` - QEMU drains and exits; vsim ignores at retire.
+- `HYBRID_HANDOFF_EXIT`  - vsim drains and exits; QEMU does not encounter this PC.
+- `HYBRID_HANDOFF_RUNTIME` - vsim decodes `rs1` from the matched insn, reads its current GPR value, fires only when it equals 1. Lets a single binary parameterize entry vs exit at runtime.
+
+## Design Rationale
+
+**One packed struct is the wire format.** Three components in three languages (QEMU plugin in C, vsim in C++, gdbstub-translation layer in C++) need to agree byte-for-byte on what state means. A C struct in a shared header (`include/hybrid/state_abi.h`) is the simplest contract that compiles into all three. Versioning is via `magic` + `version`, with `reserved` bytes for forward growth (vxsat/vxrm/vcsr were added by consuming `reserved` rather than bumping to v2).
+
+**QEMU 1 -> vsim is file-based, vsim -> QEMU 2 is gdbstub-based.** QEMU mainline is used **as-is** (no patches, no fork). It exposes two relevant extension points: the TCG plugin API can *read* state during execution, and gdbstub `-S` can *write* state before the first fetch. Plugins cannot inject state at startup, and there is no `--load-state-from-file` flag. Each direction picks the only working primitive: the plugin drains to a file out of QEMU 1, and gdbstub `G`/`P` packets seed QEMU 2. The vsim side translates between the file and the RSP packets - QEMU never has to know about `hybrid_state_v1`.
+
+**Passthrough is the largest performance lever.** A naive design would round-trip every field of `hybrid_state_v1` through DM Abstract Commands - hundreds of DMI transactions. Instead, `HandoffController::set_passthrough_input(snapshot)` keeps QEMU 1's drained state in vsim memory; when the exit trigger fires, `StateDrain::drain_with_passthrough(snapshot)` re-reads only x1..x31 + PC + (when V) the six V CSRs via DM, and merges those over the snapshot. Everything the ROI is *not allowed* to touch (FPRs, M-mode CSRs except mtvec, PMP) flows from QEMU 1 straight into the QEMU 2 gdbstub restore. ROI-mutates-FP would silently lose those changes - that's an explicit, documented limitation, not an oversight.
+
+**The Debug Module handles most ISA registers; `vtype`/`vl` need the Program Buffer.** GPRs, FPRs, and ordinary CSRs all have abstract-command slots in the AX45MPV DM - one DMI transaction each. `vtype` is the exception: the V spec marks it read-only via direct CSR write because writing it sets the `vill` flag and invalidates the vector unit. The only legal restore for `vtype` + `vl` together is the `vsetvl` instruction, which has to *execute on the hart*. The Program Buffer is exactly that slot: stage `vl` and `vtype` in scratch GPRs (x5/x6), then execute `vsetvl x0, x5, x6` in the PB. The GPR loop afterwards overwrites x5/x6, so no leakage.
+
+**Tier-A V CSRs use Abstract-first with a Program-Buffer fallback.** `vstart`, `vxsat`, `vxrm`, `vcsr`, and `mstatus.VS` are spec-compliant to direct CSR write, but the AX45MPV DM may reject the abstract path on a given build. `ResumeDriver::write_csr_abstract_or_pb` tries Abstract first, checks `abstractcs.cmderr`, and on failure clears the sticky error and falls back to a one-instruction PB sequence (`csrrw x0, csr, x5`). The fallback is silent and per-CSR, so a partially-implemented DM does not block the rest of the restore.
+
+**The V regfile rides shared mmap, not the Debug Module.** The RISC-V Debug Spec does not allocate abstract-command slots for `v0..v31`; it leaves V to optional Program Buffer or DPI extensions, and the AX45MPV wrapper does not implement either. Pushing 32 x 64-byte regs through the Program Buffer one element at a time would be both slow and intricate. Since both simulators already share an mmap, we reuse it: vsim copies `state.vreg[]` into a fixed scratch region before `dret`, and the fixture's vsim-phase prologue issues `vle8.v` from that region to load the real V regfile. Drain mirrors: the fixture's epilogue issues `vse8.v` to scratch, and the simulator wrapper reads those bytes back into `state.vreg[]` after `StateDrain` returns. The fixture is aware of the contract; the V regfile reuses the mmap that already exists for general memory.
+
+**Missing-register tolerance is part of the contract.** A given QEMU build may not advertise every PMP slot, and the DM may not implement every CSR. `apply_state` in `qemu_handback.hpp` silently skips any name not in the discovered RegMap (`try_write_named`); `StateDrain::read_64bit_register` returns 0 and clears `cmderr` when the DM rejects. Failing closed would block bring-up on every QEMU/RTL revision; failing soft keeps the happy path moving and surfaces real bugs at the fixture level.
+
+## Architecture Flowchart
+
+```mermaid
+flowchart LR
+    subgraph DISK["Shared backing files"]
+        SHM[("/dev/shm RAM<br/>(mmap shared)<br/>+ V scratch<br/>at 0x80FF0000")]
+        STATE_Q["state_qemu.bin<br/>hybrid_state_v1"]
+        STATE_V["state_vsim.bin<br/>hybrid_state_v1"]
+    end
+
+    subgraph QEMU1["QEMU 1 (functional, MHz)"]
+        Q1_TCG["TCG insn loop"]
+        Q1_PLUGIN["hybrid_handoff.so<br/>CSR mode: csrwi 0x7C0,0<br/>PC mode: enter_pc=0x..."]
+        Q1_TCG --> Q1_PLUGIN
+    end
+
+    subgraph VSIM["vsim (cycle-accurate, KHz)"]
+        V_PIPE["RTL pipeline<br/>(Verilator + SystemC)"]
+        V_DM["JTAG DM driver (in-process)<br/>Abstract Cmds + Program Buffer"]
+        V_TRIG["CsrTrigger<br/>CSR mode: csrwi 0x7C0,1 (or runtime form)<br/>PC mode: --hybrid-exit-pc"]
+        V_CTRL["HandoffController<br/>passthrough(snapshot) +<br/>fresh GPR/PC/V-CSR drain"]
+        V_DM -.GPR/FPR/CSR + vsetvl.-> V_PIPE
+        V_PIPE -.retire signals.-> V_TRIG
+        V_TRIG --> V_CTRL
+        V_CTRL --> V_DM
+    end
+
+    subgraph QEMU2["QEMU 2 (functional, MHz)"]
+        Q2_GDB["gdbstub -gdb tcp::PORT -S"]
+        Q2_TCG["TCG insn loop"]
+        Q2_GDB -.G + per-name P packets.-> Q2_TCG
+    end
+
+    Q1_PLUGIN -- "drain ALL state" --> STATE_Q
+    Q1_PLUGIN -- "qemu_plugin_request_exit" --> VSIM
+    STATE_Q -- "--resume-from-qemu (passthrough seed)" --> V_CTRL
+    STATE_Q -- "ResumeDriver: GPR/PC/mtvec/V" --> V_DM
+    V_DM -.stage V regs.-> SHM
+    SHM -.drain V regs.-> V_DM
+
+    V_CTRL -- "merge fresh + passthrough" --> STATE_V
+    V_TRIG -- "exit code 200" --> QEMU2
+    STATE_V -- "RSP G + P packets" --> Q2_GDB
+
+    Q1_TCG <-->|"every load/store"| SHM
+    V_PIPE <-->|"every load/store"| SHM
+    Q2_TCG <-->|"every load/store"| SHM
+```
+
+## Walk-Through: `rt_c_v_regs` E2E Test
+
+The canonical demo: it exercises **memory** transport (via shared mmap), **GPR / scalar CSR** transport (via the state file + DM Abstract Commands), and **V regfile** transport (via the V-scratch trick) all in one round-trip.
+
+Source: `hybrid_vsim/hybrid/test/rt_c_v_regs.c`. Two memory regions live in the shared mmap:
+
+- `SEED` at `0x80100000` - 16 int32 elements, the input pattern.
+- `V_SCRATCH` at `0x80FF0000` - 2 KB region, the V regfile transport channel.
+
+### What each phase does
+
+```
+Phase 1 (QEMU 1)              Phase 2 (vsim)                          Phase 3 (QEMU 2)
+-----------------             ---------------------------------       --------------------
+seed[0..15] = pattern         vle32.v v8..v15, (seed)                 vse32.v v8..v15, (out)
+csrwi 0x7C0, 0                vadd.vi v9, v9, +100                    verify out matches
+                              vse8.v  v0..v31, (V_SCRATCH)            seed (with v9 +100)
+                              csrwi 0x7C0, 1                          SEMIHOST_EXIT 0
+```
+
+### State that crosses each handoff
+
+| Boundary           | Memory                                                       | Fresh-read in vsim             | Passthrough through vsim                                | Fixture-mediated (mmap scratch) |
+|--------------------|--------------------------------------------------------------|--------------------------------|---------------------------------------------------------|---------------------------------|
+| QEMU 1 -> vsim     | `SEED` already in shared mmap; vsim sees it instantly         | (nothing yet)                  | Snapshot held by HandoffController; mtvec written by ResumeDriver | `state.vreg[]` (zero) staged into V_SCRATCH |
+| in vsim            | `vle32` reads SEED; `vse8` writes V regs to V_SCRATCH         | --                             | --                                                      | --                              |
+| vsim -> QEMU 2     | `SEED` unchanged                                             | x1..x31, PC, 6 V CSRs (DM)     | FP, M-mode CSRs (except mtvec written above), PMP, vlenb (all from QEMU 1) | `read_v_from_scratch` -> `state.vreg[]` -> gdbstub `P` per V-reg |
+
+### What each step proves
+
+| Step                                         | What it tests                                                                                                                                                |
+|----------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Phase 1 fills `SEED` via int32 stores        | QEMU 1's RAM backend is the shared file (not a private anonymous mapping).                                                                                    |
+| `vle32.v v8..v15, (seed)` runs in vsim       | **Memory written in QEMU survives into vsim**, AND `mstatus.VS` + `vtype/vl` were correctly re-applied by ResumeDriver (otherwise `vsetvli` would have trapped). |
+| Phase 3 `vse32.v` + verify pass              | **V regfile written in vsim survives into QEMU 2.** The `V_SCRATCH` -> `read_v_from_scratch` -> `state.vreg[]` -> gdbstub `P` chain works. `v9 == seed + 100` confirms the *mutated* value, not zero-init or stale snapshot. |
+| Final exit code 0                            | Full round-trip succeeded: shared memory, fresh GPRs, fresh V CSRs, V regfile, and passthrough fields all delivered intact to QEMU 2.                         |
+
+A sibling fixture, `rt_c_v_csrs.c`, exercises the V *scalar* CSR survival in isolation (vtype, vl, vstart, vxsat, vxrm, vcsr) using the same three-phase shape but no V regfile traffic.
+
+## Linking a Fixture That Runs on Both QEMU and vsim
+
+The same ELF executes in QEMU 1, vsim, then QEMU 2. Each simulator advertises a different set of host-call peripherals, so the C runtime has to be split into pieces that work in the right phase. Source for everything below: `hybrid_vsim/hybrid/test/runtime/`.
+
+### Three flavors of fixture
+
+| Tier         | Examples                                       | Linker script                | Toolchain flags                                     | Newlib? |
+|--------------|------------------------------------------------|------------------------------|-----------------------------------------------------|---------|
+| Pure asm     | `handoff_roundtrip`, `rt_all_gprs`, `rt_csr_survival` | `handoff_roundtrip.ld`        | `-march=rv64gc -nostdlib -static`                   | no      |
+| C-level      | `rt_c_hello`, `rt_c_matmul`, `rt_c_file_io`    | `runtime/rt_c.ld`            | `-march=rv64gc -nostartfiles -static`               | yes     |
+| C-level + V  | `rt_c_v_regs`, `rt_c_v_csrs`                   | `runtime/rt_c.ld`            | `-march=rv64gcv -nostartfiles -static`              | yes     |
+
+C-level fixtures link `runtime/{crt0.S, trap.S, libgloss.c, handler.c}` ahead of the `.c` file. Asm fixtures skip the runtime entirely and inline the semihosting-exit triple via `semihost_exit.inc`.
+
+### Memory layout (`runtime/rt_c.ld`)
+
+All fixtures load at `0x80000000` - QEMU virt's RAM base, also inside vsim's RAM region (`0x0..0x8FFFFFFF`).
+
+```
+0x80000000  .text         (entry _start; .text.init ordered first)
+            .rodata
+            .data
+            _edata
+            .bss          (zeroed by crt0)
+            _end          (heap base used by _sbrk)
+   ...
+0x80700000  _stack        (sp initialized here in crt0; PROVIDE'd, override
+                           with -Wl,--defsym,_stack=...)
+0x80FF0000  V_SCRATCH     (kVScratchGpa - 2 KB reserved for V regfile transport)
+0x88000000  end of QEMU virt's default 128 MB RAM
+```
+
+The 9 MB gap between `_stack` and `V_SCRATCH` keeps the V scratch region above any plausible stack use.
+
+### `runtime/crt0.S` - the C entry point
+
+Lands at `0x80000000` (`.text.init` orders first inside the wildcard match) and:
+
+1. Enables icache + dcache via `mcache_ctl`.
+2. Sets `sp` from the linker's `_stack`, `gp` from `__global_pointer$`.
+3. **Sets `mstatus.FS=Initial` and `mstatus.VS=Initial`** so FP and V instructions don't trap. Critical for V fixtures: `mstatus.VS=Off` would make `vsetvli` raise illegal-insn the moment the binary's first V instruction runs in vsim.
+4. Enables unaligned access via `mmisc_ctl.UNA` (Andes bit).
+5. Parks any non-zero hart at a poll loop (single-hart fixtures).
+6. Clears `.bss` between `_edata` and `_end`.
+7. Calls `init_mtvec` (in `handler.c`) - registers `m_trap_entry` as the trap vector and seeds the syscall table.
+8. `call main; call _exit`.
+
+### `runtime/trap.S` + `runtime/handler.c` - the trap path
+
+`m_trap_entry` (in `trap.S`) is a flat M-mode prologue that saves x1, x3..x31, `mepc`, `mstatus`, `mxstatus` onto the stack, then tail-calls `handle_trap(mcause, sp)`. `handle_trap` dispatches:
+
+- `mcause == 0xb` (machine ECALL) -> `handle_syscall`, which routes through `syscall_table[a7]` to a libgloss stub, returns into `a0`, and bumps `mepc += 4`.
+- Anything else -> `exception_handler`, which logs `mcause/mdcause/mepc/mtval` and calls `_exit(mcause)`.
+
+The epilogue restores everything and `mret`s. No priv-mode change; the entire fixture runs in M-mode.
+
+### `runtime/libgloss.c` - HTIF and semihosting side-by-side
+
+Two host-call channels live in the same file because each only works on one of the two simulators:
+
+| Newlib stub                   | Backend                                                              | Where it works |
+|-------------------------------|----------------------------------------------------------------------|----------------|
+| `_open`/`_read`/`_lseek`/`_fstat`/... and `_write(fd>2)` | HTIF magic-mem syscall via `frontend_syscall` -> `sim_syscall` -> `*TOHOST_CMD_REG` (`0xE0080010`) | **vsim only** |
+| `_write(fd<=2)` (printf to stdout/stderr) | byte stream to `DISPLAY_BASE_ADDR` (`0xE0080004`)                    | **vsim only** |
+| `_exit(status)`               | RISC-V semihosting magic triple `slli x0,x0,0x1f; ebreak; srai x0,x0,0x7` with `a0=SYS_EXIT_EXTENDED=0x20` | **QEMU only** (when launched with `-semihosting-config enable=on,target=native`) |
+
+The asymmetry is load-bearing. QEMU virt has no peripheral at `0xE008xxxx`, so an HTIF write there raises a store-access-fault. vsim does not implement RISC-V semihosting, so the magic triple traps into `m_trap_entry -> exception_handler` and loops. **A single binary cannot make `printf` and `_exit` work in the same phase.** The runtime gets away with bundling them only because the drain marker (`csrwi 0x7C0, 1`) fires *before* `_exit` is reached: vsim sees the libgloss-backed stdio, then exits; QEMU 2 inherits the resumed state, never touches HTIF, runs to `_exit`, which trips semihosting.
+
+`qemu_handback.hpp` always launches QEMU 2 with `-semihosting-config enable=on,target=native` and `-cpu andes-ax45mpv,vlen=512` so the magic triple is intercepted and the Andes vendor CSRs touched by crt0 (mcache_ctl, mmisc_ctl) are recognised.
+
+### Phase-aware MMIO contract (`runtime/rt_c_helpers.h`)
+
+Because each MMIO endpoint is single-simulator, C fixtures have to know which phase they are in. `rt_c_helpers.h` makes the contract explicit:
+
+```c
+// QEMU 1 phase: pure register/memory work only. No printf, no fopen.
+//   (HTIF would trap; semihosting magic would land in QEMU's stub but
+//    is reserved for the QEMU 2 _exit path.)
+rt_phase_qemu1_drain();   // emits csrwi 0x7C0, 0  + .globl _hybrid_enter_pc
+
+// vsim phase: libgloss / sim_control / printf / fopen are SAFE here.
+rt_phase_vsim_drain();    // emits csrwi 0x7C0, 1  + .globl _hybrid_exit_pc
+
+// QEMU 2 phase: rt_semihost_writes (SYS_WRITE0) and _exit (SYS_EXIT_EXTENDED)
+//   are SAFE here. Returning from main() falls into _exit naturally.
+```
+
+The two `_hybrid_{enter,exit}_pc` labels are inert in CSR-trigger mode; `run_e2e.sh` resolves them via `nm --defined-only` for PC-trigger mode and passes them as `--hybrid-exit-pc 0x...` to vsim and `enter_pc=0x...` to the QEMU plugin.
+
+### Pure-asm fixtures (Tier 1) skip all of this
+
+`handoff_*`, `rt_all_gprs`, `rt_csr_survival`, etc. link with `handoff_roundtrip.ld` (no `.bss`, no `_stack`, no global pointer) and inline the semihosting exit triple from `semihost_exit.inc`. No crt0, no newlib, no trap handler. They are used for register-survival tests where C overhead would obscure the signal under test.
+
+## Where to Look Next
+
+- `include/hybrid/state_abi.h` - the wire contract.
+- `qemu_plugin/hybrid_handoff.c` - QEMU drain side. See `resolve_handles` (lazy because the dynamic gdb coprocessors aren't registered at vcpu_init) and the entry-trigger callback.
+- `hybrid_vsim/src/hybrid/handoff_controller.hpp` - passthrough wiring and trigger dispatch.
+- `hybrid_vsim/src/hybrid/resume_driver.hpp` - GPR/PC/mtvec + V-CSR Tier-A (Abstract w/ PB fallback) + Tier-B (`vsetvl` via PB) restore order.
+- `hybrid_vsim/src/hybrid/state_drain.hpp` - DM fresh-read of GPRs/PC/V-CSRs; passthrough merge.
+- `hybrid_vsim/src/hybrid/program_buffer.hpp` - PB exec helper, `encode_vsetvl`, `encode_csrrw`.
+- `hybrid_vsim/src/hybrid/v_regfile_xfer.hpp` - V-scratch staging / drain helpers.
+- `hybrid_vsim/src/hybrid/qemu_handback.hpp` - spawning QEMU 2, RegMap discovery via `qXfer:features:read`, and the `apply_state` template that ships every category to the gdbstub.
+- `hybrid_vsim/hybrid/test/rt_c_v_regs.c`, `rt_c_v_csrs.c` - the V regfile and V scalar CSR fixtures.
+- `hybrid_vsim/hybrid/test/runtime/{rt_c.ld, crt0.S, trap.S, libgloss.c, handler.c, rt_c_helpers.h}` - the shared C runtime: linker script, entry, trap handler, newlib HTIF + semihosting stubs, phase-aware drain markers.
+- `hybrid_vsim/hybrid/test/Makefile` - per-fixture build rules; documents which `-march`/linker-script combination each tier uses.
+- `run_e2e.sh` - run all e2e tests locally without going through CMake/CTest.
+
+## Mental Model in One Sentence
+
+> Two simulators agree on a memory map and a register struct, take turns running the same program, and use a magic CSR write (or a PC match) as the baton-pass. vsim only refreshes the parts the ROI is allowed to mutate (GPRs, PC, V state); everything else rides along in the snapshot from QEMU 1 straight to QEMU 2.
