@@ -1,0 +1,372 @@
+// Spawns qemu-system-riscv64 with -gdb tcp::PORT -S -semihosting and
+// restores architectural state via the gdbstub before sending `c`. Waits
+// for QEMU to exit and propagates its process exit code.
+//
+// Used by main.cpp when `Simulator::run()` returns kExitHandoffToQemu and
+// `--qemu-binary` is set.
+
+#pragma once
+
+#include "hybrid/exit_codes.hpp"
+#include "hybrid/gdbstub_session.hpp"
+#include "hybrid/reg_names.h"
+#include "hybrid/state_abi.h"
+
+#include <spdlog/spdlog.h>
+
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace hybrid
+{
+
+namespace detail
+{
+
+inline auto pick_free_port() -> uint16_t
+{
+  const int s = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (s < 0)
+    throw std::runtime_error("pick_free_port: socket");
+
+  sockaddr_in addr{};
+  addr.sin_family      = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port        = 0;
+
+  if (::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+    ::close(s);
+    throw std::runtime_error("pick_free_port: bind");
+  }
+  socklen_t len = sizeof(addr);
+  if (::getsockname(s, reinterpret_cast<sockaddr*>(&addr), &len) < 0) {
+    ::close(s);
+    throw std::runtime_error("pick_free_port: getsockname");
+  }
+  ::close(s);
+  return ntohs(addr.sin_port);
+}
+
+// Thrown by connect_loopback when the watched child exits before the
+// gdbstub becomes reachable (typically: bad --qemu-binary path).
+struct ChildExitedDuringConnect
+{
+  int status;
+};
+
+inline auto connect_loopback(uint16_t port,
+                             std::chrono::milliseconds timeout,
+                             pid_t child_pid = -1) -> int
+{
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    const int s = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0)
+      throw std::runtime_error("connect_loopback: socket");
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = htons(port);
+    if (::connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0)
+      return s;
+    ::close(s);
+    if (child_pid > 0) {
+      int wstat = 0;
+      if (::waitpid(child_pid, &wstat, WNOHANG) == child_pid) {
+        int status = -1;
+        if (WIFEXITED(wstat)) status = WEXITSTATUS(wstat);
+        else if (WIFSIGNALED(wstat)) status = 128 + WTERMSIG(wstat);
+        throw ChildExitedDuringConnect{status};
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  throw std::runtime_error("connect_loopback: timed out waiting for QEMU "
+                           "gdbstub");
+}
+
+inline auto spawn_qemu(const std::string& binary,
+                       const std::string& elf,
+                       uint16_t gdb_port,
+                       const std::string& shared_mem_path = {},
+                       uint64_t shared_mem_size = 0) -> pid_t
+{
+  const pid_t pid = ::fork();
+  if (pid < 0)
+    throw std::runtime_error(std::string{"spawn_qemu: fork: "}
+                             + std::strerror(errno));
+  if (pid == 0) {
+    // Detach the child from the caller's tty. -nographic makes QEMU's
+    // chardev backend tcsetattr() stdin into raw mode; if the caller is
+    // launched from a non-foreground process group (e.g. under timeout(1)),
+    // that touch raises SIGTTOU/SIGTTIN and stops QEMU 2, hanging vsim's
+    // waitpid. /dev/null sidesteps the tty entirely.
+    const int devnull = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (devnull >= 0) {
+      ::dup2(devnull, STDIN_FILENO);
+      ::close(devnull);
+    }
+
+    const std::string gdb_arg = "tcp::" + std::to_string(gdb_port);
+    const std::string mem_obj = "memory-backend-file,id=mem,share=on,mem-path="
+                              + shared_mem_path
+                              + ",size=" + std::to_string(shared_mem_size);
+    std::vector<const char*> argv;
+    argv.push_back(binary.c_str());
+    if (!shared_mem_path.empty()) {
+      argv.push_back("-object");
+      argv.push_back(mem_obj.c_str());
+      argv.push_back("-machine");
+      argv.push_back("virt,memory-backend=mem");
+    } else {
+      argv.push_back("-M");
+      argv.push_back("virt");
+    }
+    // -cpu andes-ax45mpv,vlen=512: matches QEMU 1's CPU and the vsim RTL
+    // build (NDS_VLEN 512). Without this, QEMU 2 defaults to plain rv64
+    // (no V), mstatus.VS becomes read-only zero, and vsetvli traps with
+    // illegal-instruction as soon as a V-using fixture's Phase 3 runs.
+    // Andes vendor CSRs touched by the runtime crt0 (mcache_ctl, mmisc_ctl,
+    // ...) are also gated here.
+    argv.push_back("-cpu");
+    argv.push_back("andes-ax45mpv,vlen=512");
+    argv.push_back("-bios");
+    argv.push_back("none");
+    argv.push_back("-nographic");
+    argv.push_back("-semihosting-config");
+    argv.push_back("enable=on,target=native");
+    argv.push_back("-kernel");
+    argv.push_back(elf.c_str());
+    argv.push_back("-gdb");
+    argv.push_back(gdb_arg.c_str());
+    argv.push_back("-S");
+    argv.push_back(nullptr);
+
+    ::execv(binary.c_str(), const_cast<char* const*>(argv.data()));
+    std::fprintf(stderr, "exec %s: %s\n", binary.c_str(),
+                 std::strerror(errno));
+    ::_exit(127);
+  }
+  return pid;
+}
+
+}  // namespace detail
+
+namespace detail
+{
+
+// Fetches a qXfer:features:read annex in full, looping while the stub
+// answers with the 'm' (more) marker. QEMU's RISC-V CSR XML is ~6 KB and
+// PacketSize is typically 1000 bytes, so several iterations are normal.
+inline auto fetch_feature_xml(gdbstub::Session& sess, const std::string& annex)
+  -> std::string
+{
+  std::string accum;
+  std::size_t offset = 0;
+  // Use a chunk size below the QEMU default PacketSize=1000. Asking for
+  // 0x100 keeps each frame well under the wire limit even after the 'm'
+  // marker and packet framing overhead.
+  constexpr std::size_t kChunk = 0x100;
+  while (true) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), ":%zx,%zx", offset, kChunk);
+    auto body = sess.send_command("qXfer:features:read:" + annex + buf);
+    if (body.empty())
+      throw std::runtime_error("qXfer empty reply for " + annex);
+    const char marker = body.front();
+    if (marker != 'l' && marker != 'm')
+      throw std::runtime_error("qXfer non-l/m reply for " + annex + ": "
+                               + std::string{marker});
+    accum.append(body.substr(1));
+    if (marker == 'l') return accum;
+    offset += body.size() - 1;
+  }
+}
+
+// Walks target.xml and every <xi:include> annex, returning the merged
+// register-name -> packet-number map.
+inline auto discover_reg_map(gdbstub::Session& sess) -> gdbstub::RegMap
+{
+  gdbstub::RegMap map;
+  const auto target_xml = fetch_feature_xml(sess, "target.xml");
+  unsigned next = 0;
+  for (const auto& annex : gdbstub::parse_target_xml(target_xml)) {
+    const auto annex_xml = fetch_feature_xml(sess, annex);
+    gdbstub::parse_feature_xml(annex_xml, map, next);
+  }
+  return map;
+}
+
+// Sends one P packet whose body is built by the supplied encoder. A
+// missing register name is silently skipped: not every QEMU build
+// advertises every PMP slot or extension CSR, so absence isn't fatal.
+template<class Encoder>
+inline void try_write_named(gdbstub::Session& sess,
+                            const gdbstub::RegMap& map,
+                            const std::string& name,
+                            Encoder&& encoder)
+{
+  const auto reg_num = map.find(name);
+  if (!reg_num) return;
+  auto reply = sess.send_command(encoder(*reg_num));
+  if (reply != "OK")
+    throw std::runtime_error("gdbstub: P packet for " + name + " replied "
+                             + reply);
+}
+
+inline void try_write_named_u64(gdbstub::Session& sess,
+                                const gdbstub::RegMap& map,
+                                const std::string& name,
+                                uint64_t value)
+{
+  try_write_named(sess, map, name, [&](unsigned r) {
+    return gdbstub::encode_p_body(r, value);
+  });
+}
+
+inline void try_write_named_bytes(gdbstub::Session& sess,
+                                  const gdbstub::RegMap& map,
+                                  const std::string& name,
+                                  const uint8_t* bytes,
+                                  std::size_t n)
+{
+  try_write_named(sess, map, name, [&](unsigned r) {
+    return gdbstub::encode_p_body_bytes(r, bytes, n);
+  });
+}
+
+// FP register names match the riscv-64bit-fpu.xml feature; the table
+// itself is shared with the QEMU plugin via hybrid/reg_names.h.
+
+inline constexpr std::array<std::pair<const char*, uint64_t hybrid_state_v1::*>,
+                            13>
+  kCsrByName = {{
+    {"mstatus",  &hybrid_state_v1::mstatus},
+    {"mepc",     &hybrid_state_v1::mepc},
+    {"mtvec",    &hybrid_state_v1::mtvec},
+    {"mcause",   &hybrid_state_v1::mcause},
+    {"mtval",    &hybrid_state_v1::mtval},
+    {"mscratch", &hybrid_state_v1::mscratch},
+    {"medeleg",  &hybrid_state_v1::medeleg},
+    {"mideleg",  &hybrid_state_v1::mideleg},
+    {"mip",      &hybrid_state_v1::mip},
+    {"mie",      &hybrid_state_v1::mie},
+    {"mcycle",   &hybrid_state_v1::mcycle},
+    {"minstret", &hybrid_state_v1::minstret},
+    {"satp",     &hybrid_state_v1::satp},
+  }};
+
+}  // namespace detail
+
+// Restores x1..x31, PC, FPR (if HYBRID_FLAG_FP), M-mode CSRs, PMP, and
+// vector data regs (if HYBRID_FLAG_V) into the QEMU vCPU via the gdbstub
+// at `port`, then continues. Caller is responsible for waitpid().
+inline void restore_state_via_gdbstub(uint16_t port,
+                                      const hybrid_state_v1& state,
+                                      pid_t child_pid = -1)
+{
+  spdlog::info("hybrid handback: connecting to gdbstub on tcp::{}", port);
+  const int fd = detail::connect_loopback(port, std::chrono::seconds(5),
+                                          child_pid);
+  spdlog::info("hybrid handback: connected, discovering register map");
+  gdbstub::Session sess{fd};
+
+  const auto reg_map = detail::discover_reg_map(sess);
+  spdlog::info("hybrid handback: {} registers advertised, restoring state",
+               reg_map.size());
+
+  // RV64 core: x0..x31 = 0..31, pc = 32. Hard-coded because the core
+  // feature is always first.
+  for (unsigned i = 1; i < 32; ++i) {
+    auto reply = sess.send_command(gdbstub::encode_p_body(i, state.gpr[i]));
+    if (reply != "OK")
+      throw std::runtime_error(
+        "gdbstub: P packet for x" + std::to_string(i) + " replied " + reply);
+  }
+  auto reply = sess.send_command(gdbstub::encode_p_body(32, state.pc));
+  if (reply != "OK")
+    throw std::runtime_error("gdbstub: P32 (pc) replied " + reply);
+
+  if ((state.flags & HYBRID_FLAG_FP) != 0u)
+    for (std::size_t i = 0; i < 32; ++i)
+      detail::try_write_named_u64(sess, reg_map, hybrid_fpr_names[i],
+                                  state.fpr[i]);
+
+  for (const auto& slot : detail::kCsrByName)
+    detail::try_write_named_u64(sess, reg_map, slot.first,
+                                state.*(slot.second));
+
+  for (uint16_t i = 0; i < HYBRID_PMP_CFG_NUM; ++i)
+    detail::try_write_named_u64(sess, reg_map, "pmpcfg" + std::to_string(i),
+                                state.pmpcfg[i]);
+  for (uint16_t i = 0; i < HYBRID_PMP_ADDR_NUM; ++i)
+    detail::try_write_named_u64(sess, reg_map, "pmpaddr" + std::to_string(i),
+                                state.pmpaddr[i]);
+
+  if ((state.flags & HYBRID_FLAG_V) != 0u && state.vlenb > 0u
+      && state.vlenb <= HYBRID_VLEN_BYTES_MAX) {
+    detail::try_write_named_u64(sess, reg_map, "vstart", state.vstart);
+    const std::size_t vbytes = static_cast<std::size_t>(state.vlenb);
+    for (uint16_t i = 0; i < 32; ++i) {
+      const std::string name = "v" + std::to_string(i);
+      detail::try_write_named_bytes(
+        sess, reg_map, name,
+        &state.vreg[static_cast<std::size_t>(i) * HYBRID_VLEN_BYTES_MAX],
+        vbytes);
+    }
+  }
+
+  spdlog::info("hybrid handback: continuing target");
+  sess.cont();
+}
+
+// Top-level: spawns QEMU, restores state, waits for exit, returns exit
+// status (or 128 + signal for abnormal termination).
+inline auto run_qemu_handback(const std::string& qemu_binary,
+                              const std::string& elf_path,
+                              const hybrid_state_v1& state,
+                              const std::string& shared_mem_path = {},
+                              uint64_t shared_mem_size = 0) -> int
+{
+  const auto port = detail::pick_free_port();
+  spdlog::info("hybrid handback: spawning {} -gdb tcp::{} -S",
+               qemu_binary, port);
+  const pid_t pid = detail::spawn_qemu(qemu_binary, elf_path, port,
+                                       shared_mem_path, shared_mem_size);
+
+  try {
+    restore_state_via_gdbstub(port, state, pid);
+  } catch (const detail::ChildExitedDuringConnect& d) {
+    return d.status;
+  } catch (...) {
+    ::kill(pid, SIGKILL);
+    int wstat = 0;
+    ::waitpid(pid, &wstat, 0);
+    throw;
+  }
+
+  int wstat = 0;
+  if (::waitpid(pid, &wstat, 0) < 0)
+    throw std::runtime_error(std::string{"waitpid: "}
+                             + std::strerror(errno));
+  if (WIFEXITED(wstat)) return WEXITSTATUS(wstat);
+  if (WIFSIGNALED(wstat)) return 128 + WTERMSIG(wstat);
+  return -1;
+}
+
+}  // namespace hybrid

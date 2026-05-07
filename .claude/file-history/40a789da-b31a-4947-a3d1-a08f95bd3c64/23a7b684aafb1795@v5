@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# Run the hybrid e2e tests directly, bypassing the VSIM_ENABLE_HYBRID
+# CTest gate. Drives hybrid_vsim/tests/hybrid/*.sh against pre-built
+# artifacts in this workspace.
+#
+# Env overrides:
+#   VSIM_QEMU    qemu-system-riscv64 (default: build/qemu/qemu-system-riscv64)
+#   VSIM_PLUGIN  libhybrid_handoff.so (default: qemu_plugin/libhybrid_handoff.so)
+#   VSIM_BIN     sim_<cpu> (default: first sim_* under hybrid_vsim/build/)
+#   FILTER       regex; only run tests whose name matches
+#   MODE         csr | pc | both  (default: both) - drives TRIGGER_MODE
+#                for round-trip fixtures. Negative drivers run once
+#                regardless because they assert orchestrator failure
+#                modes orthogonal to the trigger mechanism.
+#   JOBS         parallel job slots (default: min($(nproc),
+#                free(/dev/shm)/256MB)). Each Tier-2 slot uses a 128 MB
+#                /dev/shm mmap and runs 3 processes (qemu1, vsim, qemu2);
+#                the headroom check leaves margin for that plus QEMU's
+#                own scratch. Pass JOBS=1 for sequential semantics.
+#   LOG_DIR      where per-test logs land (default: mktemp -d under /tmp)
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VSIM_DIR="$ROOT/hybrid_vsim"
+HARNESS="$VSIM_DIR/tests/hybrid"
+TEST_DIR="$VSIM_DIR/hybrid/test"
+
+VSIM_QEMU="${VSIM_QEMU:-$ROOT/build/qemu/qemu-system-riscv64}"
+VSIM_PLUGIN="${VSIM_PLUGIN:-$ROOT/qemu_plugin/libhybrid_handoff.so}"
+if [[ -z "${VSIM_BIN:-}" ]]; then
+  VSIM_BIN=$(ls "$VSIM_DIR"/build/sim_* 2>/dev/null | head -n1 || true)
+fi
+
+step() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+ok()   { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[skip]\033[0m %s\n' "$*"; }
+fail() { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; }
+
+require() {
+  if [[ -z "$2" || ! -e "$2" ]]; then
+    fail "$1 not found: $2"
+    fail "build artifacts first: 'source ./setup.sh'"
+    exit 1
+  fi
+}
+require VSIM_QEMU   "$VSIM_QEMU"
+require VSIM_PLUGIN "$VSIM_PLUGIN"
+require VSIM_BIN    "$VSIM_BIN"
+
+export VSIM_QEMU VSIM_PLUGIN VSIM_BIN
+
+REQUIRED_ELFS=(
+  handoff_roundtrip rt_pc_jump rt_sign_bits rt_abi_aliases rt_long_roi
+  rt_all_gprs rt_mem_loadstore rt_unaligned_lh rt_csr_survival rt_shared_mem
+  rt_c_hello rt_c_printf rt_c_file_io rt_c_matmul rt_c_v_regs
+)
+need_build=0
+for f in "${REQUIRED_ELFS[@]}"; do
+  [[ -e "$TEST_DIR/$f.elf" ]] || need_build=1
+done
+if (( need_build )); then
+  step "building test ELFs in $TEST_DIR"
+  make -C "$TEST_DIR" -j
+fi
+
+# Round-trip and Tier-2 fixtures: name|fixture-env-prefix|harness. The
+# TRIGGER_MODE env is injected per iteration based on $MODE. Negative
+# drivers live in NEG_TESTS and run once regardless of mode.
+RT_TESTS=(
+  "handoff_roundtrip|FIXTURE=handoff_roundtrip EXPECT_RC=3|$HARNESS/roundtrip_e2e.sh"
+  "rt_pc_jump|FIXTURE=rt_pc_jump EXPECT_RC=0|$HARNESS/roundtrip_e2e.sh"
+  "rt_sign_bits|FIXTURE=rt_sign_bits EXPECT_RC=0|$HARNESS/roundtrip_e2e.sh"
+  "rt_abi_aliases|FIXTURE=rt_abi_aliases EXPECT_RC=0|$HARNESS/roundtrip_e2e.sh"
+  "rt_long_roi|FIXTURE=rt_long_roi EXPECT_RC=0|$HARNESS/roundtrip_e2e.sh"
+  "rt_all_gprs|FIXTURE=rt_all_gprs EXPECT_RC=0|$HARNESS/roundtrip_e2e.sh"
+  "rt_mem_loadstore|FIXTURE=rt_mem_loadstore EXPECT_RC=0|$HARNESS/roundtrip_e2e.sh"
+  "rt_unaligned_lh|FIXTURE=rt_unaligned_lh EXPECT_RC=0|$HARNESS/roundtrip_e2e.sh"
+  "rt_csr_survival|FIXTURE=rt_csr_survival EXPECT_RC=0|$HARNESS/roundtrip_e2e.sh"
+  "rt_shared_mem||$HARNESS/rt_shared_mem.sh"
+  "rt_c_hello|FIXTURE=rt_c_hello EXPECT_RC=0|$HARNESS/rt_shared_mem.sh"
+  "rt_c_printf|FIXTURE=rt_c_printf EXPECT_RC=0|$HARNESS/rt_shared_mem.sh"
+  "rt_c_file_io|FIXTURE=rt_c_file_io EXPECT_RC=0|$HARNESS/rt_shared_mem.sh"
+  "rt_c_matmul|FIXTURE=rt_c_matmul EXPECT_RC=0 TIMEOUT=120|$HARNESS/rt_shared_mem.sh"
+  "rt_c_v_regs|FIXTURE=rt_c_v_regs EXPECT_RC=0|$HARNESS/rt_shared_mem.sh"
+)
+
+NEG_TESTS=(
+  "rt_corrupt_state|bash $HARNESS/rt_corrupt_state.sh"
+  "rt_no_qemu_binary|bash $HARNESS/rt_no_qemu_binary.sh"
+  "rt_gdbstub_timeout|bash $HARNESS/rt_gdbstub_timeout.sh"
+  "rt_pty_handback|bash $HARNESS/rt_pty_handback.sh"
+)
+
+MODE="${MODE:-both}"
+case "$MODE" in
+  csr|pc|both) ;;
+  *) fail "MODE must be one of csr|pc|both (got: $MODE)"; exit 1 ;;
+esac
+
+default_jobs() {
+  local n=1 shm_free shm_cap
+  n=$(nproc 2>/dev/null || echo 1)
+  if [[ -d /dev/shm ]]; then
+    shm_free=$(df -m --output=avail /dev/shm 2>/dev/null | tail -n +2 | tr -d ' ')
+    if [[ "$shm_free" =~ ^[0-9]+$ && "$shm_free" -gt 0 ]]; then
+      shm_cap=$((shm_free / 256))
+      (( shm_cap < n && shm_cap >= 1 )) && n=$shm_cap
+    fi
+  fi
+  (( n < 1 )) && n=1
+  printf '%d\n' "$n"
+}
+JOBS="${JOBS:-$(default_jobs)}"
+[[ "$JOBS" =~ ^[0-9]+$ && "$JOBS" -ge 1 ]] \
+  || { fail "JOBS must be a positive integer (got: $JOBS)"; exit 1; }
+
+FILTER="${FILTER:-}"
+
+LOG_DIR="${LOG_DIR:-$(mktemp -d -t e2e-XXXXXX)}"
+mkdir -p "$LOG_DIR"
+RESULTS_FILE="$LOG_DIR/results.tsv"
+LOCK_FILE="$LOG_DIR/lock"
+: > "$RESULTS_FILE"
+: > "$LOCK_FILE"
+
+# run_one MODE NAME CMD INDEX TOTAL
+# Captures the test command's stdout+stderr into $LOG_DIR/$mode--$name.log,
+# emits one atomic progress line, and appends a TSV row to $RESULTS_FILE
+# (mode<TAB>name<TAB>status<TAB>rc<TAB>elapsed). flock on $LOCK_FILE
+# serializes the progress write and the results-file append so concurrent
+# children (introduced by the parallel-execution commit) cannot interleave
+# their TTY writes or corrupt the tally file.
+run_one() {
+  local mode="$1" name="$2" cmd="$3" idx="$4" total="$5"
+  local log="$LOG_DIR/$mode--$name.log"
+  local start end elapsed status rc
+  start=$(date +%s)
+  set +e
+  bash -c "$cmd" >"$log" 2>&1
+  rc=$?
+  set -e
+  end=$(date +%s)
+  elapsed=$((end - start))
+  case $rc in
+    0)  status=PASS ;;
+    77) status=SKIP ;;
+    *)  status=FAIL ;;
+  esac
+  (
+    flock 9
+    case "$status" in
+      PASS) ok   "[$idx/$total] ${name}[${mode}] (${elapsed}s)" ;;
+      SKIP) warn "[$idx/$total] ${name}[${mode}] (rc=77, ${elapsed}s)" ;;
+      FAIL) fail "[$idx/$total] ${name}[${mode}] (rc=$rc, ${elapsed}s) -> $log" ;;
+    esac
+    printf '%s\t%s\t%s\t%d\t%d\n' \
+      "$mode" "$name" "$status" "$rc" "$elapsed" >> "$RESULTS_FILE"
+  ) 9>"$LOCK_FILE"
+}
+
+# Build the workplan: one entry per (mode, name, cmd) tuple. Order
+# matters: csr-mode tests first, then pc-mode, then negatives (matching
+# the original sequential layout so logs are streamed in the same order).
+declare -a WORKPLAN=()
+for tm in csr pc; do
+  [[ "$MODE" != "both" && "$MODE" != "$tm" ]] && continue
+  for entry in "${RT_TESTS[@]}"; do
+    rt_name="${entry%%|*}"
+    rest="${entry#*|}"
+    env_prefix="${rest%|*}"
+    harness="${rest##*|}"
+    [[ -n "$FILTER" && ! "$rt_name" =~ $FILTER ]] && continue
+    cmd="TRIGGER_MODE=$tm $env_prefix bash $harness"
+    WORKPLAN+=("$tm|$rt_name|$cmd")
+  done
+done
+for entry in "${NEG_TESTS[@]}"; do
+  neg_name="${entry%%|*}"
+  neg_cmd="${entry#*|}"
+  [[ -n "$FILTER" && ! "$neg_name" =~ $FILTER ]] && continue
+  WORKPLAN+=("neg|$neg_name|$neg_cmd")
+done
+
+TOTAL=${#WORKPLAN[@]}
+step "logs: $LOG_DIR  jobs: $JOBS  mode: $MODE  tests: $TOTAL"
+
+# FIFO-based bounded job pool. Each child reads one token from $SEM_FIFO
+# before starting and writes one back on exit; only $JOBS tokens exist,
+# so at most $JOBS children run concurrently. Opening the fifo in
+# read-write mode (<>) means writes never block the parent. The fifo
+# inode is unlinked immediately after fd 8 is bound -- the kernel keeps
+# the pipe alive as long as fd 8 is open.
+SEM_FIFO="$LOG_DIR/sem.fifo"
+mkfifo "$SEM_FIFO"
+exec 8<>"$SEM_FIFO"
+rm -f "$SEM_FIFO"
+for ((sem_i=0; sem_i<JOBS; sem_i++)); do
+  printf '.\n' >&8
+done
+
+i=0
+for w in "${WORKPLAN[@]}"; do
+  i=$((i+1))
+  w_mode="${w%%|*}"
+  w_rest="${w#*|}"
+  w_name="${w_rest%%|*}"
+  w_cmd="${w_rest#*|}"
+  read -r -u 8 _tok
+  (
+    run_one "$w_mode" "$w_name" "$w_cmd" "$i" "$TOTAL"
+    printf '.\n' >&8
+  ) &
+done
+wait
+exec 8>&-
+
+declare -A MODE_PASS=([csr]=0 [pc]=0 [neg]=0)
+declare -A MODE_FAIL=([csr]=0 [pc]=0 [neg]=0)
+declare -A MODE_SKIP=([csr]=0 [pc]=0 [neg]=0)
+declare -a FAILED_NAMES=()
+while IFS=$'\t' read -r r_mode r_name r_status _r_rc _r_el; do
+  case "$r_status" in
+    PASS) MODE_PASS[$r_mode]=$((MODE_PASS[$r_mode]+1)) ;;
+    SKIP) MODE_SKIP[$r_mode]=$((MODE_SKIP[$r_mode]+1)) ;;
+    FAIL) MODE_FAIL[$r_mode]=$((MODE_FAIL[$r_mode]+1));
+          FAILED_NAMES+=("${r_name}[${r_mode}]") ;;
+  esac
+done < "$RESULTS_FILE"
+
+# Stream failed-test logs in workplan order so the user sees a
+# deterministic post-run failure dump.
+for w in "${WORKPLAN[@]}"; do
+  w_mode="${w%%|*}"
+  w_rest="${w#*|}"
+  w_name="${w_rest%%|*}"
+  w_status=$(awk -F'\t' -v m="$w_mode" -v n="$w_name" \
+                 '$1==m&&$2==n{print $3; exit}' "$RESULTS_FILE")
+  if [[ "$w_status" == "FAIL" ]]; then
+    echo
+    echo "=== FAIL log: ${w_name}[${w_mode}] ==="
+    cat "$LOG_DIR/$w_mode--$w_name.log"
+  fi
+done
+
+echo
+csr_p=${MODE_PASS[csr]} csr_f=${MODE_FAIL[csr]} csr_s=${MODE_SKIP[csr]}
+pc_p=${MODE_PASS[pc]}   pc_f=${MODE_FAIL[pc]}   pc_s=${MODE_SKIP[pc]}
+neg_p=${MODE_PASS[neg]} neg_f=${MODE_FAIL[neg]} neg_s=${MODE_SKIP[neg]}
+total_pass=$((csr_p + pc_p + neg_p))
+total_fail=$((csr_f + pc_f + neg_f))
+total_skip=$((csr_s + pc_s + neg_s))
+step "summary: csr ${csr_p}p/${csr_f}f/${csr_s}s  pc ${pc_p}p/${pc_f}f/${pc_s}s  neg ${neg_p}p/${neg_f}f/${neg_s}s  total ${total_pass} passed, ${total_fail} failed, ${total_skip} skipped"
+if (( total_fail > 0 )); then
+  fail "failures: ${FAILED_NAMES[*]}"
+  exit 1
+fi

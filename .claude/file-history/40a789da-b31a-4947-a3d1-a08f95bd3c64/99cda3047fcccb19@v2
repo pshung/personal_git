@@ -1,0 +1,78 @@
+// Pure-byte-copy helpers that move state.vreg[] in and out of a fixed
+// scratch region inside guest RAM. The unit tests assert: bytes round-trip
+// with no padding loss, the scratch offset is computed correctly across
+// different RAM bases, and out-of-range RAM spans fail loudly.
+
+#include "hybrid/state_abi.h"
+#include "hybrid/v_regfile_xfer.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+TEST_CASE("v_regfile_xfer: stage then read round-trips state.vreg byte-for-byte")
+{
+  hybrid_state_v1 in{};
+  for (size_t i = 0; i < hybrid::kVScratchBytes; i++)
+    in.vreg[i] = static_cast<uint8_t>((i * 31u + 7u) & 0xff);
+
+  // QEMU virt RAM_BASE = 0x80000000, 128 MiB.
+  constexpr uint64_t ram_base = 0x80000000ull;
+  std::vector<uint8_t> ram(static_cast<size_t>(128) * 1024 * 1024);
+
+  hybrid::stage_v_to_scratch(in, ram, ram_base);
+
+  // Confirm the scratch window in RAM matches the source.
+  const size_t off = hybrid::kVScratchGpa - ram_base;
+  CHECK(std::memcmp(ram.data() + off, in.vreg, hybrid::kVScratchBytes) == 0);
+
+  // Round-trip via read_v_from_scratch.
+  hybrid_state_v1 out{};
+  hybrid::read_v_from_scratch(out, ram, ram_base);
+  CHECK(std::memcmp(out.vreg, in.vreg, hybrid::kVScratchBytes) == 0);
+}
+
+TEST_CASE("v_regfile_xfer: works with a non-zero RAM base offset")
+{
+  // Suppose a future board maps RAM at 0x80400000 instead of 0x80000000.
+  // The scratch GPA is fixed at 0x80FF0000, so the offset shifts.
+  constexpr uint64_t ram_base = 0x80400000ull;
+  std::vector<uint8_t> ram(static_cast<size_t>(64) * 1024 * 1024);
+
+  hybrid_state_v1 in{};
+  for (size_t i = 0; i < hybrid::kVScratchBytes; i++)
+    in.vreg[i] = static_cast<uint8_t>(i & 0xff);
+
+  hybrid::stage_v_to_scratch(in, ram, ram_base);
+  const size_t off = hybrid::kVScratchGpa - ram_base;
+  CHECK(std::memcmp(ram.data() + off, in.vreg, hybrid::kVScratchBytes) == 0);
+}
+
+TEST_CASE("v_regfile_xfer: throws when scratch region exceeds RAM span")
+{
+  constexpr uint64_t ram_base = 0x80000000ull;
+  // Only 1 MiB of RAM but scratch GPA is at +0x0FF0000 (~16 MiB).
+  std::vector<uint8_t> ram(1024 * 1024);
+  hybrid_state_v1 s{};
+  CHECK_THROWS(hybrid::stage_v_to_scratch(s, ram, ram_base));
+  CHECK_THROWS(hybrid::read_v_from_scratch(s, ram, ram_base));
+}
+
+TEST_CASE("v_regfile_xfer: throws when scratch GPA below RAM base")
+{
+  constexpr uint64_t ram_base = 0x90000000ull;  // higher than scratch GPA
+  std::vector<uint8_t> ram(static_cast<size_t>(128) * 1024 * 1024);
+  hybrid_state_v1 s{};
+  CHECK_THROWS(hybrid::stage_v_to_scratch(s, ram, ram_base));
+}
+
+TEST_CASE("v_regfile_xfer: scratch_offset arithmetic matches kVScratchGpa")
+{
+  // Sanity check the GPA constant against the documented expectation:
+  // top of QEMU virt's default 128 MiB region above 0x80000000.
+  CHECK(hybrid::kVScratchGpa == 0x80FF0000ull);
+  CHECK(hybrid::kVScratchBytes == static_cast<size_t>(32) * 64);
+}

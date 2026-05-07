@@ -1,0 +1,175 @@
+/* Tier-2 C-level round-trip: RVV register survival across the handoff.
+ *
+ *   QEMU1: seed an int32 pattern in shared memory (no V instructions; the
+ *          QEMU plugin's per-insn callback misreports the drained PC when
+ *          the immediately-preceding code uses V).
+ *   vsim:  vle32.v v8..v15 from the seed; vadd.vi v9 += 100; vse8.v
+ *          v0..v31 to the V-scratch region.
+ *   QEMU2: vle8.v v0..v31 from V-scratch (round-trip the regfile back into
+ *          QEMU's V state), then vse32.v v8..v15 + verify; v8/v10..v15
+ *          unchanged from seed, v9 == seed + 100.
+ *
+ * V-state transport
+ *   The vsim hart's V regfile is not exposed via Debug Module Abstract
+ *   Commands (the spec leaves V to optional Program Buffer / DPI). As a
+ *   stop-gap we use a fixed scratch region inside the shared mmap (V_SCRATCH
+ *   below, matching hybrid::kVScratchGpa). vsim's StateDrain reads those
+ *   bytes into hybrid_state_v1::vreg[] so qemu_handback can ship them to
+ *   QEMU 2 via existing gdbstub P packets. ResumeDriver does the inverse on
+ *   the way in, but this fixture's QEMU1 phase doesn't use V so the
+ *   inbound V state is all zeros -- vsim re-seeds v0..v31 itself by
+ *   loading from the SEED region.
+ *
+ * Memory layout:
+ *   SEED at 0x80100000        - input pattern (16 int32, 64 bytes)
+ *   PHASE_C_OUT at 0x80102000 - QEMU2 verify scratch (8 regs * 64 = 512 B)
+ *   V_SCRATCH at 0x80FF0000   - matches hybrid::kVScratchGpa (32 V regs *
+ *                                64 bytes = 2048 B)
+ *   stack at 0x80700000       - rt_c.ld places _stack here
+ *
+ * VLEN contract: VLEN=512 (vlenb=64). QEMU launched with
+ * -cpu andes-ax45mpv,vlen=512; vsim built from
+ * data/configs/ax45mpv_premium.cfg with NDS_VLEN 512.
+ */
+#include "runtime/rt_c_helpers.h"
+
+#include <stdint.h>
+
+#define VL_E32 16  /* VLEN/32 = 512/32 = 16 int32 elements per V reg at LMUL=1 */
+#define VLENB  64  /* bytes per V reg */
+#define NREGS  8   /* test v8..v15 */
+
+static int32_t* const SEED        = (int32_t*) 0x80100000UL;
+static int32_t* const PHASE_C_OUT = (int32_t*) 0x80102000UL;
+
+#define V_SCRATCH 0x80FF0000UL
+
+static void seed_pattern(int32_t* dst, int n)
+{
+  for (int i = 0; i < n; i++)
+    dst[i] = (int32_t) ((i * 17) ^ 0xA5A5);
+}
+
+int main(void)
+{
+  /* Phase 1 (QEMU1): seed memory only. No V instructions here -- the
+   * plugin's gdbstub-pc readback misreports the drain PC when V is in
+   * flight, which would resume vsim at the wrong instruction. */
+  seed_pattern(SEED, VL_E32);
+
+  rt_phase_qemu1_drain();
+
+  /* Phase 2 (vsim): set mstatus.VS, load v8..v15 from SEED, mutate v9,
+   * then save the full v0..v31 regfile to V_SCRATCH so vsim's drain can
+   * read them out for the QEMU 2 hop.
+   *
+   * mstatus.VS=Initial via csrs is necessary because vsim's DM does not
+   * honor abstract-write of mstatus on resume. */
+  asm volatile(
+    "li     t1, (1 << 9) | (1 << 13)\n"   /* VS=Initial | FS=Initial */
+    "csrs   mstatus, t1\n"
+    /* Reload v8..v15 from SEED via 32-bit unit-stride loads. */
+    "li     a4, 16\n"
+    "vsetvli zero, a4, e32, m1, ta, ma\n"
+    "mv     t0, %0\n"
+    "vle32.v v8,  (t0)\n"
+    "vle32.v v9,  (t0)\n"
+    "vle32.v v10, (t0)\n"
+    "vle32.v v11, (t0)\n"
+    "vle32.v v12, (t0)\n"
+    "vle32.v v13, (t0)\n"
+    "vle32.v v14, (t0)\n"
+    "vle32.v v15, (t0)\n"
+    /* Mutate v9 by +100 (vadd.vi takes 5-bit signed imm; +10 ten times). */
+    "vadd.vi v9, v9, 10\n"
+    "vadd.vi v9, v9, 10\n"
+    "vadd.vi v9, v9, 10\n"
+    "vadd.vi v9, v9, 10\n"
+    "vadd.vi v9, v9, 10\n"
+    "vadd.vi v9, v9, 10\n"
+    "vadd.vi v9, v9, 10\n"
+    "vadd.vi v9, v9, 10\n"
+    "vadd.vi v9, v9, 10\n"
+    "vadd.vi v9, v9, 10\n"
+    /* Save v0..v31 to V_SCRATCH for vsim's drain (e8 stride to write
+     * exactly vlenb bytes per reg, regardless of element semantics). */
+    "li     a4, 64\n"
+    "vsetvli zero, a4, e8, m1, ta, ma\n"
+    "li     t0, 0x80FF0000\n"
+    "vse8.v v0,  (t0)\n addi t0, t0, 64\n"
+    "vse8.v v1,  (t0)\n addi t0, t0, 64\n"
+    "vse8.v v2,  (t0)\n addi t0, t0, 64\n"
+    "vse8.v v3,  (t0)\n addi t0, t0, 64\n"
+    "vse8.v v4,  (t0)\n addi t0, t0, 64\n"
+    "vse8.v v5,  (t0)\n addi t0, t0, 64\n"
+    "vse8.v v6,  (t0)\n addi t0, t0, 64\n"
+    "vse8.v v7,  (t0)\n addi t0, t0, 64\n"
+    "vse8.v v8,  (t0)\n addi t0, t0, 64\n"
+    "vse8.v v9,  (t0)\n addi t0, t0, 64\n"
+    "vse8.v v10, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v11, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v12, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v13, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v14, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v15, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v16, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v17, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v18, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v19, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v20, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v21, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v22, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v23, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v24, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v25, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v26, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v27, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v28, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v29, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v30, (t0)\n addi t0, t0, 64\n"
+    "vse8.v v31, (t0)\n"
+    :: "r"(SEED)
+    : "memory","t0","t1","a4");
+
+  rt_phase_vsim_drain();
+
+  /* Phase 3 (QEMU2): the gdbstub P packets (sent by qemu_handback) have
+   * already populated v0..v31 in QEMU's V state from state.vreg[]. Run
+   * vse32.v v8..v15 to PHASE_C_OUT and verify the bytes match the seed
+   * pattern (with v9 +100).
+   *
+   * mstatus.VS may not survive the gdbstub mstatus P packet round-trip,
+   * so set it again here. QEMU 2 must be spawned with -cpu
+   * andes-ax45mpv,vlen=512 (see qemu_handback.hpp::spawn_qemu) - the
+   * default rv64 CPU has VS as read-only zero and vsetvli would trap. */
+  asm volatile(
+    "li     t1, (1 << 9) | (1 << 13)\n"
+    "csrs   mstatus, t1\n"
+    "li     a4, 16\n"
+    "vsetvli zero, a4, e32, m1, ta, ma\n"
+    "addi t0, %0, 0\n"
+    "vse32.v v8,  (t0)\n addi t0, t0, 64\n"
+    "vse32.v v9,  (t0)\n addi t0, t0, 64\n"
+    "vse32.v v10, (t0)\n addi t0, t0, 64\n"
+    "vse32.v v11, (t0)\n addi t0, t0, 64\n"
+    "vse32.v v12, (t0)\n addi t0, t0, 64\n"
+    "vse32.v v13, (t0)\n addi t0, t0, 64\n"
+    "vse32.v v14, (t0)\n addi t0, t0, 64\n"
+    "vse32.v v15, (t0)\n"
+    :: "r"(PHASE_C_OUT)
+    : "memory","t0","t1","a4");
+
+  for (int reg = 0; reg < NREGS; reg++) {
+    int32_t* row = PHASE_C_OUT + reg * VL_E32;
+    int32_t bias = (reg == 1) ? 100 : 0;  /* v9 is reg index 1 in v8..v15 */
+    for (int i = 0; i < VL_E32; i++) {
+      int32_t expected = (int32_t) ((i * 17) ^ 0xA5A5) + bias;
+      if (row[i] != expected) {
+        rt_semihost_writes("rt_c_v_regs: FAIL\n");
+        return 1;
+      }
+    }
+  }
+  rt_semihost_writes("rt_c_v_regs: PASS\n");
+  return 0;
+}
