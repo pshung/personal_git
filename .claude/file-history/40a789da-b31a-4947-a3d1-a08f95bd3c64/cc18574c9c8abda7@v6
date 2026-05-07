@@ -1,0 +1,232 @@
+# Hybrid simulator (QEMU + Verilator) build integration.
+
+option(VSIM_ENABLE_HYBRID "Enable hybrid QEMU+Verilator co-simulation" OFF)
+
+set(VSIM_QEMU_ROOT "/local/nick/qemu_v5"
+  CACHE PATH "Path to QEMU source tree used to build the hybrid TCG plugin")
+
+# The ABI test is always built so struct layout drift is caught even in
+# non-hybrid builds. It has no SystemC/Verilator dependency.
+vsim_add_test(test_state_abi tests/hybrid/state_abi.test.cpp)
+target_include_directories(test_state_abi PRIVATE
+  "${CMAKE_SOURCE_DIR}/../include"
+)
+add_dependencies(check test_state_abi)
+
+# Shared-mem smoke: glues MmapBacking + SimpleMemory and verifies bytes are
+# visible through an independent mmap of the same file.
+vsim_add_test(test_shared_mem_smoke tests/hybrid/shared_mem_smoke.test.cpp)
+target_link_libraries(test_shared_mem_smoke PRIVATE
+  lib_fmt
+  lib_spdlog
+  lib_systemc
+  ${VSIM_LINK_LIBS}
+)
+add_dependencies(test_shared_mem_smoke ext_fmt ext_spdlog ext_systemc)
+add_dependencies(check test_shared_mem_smoke)
+
+# Section 9: validates the narrowed QEMU-virt RAM region + mmap composition.
+vsim_add_test(test_shared_mem_offset tests/hybrid/shared_mem_offset.test.cpp)
+target_link_libraries(test_shared_mem_offset PRIVATE
+  lib_fmt
+  lib_spdlog
+  lib_systemc
+  ${VSIM_LINK_LIBS}
+)
+add_dependencies(test_shared_mem_offset ext_fmt ext_spdlog ext_systemc)
+add_dependencies(check test_shared_mem_offset)
+
+vsim_add_test(test_state_loader tests/hybrid/state_loader.test.cpp)
+target_include_directories(test_state_loader PRIVATE
+  "${CMAKE_SOURCE_DIR}/../include"
+)
+add_dependencies(check test_state_loader)
+
+vsim_add_test(test_abstract_command tests/hybrid/abstract_command.test.cpp)
+add_dependencies(check test_abstract_command)
+
+vsim_add_test(test_resume_driver tests/hybrid/resume_driver.test.cpp)
+target_include_directories(test_resume_driver PRIVATE
+  "${CMAKE_SOURCE_DIR}/../include"
+)
+add_dependencies(check test_resume_driver)
+
+vsim_add_test(test_insn_match tests/hybrid/insn_match.test.cpp)
+target_include_directories(test_insn_match PRIVATE
+  "${CMAKE_SOURCE_DIR}/../include"
+)
+add_dependencies(check test_insn_match)
+
+vsim_add_test(test_resume_from_qemu tests/hybrid/resume_from_qemu.test.cpp)
+target_include_directories(test_resume_from_qemu PRIVATE
+  "${CMAKE_SOURCE_DIR}/../include"
+)
+add_dependencies(check test_resume_from_qemu)
+
+vsim_add_test(test_memory_map tests/hybrid/memory_map.test.cpp)
+add_dependencies(check test_memory_map)
+
+vsim_add_test(test_csr_trigger tests/hybrid/csr_trigger.test.cpp)
+target_include_directories(test_csr_trigger PRIVATE
+  "${CMAKE_SOURCE_DIR}/../include"
+)
+add_dependencies(check test_csr_trigger)
+
+vsim_add_test(test_state_drain tests/hybrid/state_drain.test.cpp)
+target_include_directories(test_state_drain PRIVATE
+  "${CMAKE_SOURCE_DIR}/../include"
+)
+add_dependencies(check test_state_drain)
+
+vsim_add_test(test_gdbstub_client tests/hybrid/gdbstub_client.test.cpp)
+add_dependencies(check test_gdbstub_client)
+
+vsim_add_test(test_qemu_handback tests/hybrid/qemu_handback.test.cpp)
+target_include_directories(test_qemu_handback PRIVATE
+  "${CMAKE_SOURCE_DIR}/../include"
+)
+add_dependencies(check test_qemu_handback)
+
+vsim_add_test(test_handoff_controller tests/hybrid/handoff_controller.test.cpp)
+target_include_directories(test_handoff_controller PRIVATE
+  "${CMAKE_SOURCE_DIR}/../include"
+)
+add_dependencies(check test_handoff_controller)
+
+vsim_add_test(test_v_regfile_xfer tests/hybrid/v_regfile_xfer.test.cpp)
+target_include_directories(test_v_regfile_xfer PRIVATE
+  "${CMAKE_SOURCE_DIR}/../include"
+)
+add_dependencies(check test_v_regfile_xfer)
+
+if(VSIM_ENABLE_HYBRID)
+  if(NOT EXISTS "${VSIM_QEMU_ROOT}/include/qemu/qemu-plugin.h")
+    message(WARNING
+      "VSIM_ENABLE_HYBRID=ON but qemu-plugin.h not found under "
+      "${VSIM_QEMU_ROOT}/include/qemu/. Build the TCG plugin out-of-tree via "
+      "hybrid_sim/qemu_plugin/Makefile on a host that has QEMU installed.")
+  endif()
+  message(STATUS "Hybrid mode: enabled (QEMU root: ${VSIM_QEMU_ROOT})")
+
+  # Round-trip e2e tests. Each entry registers one CTest case using the
+  # parameterized roundtrip_e2e.sh harness. The harness skips (return 77)
+  # when QEMU/plugin/ELF artifacts are missing, so the same CTestTestfile
+  # works whether ctest is invoked from the container's /work/build or
+  # from the host's build/.
+  set(VSIM_RT_FIXTURES
+    "handoff_roundtrip:3"
+    "rt_pc_jump:0"
+    "rt_sign_bits:0"
+    "rt_abi_aliases:0"
+    "rt_long_roi:0"
+    "rt_all_gprs:0"
+    "rt_mem_loadstore:0"
+    "rt_unaligned_lh:0"
+    "rt_csr_survival:0"
+  )
+  foreach(entry ${VSIM_RT_FIXTURES})
+    string(REPLACE ":" ";" parts ${entry})
+    list(GET parts 0 fname)
+    list(GET parts 1 erc)
+    # CSR-trigger variant (existing path, default mode).
+    add_test(
+      NAME test_e2e_${fname}
+      COMMAND bash -c
+        "TRIGGER_MODE=csr FIXTURE=${fname} EXPECT_RC=${erc} bash ../tests/hybrid/roundtrip_e2e.sh"
+    )
+    # COST: ctest -j greedily schedules highest-cost first to keep the
+    # tail short. Tier-1 fixtures uniformly run ~15-20s on the CI host.
+    set_tests_properties(test_e2e_${fname} PROPERTIES
+      SKIP_RETURN_CODE 77
+      LABELS "hybrid-e2e;hybrid-e2e-csr"
+      COST 30
+    )
+    # PC-trigger variant: same fixture, _hybrid_{enter,exit}_pc resolved
+    # from the ELF symbol table. The csrwi insns in the binary are inert
+    # in this mode (matchers bypassed; CSR 0x7C0 is a benign vendor write
+    # on andes-ax45mp + AX45MPV).
+    add_test(
+      NAME test_e2e_${fname}_pc
+      COMMAND bash -c
+        "TRIGGER_MODE=pc FIXTURE=${fname} EXPECT_RC=${erc} bash ../tests/hybrid/roundtrip_e2e.sh"
+    )
+    set_tests_properties(test_e2e_${fname}_pc PROPERTIES
+      SKIP_RETURN_CODE 77
+      LABELS "hybrid-e2e;hybrid-e2e-pc"
+      COST 30
+    )
+  endforeach()
+
+  # Tier-2: separate driver because it allocates /dev/shm and uses
+  # --shared-mem-path / -object memory-backend-file to share RAM across
+  # QEMU 1, vsim, and QEMU 2.
+  # Format: fname:expected_rc[:timeout_s]. Default timeout is 60 (set in
+  # rt_shared_mem.sh). rt_c_matmul needs more headroom because the GEMM
+  # kernel runs cycle-accurately under vsim (~45-50s) before drain.
+  set(VSIM_RT_T2_FIXTURES
+    "rt_shared_mem:0"
+    # C-level fixtures: linked against vsim-demo C runtime (crt0/trap/libgloss/
+    # handler). They need Tier-2 (shared mmap) so the stack and heap survive
+    # the vsim->QEMU2 boundary -- main()'s ra-spill/restore around the
+    # csrwi 0x7C0,1 marker would otherwise read uninitialized RAM in QEMU2.
+    "rt_c_hello:0"
+    "rt_c_printf:0"
+    "rt_c_file_io:0"
+    "rt_c_matmul:0:120"
+    # RVV register survival: seeds v8..v15 in QEMU1, mutates v9 in vsim,
+    # verifies in QEMU2. Requires vsim-side V transport (v_regfile_xfer +
+    # resume_driver / state_drain wiring).
+    "rt_c_v_regs:0"
+  )
+  foreach(entry ${VSIM_RT_T2_FIXTURES})
+    string(REPLACE ":" ";" parts ${entry})
+    list(GET parts 0 fname)
+    list(GET parts 1 erc)
+    list(LENGTH parts nparts)
+    set(timeout_env "")
+    set(tcost 60)
+    if(nparts GREATER 2)
+      list(GET parts 2 tsec)
+      set(timeout_env "TIMEOUT=${tsec} ")
+      # Use the per-fixture timeout as the scheduling cost so long
+      # fixtures (rt_c_matmul: 120s) start in the first wave under -j.
+      set(tcost ${tsec})
+    endif()
+    # CSR variant.
+    add_test(
+      NAME test_e2e_${fname}
+      COMMAND bash -c
+        "${timeout_env}TRIGGER_MODE=csr FIXTURE=${fname} EXPECT_RC=${erc} bash ../tests/hybrid/rt_shared_mem.sh"
+    )
+    set_tests_properties(test_e2e_${fname} PROPERTIES
+      SKIP_RETURN_CODE 77
+      LABELS "hybrid-e2e;hybrid-e2e-csr"
+      COST ${tcost}
+    )
+    # PC variant: same fixture, same timeout, mode flipped.
+    add_test(
+      NAME test_e2e_${fname}_pc
+      COMMAND bash -c
+        "${timeout_env}TRIGGER_MODE=pc FIXTURE=${fname} EXPECT_RC=${erc} bash ../tests/hybrid/rt_shared_mem.sh"
+    )
+    set_tests_properties(test_e2e_${fname}_pc PROPERTIES
+      SKIP_RETURN_CODE 77
+      LABELS "hybrid-e2e;hybrid-e2e-pc"
+      COST ${tcost}
+    )
+  endforeach()
+
+  # Negative / robustness drivers: each guards a quietly-degrading failure
+  # path the happy-path round-trips can't see (corrupted state file,
+  # missing --qemu-binary, silent gdbstub peer, tty-induced SIGTTOU).
+  # No PC variants - these assert orchestrator failure modes that are
+  # orthogonal to the trigger mechanism.
+  foreach(neg corrupt_state no_qemu_binary gdbstub_timeout pty_handback)
+    add_test(NAME test_e2e_rt_${neg}
+      COMMAND bash ../tests/hybrid/rt_${neg}.sh)
+    set_tests_properties(test_e2e_rt_${neg} PROPERTIES
+      SKIP_RETURN_CODE 77
+      LABELS "hybrid-e2e"
+    )
+  endforeach()
+endif()

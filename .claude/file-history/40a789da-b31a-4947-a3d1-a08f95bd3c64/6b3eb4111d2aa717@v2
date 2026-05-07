@@ -1,0 +1,128 @@
+// Unit tests for the gdbstub state-write path in qemu_handback.hpp.
+// Uses a RecordingSession stub so no real TCP socket is needed.
+
+#include "hybrid/gdbstub_client.hpp"
+#include "hybrid/qemu_handback.hpp"
+#include "hybrid/state_abi.h"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace {
+
+struct RecordingSession
+{
+  std::vector<std::string> commands;
+
+  auto send_command(std::string_view body) -> std::string
+  {
+    commands.push_back(std::string(body));
+    return "OK";
+  }
+
+  void cont() {}
+};
+
+auto make_v_csr_map() -> hybrid::gdbstub::RegMap
+{
+  hybrid::gdbstub::RegMap m;
+  // Assign arbitrary but distinct regnums for the V CSRs.
+  m.insert("vstart", 1001u);
+  m.insert("vxsat",  1002u);
+  m.insert("vxrm",   1003u);
+  m.insert("vcsr",   1004u);
+  m.insert("vtype",  1005u);
+  m.insert("vl",     1006u);
+  return m;
+}
+
+bool commands_contain(const std::vector<std::string>& cmds,
+                      const std::string& body)
+{
+  for (const auto& c : cmds)
+    if (c == body) return true;
+  return false;
+}
+
+}  // namespace
+
+TEST_CASE("apply_state with HYBRID_FLAG_V: sends P packets for vxsat/vxrm/vcsr/vtype/vl")
+{
+  RecordingSession sess;
+  const auto reg_map = make_v_csr_map();
+
+  hybrid_state_v1 state{};
+  state.magic   = HYBRID_STATE_MAGIC;
+  state.version = HYBRID_STATE_VERSION;
+  state.flags   = HYBRID_FLAG_RV64 | HYBRID_FLAG_V;
+  state.priv    = 3;
+  state.vlenb   = 64;  // required: V block only runs when vlenb > 0
+  state.vstart  = 0;
+  state.vxsat   = 1;
+  state.vxrm    = 2;
+  state.vcsr    = 5;
+  state.vtype   = 0xC1ULL;
+  state.vl      = 16;
+
+  hybrid::detail::apply_state(sess, reg_map, state);
+
+  CHECK(commands_contain(sess.commands, hybrid::gdbstub::encode_p_body(1002u, 1u)));        // vxsat
+  CHECK(commands_contain(sess.commands, hybrid::gdbstub::encode_p_body(1003u, 2u)));        // vxrm
+  CHECK(commands_contain(sess.commands, hybrid::gdbstub::encode_p_body(1004u, 5u)));        // vcsr
+  CHECK(commands_contain(sess.commands, hybrid::gdbstub::encode_p_body(1005u, 0xC1ULL)));   // vtype
+  CHECK(commands_contain(sess.commands, hybrid::gdbstub::encode_p_body(1006u, 16u)));       // vl
+}
+
+TEST_CASE("apply_state without HYBRID_FLAG_V: no V CSR P packets sent")
+{
+  RecordingSession sess;
+  const auto reg_map = make_v_csr_map();
+
+  hybrid_state_v1 state{};
+  state.magic   = HYBRID_STATE_MAGIC;
+  state.version = HYBRID_STATE_VERSION;
+  state.flags   = HYBRID_FLAG_RV64;  // no HYBRID_FLAG_V
+  state.priv    = 3;
+
+  hybrid::detail::apply_state(sess, reg_map, state);
+
+  // None of the V CSR regnums should appear.
+  for (unsigned rn = 1001u; rn <= 1006u; ++rn) {
+    bool found = false;
+    for (const auto& c : sess.commands)
+      if (c.find('P' + hybrid::gdbstub::encode_p_body(rn, 0u).substr(0, 4)) != std::string::npos)
+        found = true;
+    // simpler: check the specific body for zero-value is not present
+    (void)found;
+  }
+  // Precise check: no command body starts with any of the V CSR regnums.
+  for (unsigned rn = 1001u; rn <= 1006u; ++rn) {
+    const auto prefix = hybrid::gdbstub::encode_p_body(rn, 0u).substr(0, 5);
+    for (const auto& c : sess.commands)
+      CHECK(c.substr(0, prefix.size()) != prefix);
+  }
+}
+
+TEST_CASE("apply_state: sends x1..x31 P packets at reg indices 1..31")
+{
+  RecordingSession sess;
+  hybrid::gdbstub::RegMap reg_map;  // empty - only numbered GPRs 1..31 are used
+
+  hybrid_state_v1 state{};
+  state.magic   = HYBRID_STATE_MAGIC;
+  state.version = HYBRID_STATE_VERSION;
+  state.flags   = HYBRID_FLAG_RV64;
+  state.priv    = 3;
+  for (int i = 1; i < 32; ++i) state.gpr[i] = 0xA00000000ULL + i;
+
+  hybrid::detail::apply_state(sess, reg_map, state);
+
+  for (unsigned i = 1; i < 32; ++i)
+    CHECK(commands_contain(sess.commands,
+                           hybrid::gdbstub::encode_p_body(i, 0xA00000000ULL + i)));
+}
