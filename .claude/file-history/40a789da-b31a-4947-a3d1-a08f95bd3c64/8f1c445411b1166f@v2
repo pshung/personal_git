@@ -1,0 +1,140 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Repository Overview
+
+Andes hybrid RISC-V co-simulator: QEMU 9.x (functional, MHz-level) + vsim (SystemC + Verilator, cycle-accurate) share architectural state across a magic-CSR boundary. The system runs a three-phase round-trip: **QEMU1** (drain on CSR/PC trigger) -> **vsim** (resume + execute + drain) -> **QEMU2** (restore via gdbstub, continue).
+
+Two Git submodules:
+- `hybrid_qemu/` - QEMU fork hosting the TCG plugin (branch: `hybrid`)
+- `hybrid_vsim/` - vsim sources; `hybrid/` subdirs hold the plugin and test fixtures
+
+Shared ABI lives at `include/hybrid/state_abi.h` (not inside either submodule).
+
+## Build Commands
+
+```sh
+# Build everything (qemu -> vsim -> plugin)
+source ./setup.sh
+
+# Build individual components
+./build_qemu.sh                              # QEMU (configure + make -j64)
+./build_vsim.sh                              # vsim (Docker/podman, runs ./build.sh inside container)
+make -C qemu_plugin QEMU_ROOT=./hybrid_qemu  # TCG plugin (out-of-tree)
+
+# Build RISC-V ELF test fixtures
+make -C hybrid_vsim/hybrid/test              # all fixtures
+make -C hybrid_vsim/hybrid/test rt_c_v_regs.elf  # single fixture
+
+# Clean
+source ./setup.sh clean [qemu|vsim|plugin|all]
+```
+
+**Outputs:**
+- `build/qemu/qemu-system-riscv64`
+- `hybrid_vsim/build/sim_ax45mpv_premium` (or other CPU variant)
+- `qemu_plugin/libhybrid_handoff.so`
+
+`build_vsim.sh` is Docker-based (podman). It builds an image from `hybrid_vsim/Dockerfile` (target `env`) then runs `./build.sh` inside it, mounting the repo at `/work` and `include/` as `/include:ro`.
+
+## Running Tests
+
+```sh
+# All e2e tests in parallel (auto-detects job count from nproc + /dev/shm headroom)
+bash run_e2e.sh
+
+# Run with specific options
+JOBS=4 MODE=csr bash run_e2e.sh         # 4-way parallel, CSR-mode only
+JOBS=1 bash run_e2e.sh                  # sequential (debug)
+FILTER=rt_c_v bash run_e2e.sh           # regex filter on fixture name
+LOG_DIR=/tmp/my-logs bash run_e2e.sh    # custom log directory
+
+# Unit tests (inside vsim build container)
+# The container build runs: cmake --build build -j
+# To run ctest directly after build:
+#   podman run ... ./build.sh && podman exec ... ctest --test-dir build -L hybrid-e2e
+```
+
+**Important:** on a high-core-count machine (128+ cores) `default_jobs()` computes `min(nproc, /dev/shm_free/256MB)` which can reach 128+. Running that many vsim Verilator processes simultaneously saturates CPU and causes timeouts. Use `JOBS=8` (or lower) as a practical cap: `JOBS=8 bash run_e2e.sh`.
+
+`run_e2e.sh` exits 0 only when all tests pass. Logs go to a `mktemp` directory under `/tmp`; path is printed at the start of each run. Each test's full output lands in `$LOG_DIR/$mode--$name.log`.
+
+## Architecture
+
+### Three-Phase Handoff
+
+```
+QEMU1 --(state file)--> vsim --(state file + V-scratch mmap)--> QEMU2
+```
+
+1. **QEMU plugin** (`qemu_plugin/hybrid_handoff.c`) - TCG plugin. On CSR-write trigger (`csrwi 0x7C0, 0`) or PC-trigger, drains QEMU's architectural state into a binary `hybrid_state_v1` struct written to `--outfile`.
+2. **vsim handoff controller** (`src/hybrid/handoff_controller.hpp`) - Detects the trigger inside vsim, pauses the hart via DMI, then calls `ResumeDriver` to restore state.
+3. **ResumeDriver** (`src/hybrid/resume_driver.hpp`) - Writes GPRs/FPRs/CSRs/V-state into the vsim hart via RISC-V Debug Module Abstract Commands and Program Buffer.
+4. **StateDrain** (`src/hybrid/state_drain.hpp`) - On vsim exit trigger, reads back the full architectural state via DMI Abstract Commands.
+5. **qemu_handback** (`src/hybrid/qemu_handback.hpp`) - Spawns QEMU2, connects via gdbstub, sends P-packet register writes for GPRs/FPRs/CSRs/V-regs, then `continue`s.
+
+### Trigger Modes
+
+- **CSR mode** (default): Pattern-matches `csrwi 0x7C0, 0` (entry) / `csrwi 0x7C0, 1` (exit) at retire time. CSR 0x7C0 is a benign vendor write on Andes ax45mp.
+- **PC mode**: ELF symbols `_hybrid_enter_pc` / `_hybrid_exit_pc` resolved at startup; CSR insns are bypassed.
+
+Both modes coexist in the fixtures. `TRIGGER_MODE=csr|pc` selects at runtime.
+
+### Shared ABI (`include/hybrid/state_abi.h`)
+
+`hybrid_state_v1` is the binary wire format exchanged between QEMU plugin, vsim, and the handback path. It holds: 32 GPRs, 32 FPRs, M-mode CSRs (mstatus, mepc, etc.), PMP (64 pmpaddr + 16 pmpcfg), and the V extension block (vstart, vtype, vl, vlenb, 32 vreg[], vxsat, vxrm, vcsr). `HYBRID_VLEN_BYTES_MAX=64` supports VLEN up to 512 bits.
+
+Flags (`HYBRID_FLAG_RV64`, `HYBRID_FLAG_FP`, `HYBRID_FLAG_V`) gate which state blocks are live. The ABI struct is validated by `tests/hybrid/state_abi.test.cpp`.
+
+### V-State Transport
+
+V register transport uses a fixed scratch region (`kVScratchGpa = 0x80FF0000`) in the shared mmap. vsim's inline asm writes all 32 V regs there via `vse8.v`; `StateDrain` reads those bytes into `hybrid_state_v1::vreg[]`. `qemu_handback` ships them to QEMU2 via gdbstub P-packets by register number.
+
+V scalar CSR transport (vtype, vl, vstart, vxsat, vxrm, vcsr):
+- **Tier A** (Abstract Commands): vstart, vxsat, vxrm, vcsr, mstatus.VS
+- **Tier B** (Program Buffer): vtype + vl via `vsetvl x0, x5, x6` (direct CSR write to vtype sets vill; vl is read-only; only `vsetvl` restores both atomically)
+
+Restore order in `ResumeDriver::resume()` when `HYBRID_FLAG_V` is set:
+1. `mstatus.VS` (enables V in the hart)
+2. `vsetvl x0, x5, x6` in Program Buffer (stages `vl` in x5, `vtype` in x6 via abstract GPR writes first)
+3. `vstart` (AFTER vsetvl: vsetvl resets vstart to 0)
+4. `vxsat`, `vxrm`, `vcsr`
+5. GPR loop (overwrites the x5/x6 scratch - safe now)
+
+### Test Fixture Tiers
+
+| Tier | Harness | Memory model | Examples |
+|------|---------|-------------|---------|
+| 1 | `roundtrip_e2e.sh` | QEMU-private RAM | handoff_roundtrip, rt_all_gprs, rt_csr_survival |
+| 2 | `rt_shared_mem.sh` | shared `/dev/shm` mmap | rt_c_hello, rt_c_matmul, rt_c_v_regs, rt_c_v_csrs |
+
+Tier-2 is required for C-level fixtures because the C stack and heap must survive the vsim -> QEMU2 boundary. The shared mmap is created with `mktemp -p /dev/shm` + `truncate`, then QEMU is launched with `-object memory-backend-file`.
+
+Fixture source lives in `hybrid_vsim/hybrid/test/`. C-level fixtures link against `runtime/` (crt0.S, trap.S, libgloss.c, handler.c) using `rt_c.ld`. V-using fixtures require `-march=rv64gcv`.
+
+### vsim CMake Structure
+
+vsim lives entirely in `hybrid_vsim/`. Key CMake options:
+- `VSIM_ENABLE_HYBRID` (default OFF) - enables e2e CTest registration
+- `VSIM_CONFIG_FILE` - CPU YAML (default `config.yaml`)
+- `VSIM_NO_VERILATOR` - skip Verilator build (assume prebuilt)
+
+The hybrid orchestration layer (`src/hybrid/*.hpp`) is header-only and depends only on C++20 standard library + the shared ABI header. SystemC/Verilator are not required for hybrid unit tests.
+
+Hybrid unit tests (`tests/hybrid/`) use [doctest](https://github.com/doctest/doctest). They are registered in `cmake/HybridConfig.cmake` and run via `ctest`. The `recording_bus.hpp` / `RecordingSession` patterns provide duck-typed test doubles for the DMI bus and gdbstub session without requiring virtual interfaces.
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `include/hybrid/state_abi.h` | Wire-format struct (shared by all three components) |
+| `qemu_plugin/hybrid_handoff.c` | TCG plugin: drain on trigger |
+| `hybrid_vsim/src/hybrid/handoff_controller.hpp` | Phase dispatcher |
+| `hybrid_vsim/src/hybrid/resume_driver.hpp` | DMI state restore (Tier A+B) |
+| `hybrid_vsim/src/hybrid/state_drain.hpp` | DMI state capture |
+| `hybrid_vsim/src/hybrid/qemu_handback.hpp` | Spawn QEMU2, gdbstub P-packets |
+| `hybrid_vsim/src/hybrid/v_regfile_xfer.hpp` | V register transport via scratch region |
+| `hybrid_vsim/cmake/HybridConfig.cmake` | CTest registration for all e2e fixtures |
+| `run_e2e.sh` | Parallel e2e runner (FIFO job pool, per-test logs) |
+| `hybrid_vsim/hybrid/test/Makefile` | RISC-V ELF fixture build (Andes toolchain) |

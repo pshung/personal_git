@@ -1,0 +1,311 @@
+# How the Hybrid Simulator Works
+
+A friendly tour for engineers new to this codebase.
+
+## The Problem in One Paragraph
+
+A pure RTL simulator (`vsim`, built on Verilator + SystemC) is **cycle-accurate**: it tells you exactly how many cycles every instruction takes inside the CPU pipeline. The price is speed: it runs at ~5-9 KHz. Booting Linux, running libc init, and warming up before reaching the actual code you care about can take hours. Meanwhile, QEMU runs the same program **functionally** at MHz speed, but it has no notion of pipeline cycles.
+
+The hybrid simulator combines them: run the boring parts in QEMU, switch to vsim for the small region of interest (ROI) you actually want to measure, and (optionally) hand back to QEMU to finish.
+
+## High-Level Concept
+
+Three big ideas make this possible:
+
+1. **Memory is shared, not copied.** Both simulators `mmap` the same backing file (`/dev/shm/...`) as their RAM. When QEMU writes a byte at address `0x80001000`, vsim sees it instantly, and vice versa. RAM size becomes irrelevant - no transfer cost.
+
+2. **CPU state is small enough to copy.** The architectural registers (32 GPRs + 32 FPRs + a few CSRs) are only a few KB. We define a packed C struct (`struct hybrid_state_v1` in `include/hybrid/state_abi.h`) that both sides agree on. At a handoff, one side writes the struct to a file; the other side reads it.
+
+3. **Microarchitectural state is thrown away.** Caches, TLB, branch predictor, store buffer - none of it transfers. We accept cold caches at handoff and rely on a "warm-up window" before recording any measurements.
+
+The trigger for a handoff is a **magic CSR write**: `csrwi 0x7C0, 0` means "QEMU, hand off to vsim", and `csrwi 0x7C0, 1` means "vsim, hand back to QEMU". The CSR address `0x7C0` is in the user-defined range, so it does not collide with anything real.
+
+The write-back path on the vsim side reuses the existing **JTAG Debug Module** that the RTL already implements. Vsim drives the DM in-process (no socket, no OpenOCD) to halt the core, write all 32 GPRs, set the PC, and resume. The QEMU side uses a TCG plugin that drains state through the plugin API and exits cleanly. Hand-back from vsim to QEMU spawns a fresh QEMU process and restores state via QEMU's `gdbstub`.
+
+## Architecture Flowchart
+
+```mermaid
+flowchart LR
+    subgraph DISK["Shared State (on disk / shm)"]
+        SHM[("/dev/shm RAM<br/>(mmap shared)")]
+        STATE_Q["state_qemu.bin<br/>(packed struct)"]
+        STATE_V["state_vsim.bin<br/>(packed struct)"]
+    end
+
+    subgraph QEMU1["QEMU 1 (functional, MHz)"]
+        Q1_TCG["TCG instruction loop"]
+        Q1_PLUGIN["hybrid_handoff.so<br/>watches for csrwi 0x7C0,0"]
+        Q1_TCG --> Q1_PLUGIN
+    end
+
+    subgraph VSIM["vsim (cycle-accurate, KHz)"]
+        V_PIPE["RTL pipeline<br/>(Verilator + SystemC)"]
+        V_DM["JTAG DM driver<br/>(in-process)"]
+        V_TRIG["csr_trigger<br/>watches retire of csrwi 0x7C0,1"]
+        V_DM -.resumes regs.-> V_PIPE
+        V_PIPE -.retire signals.-> V_TRIG
+    end
+
+    subgraph QEMU2["QEMU 2 (functional, MHz)"]
+        Q2_GDB["gdbstub -gdb -S"]
+        Q2_TCG["TCG instruction loop"]
+        Q2_GDB -.restores regs.-> Q2_TCG
+    end
+
+    Q1_PLUGIN -- "drain GPR/FPR/CSR" --> STATE_Q
+    Q1_PLUGIN -- "qemu_plugin_request_exit" --> VSIM
+    STATE_Q -- "--resume-from-qemu" --> V_DM
+
+    V_TRIG -- "drain via DM" --> STATE_V
+    V_TRIG -- "exit code 200" --> QEMU2
+    STATE_V -- "gdb 'G' packet" --> Q2_GDB
+
+    Q1_TCG <-->|"every load/store"| SHM
+    V_PIPE <-->|"every load/store"| SHM
+    Q2_TCG <-->|"every load/store"| SHM
+```
+
+## Walk-Through: `rt_shared_mem` E2E Test
+
+This is the canonical hybrid-sim demo: it exercises **both** register transfer (via the state file) and memory transfer (via shared mmap) across all three simulators. Each phase mutates memory that the next phase observes.
+
+### The test program (`hybrid_vsim/hybrid/test/rt_shared_mem.S`)
+
+```asm
+_start:
+    // Phase A (runs in QEMU 1): fill 4 KB at 0x80010000 with 0xA5 bytes.
+    li      t0, 0x80010000
+    li      t3, 0xA5A5A5A5A5A5A5A5
+    li      t1, 512
+1:  sd      t3, 0(t0)
+    addi    t0, t0, 8
+    addi    t1, t1, -1
+    bnez    t1, 1b
+
+    csrwi   0x7C0, 0           // QEMU drains regs+PC -> state file, exits
+
+    // Phase B (runs in vsim): verify the 0xA5 pattern is still there,
+    // then XOR the page in place with 0x5A. After this loop every byte
+    // is 0xA5 ^ 0x5A = 0xFF.
+    li      t0, 0x80010000
+    li      t3, 0xA5A5A5A5A5A5A5A5
+    li      t4, 0x5A5A5A5A5A5A5A5A
+    li      t1, 512
+verify_a:
+    ld      t2, 0(t0)
+    bne     t2, t3, fail_b      // exit 50 if QEMU's writes did not survive
+    addi    t0, t0, 8
+    addi    t1, t1, -1
+    bnez    t1, verify_a
+    li      t0, 0x80010000
+    li      t1, 512
+xor_loop:
+    ld      t2, 0(t0)
+    xor     t2, t2, t4
+    sd      t2, 0(t0)
+    addi    t0, t0, 8
+    addi    t1, t1, -1
+    bnez    t1, xor_loop
+
+    csrwi   0x7C0, 1            // vsim drains regs+PC -> state file, exits 200
+
+phase_c:                        // (runs in QEMU 2): verify all 4 KB is 0xFF.
+    li      t0, 0x80010000
+    li      t5, -1
+    li      t1, 512
+verify_c:
+    ld      t2, 0(t0)
+    bne     t2, t5, fail_c      // exit 51 if vsim's writes did not survive
+    addi    t0, t0, 8
+    addi    t1, t1, -1
+    bnez    t1, verify_c
+    li      a2, 0
+    SEMIHOST_EXIT a2            // PASS: exit 0
+```
+
+Three phases, with **two kinds of state** crossing each handoff boundary:
+
+| Boundary | Register state (via state file) | Memory state (via shared mmap) |
+|---|---|---|
+| QEMU 1 -> vsim | PC must point at the instruction after `csrwi 0x7C0, 0`. All 32 GPRs are copied through the packed struct. | The 4 KB of `0xA5` bytes Phase A wrote is already on disk in `/dev/shm/vsim-rt-shared.*`. vsim sees it instantly via mmap. |
+| vsim -> QEMU 2 | PC must point at `phase_c`. GPRs copied back through a second state file. | The page is now `0xFF` because vsim XOR'd it. QEMU 2's mmap of the same file sees it byte-for-byte. |
+
+If `bne t2, t3, fail_b` ever fires, QEMU's memory writes did not survive into vsim. If `bne t2, t5, fail_c` fires, vsim's writes did not survive into QEMU 2. The test only exits 0 when **both** transfer paths work end to end.
+
+### How register state moves: the state file
+
+```
+QEMU 1                                          vsim
+  hybrid_handoff.so            state_qemu.bin           qemu_resume.hpp
+  --------------------         ------------------        --------------------
+  on csrwi 0x7C0, 0   --->     struct hybrid_state_v1    halt CPU via JTAG DM
+  read x1..x31 via     write   { magic = 'AHYB',         for each reg: write
+  qemu_plugin_         atomic  version = 1,                via DM Abstract Cmd
+  read_register()      with    pc = <next insn after     set DPC = state.pc
+  read PC, CSRs        O_TMPFILE  csrwi>,                issue 'dret' -> resume
+  qemu_plugin_                  gpr[32] = {...},         at the right PC
+  request_exit()                csr = {...}, ... }
+```
+
+The same packed struct (`include/hybrid/state_abi.h`, `struct hybrid_state_v1`) is the wire format on **both** sides. vsim drains symmetrically when it hits `csrwi 0x7C0, 1`, and the spawned QEMU 2 picks up the regs through its `gdbstub` `G` packet.
+
+### How memory state moves: shared mmap
+
+```
+host shell           QEMU 1                  vsim                    QEMU 2
+  truncate -s 128M
+  /dev/shm/foo
+       |
+       +-- mmap'd at 0x80000000 in all three guest address spaces ----+
+       |              |                         |                    |
+       v              v                         v                    v
+   one 128 MB       sd 0xA5...               ld / xor / sd          ld 0xFF...
+   backing file     at GPA 0x80010000        at GPA 0x80010000      at GPA 0x80010000
+                    -> file off 0x10000      -> same file off       -> same file off
+```
+
+Both guests are launched with the same backing file:
+- QEMU 1: `-object memory-backend-file,share=on,mem-path=/dev/shm/foo -machine virt,memory-backend=mem`
+- vsim: `--shared-mem-path /dev/shm/foo --shared-mem-size 128M`
+- QEMU 2: spawned by vsim with the same `-object memory-backend-file,share=on,...` args.
+
+A guest physical address `0x80010000` maps to file offset `0x10000` in every process. Loads and stores in any simulator hit the same OS page cache - no copying, no serialization, no synchronization needed beyond the handoff fence (each simulator has fully exited before the next starts).
+
+### The driver (`hybrid_vsim/tests/hybrid/rt_shared_mem.sh`)
+
+```mermaid
+sequenceDiagram
+    participant SH as rt_shared_mem.sh
+    participant FS as /dev/shm/foo<br/>(128 MB mmap)
+    participant Q1 as QEMU 1 + plugin
+    participant VS as vsim
+    participant Q2 as QEMU 2 (spawned by vsim)
+
+    SH->>FS: truncate -s 128M (allocate empty backing file)
+    SH->>Q1: launch with -object memory-backend-file,share=on,mem-path=foo<br/>+ -plugin hybrid_handoff.so,outfile=state_qemu.bin
+
+    Note over Q1,FS: Phase A: writes 4 KB of 0xA5 at GPA 0x80010000
+    Q1->>FS: mmap stores -> file offset 0x10000
+
+    Q1->>Q1: hits csrwi 0x7C0, 0
+    Q1->>SH: writes state_qemu.bin (regs + PC), exits
+
+    SH->>VS: launch with --resume-from-qemu state_qemu.bin<br/>--shared-mem-path foo --qemu-binary qemu...
+    VS->>VS: JTAG DM restores 32 GPRs and PC from state_qemu.bin
+    VS->>FS: ld at 0x80010000 -> reads 0xA5 (QEMU's writes survived!)
+    Note over VS,FS: Phase B: XOR loop -> page becomes 0xFF
+    VS->>FS: sd at 0x80010000 -> file now contains 0xFF
+
+    VS->>VS: hits csrwi 0x7C0, 1, drains regs+PC to state_vsim.bin
+    VS->>Q2: fork+exec qemu -gdb tcp:... -S -semihosting<br/>-object memory-backend-file,share=on,mem-path=foo
+    VS->>Q2: gdb 'G' packet with regs from state_vsim.bin, then 'c'
+    Q2->>FS: ld at 0x80010000 -> reads 0xFF (vsim's writes survived!)
+    Note over Q2: Phase C verify loop passes
+    Q2->>VS: SEMIHOST_EXIT 0
+    VS->>SH: process exits with code 0
+    SH->>SH: assert exit code == 0 -> PASS
+```
+
+### What each step proves
+
+| Step | What it tests |
+|---|---|
+| Phase A writes 0xA5 to mmap | QEMU's RAM backend is the shared file (not a private anonymous mapping). |
+| QEMU 1 produces `state_qemu.bin` | The TCG plugin recognizes `csrwi 0x7C0, 0` and drains all 32 GPRs + PC + CSRs through the plugin API. |
+| Phase B `verify_a` loop passes | **Memory written in QEMU survives into vsim.** Shared mmap works as advertised. |
+| vsim runs the XOR loop | Resumed register state was correct - in particular `t0`, `t1`, `t3`, `t4` are reinitialized by Phase B but the **PC** must have been restored to point at Phase B's first instruction. |
+| Phase C `verify_c` loop passes | **Memory written in vsim survives into QEMU 2.** Both transfer paths work. |
+| Final exit code 0 | Full round-trip succeeded. Exit 50 means QEMU->vsim memory broke; exit 51 means vsim->QEMU memory broke. |
+
+If any link breaks, the distinct exit codes tell you exactly which transfer path failed.
+
+## Why the Asymmetry? File for QEMU->vsim, gdbstub for vsim->QEMU
+
+A natural question on first reading: vsim reads register state from a file, but QEMU 2 receives it through gdbstub. Why not use a file in both directions?
+
+**Short answer**: QEMU has no built-in "load architectural state from a file before fetch starts" hook. gdbstub is exactly that hook, already shipping in mainline QEMU.
+
+The whole design rests on one rule (`hybrid_plan.md` Section 2.4): **no QEMU patches, no fork**. Mainline QEMU 9.2.0 is used as-is. That ships exactly two extension points relevant to state injection:
+
+| Extension point | What it can do |
+|---|---|
+| TCG plugin API (`qemu_plugin_*`) | **Read** registers and memory while QEMU runs. `qemu_plugin_read_register()` exists and is reliable for all reg classes. There is no clean way to set all 32 GPRs + PC + CSRs *before the very first TB executes* - plugins are designed for instrumentation, not state injection at startup. |
+| gdbstub (`-gdb tcp::PORT -S`) | Stops QEMU before any guest instruction runs and opens a port speaking the standard RSP protocol. Whoever connects can write all registers, then resume. This is exactly the "set state, then start" primitive we need. |
+
+So each direction picks the only working mechanism mainline QEMU offers:
+
+```
+QEMU 1 -> vsim:  plugin reads regs (read_register works)
+                 plugin writes file at exit
+                 vsim reads file
+                 vsim has the JTAG DM already, drives it in-process to WRITE
+                 regs into RTL via Abstract Commands.
+
+vsim -> QEMU 2:  vsim drains regs via JTAG DM into a state file.
+                 spawn `qemu -gdb tcp::PORT -S` (start halted).
+                 vsim connects, sends 'G' packet (regs from the file), 'c'.
+                 QEMU does not parse the file - vsim translates file -> RSP packet.
+```
+
+Why not "QEMU 2 reads the file itself"?
+
+1. **No CLI flag exists.** `qemu-system-riscv64` has no `--load-state-from <file>` for an arbitrary register struct. Adding one means patching QEMU - ruled out.
+2. **Plugins can't do it either.** A plugin's earliest hook (`vcpu_init`, first TB callback) runs *after* the reset vector executes some instructions. Setting the PC from a plugin at that point fights QEMU's fetch loop.
+3. **gdbstub is purpose-built for this.** `-S` (start halted) plus the RSP `G` packet are the canonical way to externally seed QEMU state. Mature, covers every reg class the gdb XML exposes, works for every machine type.
+4. **Decouples the wire format.** vsim translates `struct hybrid_state_v1` into RSP packets. QEMU 2 only sees a standard gdb client. No coupling between QEMU and the project's struct definition.
+
+Memory does not face this problem because QEMU **does** have a file-backed memory primitive (`-object memory-backend-file,share=on`), so the same mmap trick works on both QEMU instances. Registers don't have an equivalent "memory-backend-file for regs" - gdbstub is the closest thing, and it happens to be enough.
+
+### What is the "RSP `G` packet"?
+
+**RSP** = Remote Serial Protocol, the text-based wire protocol gdb uses to talk to a remote target (gdbserver, QEMU's gdbstub, OpenOCD, J-Link, etc.). Every packet has the form `$<payload>#<checksum>`.
+
+**The `G` packet** is one specific RSP command: *"write all CPU registers at once."* Its payload is a single hex string concatenating every register's bytes in the exact order the target's gdb XML description declares them.
+
+Companion packets in the same family:
+
+| Packet | Meaning |
+|---|---|
+| `g` (lowercase) | read all registers - target replies with the hex blob |
+| `G` (uppercase) | write all registers - sender provides the hex blob |
+| `p N` / `P N=...` | read / write a single register by index |
+| `m addr,len` / `M addr,len:...` | read / write memory |
+| `c` | continue execution |
+| `s` | single-step |
+
+For RV64 with FP and CSRs, the `G` payload looks like (hex, little-endian per register):
+
+```
+$G<x0><x1>...<x31><pc><f0>...<f31><csr0>...#xx
+ \____________ regs in gdb-XML order ____________/
+```
+
+Concretely, what vsim does in the handback (see `hybrid_vsim/src/hybrid/gdbstub_session.hpp` and `gdbstub_client.hpp`):
+
+```
+1. spawn qemu-system-riscv64 -gdb tcp::PORT -S -kernel elf
+   (QEMU opens PORT, halts before any insn fetch)
+
+2. connect TCP, do gdb handshake (qSupported, qXfer:features:read, ...)
+
+3. build the hex string from struct hybrid_state_v1:
+     concat hex(state.gpr[0..31]) + hex(state.pc) + hex(state.fpr[...]) + ...
+
+4. send  $G<that-string>#<cksum>     -> QEMU replies "OK"
+
+5. send  $c#<cksum>                   -> QEMU starts executing at state.pc
+```
+
+That's the entire protocol exchange. No QEMU code changes; no custom file format on the QEMU side; just standard gdb RSP. Reference: GDB Remote Serial Protocol, sections "Packets" and "Register Packet Format" in the gdb manual.
+
+## Where to Look Next
+
+- `include/hybrid/state_abi.h` - the wire contract; both QEMU plugin and vsim include this exact header.
+- `qemu_plugin/hybrid_handoff.c` - the QEMU side. Look at `resolve_handles` and the entry-trigger callback.
+- `hybrid_vsim/src/hybrid/` - the vsim side: `qemu_resume.hpp`, `state_drain.hpp`, `csr_trigger.hpp`, `qemu_handback.hpp`.
+- `hybrid_vsim/hybrid_plan.md` - the original design document, with full rationale for every decision.
+- `run_e2e.sh` - run all e2e tests locally without going through CMake/CTest.
+
+## Mental Model in One Sentence
+
+> Two simulators agree on a memory map and a register struct, take turns running the same program, and use a magic CSR write as the baton-pass.
