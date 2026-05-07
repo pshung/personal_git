@@ -1,0 +1,90 @@
+# Build tiny RV64 fixtures used by hybrid smoke tests.
+# Default toolchain matches /local/nick/SW_Release/build-ast540/...
+
+TOOLCHAIN ?= /local/nick/SW_Release/build-ast540/build-toolchain/linux/nds64le-elf-newlib-v5d
+CC        := $(TOOLCHAIN)/bin/riscv64-unknown-elf-gcc
+LD        := $(TOOLCHAIN)/bin/riscv64-unknown-elf-ld
+OBJDUMP   := $(TOOLCHAIN)/bin/riscv64-unknown-elf-objdump
+
+CFLAGS  := -march=rv64gc -mabi=lp64d -nostdlib -static -Wall
+LDFLAGS := -T spin.ld -nostdlib -static
+
+# Tier-1 round-trip e2e fixtures share handoff_roundtrip.ld.
+RT_FIXTURES := rt_all_gprs rt_abi_aliases rt_sign_bits rt_pc_jump \
+               rt_long_roi rt_mem_loadstore rt_unaligned_lh \
+               rt_shared_mem rt_csr_survival
+
+# Tier-1 C-level fixtures share runtime/ (crt0+trap+libgloss+handler) and
+# runtime/rt_c.ld. Newlib is linked (no -nostdlib) for printf/fopen/...
+RT_C_FIXTURES   := rt_c_hello rt_c_printf rt_c_file_io rt_c_matmul
+RT_C_V_FIXTURES  := rt_c_v_regs
+# Probe fixtures: QEMU1-only, no vsim/QEMU2 phase. Used by shell tests
+# that inspect the raw state file to verify plugin drain behavior.
+PROBE_V_FIXTURES := probe_v_csr
+RUNTIME_DIR     := runtime
+RUNTIME_SRCS    := $(RUNTIME_DIR)/crt0.S $(RUNTIME_DIR)/trap.S \
+                   $(RUNTIME_DIR)/libgloss.c $(RUNTIME_DIR)/handler.c
+RT_C_CFLAGS     := -march=rv64gc -mabi=lp64d -O1 -static -nostartfiles \
+                   -I$(RUNTIME_DIR) -Wall
+# RVV-using fixtures need -march=rv64gcv. The crt0 already sets mstatus.VS
+# to Initial (line 81), so V instructions don't trap.
+RT_C_V_CFLAGS   := -march=rv64gcv -mabi=lp64d -O1 -static -nostartfiles \
+                   -I$(RUNTIME_DIR) -Wall
+
+.PHONY: all clean dump
+
+all: spin.elf handoff.elf handoff_exit.elf handoff_roundtrip.elf \
+     $(RT_FIXTURES:%=%.elf) $(RT_C_FIXTURES:%=%.elf) \
+     $(RT_C_V_FIXTURES:%=%.elf) \
+     $(PROBE_V_FIXTURES:%=%.elf)
+
+spin.elf: spin.S spin.ld
+	$(CC) $(CFLAGS) -c spin.S -o spin.o
+	$(LD) $(LDFLAGS) spin.o -o $@
+
+handoff.elf: handoff.S handoff.ld
+	$(CC) $(CFLAGS) -c handoff.S -o handoff.o
+	$(LD) -T handoff.ld -nostdlib -static handoff.o -o $@
+
+handoff_exit.elf: handoff_exit.S handoff_exit.ld
+	$(CC) $(CFLAGS) -c handoff_exit.S -o handoff_exit.o
+	$(LD) -T handoff_exit.ld -nostdlib -static handoff_exit.o -o $@
+
+handoff_roundtrip.elf: handoff_roundtrip.S handoff_roundtrip.ld semihost_exit.inc
+	$(CC) $(CFLAGS) -c handoff_roundtrip.S -o handoff_roundtrip.o
+	$(LD) -T handoff_roundtrip.ld -nostdlib -static handoff_roundtrip.o -o $@
+
+$(RT_FIXTURES:%=%.elf): %.elf: %.S handoff_roundtrip.ld semihost_exit.inc
+	$(CC) $(CFLAGS) -c $< -o $*.o
+	$(LD) -T handoff_roundtrip.ld -nostdlib -static $*.o -o $@
+
+# C-level fixtures: compile+link via gcc (so newlib is pulled in). The shared
+# runtime is rebuilt per-fixture, which is fine -- they're tiny and isolating
+# each ELF avoids stale-object pitfalls. crt0.S is passed FIRST so _start
+# lands at the load address (0x80000000) -- ld preserves input order within
+# the .text wildcard.
+$(RT_C_FIXTURES:%=%.elf): %.elf: %.c $(RUNTIME_SRCS) $(RUNTIME_DIR)/rt_c.ld $(RUNTIME_DIR)/rt_c_helpers.h
+	$(CC) $(RT_C_CFLAGS) -T $(RUNTIME_DIR)/rt_c.ld $(RUNTIME_SRCS) $< -o $@
+
+# RVV-enabled fixtures: same runtime, different -march. Listed separately so
+# changes to RT_C_CFLAGS don't accidentally drop V from rt_c_v_*.
+$(RT_C_V_FIXTURES:%=%.elf): %.elf: %.c $(RUNTIME_SRCS) $(RUNTIME_DIR)/rt_c.ld $(RUNTIME_DIR)/rt_c_helpers.h
+	$(CC) $(RT_C_V_CFLAGS) -T $(RUNTIME_DIR)/rt_c.ld $(RUNTIME_SRCS) $< -o $@
+
+# Probe fixtures: pure asm, -march=rv64gcv (need V CSR names), no C runtime.
+PROBE_V_CFLAGS := -march=rv64gcv -mabi=lp64d -nostdlib -static -Wall
+$(PROBE_V_FIXTURES:%=%.elf): %.elf: %.S handoff_roundtrip.ld
+	$(CC) $(PROBE_V_CFLAGS) -c $< -o $*.o
+	$(LD) -T handoff_roundtrip.ld -nostdlib -static $*.o -o $@
+
+dump: spin.elf handoff.elf handoff_exit.elf
+	$(OBJDUMP) -d spin.elf
+	$(OBJDUMP) -d handoff.elf
+	$(OBJDUMP) -d handoff_exit.elf
+
+clean:
+	rm -f spin.o spin.elf handoff.o handoff.elf handoff_exit.o handoff_exit.elf \
+	      handoff_roundtrip.o handoff_roundtrip.elf \
+	      $(RT_FIXTURES:%=%.o) $(RT_FIXTURES:%=%.elf) \
+	      $(RT_C_FIXTURES:%=%.elf) $(RT_C_V_FIXTURES:%=%.elf) \
+	      $(PROBE_V_FIXTURES:%=%.o) $(PROBE_V_FIXTURES:%=%.elf)

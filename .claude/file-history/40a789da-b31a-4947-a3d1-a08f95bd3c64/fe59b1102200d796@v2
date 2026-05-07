@@ -1,0 +1,147 @@
+# Full V-CSR support across the hybrid handoff
+
+## Context
+
+Today the QEMU1 -> vsim -> QEMU2 round trip passes V *register* data
+(v0..v31) reliably via the `kVScratchGpa` shared-mmap stop-gap, but V
+*CSRs* are partial:
+
+| Component                                    | Out (drain)                          | In (restore)                |
+|----------------------------------------------|--------------------------------------|-----------------------------|
+| QEMU1 plugin (`hybrid_handoff.c`)            | vstart vtype vl vlenb + vreg         | n/a                         |
+| vsim StateDrain (`state_drain.hpp`)          | x1..x31 + DPC; V CSRs lost           | n/a                         |
+| vsim ResumeDriver (`resume_driver.hpp`)      | n/a                                  | mtvec only                  |
+| QEMU2 handback (`qemu_handback.hpp`)         | n/a                                  | vstart + vreg               |
+
+Concrete consequences:
+
+1. `hybrid_state_v1` has no slots for **vxsat (0x009), vxrm (0x00A),
+   vcsr (0x00F)**, so the ABI cannot represent the fixed-point flags or
+   the bundled vcsr alias at any point in the pipeline.
+2. `ResumeDriver::resume()` (resume_driver.hpp:52-85) restores only
+   `mtvec`. Per its inline comment, mstatus/vtype/vl/vstart are
+   "intentionally NOT restored" because vsim DM may silently drop
+   abstract write of mstatus, and a direct CSR write of vtype sets
+   `vill=1` per V spec, poisoning the next V instruction.
+3. `rt_c_v_regs.c:68-72` and `:146-148` work around (2) by re-issuing
+   `csrs mstatus, t1` and `vsetvli` inside the fixture itself. Every
+   future V fixture would need to repeat that prologue.
+4. `StateDrain::drain_with_passthrough()` (state_drain.hpp:53-61) falls
+   back on the QEMU1 snapshot for every field except GPRs and PC. If
+   vsim mutates vstart / vxsat / vxrm / vtype / vl, those mutations
+   never reach QEMU2.
+5. `restore_state_via_gdbstub()` only sends `vstart` + the v0..v31 byte
+   blobs (qemu_handback.hpp:321-332). vtype / vl / vxsat / vxrm / vcsr
+   are dropped, so QEMU2 boots with stale values from its `-cpu` reset
+   defaults.
+
+Goal: every V CSR survives the round trip transparently. Fixtures stop
+needing inline `csrs mstatus, ...` or other compensating prologues.
+
+## Tiering
+
+V CSRs split by writability:
+
+- **Tier A - directly writable**: `vstart` (0x008), `vxsat` (0x009),
+  `vxrm` (0x00A), `vcsr` (0x00F), and `mstatus.VS`. Spec-compliant to
+  CSR-write directly. DM Abstract path is preferred; Program Buffer is
+  the fallback when the DM rejects (`cmderr` set).
+- **Tier B - vsetvli-only**: `vtype` (0xC21), `vl` (0xC20). V spec says
+  direct CSR write of `vtype` sets `vill=1`; the only correct restore is
+  `vsetvl x0, rs1, rs2`. Always Program Buffer.
+- **Tier C - read-only**: `vlenb` (0xC22). Constant from CPU
+  configuration (`NDS_VLEN`); verify on receive only.
+
+Restore order on the vsim side (each step issued via the resume driver):
+
+1. mstatus.VS = Initial (Tier A).
+2. `vsetvl` to re-establish vtype + vl (Tier B).
+3. vstart (Tier A) - written *after* vsetvl because vsetvl resets vstart
+   to 0; non-zero values must be restored last to survive.
+4. vxsat, vxrm, vcsr (Tier A).
+5. Then the non-V GPR/CSR/PC restore as today.
+
+## Critical files
+
+| File                                                    | Change                                                                                                |
+|---------------------------------------------------------|-------------------------------------------------------------------------------------------------------|
+| `include/hybrid/state_abi.h`                            | Add `vxsat`, `vxrm`, `vcsr` (consume 24 bytes from `reserved[256]`). Stay on v1.                       |
+| `include/hybrid/state_abi_check.h`                      | New offset/size static_asserts for the three new fields.                                              |
+| `qemu_plugin/hybrid_handoff.c`                          | Resolve + drain vxsat / vxrm / vcsr alongside the existing vstart/vtype/vl/vlenb block.               |
+| `hybrid_vsim/src/hybrid/program_buffer.hpp` *(new)*     | Helper: stage GPR via Data0/1 -> AccessRegister, write progbufN, AccessRegister postexec=1, clear cmderr. |
+| `hybrid_vsim/src/hybrid/resume_driver.hpp`              | Tier A path with Abstract-first + PB fallback. Tier B `vsetvl` via PB. New helpers `write_csr_via_pb`, `vsetvl_via_pb`. |
+| `hybrid_vsim/src/hybrid/state_drain.hpp`                | Read V CSRs via Abstract. Stop relying on QEMU1 passthrough for them.                                 |
+| `hybrid_vsim/src/hybrid/qemu_handback.hpp`              | Send vtype, vl, vxsat, vxrm, vcsr via gdbstub P packets (extend `kCsrByName` or add a V-CSR list).   |
+| `hybrid_vsim/hybrid/test/rt_c_v_regs.c`                 | (Final step) drop `csrs mstatus, t1` prologues once restore is reliable.                              |
+| `hybrid_vsim/hybrid/test/rt_c_v_csrs.c` *(new)*         | Fixture seeding non-default vtype/vl/vstart/vxsat/vxrm in QEMU1, mutating in vsim, verifying in QEMU2.|
+| `hybrid_vsim/cmake/HybridConfig.cmake`                  | Register `rt_c_v_csrs:0` as Tier-2 fixture (csr + pc variants).                                       |
+
+## TDD sequence
+
+Each commit prefixed `structural:` or `behavioral:` per repo convention.
+
+1. **structural** - Extend `hybrid_state_v1` (vxsat/vxrm/vcsr from
+   `reserved`). Update `state_abi_check.h`. Suite stays green; struct
+   grew but nothing reads/writes the new fields yet.
+2. **behavioral** - QEMU plugin drains vxsat/vxrm/vcsr. Verify by
+   inspecting state file from a fixture that issues e.g. `csrwi vxrm,
+   1; csrwi vxsat, 1` before the trigger.
+3. **structural** - Extract `ProgramBuffer` helper + unit test on a
+   recording stub `DmiBus`. No runtime path uses it yet.
+4. **behavioral** - ResumeDriver Tier A: Abstract-first restore for
+   mstatus/vstart/vxsat/vxrm/vcsr with PB fallback on cmderr. Unit-test
+   the fallback decision against a stub bus that fails one CSR.
+5. **behavioral** - ResumeDriver Tier B: `vsetvl` via PB. Unit-test the
+   encoded vsetvl matches V spec for representative (sew, lmul, ta, ma)
+   tuples.
+6. **behavioral** - StateDrain reads V CSRs via Abstract; remove the
+   passthrough for them in `drain_with_passthrough`.
+7. **behavioral** - qemu_handback sends V CSRs via gdbstub P packets.
+   Probe whether QEMU's stub accepts vtype direct write; if not, send
+   via a one-shot `monitor` or memory-staged stub.
+8. **behavioral** - New e2e fixture `rt_c_v_csrs.c`, wired as Tier-2 in
+   `HybridConfig.cmake` (csr + pc trigger variants).
+9. **cleanup (structural)** - Strip `csrs mstatus, t1` from
+   `rt_c_v_regs.c`. Confirm suite stays green; restore path now carries
+   it.
+
+## Verification ladder
+
+1. After step 1: `ctest -L hybrid-e2e` 30 PASS unchanged.
+2. After step 4: unit test exercises Tier A Abstract->PB fallback on a
+   synthetic DM rejecting one CSR.
+3. After step 5: unit test asserts vsetvl encoding for SEW=8/16/32/64
+   times LMUL=1/2/4/8 times {ta, ma}.
+4. After step 6: existing `rt_c_v_regs` round trip still passes; vsim
+   mutating mstatus/vtype/vl/vstart in a probe fixture is observable in
+   the drained state file.
+5. After step 8: `rt_c_v_csrs` PASS in both csr and pc modes; QEMU2
+   reads exactly the values vsim left.
+6. After step 9: `rt_c_v_regs` runs unchanged with the prologue removed.
+   Total e2e count goes 30 -> 32 (csr + pc variant of the new fixture).
+7. `JOBS=8 bash run_e2e.sh` total reaches 36 PASS (34 baseline + 2 new).
+
+## Risks
+
+- **vsim DM may not expose Tier A V CSRs via Abstract**. Mitigation: PB
+  fallback is the canonical path; an orchestrator-startup probe logs
+  which CSRs are Abstract-accessible so reachability stays observable.
+- **Direct mstatus abstract write may be silently dropped on vsim's
+  DM** (already noted in resume_driver.hpp:74). Mitigation: rely on
+  PB for mstatus, treat Abstract-success as a fast path only.
+- **GPR clobber inside PB**: PB needs scratch GPRs (t0/t1). Restore
+  those *after* the PB sequence so the snapshot's t0/t1 survive. Order
+  the GPR-write loop accordingly.
+- **QEMU2 may reject direct vtype write** depending on version. If
+  empirically broken: write a tiny `vsetvl; addi pc, ra, 0` stub at a
+  scratch GPA via `M` packets, set DPC there, single-step, then jump
+  back. Confirm before locking step 7's implementation.
+- **vlenb mismatch** (QEMU1 reports vlenb != vsim NDS_VLEN/8):
+  unrecoverable; fail loudly at restore. Already partially asserted in
+  qemu_handback.hpp:321-322.
+
+## Out of scope
+
+- Phase 5 transparent V regfile transport (Program Buffer or DPI for v0..v31). Plan keeps the existing `kVScratchGpa` mechanism unchanged.
+- Andes-custom V CSRs beyond the spec set (no fixture exercises them today).
+- Fault state when mstatus.VS=Off at the QEMU1 trigger (current fixtures all start with V enabled).
