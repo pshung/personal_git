@@ -1,0 +1,167 @@
+#pragma once
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/dmi_poll.hpp"
+#include "hybrid/program_buffer.hpp"
+#include "hybrid/state_abi.h"
+
+#include <array>
+#include <cstdint>
+#include <stdexcept>
+
+namespace hybrid {
+
+struct DmiBus
+{
+  virtual ~DmiBus() = default;
+  virtual void write(uint8_t reg, uint32_t value) = 0;
+  virtual auto read(uint8_t reg) -> uint32_t = 0;
+};
+
+class ResumeDriver
+{
+public:
+  static constexpr uint8_t kData0      = 0x04;
+  static constexpr uint8_t kData1      = 0x05;
+  static constexpr uint8_t kDmcontrol  = 0x10;
+  static constexpr uint8_t kDmstatus   = 0x11;
+  static constexpr uint8_t kAbstractcs = 0x16;
+  static constexpr uint8_t kCommand    = 0x17;
+
+  static constexpr uint16_t kCsrDpc      = 0x7B1;
+  static constexpr uint16_t kCsrMstatus  = 0x300;
+  static constexpr uint16_t kCsrMtvec    = 0x305;
+  static constexpr uint16_t kCsrVstart   = 0x008;
+  static constexpr uint16_t kCsrVxsat    = 0x009;
+  static constexpr uint16_t kCsrVxrm     = 0x00A;
+  static constexpr uint16_t kCsrVcsr     = 0x00F;
+  static constexpr uint16_t kCsrVtype    = 0xC21;
+  static constexpr uint16_t kCsrVl       = 0xC20;
+
+  static constexpr uint32_t kDmcontrolDmactive  = 1u << 0;
+  static constexpr uint32_t kDmcontrolResumereq = 1u << 30;
+  static constexpr uint32_t kDmcontrolHaltreq   = 1u << 31;
+
+  static constexpr uint32_t kDmstatusAllhalted    = 1u << 9;
+  static constexpr uint32_t kDmstatusAllresumeack = 1u << 17;
+
+  static constexpr uint32_t kAbstractcsBusy        = 1u << 12;
+  static constexpr uint32_t kAbstractcsCmderrMask  = 0x7u << 8;
+
+  static constexpr unsigned kPollIterations = kDmiPollIterations;
+
+  explicit ResumeDriver(DmiBus& bus)
+      : bus_{bus}
+  {}
+
+  void resume(const hybrid_state_v1& state)
+  {
+    if (state.magic != HYBRID_STATE_MAGIC)
+      throw std::runtime_error("ResumeDriver::resume: bad magic");
+    if (state.version != HYBRID_STATE_VERSION)
+      throw std::runtime_error("ResumeDriver::resume: unsupported version");
+
+    // dmactive must transition 0->1 in its own write before any other
+    // DMCONTROL bit is honored (RISC-V Debug Spec).
+    bus_.write(kDmcontrol, kDmcontrolDmactive);
+    request_halt();
+    poll_until_set(bus_, kDmstatus, kDmstatusAllhalted, "ResumeDriver halt");
+
+    // Tier-A V CSR restore (before GPRs: PB fallback uses x5 as scratch;
+    // the GPR loop overwrites x5 afterward so state is preserved).
+    if (state.flags & HYBRID_FLAG_V) {
+      // mstatus: only write when VS field is non-zero (restore previous VS
+      // mode; leave at Off when the state was Off to avoid unnecessary DM
+      // abstract-write failures on implementations that reject mstatus).
+      if (state.mstatus & 0x600u)
+        write_csr_abstract_or_pb(kCsrMstatus, state.mstatus);
+      // Tier-B: vtype+vl via vsetvl x0,x5,x6 in PB.
+      // Direct csrrw to vtype sets vill; vl is read-only. Stage operands in
+      // scratch GPRs x5(vl) and x6(vtype) then let vsetvl set both atomically.
+      // x5/x6 are overwritten by the GPR loop below, so no leakage.
+      write_64bit_register(regno_gpr(5), state.vl);
+      write_64bit_register(regno_gpr(6), state.vtype);
+      const std::array<uint32_t, 1> pb_vsetvl = { encode_vsetvl(0, 5, 6) };
+      exec_progbuf(bus_, std::span<const uint32_t>{pb_vsetvl});
+      // vstart must come AFTER vsetvl: vsetvl resets vstart to 0.
+      write_csr_abstract_or_pb(kCsrVstart, state.vstart);
+      write_csr_abstract_or_pb(kCsrVxsat,  state.vxsat);
+      write_csr_abstract_or_pb(kCsrVxrm,   state.vxrm);
+      write_csr_abstract_or_pb(kCsrVcsr,   state.vcsr);
+    }
+
+    // GPRs + DPC (after V CSRs so PB scratch x5 is safe to overwrite).
+    for (uint16_t i = 1; i < 32; ++i)
+      write_64bit_register(regno_gpr(i), state.gpr[i]);
+    write_64bit_register(regno_csr(kCsrDpc), state.pc);
+
+    write_csr_tolerant(kCsrMtvec, state.mtvec);
+
+    clear_cmderr_if_set();
+    request_resume();
+    poll_until_set(bus_, kDmstatus, kDmstatusAllresumeack,
+                   "ResumeDriver resume");
+  }
+
+private:
+  void request_halt()
+  {
+    bus_.write(kDmcontrol, kDmcontrolDmactive | kDmcontrolHaltreq);
+  }
+
+  void request_resume()
+  {
+    bus_.write(kDmcontrol, kDmcontrolDmactive | kDmcontrolResumereq);
+  }
+
+  void write_64bit_register(uint16_t regno, uint64_t value)
+  {
+    bus_.write(kData0, uint32_t(value & 0xffffffffu));
+    bus_.write(kData1, uint32_t((value >> 32) & 0xffffffffu));
+    bus_.write(kCommand,
+               access_register_command(regno, AarSize::Bits64, /*write=*/true));
+    poll_until_clear(bus_, kAbstractcs, kAbstractcsBusy,
+                     "ResumeDriver write_register");
+  }
+
+  // Abstract-first CSR write with Program Buffer fallback.
+  // Tries an abstract register write; if the DM signals cmderr, clears it,
+  // stages the value in scratch_gpr via abstract GPR write, then executes a
+  // one-instruction PB (`csrrw x0, csr, scratch_gpr`).  scratch_gpr defaults
+  // to x5 (t0) which the GPR restore loop overwrites later.
+  void write_csr_abstract_or_pb(uint16_t csr, uint64_t value,
+                                 uint8_t scratch_gpr = 5)
+  {
+    write_64bit_register(regno_csr(csr), value);
+    if ((bus_.read(kAbstractcs) & kAbstractcsCmderrMask) == 0u) return;
+    bus_.write(kAbstractcs, kAbstractcsCmderrMask);  // W1C: clear sticky error
+    write_64bit_register(regno_gpr(scratch_gpr), value);
+    const std::array<uint32_t, 1> pb = { encode_csrrw(0, csr, scratch_gpr) };
+    exec_progbuf(bus_, std::span<const uint32_t>{pb});
+  }
+
+  // Write a CSR-addressable register and clear any cmderr the DM raised.
+  // Used for CSRs whose abstract-access support may be implementation
+  // dependent; a missing CSR mirrors as a no-op rather than blocking the
+  // remaining writes.
+  void write_csr_tolerant(uint16_t csr, uint64_t value)
+  {
+    write_64bit_register(regno_csr(csr), value);
+    clear_cmderr_if_set();
+  }
+
+  // abstractcs.cmderr is sticky per the Debug Spec - a subsequent command
+  // is rejected until the bits are W1C-cleared. We tolerate per-register
+  // failures (e.g. unimplemented FPR/CSR Abstract access) by clearing the
+  // error before resuming so the hart isn't left in a stuck state.
+  void clear_cmderr_if_set()
+  {
+    const auto status = bus_.read(kAbstractcs);
+    if ((status & kAbstractcsCmderrMask) != 0u)
+      bus_.write(kAbstractcs, kAbstractcsCmderrMask);
+  }
+
+  DmiBus& bus_;
+};
+
+}  // namespace hybrid
