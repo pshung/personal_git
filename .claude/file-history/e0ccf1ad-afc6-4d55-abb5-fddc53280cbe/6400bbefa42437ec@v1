@@ -1,0 +1,116 @@
+/* Tier-2 C-level fixture: 16x16x16 GEMM via RVV intrinsics, split across
+ * the three handoff phases.
+ *
+ *   QEMU 1: init_matrices -- RVV vid.v + vadd.vx + vrem.vx fills A and B.
+ *           V instructions retire just before the entry drain, exercising
+ *           the plugin's HandoffSite translation-time PC capture (the
+ *           old qemu_plugin_read_register("pc") path lagged for V).
+ *   vsim:   vmatmul_kernel -- RVV outer-product GEMM (vle32 + vmacc.vx +
+ *           vse32). V instructions also straddle the exit drain.
+ *   QEMU 2: scalar_matmul_verify -- pure C reference recomputation, then
+ *           cell-by-cell compare against vsim's C. Mismatch -> PASS=0.
+ *
+ * RVV shape
+ *   VLEN=512, e32, LMUL=1 -> vlmax = 16 elements per V reg, exactly one
+ *   row of a 16-wide matrix. The kernel runs N outer iterations (one per
+ *   row of A), each accumulating into a single V register seeded to zero
+ *   and storing it back as one row of C. No mask register, no tail policy
+ *   subtlety: the vl set by vsetvli equals N for every iteration.
+ *
+ * Cross-phase memory survival (same convention as rt_c_matmul.c)
+ *   Matrices live at fixed addresses inside the 128 MiB shared mmap
+ *   (0x80100000+) so neither QEMU's -kernel load nor vsim's elf-loader
+ *   zero-fill (utils/elf_loader.hpp:94) clobbers them. Pointers, not
+ *   arrays, so the compiler reserves no .bss for them.
+ */
+#include "runtime/rt_c_helpers.h"
+
+#include <riscv_vector.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#define N 16
+
+static int32_t* const A = (int32_t*) 0x80100000UL;
+static int32_t* const B = (int32_t*) 0x80101000UL;
+static int32_t* const C = (int32_t*) 0x80102000UL;
+
+#define AT(M, i, j) ((M)[(i) *N + (j)])
+
+/* Vectorized init: one V register holds [0, 1, ..., N-1], reused across
+ * rows. Per row i: A[i][:] = (vidx + i)   % 7, B[i][:] = (vidx + 3i) % 5.
+ * vid.v writes unsigned lane indices; reinterpret to signed so the rest of
+ * the math (and the int32_t* matrix pointers) stay in i32 land. */
+static void init_matrices(void)
+{
+  size_t           vl     = __riscv_vsetvl_e32m1((size_t) N);
+  const vuint32m1_t vidx_u = __riscv_vid_v_u32m1(vl);
+  const vint32m1_t  vidx   = __riscv_vreinterpret_v_u32m1_i32m1(vidx_u);
+
+  for (int i = 0; i < N; i++) {
+    vint32m1_t va = __riscv_vadd_vx_i32m1(vidx, i, vl);
+    va            = __riscv_vrem_vx_i32m1(va, 7, vl);
+    __riscv_vse32_v_i32m1(&AT(A, i, 0), va, vl);
+
+    vint32m1_t vb = __riscv_vadd_vx_i32m1(vidx, i * 3, vl);
+    vb            = __riscv_vrem_vx_i32m1(vb, 5, vl);
+    __riscv_vse32_v_i32m1(&AT(B, i, 0), vb, vl);
+  }
+}
+
+/* Outer-product RVV GEMM: for each row i of C, accumulate
+ *   C[i][:] += A[i][k] * B[k][:]
+ * using a single V register per row. */
+static void vmatmul_kernel(void)
+{
+  for (int i = 0; i < N; i++) {
+    size_t     vl   = __riscv_vsetvl_e32m1((size_t) N);
+    vint32m1_t vacc = __riscv_vmv_v_x_i32m1(0, vl);
+    for (int k = 0; k < N; k++) {
+      const int32_t  a_ik = AT(A, i, k);
+      const vint32m1_t vb_k =
+        __riscv_vle32_v_i32m1(&AT(B, k, 0), vl);
+      vacc = __riscv_vmacc_vx_i32m1(vacc, a_ik, vb_k, vl);
+    }
+    __riscv_vse32_v_i32m1(&AT(C, i, 0), vacc, vl);
+  }
+}
+
+/* Pure scalar reference, independent of the RVV kernel above. */
+static int scalar_matmul_verify(void)
+{
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < N; j++) {
+      int32_t s = 0;
+      for (int k = 0; k < N; k++)
+        s += AT(A, i, k) * AT(B, k, j);
+      if (AT(C, i, j) != s)
+        return 0;
+    }
+  }
+  return 1;
+}
+
+int main(void)
+{
+  /* Phase 1 (QEMU 1): seed inputs only. */
+  init_matrices();
+
+  rt_phase_qemu1_drain();
+
+  /* Phase 2 (vsim): RVV kernel. printf goes to libgloss/sim_control. */
+  setvbuf(stdout, NULL, _IONBF, 0);
+  printf("rt_c_v_matmul: vsim running 16x16x16 RVV GEMM\n");
+  vmatmul_kernel();
+  printf("rt_c_v_matmul: vsim kernel done\n");
+
+  rt_phase_vsim_drain();
+
+  /* Phase 3 (QEMU 2): scalar reference compare via semihosting. */
+  if (!scalar_matmul_verify()) {
+    rt_semihost_writes("rt_c_v_matmul: FAIL\n");
+    return 1;
+  }
+  rt_semihost_writes("rt_c_v_matmul: PASS\n");
+  return 0;
+}

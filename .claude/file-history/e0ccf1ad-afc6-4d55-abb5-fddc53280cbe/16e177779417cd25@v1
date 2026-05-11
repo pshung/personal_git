@@ -1,0 +1,134 @@
+/* Tier-2 C-level fixture: 16x16x16 GEMM split across all three phases.
+ *
+ *   QEMU 1: init_matrices -- fills A and B with deterministic patterns.
+ *   vsim:   matmul_kernel -- the only phase that touches sim_control via
+ *           printf(); also computes C = A * B.
+ *   QEMU 2: prints C row-by-row via RISC-V semihosting (SYS_WRITE0,
+ *           QEMU virt has no sim_control), then re-derives the expected
+ *           value of every C[i][j] and compares. Mismatch -> _exit(1).
+ *
+ * Cross-phase memory survival
+ *   vsim's elf loader (utils/elf_loader.hpp:94) zero-fills (memsz - filesz)
+ *   for every PT_LOAD on resume, which would blow away anything in .bss
+ *   that QEMU 1 had written. The matrices therefore live at fixed addresses
+ *   (0x80100000+) -- inside the 128 MiB shared mmap, above the ELF's last
+ *   loaded byte (~0x8000d800), below the stack (0x80700000), so QEMU's
+ *   -kernel load and vsim's loader both leave them untouched. The shared
+ *   memory-backend-file then preserves the bytes across QEMU1 -> vsim ->
+ *   QEMU2.
+ */
+#include "runtime/rt_c_helpers.h"
+
+#include <stdint.h>
+#include <stdio.h>
+
+#define N 16
+
+/* Fixed-address scratch region. Pointers (not arrays) so the compiler
+ * doesn't reserve .bss for them. */
+static int32_t* const A = (int32_t*) 0x80100000UL;
+static int32_t* const B = (int32_t*) 0x80101000UL;
+static int32_t* const C = (int32_t*) 0x80102000UL;
+
+#define AT(M, i, j) ((M)[(i) *N + (j)])
+
+static void init_matrices(void)
+{
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < N; j++) {
+      AT(A, i, j) = (int32_t) ((i + j) % 7);
+      AT(B, i, j) = (int32_t) ((i * 3 + j) % 5);
+    }
+  }
+}
+
+static void matmul_kernel(void)
+{
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < N; j++) {
+      int32_t s = 0;
+      for (int k = 0; k < N; k++) {
+        s += AT(A, i, k) * AT(B, k, j);
+      }
+      AT(C, i, j) = s;
+    }
+  }
+}
+
+/* Independent recomputation in QEMU2 -- catches any kernel error. */
+static int verify(void)
+{
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < N; j++) {
+      int32_t s = 0;
+      for (int k = 0; k < N; k++) {
+        s += AT(A, i, k) * AT(B, k, j);
+      }
+      if (AT(C, i, j) != s)
+        return 0;
+    }
+  }
+  return 1;
+}
+
+/* Right-justified 4-char decimal cell + space, no printf. */
+static int format_cell(char* dst, int32_t v)
+{
+  char tmp[12];
+  int t = 0, neg = v < 0;
+  uint32_t uv = neg ? -(uint32_t) v : (uint32_t) v;
+  if (uv == 0)
+    tmp[t++] = '0';
+  while (uv) {
+    tmp[t++] = (char) ('0' + (uv % 10));
+    uv /= 10;
+  }
+  if (neg)
+    tmp[t++] = '-';
+  int p = 0;
+  for (int pad = 4 - t; pad > 0; pad--)
+    dst[p++] = ' ';
+  while (t--)
+    dst[p++] = tmp[t];
+  dst[p++] = ' ';
+  return p;
+}
+
+static void semihost_print_row(const int32_t* row, int n)
+{
+  char line[N * 6 + 4];
+  int p = 0;
+  for (int i = 0; i < n; i++)
+    p += format_cell(line + p, row[i]);
+  line[p++] = '\n';
+  line[p] = '\0';
+  rt_semihost_writes(line);
+}
+
+int main(void)
+{
+  /* Phase 1 (QEMU 1): seed inputs. No I/O reachable. */
+  init_matrices();
+
+  rt_phase_qemu1_drain();
+
+  /* Phase 2 (vsim): GEMM kernel + status via libgloss/sim_control. */
+  setvbuf(stdout, NULL, _IONBF, 0);
+  printf("rt_c_matmul: vsim running 16x16x16 GEMM\n");
+  matmul_kernel();
+  printf("rt_c_matmul: vsim kernel done\n");
+
+  rt_phase_vsim_drain();
+
+  /* Phase 3 (QEMU 2): print + verify via semihosting (no sim_control). */
+  rt_semihost_writes("rt_c_matmul: C[16][16]=\n");
+  for (int i = 0; i < N; i++)
+    semihost_print_row(C + i * N, N);
+
+  if (!verify()) {
+    rt_semihost_writes("rt_c_matmul: FAIL\n");
+    return 1;
+  }
+  rt_semihost_writes("rt_c_matmul: PASS\n");
+  return 0;
+}
