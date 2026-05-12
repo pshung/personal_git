@@ -1,0 +1,94 @@
+/* Tier-2 C-level fixture: 16x16x16 GEMM split across all three phases.
+ *
+ *   QEMU 1: init_matrices -- fills A and B with deterministic patterns.
+ *   vsim:   matmul_kernel -- pure C = A * B, no syscalls (phase-2 rule).
+ *   QEMU 2: prints C row-by-row via printf, then re-derives the expected
+ *           value of every C[i][j] and compares. Mismatch -> _exit(1).
+ *
+ * Cross-phase memory survival
+ *   Matrices sit in .bss. The "no redundant ELF reload" rule (vsim
+ *   skips load_elf and QEMU 2 drops -kernel when --shared-mem-path is
+ *   set) keeps phase-1 .bss writes intact through the shared
+ *   memory-backend-file.
+ */
+#include "runtime/rt_c_helpers.h"
+
+#include <stdint.h>
+#include <stdio.h>
+
+#define N 16
+
+static int32_t A[N * N];
+static int32_t B[N * N];
+static int32_t C[N * N];
+
+#define AT(M, i, j) ((M)[(i) *N + (j)])
+
+static void init_matrices(void)
+{
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < N; j++) {
+      AT(A, i, j) = (int32_t) ((i + j) % 7);
+      AT(B, i, j) = (int32_t) ((i * 3 + j) % 5);
+    }
+  }
+}
+
+static void matmul_kernel(void)
+{
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < N; j++) {
+      int32_t s = 0;
+      for (int k = 0; k < N; k++) {
+        s += AT(A, i, k) * AT(B, k, j);
+      }
+      AT(C, i, j) = s;
+    }
+  }
+}
+
+/* Independent recomputation in QEMU2 -- catches any kernel error. */
+static int verify(void)
+{
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < N; j++) {
+      int32_t s = 0;
+      for (int k = 0; k < N; k++) {
+        s += AT(A, i, k) * AT(B, k, j);
+      }
+      if (AT(C, i, j) != s)
+        return 0;
+    }
+  }
+  return 1;
+}
+
+int main(void)
+{
+  /* Phase 1 (QEMU 1): seed inputs. */
+  init_matrices();
+
+  enter_vsim();
+
+  /* Phase 2 (vsim): GEMM kernel only. No syscalls. */
+  matmul_kernel();
+
+  exit_vsim();
+
+  /* Phase 3 (QEMU 2): print + verify. */
+  printf("rt_c_matmul: C[16][16]=\n");
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < N; j++)
+      printf("%4d ", (int) AT(C, i, j));
+    printf("\n");
+  }
+
+  if (!verify()) {
+    printf("rt_c_matmul: FAIL\n");
+    fflush(stdout);
+    return 1;
+  }
+  printf("rt_c_matmul: PASS\n");
+  fflush(stdout);
+  return 0;
+}
