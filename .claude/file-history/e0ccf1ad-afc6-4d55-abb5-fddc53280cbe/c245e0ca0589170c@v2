@@ -1,0 +1,64 @@
+/* Drain markers and helpers shared by all C-level round-trip fixtures.
+ *
+ * Phase rule (enforced by inspection):
+ *   The span between rt_phase_qemu1_drain() and rt_phase_vsim_drain()
+ *   runs on vsim and MUST NOT perform any I/O -- no libgloss / sim_control
+ *   MMIO (0xE0080000+), no RISC-V semihosting. vsim does not implement
+ *   semihosting, and emitting status bytes during the cycle-accurate span
+ *   pollutes the round-trip with non-architectural events.
+ *
+ *   Printing is permitted in QEMU1 (before rt_phase_qemu1_drain) and in
+ *   QEMU2 (after rt_phase_vsim_drain) via rt_semihost_writes(). Both QEMU
+ *   launches are configured with -semihosting-config enable=on,target=native
+ *   (roundtrip_e2e.sh, rt_shared_mem.sh, qemu_handback.hpp).
+ */
+
+#ifndef RT_C_HELPERS_H
+#define RT_C_HELPERS_H
+
+#include <stdint.h>
+#include <stdio.h>
+
+/* Plugin- / handoff-controller-recognized drain markers (CSR 0x7C0,
+ * uimm 0 = ENTER, uimm 1 = EXIT). Match insn_match.h.
+ *
+ * Each helper exposes a global `_hybrid_{enter,exit}_pc` label co-located
+ * with the csrwi insn. The labels are inert in CSR mode and consumed by
+ * the PC-trigger mode driver (resolved via `nm --defined-only`). Because
+ * each fixture calls each helper exactly once, the labels stay unique. */
+static inline void rt_phase_qemu1_drain(void)
+{
+  __asm__ __volatile__(".globl _hybrid_enter_pc\n"
+                       "_hybrid_enter_pc:\n"
+                       "csrwi 0x7C0, 0\n");
+}
+static inline void rt_phase_vsim_drain(void)
+{
+  __asm__ __volatile__(".globl _hybrid_exit_pc\n"
+                       "_hybrid_exit_pc:\n"
+                       "csrwi 0x7C0, 1\n");
+}
+
+/* RISC-V semihosting write-string. Safe in QEMU1 (phase 1) and QEMU2
+ * (phase 3); both QEMUs are spawned with -semihosting-config
+ * enable=on,target=native so the magic slli/ebreak/srai triple is
+ * intercepted before reaching mtvec. MUST NOT be called inside the
+ * vsim span (between rt_phase_qemu1_drain and rt_phase_vsim_drain):
+ * vsim does not implement semihosting, the ebreak routes to
+ * m_trap_entry -> exception_handler and loops. */
+static inline void rt_semihost_writes(const char* s)
+{
+  register long a0 __asm__("a0") = 0x04; /* SYS_WRITE0 */
+  register long a1 __asm__("a1") = (long) (uintptr_t) s;
+  __asm__ __volatile__(".option push\n"
+                       ".option norvc\n"
+                       "slli x0, x0, 0x1f\n"
+                       "ebreak\n"
+                       "srai x0, x0, 0x7\n"
+                       ".option pop\n"
+                       :
+                       : "r"(a0), "r"(a1)
+                       : "memory");
+}
+
+#endif /* RT_C_HELPERS_H */
