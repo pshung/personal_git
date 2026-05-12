@@ -1,0 +1,184 @@
+/* Tier-2 C-level fixture: V regfile carries state across all three handoff
+ * phases. The vector computation is written in RVV intrinsics; only the
+ * unavoidable scaffolding (pinning typed vector values into specific
+ * physical V registers at the phase boundaries) is inline asm.
+ *
+ * Why the asm scaffolding cannot be removed
+ *   RVV C intrinsics expose typed vector variables (vint32m1_t, ...) but
+ *   provide no syntax for binding a value to a specific physical V
+ *   register. The V regfile transport between vsim and QEMU is indexed by
+ *   physical V-reg number (V_SCRATCH slot N corresponds to state.vreg[N]
+ *   which corresponds to v<N> in QEMU's gdbstub view). So the test has to
+ *   name the registers at the boundary - exactly two places per phase
+ *   transition.
+ *
+ * Pipeline
+ *
+ *   QEMU 1   intrinsic compute:  va = vid * 3,  vb = vid + 100
+ *            asm pin:            va -> v1,      vb -> v2
+ *            enter_vsim          plugin drains v0..v31 to state.vreg[]
+ *
+ *   vsim     asm load:           v1, v2 <- V_SCRATCH (staged by
+ *                                ResumeDriver::stage_v_to_scratch from
+ *                                state.vreg[1], state.vreg[2])
+ *            intrinsic compute:  vp = va * vb,  vc = vp + va
+ *            asm pin+store:      vc -> v3,  vse8.v v3 -> V_SCRATCH
+ *            exit_vsim           vsim reads V_SCRATCH back into
+ *                                state.vreg[] via read_v_from_scratch
+ *
+ *   QEMU 2   gdbstub P-packets restored state.vreg[3] into v3 during
+ *            qemu_handback. asm extract: v3 -> typed var. Store to
+ *            memory via vse32, scalar verify against the closed form
+ *            vc[i] = 3i * (i + 101).
+ *
+ * What this test proves that a SEED-buffer reload cannot
+ *   v1, v2 in vsim come from the V_SCRATCH region that ResumeDriver
+ *   staged from state.vreg[]. They are NOT reloaded from a memory buffer
+ *   that QEMU 1 happened to fill with the same pattern. A bug in the
+ *   plugin V drain, in stage_v_to_scratch, or in the e8 stride math would
+ *   cause v1/v2 to read junk in vsim and the test would fail.
+ *
+ * V transport layout (matches hybrid::kVScratchGpa / v_regfile_xfer.hpp)
+ *   V_SCRATCH = 0x80FF0000, 32 slots * 64 B = 2 KiB.
+ *   v<N> slot = V_SCRATCH + N * 64. This test uses:
+ *     v1 slot 0x80FF0040
+ *     v2 slot 0x80FF0080
+ *     v3 slot 0x80FF00C0
+ *
+ * VLEN contract: VLEN=512 -> vlenb=64. e32 m1 -> 16 i32 lanes per V reg.
+ *
+ * Phase-2 rule: no syscalls between enter_vsim and exit_vsim (vsim does
+ * not implement semihosting). All printf calls live in QEMU 1 or QEMU 2.
+ */
+#include "runtime/rt_c_helpers.h"
+
+#include <riscv_vector.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#define N 16
+
+/* Pin two intrinsic-typed vectors into v1, v2 just before enter_vsim.
+ *
+ * "v1"/"v2" are listed as clobbers so the compiler cannot allocate them
+ * as the source V regs for the "vr" inputs - otherwise the first
+ * vmv.v.v could overwrite the source for the second. After this returns
+ * the compiler no longer tracks v1/v2 as holding anything meaningful;
+ * that is fine, the next architecturally observable event is the plugin
+ * drain triggered by enter_vsim. */
+static inline __attribute__((always_inline)) void
+pin_v1_v2(vint32m1_t va, vint32m1_t vb)
+{
+  asm volatile("vmv.v.v v1, %0\n"
+               "vmv.v.v v2, %1\n"
+               :
+               : "vr"(va), "vr"(vb)
+               : "memory", "v1", "v2");
+}
+
+/* Pull v1, v2 out of the V_SCRATCH region (staged by
+ * ResumeDriver::stage_v_to_scratch from state.vreg[1] / state.vreg[2])
+ * and surface them as intrinsic-typed vectors for the kernel body. */
+static inline __attribute__((always_inline)) void
+load_v1_v2_from_scratch(vint32m1_t* va_out, vint32m1_t* vb_out)
+{
+  vint32m1_t va_loaded;
+  vint32m1_t vb_loaded;
+  asm volatile(
+    /* e8 m1 vl=vlenb: byte-stride single-V-reg load. */
+    "li      a4, 64\n"
+    "vsetvli zero, a4, e8, m1, ta, ma\n"
+    "li      t0, 0x80FF0040\n"  /* V_SCRATCH + 1*64 (v1 slot) */
+    "vle8.v  v1, (t0)\n"
+    "addi    t0, t0, 64\n"       /* -> V_SCRATCH + 2*64 (v2 slot) */
+    "vle8.v  v2, (t0)\n"
+    /* Switch to e32 m1 and surface v1/v2 as compiler-tracked V regs.
+     * vmv.v.v copies vl*sew/8 bytes; at e32 vl=16 that is the full 64-B
+     * V reg, byte-identical to the e8 vl=64 load above. */
+    "vsetvli zero, %2, e32, m1, ta, ma\n"
+    "vmv.v.v %0, v1\n"
+    "vmv.v.v %1, v2\n"
+    : "=vr"(va_loaded), "=vr"(vb_loaded)
+    : "r"((unsigned long) N)
+    : "memory", "t0", "a4", "v1", "v2");
+  *va_out = va_loaded;
+  *vb_out = vb_loaded;
+}
+
+/* Pin vc into v3 and store v3 to V_SCRATCH so vsim's exit drain can
+ * pull it back into state.vreg[3] via read_v_from_scratch. */
+static inline __attribute__((always_inline)) void pin_v3_and_dump(vint32m1_t vc)
+{
+  asm volatile("vmv.v.v v3, %0\n"
+               "li      a4, 64\n"
+               "vsetvli zero, a4, e8, m1, ta, ma\n"
+               "li      t0, 0x80FF00C0\n"  /* V_SCRATCH + 3*64 (v3 slot) */
+               "vse8.v  v3, (t0)\n"
+               :
+               : "vr"(vc)
+               : "memory", "t0", "a4", "v3");
+}
+
+/* Pull v3 (just restored into QEMU 2's regfile by gdbstub P-packet)
+ * back into an intrinsic-typed value. Must be called before any other
+ * vector intrinsic in phase 3 - the compiler does not know v3 is "live"
+ * and would happily reuse it. */
+static inline __attribute__((always_inline)) vint32m1_t load_v3(void)
+{
+  vint32m1_t vc_loaded;
+  asm volatile("vsetvli zero, %1, e32, m1, ta, ma\n"
+               "vmv.v.v %0, v3\n"
+               : "=vr"(vc_loaded)
+               : "r"((unsigned long) N));
+  return vc_loaded;
+}
+
+int main(void)
+{
+  /* Phase 1 (QEMU 1): seed v1/v2 via intrinsic vid-based compute. */
+  {
+    size_t            vl     = __riscv_vsetvl_e32m1((size_t) N);
+    const vuint32m1_t vidx_u = __riscv_vid_v_u32m1(vl);
+    const vint32m1_t  vi     = __riscv_vreinterpret_v_u32m1_i32m1(vidx_u);
+    const vint32m1_t  va     = __riscv_vmul_vx_i32m1(vi, 3, vl);    /* 3i */
+    const vint32m1_t  vb     = __riscv_vadd_vx_i32m1(vi, 100, vl);  /* i+100 */
+    pin_v1_v2(va, vb);
+  }
+
+  enter_vsim();
+
+  /* Phase 2 (vsim): pick up v1/v2 from V_SCRATCH, compute, pin v3. */
+  {
+    vint32m1_t va, vb;
+    load_v1_v2_from_scratch(&va, &vb);
+    size_t           vl = __riscv_vsetvl_e32m1((size_t) N);
+    const vint32m1_t vp = __riscv_vmul_vv_i32m1(va, vb, vl);  /* va * vb */
+    const vint32m1_t vc = __riscv_vadd_vv_i32m1(vp, va, vl);  /*    + va */
+    pin_v3_and_dump(vc);
+  }
+
+  exit_vsim();
+
+  /* Phase 3 (QEMU 2): extract v3, vse32 to memory, scalar verify. */
+  const vint32m1_t vc_loaded = load_v3();
+
+  int32_t out[N];
+  {
+    size_t vl = __riscv_vsetvl_e32m1((size_t) N);
+    __riscv_vse32_v_i32m1(out, vc_loaded, vl);
+  }
+
+  for (int i = 0; i < N; i++) {
+    /* va_i = 3i, vb_i = i + 100  =>  vc_i = 3i + 3i*(i+100) = 3i*(i+101). */
+    const int32_t expected = (int32_t) ((3 * i) * (i + 101));
+    if (out[i] != expected) {
+      printf("rt_c_v_regs: FAIL i=%d got=%d expected=%d\n", i, (int) out[i],
+             (int) expected);
+      fflush(stdout);
+      return 1;
+    }
+  }
+  printf("rt_c_v_regs: PASS\n");
+  fflush(stdout);
+  return 0;
+}
