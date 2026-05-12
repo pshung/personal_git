@@ -1,0 +1,93 @@
+// V-register transport via shared scratch RAM. The vsim Debug Module
+// abstract-command space does not allocate slots for v0..v31 (RISC-V Debug
+// Spec leaves V to optional Program Buffer or implementation-specific
+// extensions), and the AX45MPV CPU wrapper does not export a DPI probe for
+// the V regfile. As a stop-gap that keeps Phase 5 (DPI / PB) deferred while
+// still letting C-level RVV fixtures round-trip:
+//
+//   - On resume from QEMU 1, vsim copies state.vreg[] into a fixed scratch
+//     region of guest RAM (kVScratchGpa). The fixture's vsim-phase prologue
+//     issues `vle8.v vN, (t0)` against that region to repopulate v0..v31.
+//   - Before the vsim->QEMU2 drain trigger, the fixture issues `vse8.v vN,
+//     (t0)` to write the (possibly mutated) regfile back to the same region.
+//     vsim's StateDrain side reads the scratch bytes into state.vreg[] so
+//     qemu_handback can ship them to QEMU 2 via the existing gdbstub P
+//     packets.
+//
+// The contract is fixture-aware: any program that wants V state preserved
+// across the vsim boundary must perform the load/store at the boundaries.
+// rt_c_v_regs.c demonstrates the pattern. Phase 5 will replace this with a
+// transparent mechanism (PB or DPI) so benchmark binaries don't need to be
+// modified.
+//
+// Pure logic: no SystemC, no DMI bus. Easy to unit-test.
+
+#pragma once
+
+#include "hybrid/state_abi.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <span>
+#include <stdexcept>
+
+namespace hybrid
+{
+
+// Top of QEMU virt's default 128 MiB RAM (RAM_BASE 0x80000000 + 0x0FF0000
+// = 0x80FF0000). Below the C-runtime stack at 0x80700000 only when the
+// runtime grows beyond default; rt_c.ld places _stack at 0x80700000 so
+// 0x80FF0000 sits well above it. Document the reservation in fixture
+// comments so future memory-layout changes don't collide.
+inline constexpr uint64_t kVScratchGpa = 0x80FF0000ull;
+
+// Total scratch bytes needed: 32 V regs × HYBRID_VLEN_BYTES_MAX. Sized to
+// the maximum supported VLEN; the actual per-reg byte count is `vlenb`.
+inline constexpr std::size_t kVScratchBytes =
+  static_cast<std::size_t>(32) * HYBRID_VLEN_BYTES_MAX;
+
+namespace detail
+{
+
+// Translate scratch GPA into a byte offset inside a RAM span whose first
+// byte sits at `ram_base`. Throws if the scratch region falls outside the
+// supplied span (i.e. the caller passed a too-small RAM mapping).
+inline auto scratch_offset(std::size_t ram_size, uint64_t ram_base)
+  -> std::size_t
+{
+  if (kVScratchGpa < ram_base)
+    throw std::runtime_error(
+      "v_regfile_xfer: scratch GPA below RAM base");
+  const auto off = static_cast<std::size_t>(kVScratchGpa - ram_base);
+  if (off + kVScratchBytes > ram_size)
+    throw std::runtime_error(
+      "v_regfile_xfer: scratch region exceeds RAM span");
+  return off;
+}
+
+}  // namespace detail
+
+// Copy state.vreg[] into ram[scratch_offset .. scratch_offset+kVScratchBytes].
+// Called just before vsim resumes the hart so the fixture can vle8.v from
+// scratch and pick up QEMU 1's V values.
+inline void stage_v_to_scratch(const hybrid_state_v1& state,
+                               std::span<uint8_t> ram,
+                               uint64_t ram_base)
+{
+  const auto off = detail::scratch_offset(ram.size(), ram_base);
+  std::memcpy(ram.data() + off, state.vreg, kVScratchBytes);
+}
+
+// Copy ram[scratch_offset .. +kVScratchBytes] into state.vreg[]. Called
+// inside the vsim drain path after the fixture's prologue vse8.v has
+// settled the (possibly mutated) regfile bytes into RAM.
+inline void read_v_from_scratch(hybrid_state_v1& state,
+                                std::span<const uint8_t> ram,
+                                uint64_t ram_base)
+{
+  const auto off = detail::scratch_offset(ram.size(), ram_base);
+  std::memcpy(state.vreg, ram.data() + off, kVScratchBytes);
+}
+
+}  // namespace hybrid
