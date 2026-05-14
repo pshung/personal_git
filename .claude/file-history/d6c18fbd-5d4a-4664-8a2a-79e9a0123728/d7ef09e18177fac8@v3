@@ -1,0 +1,239 @@
+# SimPoint-driven hybrid sim: shared-mmap transport vs dump/reload transport
+
+Context: extend the existing QEMU + vsim/Verilator hybrid with a SimPoint-driven
+workflow. End-to-end pipeline:
+
+1. **BBV generation** - run the workload in QEMU; emit Basic Block Vectors
+   (one per fixed-size slice of dynamic instructions) into a `.bb` file.
+2. **SimPoint clustering** - feed the `.bb` file into the SimPoint tool; it
+   selects K representative slices and weights.
+3. **Checkpoint collection** - replay the workload in QEMU, drain a checkpoint
+   (architectural state + memory image) at each of the K simpoint boundaries.
+4. **Detailed replay** - for each checkpoint, restore into vsim/Verilator and
+   collect cycle-accurate metrics. Combine per-region metrics by weight.
+
+Steps 3 and 4 are exactly the QEMU -> vsim handoff we already have, just
+repeated K times at SimPoint-selected boundaries instead of at WFI / CSR write.
+The transport choice for that handoff matters: per-region snapshot cost
+multiplies by K (often 10-30), and the trigger surface must accept "fire at
+instruction count N", not just "fire at this PC".
+
+Two candidate transports exist in our tree today:
+
+1. The **shared-mmap** transport used by `hybrid_sim/` (this repo).
+2. The **dump/reload** transport used by `/local/nick/vsim-demo-new/demo/hybrid`.
+
+This document compares them and recommends a path.
+
+---
+
+## 1. Mechanics side-by-side
+
+| Aspect | `hybrid_sim` (shared mmap) | `vsim-demo-new/demo/hybrid` (dump/reload) |
+|---|---|---|
+| Memory transport | Shared `/dev/shm` file mmap'd by QEMU1, vsim, QEMU2 via `-object memory-backend-file,share=on,...`. Zero-copy. | `dump-guest-memory` -> ELF core -> `tools/qemu_elfdump_to_main_memory.sh` extracts PT_LOAD 0 -> gzip -> vsim `--restore-memory <gz>`. |
+| Arch state format | Binary `hybrid_state_v1` struct in `include/hybrid/state_abi.h`. Magic + version + ABI-locked offsets; layout enforced by `state_abi_check.h` static_asserts. | Text file `ae350regs.txt` with `REG`/`CSR`/`MMIO` lines; converted by `tools/regs2cmds.sh` into a GDB script of `set $csrN = 0x...` commands. |
+| Drain mechanism | QEMU TCG plugin `qemu_plugin/hybrid_handoff.c` triggered on `csrwi 0x7C0, 0` or on ELF-symbol PC. Programmatic, no human in the loop. | Manual rendezvous on WFI: `Ctrl-A c` for `dump-guest-memory`, then attach GDB and `source tools/dump_ae350.gdb`. |
+| Restore mechanism | vsim `ResumeDriver` (DMI Abstract Commands + Program Buffer); for QEMU2, `qemu_handback` spawns QEMU2 and pushes registers via gdbstub P-packets. | `./sim --restore-memory snap --reset-vector PC`, then attach GDB and `source ae350regs.cmds`, `set $dpc`, `continue`. |
+| V extension support | Yes. V regs go through scratch GPA `0x80FF0000` via `vse8.v`; vtype/vl restored via Program Buffer `vsetvl`; vstart/vxsat/vxrm/vcsr via Abstract Cmds. | Not supported. `dump_ae350.gdb` lists only Andes V5 CSRs - no V regs and no V CSRs. |
+| Trigger surface | `csrwi 0x7C0, 0/1` (default) or ELF-symbol PC (`_hybrid_enter_pc`/`_hybrid_exit_pc`). Both extensible from the TCG plugin (insn-count, region marker, ...). | WFI only; manual UI driving. Extending requires GDB scripting or QMP scripting. |
+| Per-handoff latency | Microseconds: mmap is shared (no copy); state file is a few KB binary. | Seconds: 2 GiB gzip pass + ELF parsing + GDB scripting per drain and per restore. |
+| Coupling between sides | Tight - both sides include the same C ABI header. | Loose - the GDB remote protocol is the only contract. |
+| Auditability of snapshot | Binary; needs a viewer (or a converter to text). | Human-readable `ae350regs.txt` is the wire format. Easy to diff. |
+| Persistence model | One live mmap file at a time; ephemeral. Snapshotting per region is `cp` (reflink-friendly). | One snapshot *directory* per checkpoint; archivable, portable, by construction. |
+
+Key file references in `hybrid_sim`:
+
+- `include/hybrid/state_abi.h` (wire struct)
+- `qemu_plugin/hybrid_handoff.c` (drain on QEMU side; natural home for BBV emission too)
+- `hybrid_vsim/src/hybrid/resume_driver.hpp` (restore into vsim via DMI)
+- `hybrid_vsim/src/hybrid/state_drain.hpp` (drain on vsim side)
+- `hybrid_vsim/tests/hybrid/rt_shared_mem.sh` (tier-2 harness using `memory-backend-file`)
+
+Key file references in the demo:
+
+- `demo/hybrid/main.c` (WFI-trigger fixture)
+- `demo/hybrid/tools/dump_ae350.gdb` (GDB script that prints `ae350regs.txt`)
+- `demo/hybrid/tools/regs2cmds.sh` (text -> GDB restore commands)
+- `demo/hybrid/tools/qemu_elfdump_to_main_memory.sh` (ELF core -> gz raw)
+- `demo/hybrid/README.md` (step-by-step instructions, ~140 lines)
+
+---
+
+## 2. Fit to a SimPoint pipeline driven from QEMU
+
+SimPoint needs three things from the host simulator:
+
+- **BBV emission**: per fixed-size slice (e.g. every 100 M insns), count how
+  many times each static basic block was executed; dump as one row of the
+  `.bb` file.
+- **Insn-count trigger**: fire a drain when the dynamic instruction counter
+  reaches a SimPoint-chosen value.
+- **K-region replay**: K snapshots persisted to disk, each independently
+  restorable.
+
+### 2.1 Shared mmap
+
+Strengths:
+
+- **BBV emission lives in the same plugin as the drain hook.** The QEMU TCG
+  plugin already sees every translated TB and every executed insn; counting
+  per-BB hits per slice and writing a row to a `.bb` file is a natural
+  extension of `qemu_plugin/hybrid_handoff.c`. No new process, no GDB.
+- **Insn-count trigger is a one-line addition** to the existing CSR/PC
+  trigger logic in the plugin. The plugin already runs at retire time.
+- **Per-snapshot drain is microseconds.** Taking K=10 (or K=30) checkpoints
+  is effectively free relative to the simulation work.
+- **Memory snapshot per region is a file copy of the mmap backing**:
+  `cp --reflink=auto /dev/shm/mem snap/N/mem`. On btrfs/xfs this is
+  O(metadata). On other filesystems it is one sequential read+write of RAM
+  size, no compression on the critical path.
+- **vsim restore path is unchanged.** `ResumeDriver` does not care whether
+  `hybrid_state_v1` was emitted at a WFI, a CSR write, or an insn-count
+  boundary.
+- **V-state already validated end to end** through `rt_c_v_regs`,
+  `rt_c_v_csrs` fixtures. SimPoint-driven runs of V workloads inherit this.
+
+Weaknesses:
+
+- A shared mmap is *live*. To collect K checkpoints we need to copy the
+  mmap to a per-region file as part of the drain step; that is one extra
+  syscall in the plugin but it must happen *before* QEMU resumes mutating
+  the mmap. Solvable in the plugin (it is already the synchronization
+  point) but a new code path.
+- The binary ABI couples both sides: when state grows (new CSR, wider VLEN)
+  the header bumps and producer + consumer rebuild in lock-step.
+- vsim today reads memory live from the mmap. For checkpoint *replay* we
+  need vsim to mmap the per-region snapshot file instead of the live one.
+  This is a flag change in the tier-2 harness (`--shared-mem-path
+  snap/N/mem`), not a structural change.
+
+### 2.2 Dump/reload
+
+Strengths:
+
+- Snapshots are *directories on disk* by construction. K checkpoints, K
+  directories, no extra copy step.
+- Loose coupling: schema drift between QEMU and vsim is absorbed in the awk
+  filter (`void` and read-only entries are dropped).
+- Human-readable text dump is a great debugging aid for a single mismatched
+  CSR.
+
+Weaknesses:
+
+- **No BBV story.** GDB cannot see per-TB execution counts; `dump-guest-memory`
+  is a memory dump, not an instrumentation hook. BBV emission would have to
+  go in a TCG plugin anyway, at which point we are back to the mmap design
+  for the BBV side and only using dump/reload for the snapshot side.
+- **No insn-count trigger.** WFI is the only rendezvous today; reaching a
+  SimPoint boundary by WFI would require injecting WFI traps into the
+  workload, which is invasive and slow.
+- **Per-region wall time is dominated by gzip of memory and GDB
+  serialization.** For K=10 phases over a 2 GiB image, this is roughly two
+  minutes of pure I/O per replay before any simulation begins.
+- **V regs and V CSRs not supported.** Extending the text dump to cover them
+  re-invents the V-state transport that the mmap path already has working.
+- **GDB-as-orchestrator** means three or four shell processes per snapshot
+  (QEMU, ICEman or vsim's gdbstub, GDB, vsim itself). Hard to make reliable
+  across K regions in CI.
+
+### 2.3 Cost summary on a 2 GiB workload, K=10 regions
+
+| Stage | Shared mmap | Dump/reload |
+|---|---|---|
+| BBV emission (whole run) | in-plugin counter, one fwrite per slice (microseconds) | not natively supported; would need a parallel plugin anyway |
+| Drain (per region) | ~0.05 ms (`state.bin` write) + cp/reflink of mmap | ~30 s (gzip 2 GiB) + ~2 s (GDB script) |
+| Snapshot to disk (per region) | ~3 s `cp`, ~0 with reflink | already on disk |
+| Restore into vsim (per region) | ~10 ms (DMI replay) + mmap open of snap | ~20 s (gunzip) + ~5 s (GDB replay) |
+| Total per region | ~3 s worst case, ~10 ms with reflink | ~55 s |
+| Total for K=10 | ~30 s worst case | ~10 min |
+
+Numbers are order-of-magnitude estimates, not measured. The point is the gap
+is one to three decades, not 2x.
+
+---
+
+## 3. Recommendation
+
+Adopt the shared-mmap transport. Extend the existing TCG plugin and tier-2
+harness; do not introduce the dump/reload path.
+
+### 3.1 What changes in `qemu_plugin/hybrid_handoff.c`
+
+1. **Add a BBV-emit mode** (`bbv_out=<path>,slice=<N>` plugin args). On each
+   executed TB, increment a `bbv_t -> count` map keyed by translation-time
+   BB id; every `slice` retired insns, write one row to the `.bb` file and
+   reset the map. This is the standard SimPoint input format.
+2. **Add an insn-count trigger** (`drain_at=<csv-of-N>` plugin arg). When the
+   retired-insn counter reaches each value, run the same drain code path
+   that the existing CSR/PC triggers use, and emit `state.bin` + the memory
+   snapshot under `snap/region_<N>/`. The drain code already exists; only
+   the trigger is new.
+3. **Memory snapshot at drain time**: in the plugin, immediately before
+   returning to QEMU, `cp --reflink=auto` (or plain `read/write`) the live
+   mmap to `snap/region_<N>/mem`. This is the only new I/O code path.
+
+### 3.2 What changes in vsim
+
+Nothing structural. The tier-2 harness already accepts `--shared-mem-path`,
+`--shared-mem-size`, `--shared-mem-base`. For replay, point it at
+`snap/region_N/mem` and `--resume-from-qemu snap/region_N/state.bin`.
+`ResumeDriver` is unchanged.
+
+### 3.3 What to keep from the demo
+
+The one feature worth borrowing is the **text pretty-printer** for snapshots.
+Port `regs2cmds.sh` into a small tool that takes `hybrid_state_v1` (binary)
+and prints `REG`/`CSR`/`MMIO` lines. Useful for diffing region N vs region N+1
+when something looks wrong. Not on the critical path; ships alongside
+snapshots as optional `state.txt`.
+
+### 3.4 What to drop from the demo entirely
+
+- gzip + ELF extraction of memory
+- WFI as the only trigger
+- text-as-wire-format
+- GDB as the restore driver
+
+They were appropriate for a manual one-shot demo; they are wrong for
+K-region replay.
+
+### 3.5 Final snapshot tree
+
+```
+snap/
+  bbv.bb                     # SimPoint input
+  simpoints.txt              # SimPoint output (chosen region indices + weights)
+  region_00/
+    mem                      # mmap snapshot, restorable via memory-backend-file
+    state.bin                # hybrid_state_v1
+    state.txt                # optional pretty-print
+  region_01/
+    mem
+    state.bin
+    state.txt
+  ...
+```
+
+Each `region_N/` is independently consumable by the existing tier-2 harness.
+
+---
+
+## 4. Open questions before we commit
+
+- **Slice size for BBV emission**: SimPoint papers commonly use 100 M
+  insns; we should sanity-check that against our workload lengths and
+  cluster stability.
+- **Insn counting precision in the plugin**: QEMU's
+  `qemu_plugin_register_vcpu_insn_exec_cb` fires per executed insn but
+  may batch by TB; the exact retire-time counter that the drain reads must
+  match the one the trigger compares against, or we drift across regions.
+- **Multi-hart workloads**: BBVs and checkpoints are per-hart. Decide
+  whether to extend `hybrid_state_v1` to multiple harts in the same file
+  or to one file per hart per region.
+- **Snapshot warmup**: cycle-accurate replay needs cache/TLB/branch-predictor
+  warmup before the measurement window opens. Neither transport addresses
+  this today; it belongs in a separate doc.
+- **Region length for detailed sim**: Verilator throughput sets a practical
+  upper bound on N (insns per measured region). We should benchmark vsim
+  on a representative workload before fixing N in the SimPoint clustering.

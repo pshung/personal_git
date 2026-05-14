@@ -1,0 +1,192 @@
+# SimPoint-driven gem5: shared-mmap transport vs dump/reload transport
+
+Context: we want to drive vsim (cycle-accurate) from gem5 (functional, SimPoint
+fast-forward) the same way we currently drive it from QEMU. SimPoint picks K
+representative regions (typically K=10, ~100M insns each); for each region we
+fast-forward gem5 to the start PC, snapshot architectural state + memory, then
+replay the snapshot in vsim for detailed measurement. Throughput per snapshot
+matters because we take K of them and replay K of them.
+
+Two candidate transports exist in our tree today:
+
+1. The **shared-mmap** transport used by `hybrid_sim/` (this repo).
+2. The **dump/reload** transport used by `/local/nick/vsim-demo-new/demo/hybrid`.
+
+This document compares them and recommends a path for gem5.
+
+---
+
+## 1. Mechanics side-by-side
+
+| Aspect | `hybrid_sim` (shared mmap) | `vsim-demo-new/demo/hybrid` (dump/reload) |
+|---|---|---|
+| Memory transport | Shared `/dev/shm` file mmap'd by QEMU1, vsim, QEMU2 via `-object memory-backend-file,share=on,...`. Zero-copy. | `dump-guest-memory` -> ELF core -> `tools/qemu_elfdump_to_main_memory.sh` extracts PT_LOAD 0 -> gzip -> vsim `--restore-memory <gz>`. |
+| Arch state format | Binary `hybrid_state_v1` struct in `include/hybrid/state_abi.h`. Magic + version + ABI-locked offsets; layout enforced by `state_abi_check.h` static_asserts. | Text file `ae350regs.txt` with `REG`/`CSR`/`MMIO` lines; converted by `tools/regs2cmds.sh` into a GDB script of `set $csrN = 0x...` commands. |
+| Drain mechanism | QEMU TCG plugin `qemu_plugin/hybrid_handoff.c` triggered on `csrwi 0x7C0, 0` or on ELF-symbol PC. Programmatic, no human in the loop. | Manual rendezvous on WFI: `Ctrl-A c` for `dump-guest-memory`, then attach GDB and `source tools/dump_ae350.gdb`. |
+| Restore mechanism | vsim `ResumeDriver` (DMI Abstract Commands + Program Buffer); for QEMU2, `qemu_handback` spawns QEMU2 and pushes registers via gdbstub P-packets. | `./sim --restore-memory snap --reset-vector PC`, then attach GDB and `source ae350regs.cmds`, `set $dpc`, `continue`. |
+| V extension support | Yes. V regs go through scratch GPA `0x80FF0000` via `vse8.v`; vtype/vl restored via Program Buffer `vsetvl`; vstart/vxsat/vxrm/vcsr via Abstract Cmds. | Not supported. `dump_ae350.gdb` lists only Andes V5 CSRs - no V regs and no V CSRs. |
+| Trigger surface | `csrwi 0x7C0, 0/1` (default) or ELF-symbol PC (`_hybrid_enter_pc`/`_hybrid_exit_pc`). | WFI only; manual UI driving. |
+| Per-handoff latency | Microseconds: mmap is shared (no copy); state file is a few KB binary. | Seconds: 2 GiB gzip pass + ELF parsing + GDB scripting per drain and per restore. |
+| Coupling between sides | Tight - both sides include the same C ABI header. | Loose - the GDB remote protocol is the only contract. |
+| Auditability of snapshot | Binary; needs a viewer (or a converter to text). | Human-readable `ae350regs.txt` is the wire format. Easy to diff. |
+| Persistence model | One live mmap file at a time; ephemeral. | One snapshot *directory* per checkpoint; archivable, portable. |
+
+Key file references in `hybrid_sim`:
+
+- `include/hybrid/state_abi.h` (wire struct)
+- `qemu_plugin/hybrid_handoff.c` (drain on QEMU side)
+- `hybrid_vsim/src/hybrid/resume_driver.hpp` (restore into vsim via DMI)
+- `hybrid_vsim/src/hybrid/state_drain.hpp` (drain on vsim side)
+- `hybrid_vsim/src/hybrid/qemu_handback.hpp` (restore into QEMU2 via gdbstub)
+- `hybrid_vsim/tests/hybrid/rt_shared_mem.sh` (tier-2 harness using `memory-backend-file`)
+
+Key file references in the demo:
+
+- `demo/hybrid/main.c` (WFI-trigger fixture)
+- `demo/hybrid/tools/dump_ae350.gdb` (GDB script that prints `ae350regs.txt`)
+- `demo/hybrid/tools/regs2cmds.sh` (text -> GDB restore commands)
+- `demo/hybrid/tools/qemu_elfdump_to_main_memory.sh` (ELF core -> gz raw)
+- `demo/hybrid/tools/restore_ae350.gdb` (sources the `.cmds` file on the target side)
+- `demo/hybrid/README.md` (step-by-step instructions, ~140 lines)
+
+---
+
+## 2. Fit to SimPoint workflow
+
+SimPoint workflow recap:
+
+1. Profile workload, emit Basic Block Vectors.
+2. Cluster BBVs into K phases (typical K=10), each represented by a starting
+   instruction count and a weight.
+3. For each phase: fast-forward gem5 to that instruction count, take a
+   checkpoint, run detailed sim of N=100M insns from the checkpoint, record IPC.
+4. Combine per-phase IPC by weight to estimate whole-workload IPC.
+
+The transport sits between step 3's "take a checkpoint" and "run detailed sim".
+
+### 2.1 Shared mmap
+
+Strengths:
+
+- Per-snapshot drain is microseconds. Taking K=10 (or K=30) snapshots is
+  effectively free relative to the simulation work.
+- A snapshot of memory is a file copy of the mmap backing: `cp /dev/shm/mem
+  snap/N/mem`. On btrfs/xfs that becomes a reflink (`cp --reflink=auto`), i.e.
+  O(metadata). On other filesystems it is one sequential read+write of RAM
+  size, no compression on the critical path.
+- Programmatic triggers - CSR write or PC - map cleanly onto gem5 `m5ops`,
+  which are exactly "trap at a specific PC".
+- The binary ABI is already validated end-to-end through V-extension fixtures
+  (`rt_c_v_regs`, `rt_c_v_csrs`).
+- vsim restore path is unchanged: `ResumeDriver` does not care whether the
+  producer of `hybrid_state_v1` was QEMU or gem5.
+
+Weaknesses:
+
+- Requires a gem5-side drain hook. gem5 has no plugin system equivalent to
+  QEMU TCG plugins; we have to add code (a SimObject probe, or an m5op
+  pseudo-inst handler) to walk `ThreadContext` and emit `hybrid_state_v1`.
+- The mmap memory model needs gem5 to back its RAM with a shared file. gem5
+  supports this via `SimpleMemory` (`shared_backstore` / `file=`) but the
+  config wiring is non-trivial and depends on which CPU model is used.
+- Tight ABI coupling means whenever vsim or gem5 grows a new piece of state
+  (new CSR, wider VLEN, new arch extension), the header must bump and both
+  sides must be rebuilt in lock-step.
+
+### 2.2 Dump/reload
+
+Strengths:
+
+- gem5 already has a gdbstub. A v0 port is "swap `qemu-system-riscv32 -s` for
+  `gem5 --remote-gdb-port=...`" in the demo's shell snippets - no source
+  changes to gem5.
+- Snapshots are naturally per-region directories on disk; archivable,
+  copyable to a different machine, replayable months later.
+- Loose coupling: when a CSR is unimplemented in gem5, the text dump prints
+  `void` and the awk filter drops it. Schema drift is absorbed in shell.
+- Human-readable `ae350regs.txt` is excellent for debugging a single
+  mismatched register.
+
+Weaknesses:
+
+- Per-region wall time is dominated by gzip of memory and by GDB script
+  serialization. For K=10 phases over a 2 GiB image, that's roughly two
+  minutes of pure I/O per replay, before any simulation begins.
+- WFI is the only trigger today; SimPoint region boundaries are arbitrary
+  PCs, so we would still need to extend the trigger story. At that point
+  most of the demo's "simplicity" advantage evaporates.
+- V regs and V CSRs are not in the dump script. We would have to add them,
+  and at that point we have re-invented the V-state transport that
+  `hybrid_sim` already has.
+- Text serialization is fragile: `void` for unimplemented, awk fixups for
+  read-only filters, deferred `mstatus`/`sstatus` writes due to FS/VS
+  gating. Each of these is a footgun for K-region automation.
+- GDB-as-orchestrator means three or four shell processes per snapshot
+  (qemu/gem5, ICEman or vsim's gdbstub, GDB, vsim itself). Hard to make
+  reliable across K regions in CI.
+
+### 2.3 Cost summary on a 2 GiB workload, K=10 regions
+
+| Stage | Shared mmap | Dump/reload |
+|---|---|---|
+| Drain (per region) | ~0.05 ms (state.bin write) + ~0 (mmap is live) | ~30 s (gzip 2 GiB) + ~2 s (GDB script) |
+| Snapshot to disk (per region) | ~3 s (`cp`) or ~0 (reflink) | already on disk |
+| Restore into vsim (per region) | ~10 ms (DMI replay) + mmap open | ~20 s (gunzip) + ~5 s (GDB replay) |
+| Total per region | ~3 s worst case, ~10 ms with reflink | ~55 s |
+| Total for K=10 | ~30 s worst case | ~10 min |
+
+Numbers are order-of-magnitude estimates, not measured. The point is the gap
+is one to three decades, not 2x.
+
+---
+
+## 3. Recommendation for gem5
+
+Adopt the shared-mmap transport. Reuse most of `hybrid_sim` unchanged; port
+only the producer side.
+
+Concrete steps:
+
+1. **Memory**: back gem5's RAM with the same `/dev/shm` file vsim mmaps.
+   gem5 has `SimpleMemory.shared_backstore` for SE mode; for FS mode use
+   `mem-ranges` + `file=` or patch in an mmap-backed backstore. Snapshot per
+   region is `cp --reflink=auto /dev/shm/mem snap/N/mem`. Restore is
+   `mmap(snap/N/mem)`.
+2. **State**: add a gem5 m5op (e.g. `m5_hybrid_drain(path)`) that walks
+   `ThreadContext` and writes `hybrid_state_v1` to `path`. The struct is the
+   contract - reuse `include/hybrid/state_abi.h` unchanged. vsim's
+   `ResumeDriver` stays untouched.
+3. **Trigger**: PC mode is the right choice for SimPoint. m5ops are
+   PC-resolved by definition. CSR mode is a QEMU-flavor convenience and not
+   needed for gem5.
+4. **Persistence**: snapshot directory per region:
+   ```
+   snap/
+     region_00/  mem  state.bin  state.txt   weight=0.18
+     region_01/  mem  state.bin  state.txt   weight=0.14
+     ...
+   ```
+   `state.txt` is an optional pretty-print of `state.bin` for debugging - this
+   is the one feature worth borrowing from the demo (port `regs2cmds.sh` to a
+   `hybrid_state_v1` -> text formatter).
+5. **What to drop from the demo entirely**: gzip+ELF extraction, WFI trigger,
+   text-as-wire-format, GDB-as-restore-driver. They were appropriate for a
+   manual one-shot demo; they are wrong for K-region replay.
+
+Net effect: vsim and the wire ABI stay as they are. The only new code is a
+gem5-side drain hook and (optional) a text pretty-printer for debugging.
+
+---
+
+## 4. Open questions before we commit
+
+- Does gem5's chosen CPU model (TimingSimpleCPU vs O3CPU vs KvmCPU during
+  fast-forward) interact with `shared_backstore`? KVM mode in particular may
+  refuse mmap-backed RAM.
+- For multi-hart workloads, does the ABI need to grow a hart index in the
+  state file name, or do we serialize all harts into one `state.bin`?
+- SimPoint regions are defined by *instruction count*, not by PC. We need a
+  reliable insn-count trigger in gem5 - either an m5op invoked from
+  instrumented code, or a per-cycle hook in the CPU model.
+- Snapshot warmup: cycle-accurate sim needs cache/TLB warmup. Neither
+  transport addresses this today. That belongs in a separate doc.
