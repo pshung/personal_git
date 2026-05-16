@@ -1,0 +1,112 @@
+// IcountTrigger is the F6 sibling of CsrTrigger: instead of pattern-matching
+// a magic csrw, it counts committed insns and fires HYBRID_HANDOFF_EXIT once
+// the per-hart counter reaches the configured target. Lets vsim drain at an
+// arbitrary dynamic-insn position - the foundation for SimPoint slice-consume
+// (F11) and orchestrator-driven icount switching.
+//
+// Duck-typed interface contract (matches CsrTrigger so HandoffController's
+// template instantiation works for both):
+//   - lookup(pc) -> std::optional<CsrTriggerHit>
+//   - empty()    -> bool
+//   - observe_commit() -> void   (icount-specific; HandoffController calls
+//                                 via if-constexpr requires-clause)
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/handoff_controller.hpp"
+#include "hybrid/icount_trigger.hpp"
+#include "hybrid/resume_driver.hpp"
+#include "hybrid/state_abi.h"
+#include "recording_bus.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <cstdint>
+
+using hybrid::test::kDmstatusHaltedAndAcked;
+using hybrid::test::RecordingBus;
+using RD = hybrid::ResumeDriver;
+
+namespace {
+
+void prime_drainable_bus(RecordingBus& bus, uint64_t dpc)
+{
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_csr(RD::kCsrDpc)] = dpc;
+}
+
+}  // namespace
+
+TEST_CASE("IcountTrigger: standalone lookup is silent until target hit")
+{
+  hybrid::IcountTrigger trig(/*target=*/100);
+  CHECK_FALSE(trig.empty());
+
+  for (int i = 0; i < 99; ++i) {
+    trig.observe_commit();
+    CHECK_FALSE(trig.lookup(0xCAFE).has_value());
+  }
+
+  trig.observe_commit();
+  const auto hit = trig.lookup(0xCAFE);
+  REQUIRE(hit);
+  CHECK(hit->kind == HYBRID_HANDOFF_EXIT);
+  CHECK(hit->insn == 0u);  // icount mode: insn is unused, sentinel zero
+}
+
+TEST_CASE("IcountTrigger: lookup is PC-agnostic once the threshold is met")
+{
+  hybrid::IcountTrigger trig(/*target=*/3);
+  for (int i = 0; i < 3; ++i) trig.observe_commit();
+
+  CHECK(trig.lookup(0x80000000).has_value());
+  CHECK(trig.lookup(0xDEADBEEF).has_value());
+  CHECK(trig.lookup(0).has_value());
+}
+
+TEST_CASE("IcountTrigger: target=0 means disabled - never fires")
+{
+  hybrid::IcountTrigger trig(/*target=*/0);
+  CHECK(trig.empty());
+
+  for (int i = 0; i < 50; ++i) {
+    trig.observe_commit();
+    CHECK_FALSE(trig.lookup(0xCAFE).has_value());
+  }
+}
+
+TEST_CASE("HandoffController<IcountTrigger>: drains at exactly the Nth retire")
+{
+  RecordingBus bus;
+  prime_drainable_bus(bus, /*dpc=*/0x80000400);
+
+  hybrid::IcountTrigger trigger(/*target=*/100);
+  hybrid::HandoffController h(std::move(trigger), bus);
+
+  // 99 retires must not fire
+  for (int i = 0; i < 99; ++i) {
+    const auto state =
+      h.on_retire(0x80000000, [](uint8_t) -> uint64_t { return 0u; });
+    CHECK_FALSE(state.has_value());
+  }
+  // 100th retire fires the drain
+  const auto state =
+    h.on_retire(0x80000000, [](uint8_t) -> uint64_t { return 0u; });
+  REQUIRE(state);
+  CHECK(state->magic == HYBRID_STATE_MAGIC);
+  CHECK(state->pc == 0x80000400);
+}
+
+TEST_CASE("HandoffController<IcountTrigger>: target=1 fires on the first retire")
+{
+  RecordingBus bus;
+  prime_drainable_bus(bus, /*dpc=*/0x80000020);
+
+  hybrid::IcountTrigger trigger(/*target=*/1);
+  hybrid::HandoffController h(std::move(trigger), bus);
+
+  const auto state =
+    h.on_retire(0x80000000, [](uint8_t) -> uint64_t { return 0u; });
+  REQUIRE(state);
+  CHECK(state->pc == 0x80000020);
+}
