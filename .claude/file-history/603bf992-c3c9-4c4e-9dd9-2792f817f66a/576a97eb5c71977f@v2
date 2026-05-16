@@ -1,0 +1,266 @@
+# gem5 CPU Model Switch
+
+> Status: Draft | Author: Nick Hung | Date: 2026-05-16 | Reviewers: self (design archive for own simulator)
+
+## 1. 摘要與目標 (Summary & Objective)
+
+This spec documents gem5's existing CPU-model switching mechanism: the protocol that lets a running simulation hand off architectural state from one CPU model (e.g., AtomicSimple) to another (e.g., TimingSimple or O3) without restarting. Scope is limited to single-ISA, non-KVM switches between AtomicSimple <-> TimingSimple and AtomicSimple <-> O3. The end state is a design archive precise enough to reimplement the same capability in a new simulator.
+
+## 2. 背景與痛點 (Background & Problem Statement)
+
+A cycle-accurate model (O3) is 100x-1000x slower than a functional model (AtomicSimple). Simulating an entire benchmark on O3 is impractical. gem5 solves this by letting a fast model fast-forward / warm up shared state (caches, branch predictors, page tables) and then hand the live execution over to a detailed model that produces the measurements that matter.
+
+Without a switch primitive, the only options are:
+- run the slow model from boot (intractable for SPEC, server workloads),
+- restart from a checkpoint into a single model (loses the ability to mix fast-forward and detailed phases in one run).
+
+The switch primitive is what makes the standard SimPoint / fast-forward / warmup / detailed workflow possible. It is also reused by `repeatSwitch` to alternate models periodically and by checkpoint-restore to load into a different model than the one that saved.
+
+Concrete usage patterns this spec must support:
+- (a) Instruction-count marker: e.g., `--fast-forward N --warmup-insts M --maxinsts K`.
+- (b) SimPoint-driven: switch at basic-block-vector phase boundaries.
+- (c) Checkpoint-restore: load checkpoint into a warm-up CPU then switch to a detailed CPU.
+- (d) Pseudo-instruction `m5_switchcpu` from guest code.
+
+## 3. 架構設計與核心邏輯 (Architecture & Core Logic)
+
+### 3.1 High-level component diagram
+
+```
+                  +----------------------------------------+
+                  |  Python script (e.g. Simulation.py)    |
+                  |  - decides WHEN to switch              |
+                  |  - calls m5.switchCpus(sys, pairs)     |
+                  +-------------------+--------------------+
+                                      |
+                                      v
+                  +----------------------------------------+
+                  |  m5.switchCpus()  (simulate.py)        |
+                  |  1. validate pairs                     |
+                  |  2. drain() -> all Drainable quiescent |
+                  |  3. for each pair: old.switchOut()     |
+                  |  4. setMemoryMode() if different       |
+                  |  5. for each pair: new.takeOverFrom()  |
+                  +-------------------+--------------------+
+                                      |
+              +-----------------------+-----------------------+
+              v                                               v
+   +----------------------+                       +----------------------+
+   |   Old CPU (active)   |  --- handoff --->     |   New CPU (switched  |
+   |   AtomicSimple       |                       |   out -> active)     |
+   |   - ThreadContext[]  |  copyArchRegs()       |   Timing or O3       |
+   |   - InstPort/DataPort|  port::takeOverFrom() |   - empty TLBs       |
+   |   - interrupts[]     |  pointer move         |   - dangling ports   |
+   +----------+-----------+                       +----------+-----------+
+              |                                              |
+              | both share the SAME peers below              |
+              v                                              v
+              +----------------------------------------------+
+              |  L1 I$, L1 D$, L2, memory, interrupts, TLB   |
+              |  page table, system threads vector           |
+              |  (cache state preserved; CPU-owned TLB       |
+              |   flushed in switchOut)                      |
+              +----------------------------------------------+
+```
+
+Key design decisions:
+- **Both CPUs co-exist in memory.** The "new" CPU is instantiated up-front with `switched_out=True` and shares the same `system`, `workload`, `clk_domain`, `isa`, and `cpu_id` as the old one. Switching is a state transfer, not a destroy-and-create.
+- **Cache hierarchy stays put.** Switching rebinds the CPU side of `icache_port` / `dcache_port` to the peer that the old CPU was talking to. The cache itself never sees that anything changed; warmed lines remain warm. This is the entire point of the warmup-then-detailed pattern.
+- **TLB is per-CPU and is flushed on switchOut.** The new CPU starts with an empty TLB. Page tables are in the workload/system layer and persist.
+- **ThreadContext is the unit of architectural state.** Registers, PC, and status are deep-copied from old TC to new TC; context-ID and thread-ID are preserved so external observers (system->threads vector, PC events) keep the same handle.
+- **Drain is the universal quiescence protocol.** Every in-flight simulator event (pipeline insts, outstanding memory requests, periodic ticks) belongs to a Drainable that must reach state `Drained` before the swap. There is no model-specific drain; Drainable is the contract.
+
+### 3.2 Core logic - the three phases
+
+**Phase A - Drain.** Python calls `m5.drain()`. The DrainManager walks every Drainable; if any returns >0 (work remaining), the simulation loop runs until a "Finished drain" exit event fires, then retries. Loop terminates when all Drainables are `Drained`. After this, no ticks are scheduled, no memory requests are outstanding, and the CPU's `tickEvent` is descheduled.
+
+**Phase B - Swap.** For each `(old, new)` pair:
+1. `old.switchOut()` - sets `_switchedOut=true`, flushes the old CPU's TLBs, transitions power state to OFF. The old CPU is now inert but still in memory.
+2. If `new.memory_mode()` differs from the current system memory mode, change it (and if the new mode is `atomic_noncaching`, write back + invalidate caches first).
+3. `new.takeOverFrom(old)`. This is where the actual state transfer happens (see 3.3).
+
+**Phase C - Resume.** After all pairs are swapped, the DrainManager resumes (Drained -> Resuming -> Running). The new CPU re-schedules its tick events and execution continues from the same `curTick()` with the same architectural PC.
+
+### 3.3 What `takeOverFrom` transfers
+
+| Item | Method | Direction | Notes |
+|------|--------|-----------|-------|
+| Process ID, task ID | assignment | old -> new | for stats/scheduling |
+| Power state | `powerState->set(old)` | old -> new | typically ON |
+| Per-thread arch regs, PC, status | `ThreadContext::copyArchRegs()` | deep copy | per TC, in a loop |
+| Context ID, thread ID | setters | preserved | asserts equal across old/new |
+| System threads vector entry | `system->replaceThreadContext()` | replaces pointer | so global lookups hit new TC |
+| MMU (TLB object) | `MMU::takeOverFrom()` | per TC | new TLB is empty (flushed in switchOut) |
+| Interrupt controllers | move + `setThreadContext` | vector move | old's `interrupts` is cleared |
+| Inst / Data ports | `Port::takeOverFrom()` | unbind old, rebind new to old's peer | cache peer is unchanged |
+| Reset line | `Port::takeOverFrom()` | conditional | only if old had it connected |
+| `_switchedOut` | flip | old=true, new=false | order: old set first, then new cleared |
+
+Things that do NOT transfer (left to model-specific overrides or left behind):
+- Pipeline state (O3): the new O3's fetch/decode/rename/IEW/commit are freshly initialized; only `globalSeqNum` is copied.
+- Old TC's status becomes `Halted` (set inside `ThreadContext::takeOverFrom`).
+- Caches: out of scope of the CPU swap; they belong to the peer side of the port.
+
+### 3.4 Model-specific overrides
+
+- **AtomicSimpleCPU::takeOverFrom** - calls `BaseSimpleCPU::takeOverFrom`, then asserts `tickEvent` is not scheduled. Effectively nothing model-specific.
+- **TimingSimpleCPU::takeOverFrom** - same shape as Atomic. Trivial.
+- **O3CPU::takeOverFrom** - after `BaseCPU::takeOverFrom`, each pipeline stage runs its own `takeOverFrom()` (BAC, fetch, decode, rename, IEW, commit). Copies `globalSeqNum` from the old O3 if the old CPU was also O3 (otherwise it starts fresh). Sets `_status = Idle` and `lastRunningCycle = curCycle()`.
+
+The key portability lesson: each model's `takeOverFrom` only handles its private state; everything shared lives in `BaseCPU::takeOverFrom`.
+
+## 4. 介面與資料合約 (Interface & Data Contract)
+
+This section describes the contract at the architecture level. Implementation-language type names are not normative.
+
+### 4.1 The CPU object's switch contract
+
+Every switchable CPU model must provide:
+
+- A boolean property `switched_out` (constructor argument and runtime query). Models that cannot be a switch source/target return `false` from a `support_take_over()` query.
+- A `switchOut()` operation that:
+  - is callable only when `!switchedOut` and after `drain()` has reported Drained,
+  - flushes any CPU-private translation cache (TLBs),
+  - releases periodic events (the tick event must not be scheduled afterward),
+  - is idempotent against being re-entered (asserted, not handled).
+- A `takeOverFrom(otherCPU)` operation that:
+  - is callable only when this CPU `switchedOut == true` and `other.switchedOut == false`,
+  - asserts that `threadContexts.size() == other.threadContexts.size()` and `cpu_id == other.cpu_id` (the two CPUs occupy the same logical slot),
+  - is responsible for re-binding its memory ports to whatever peers the old CPU was connected to,
+  - clears `switchedOut` only after all transfer is complete.
+
+### 4.2 ThreadContext contract
+
+A ThreadContext is the per-thread architectural state holder. The switch requires:
+- `copyArchRegs(otherTC)` - deep copy of every architectural register file the ISA defines.
+- Setters for context ID, thread ID, status, PC.
+- An MMU pointer that itself supports `takeOverFrom`.
+- A status enum that includes at least `{Active, Halted, Suspended}` so the old TC can be parked.
+
+### 4.3 Port contract
+
+A port supports `takeOverFrom(otherPort)`:
+- the other port must be connected; this port must NOT be connected,
+- it disconnects the other port from its peer and reconnects this port to that same peer,
+- after the operation, the peer (cache, crossbar) has no knowledge that the CPU side changed.
+
+### 4.4 System contract
+
+The containing system provides:
+- a `setMemoryMode(mode)` operation that propagates to all timing-sensitive components,
+- a `replaceThreadContext(newTC, contextId)` operation that updates the global TC vector and migrates any PC events the old TC owned.
+
+### 4.5 Drainable contract
+
+Any object whose internal state could be inconsistent at an arbitrary tick must implement Drainable:
+- `drain()` returns the count of work units still in flight (0 means "I am Drained").
+- `drainResume()` lets the object re-schedule any events it tore down.
+- DrainManager polls; the simulator loop fires a "Finished drain" exit event whenever a Drainable transitions from >0 to 0, so the polling loop can retry.
+
+### 4.6 Top-level switch API
+
+The user-facing operation is a single call:
+
+```
+switchCpus(system, [(old_cpu, new_cpu), ...]) -> void
+```
+
+Pre-conditions enforced by the API (not by individual CPUs):
+- list is non-empty,
+- every `new_cpu.switchedOut == true`, every `old_cpu.switchedOut == false`,
+- both sides report `support_take_over() == true`,
+- all `new_cpu.memory_mode()` agree (a single switch cannot mix memory modes),
+- no `new_cpu` appears in the `old_cpu` set (no self-handoff).
+
+Post-conditions:
+- every old CPU is `switchedOut=true`, every new CPU is `switchedOut=false`,
+- `curTick()` is unchanged,
+- architectural PC and registers of each thread are unchanged across the boundary,
+- cache contents are unchanged (modulo memory-mode change), TLBs are empty on the new CPUs.
+
+## 5. 邊界條件與例外處理 (Edge Cases & Error Handling)
+
+| Scenario | Likelihood | Strategy | Justification |
+|----------|------------|----------|---------------|
+| Cross-ISA switch (e.g., RISC-V <-> ARM) | N/A (out of scope) | Not supported | `copyArchRegs` assumes identical register layout; ISA pointer is per-TC. Single-ISA is a precondition of this spec. |
+| Mismatched thread count (old has 4 TCs, new has 2) | Low | Hard assert in `takeOverFrom` | Cannot half-transfer state; user error in config. |
+| Mismatched cpu_id | Low | Hard assert | The pair occupies one logical slot; mis-pairing would corrupt system->threads. |
+| New CPU not marked `switched_out=True` in config | Medium | Top-level API raises before drain | Common config mistake; cheap to catch early. |
+| Both CPUs disagree on memory mode (atomic vs timing) | Medium | `setMemoryMode` is invoked between switchOut and takeOverFrom | Atomic <-> Timing needs the system-wide mode flipped; cache invalidation is forced only when going to `atomic_noncaching`. |
+| In-flight cache transactions at switch time | Always present | Drain protocol blocks until all Drainables are quiescent | Without this, ports could be re-bound mid-packet. |
+| Stale TLB entries on new CPU | Always present | `switchOut` flushes old TLB; new TLB is already empty | New CPU's TLB has never been populated; flushing the old one is belt-and-braces for re-switch-back. |
+| O3 mid-pipeline at drain | High | O3's `drain()` waits for ROB to empty and squashes speculative state | Detailed-model-specific; lives in O3's Drainable impl. |
+| Switch back (e.g., Timing -> Atomic later) | Supported | Symmetric: old pair becomes new pair | Used by `repeatSwitch`. The previously-switched-out CPU must be re-validated as switchable. |
+| Switch with `atomic_noncaching` target (KVM-like) | Out of scope | Would force cache writeback + invalidate before mode change | Not used in single-ISA Atomic/Timing/O3 paths. |
+| Trigger event fires before drain completes | Medium | Exit cause is queued; outer Python loop calls `simulate()` again until "Finished drain" surfaces | `m5.drain()` swallows non-drain exit events; this is a known caveat documented inline. |
+| User issues `m5_switchcpu` pseudo-op but no switch is configured | Low | Pseudo-op simply calls `exitSimLoop("switchcpu")`; if no Python handler matches the cause, simulation exits | Decoupling pseudo-op from switch policy is intentional. |
+| New CPU's pipeline stages not yet `createThreads()`-ed | Medium | Config must call `createThreads()` on each switchable CPU before simulation starts | Without this, ThreadContexts do not exist and the assert at the top of `takeOverFrom` fires. |
+
+## 6. 替代方案與權衡 (Alternatives Considered & Trade-offs)
+
+These are designs gem5 could have chosen but did not. Each is worth understanding because the rejected design corresponds to a temptation the reimplementer is likely to feel.
+
+### Alternative A: Destroy-and-recreate (single CPU object per slot)
+
+- Approach: when a switch is requested, serialize the old CPU's state, destroy the object, construct a new CPU of the target type, deserialize the state.
+- Pros: only one CPU object in memory at a time; lower memory footprint; conceptually clean ("checkpoint + restore in-process").
+- Cons: requires every piece of architectural state to round-trip through the serialization format, which is far more code (and bug surface) than `copyArchRegs`; port re-binding is harder when peers hold raw pointers; cannot switch back to the original instance because it no longer exists.
+- Why rejected: gem5's approach (both CPUs co-exist, `switched_out` flag) is cheaper at switch time and preserves the ability to flip back. The "second copy in memory" cost is small relative to the cache and DRAM models.
+
+### Alternative B: Make the CPU model a dynamic strategy (one CPU class, swappable backend)
+
+- Approach: a single `CPU` class holds a `Backend` pointer (`AtomicBackend`, `TimingBackend`, `O3Backend`). Switching is `cpu->setBackend(new Backend)`.
+- Pros: no thread-context copy; no port re-bind; switching is a single pointer write.
+- Cons: forces every CPU model into a uniform interface even where they differ fundamentally (O3's pipeline stages, ROB, IQ are not naturally expressible behind an interface designed for Atomic); breaks gem5's existing inheritance hierarchy; couples all models at compile time.
+- Why rejected: the models really are different code paths with different parameter sets, different SimObjects, and different statistics groups. The shared interface (`BaseCPU`) is the abstraction; switchOut/takeOverFrom is the surface. A strategy pattern would push the divergence somewhere uglier.
+
+### Alternative C: Drain by global pause (no per-object Drainable contract)
+
+- Approach: at switch time, freeze the event queue, do the swap, unfreeze.
+- Pros: trivially simple top-level logic; no Drainable interface required.
+- Cons: an event that was scheduled to fire mid-cache-transaction will fire on the new CPU and observe stale state; in-flight packets on the interconnect would never complete; O3's speculative state would carry across the swap (or be silently discarded).
+- Why rejected: switching is not just a CPU concern; the memory system, interconnect, and any periodic probe need to know they are about to be paused so they can finish in-flight work first. The Drainable contract is what makes "switch + checkpoint + memory-mode-change" composable from the same primitive. Without it, each new use case would need its own ad-hoc quiescence logic.
+
+## Open Questions / TBD
+
+- [ ] Confirm whether `globalSeqNum` transfer is required when the source CPU is NOT O3 (it currently no-ops because of the `dynamic_cast`). Reimplementer should decide if their O3-equivalent needs a seeded value.
+- [ ] Decide whether the reimplementation needs `repeatSwitch` (periodic switching back and forth). If yes, document additional invariants around statistics reset.
+- [ ] Decide whether to support cross-ISA in a future revision. If yes, ThreadContext copy becomes a translation, not a memcpy, and is a much larger design task.
+- [ ] Pseudo-instruction handler path (`m5_switchcpu`) is documented as "exit -> Python catches -> calls switchCpus". Reimplementer must decide if guest code is allowed to drive the switch or if it should be host-script-only.
+
+## Reference: Key gem5 source locations
+
+For grounding the reimplementation; not part of the spec proper.
+
+- `src/cpu/base.cc:620` - `BaseCPU::switchOut`
+- `src/cpu/base.cc:634` - `BaseCPU::takeOverFrom`
+- `src/cpu/base.cc:722` - `BaseCPU::flushTLBs`
+- `src/cpu/thread_context.cc:253` - `ThreadContext::takeOverFrom` (free function form)
+- `src/sim/system.cc:270` - `System::replaceThreadContext`
+- `src/sim/port.hh:136` - `Port::takeOverFrom`
+- `src/sim/drain.hh:75` - `DrainState` enum
+- `src/python/m5/simulate.py:355` - `m5.drain`
+- `src/python/m5/simulate.py:430` - `m5.switchCpus`
+- `configs/common/Simulation.py:595` - canonical Atomic -> Timing -> O3 standard-switch wiring
+- `configs/common/Simulation.py:453` - `repeatSwitch`
+- `src/python/gem5/components/processors/switchable_processor.py` - stdlib `SwitchableProcessor`
+- `src/sim/pseudo_inst.cc` - `switchcpu` pseudo-op
+- `src/cpu/o3/cpu.cc` - `O3CPU::takeOverFrom` (per-stage handoff)
+- `src/cpu/simple/atomic.cc` - `AtomicSimpleCPU::takeOverFrom`
+- `src/cpu/simple/probes/simpoint.cc` - SimPoint BBV probe (trigger source for SimPoint-driven switch)
+
+---
+
+## Reviewer Checklist
+
+Use this while reading. If any item is "no", leave a comment in the relevant section.
+
+- [ ] Section 1: I understood the scope and goal in under 30 seconds.
+- [ ] Section 2: I agree the problem is real and worth solving now.
+- [ ] Section 3: I can draw the data flow on a whiteboard from memory after reading.
+- [ ] Section 3: Coupling to existing modules is justified, not incidental.
+- [ ] Section 4: The boundary is clear enough that I could implement either side independently.
+- [ ] Section 5: At least one failure mode I would have raised is already addressed.
+- [ ] Section 6: At least one alternative I would have asked about is already covered.
+- [ ] Section 6: The trade-off framing matches reality - no strawmen.
+- [ ] Open Questions: every TBD has an owner.
