@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Demo T4: BBV-emit switching mode (M4) + SimPoint clustering integration.
+#
+# QEMU + plugin runs icount_spin.elf with bbv_out=PATH,slice=N,icount=M.
+# Plugin writes one SimPoint .bb row per N retired insns; expected
+# rows = M/N. Then tools/simpoint/bin/simpoint clusters the .bb file
+# and produces simpts (slice -> cluster) + weights (cluster -> mass).
+#
+# Outputs are persisted under $WORKDIR (default: mktemp -d under /tmp)
+# so T5/T7 can consume them. WORKDIR is printed on PASS.
+#
+# Env (auto-detected with sensible defaults):
+#   VSIM_QEMU     qemu-system-riscv64
+#   VSIM_PLUGIN   libhybrid_handoff.so
+#   VSIM_ELF      a CSR-less fixture (default: icount_spin.elf)
+#   SIMPOINT_BIN  the built simpoint clustering binary
+#   WORKDIR       persistent dir for bbv/simpts/weights (default: mktemp -d)
+#   SLICE         insns per BBV row (default: 1000)
+#   ICOUNT        total insns before drain (default: 10000)
+#   MAXK          simpoint -maxK (default: 2; tiny BBVs need conservative K)
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+TOP_ROOT=$(cd -- "$REPO_ROOT/.." && pwd)
+
+VSIM_QEMU="${VSIM_QEMU:-/local/nick/qemu_v5/build/qemu-system-riscv64}"
+VSIM_PLUGIN="${VSIM_PLUGIN:-$REPO_ROOT/hybrid/qemu_plugin/libhybrid_handoff.so}"
+VSIM_ELF="${VSIM_ELF:-$REPO_ROOT/hybrid/test/icount_spin.elf}"
+SIMPOINT_BIN="${SIMPOINT_BIN:-$TOP_ROOT/tools/simpoint/bin/simpoint}"
+WORKDIR="${WORKDIR:-$(mktemp -d -t demo-bbv-XXXXXX)}"
+SLICE="${SLICE:-1000}"
+ICOUNT="${ICOUNT:-10000}"
+MAXK="${MAXK:-2}"
+
+MODE_LABEL="BBV emit + SimPoint cluster (M4)"
+echo "=========================================================="
+echo "Mode: $MODE_LABEL"
+echo "Workload: icount_spin (tight 2-insn loop, CSR-less)"
+echo "Plugin: bbv_out=...,slice=$SLICE,icount=$ICOUNT"
+echo "Workdir: $WORKDIR"
+echo "=========================================================="
+
+for f in "$VSIM_QEMU" "$VSIM_PLUGIN" "$VSIM_ELF"; do
+  if [ ! -e "$f" ]; then
+    echo "[demo M4] SKIP: $f not built"
+    exit 77
+  fi
+done
+if [ ! -x "$SIMPOINT_BIN" ]; then
+  echo "[demo M4] SKIP: $SIMPOINT_BIN not built"
+  exit 77
+fi
+
+mkdir -p "$WORKDIR"
+BBV_OUT="$WORKDIR/icount_spin.bb"
+SIMPTS="$WORKDIR/simpts"
+WEIGHTS="$WORKDIR/weights"
+STATE_OUT="$WORKDIR/state_qemu.bin"
+QEMU_LOG="$WORKDIR/qemu.log"
+SP_LOG="$WORKDIR/simpoint.log"
+
+SHARED_SIZE=$((128 * 1024 * 1024))
+SHARED_MEM=$(mktemp -p /dev/shm vsim-bbv-shared.XXXXXX)
+trap 'rm -f "$SHARED_MEM"' EXIT
+truncate -s "$SHARED_SIZE" "$SHARED_MEM"
+
+EXPECTED_ROWS=$((ICOUNT / SLICE))
+
+echo "[demo M4 1/3] QEMU + plugin: emit BBV ($EXPECTED_ROWS rows expected)"
+set +e
+timeout 30 "$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHARED_MEM,size=$SHARED_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -semihosting-config enable=on,target=native \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_OUT,icount=$ICOUNT,bbv_out=$BBV_OUT,slice=$SLICE" \
+  >"$QEMU_LOG" 2>&1
+RC=$?
+set -e
+
+if [ "$RC" -ne 200 ]; then
+  echo "[demo M4] FAIL: QEMU expected exit 200, got $RC"
+  tail -20 "$QEMU_LOG"
+  exit 1
+fi
+
+ROWS=$(wc -l < "$BBV_OUT")
+if [ "$ROWS" -ne "$EXPECTED_ROWS" ]; then
+  echo "[demo M4] FAIL: expected $EXPECTED_ROWS BBV rows, got $ROWS"
+  exit 1
+fi
+
+echo "[demo M4 2/3] SimPoint cluster: maxK=$MAXK"
+set +e
+"$SIMPOINT_BIN" -loadFVFile "$BBV_OUT" -maxK "$MAXK" -dim 2 \
+  -saveSimpoints "$SIMPTS" -saveSimpointWeights "$WEIGHTS" \
+  >"$SP_LOG" 2>&1
+SP_RC=$?
+set -e
+
+if [ "$SP_RC" -ne 0 ]; then
+  echo "[demo M4] FAIL: simpoint exit $SP_RC"
+  tail -20 "$SP_LOG"
+  exit 1
+fi
+
+if [ ! -s "$SIMPTS" ] || [ ! -s "$WEIGHTS" ]; then
+  echo "[demo M4] FAIL: simpoint output empty (simpts=$(wc -c <"$SIMPTS") weights=$(wc -c <"$WEIGHTS"))"
+  exit 1
+fi
+
+echo "[demo M4 3/3] Chosen phases:"
+echo "  simpts (slice_idx cluster_id):"
+awk '{printf "    %s\n", $0}' "$SIMPTS"
+echo "  weights (mass cluster_id):"
+awk '{printf "    %s\n", $0}' "$WEIGHTS"
+
+# Informational: weights should sum to ~1.0 (no hard assert; simpoint
+# may emit weights in unnormalised form for some -maxK paths).
+SUM=$(awk '{s+=$1} END{printf "%.4f", s}' "$WEIGHTS")
+echo "  weight sum: $SUM"
+
+echo "[demo M4] PASS ($MODE_LABEL): rows=$ROWS, clusters=$(wc -l <"$SIMPTS"), workdir=$WORKDIR"

@@ -1,0 +1,135 @@
+# vsim Semihosting Investigation
+
+Scope: can we port QEMU's RISC-V semihosting into the Verilator-based vsim so
+that binaries linked with `-mvh` (Andes virtual hosting, `libgloss_vh`) can
+perform I/O system calls on both QEMU and vsim?
+
+This document answers step 1 only: how the current vsim handles those system
+calls today.
+
+## Bottom Line
+
+vsim does NOT implement semihosting. Every guest syscall trap is fatal.
+The fixtures work around this with the Phase-2 rule: no libc I/O between
+`enter_vsim()` and `exit_vsim()`.
+
+## Current vsim Trap Flow
+
+1. `libgloss_vh` in the Andes toolchain compiles `printf` / `_write` /
+   `_exit` / `_sbrk` down to the RISC-V semihosting magic triple:
+
+   ```
+   slli x0, x0, 0x1f    # at mepc - 4
+   ebreak               # at mepc
+   srai x0, x0, 0x7     # at mepc + 4
+   ```
+
+2. vsim's hart takes a breakpoint exception at `ebreak` (mcause = 3) and
+   jumps to `mtvec`.
+
+3. `mtvec` points to the fixture's own trap stub:
+   `hybrid_vsim/hybrid/test/runtime/trap.S:19-120` saves all GPRs/CSRs and
+   calls `handle_trap()`.
+
+4. `hybrid_vsim/hybrid/test/runtime/handler.c:23-52` reads `mcause`,
+   `mdcause`, `mepc`, `mtval` via inline CSR reads, prints
+   `[ERROR] Trap occurred!` to stderr through libgloss, then calls
+   `_exit(mcause)`.
+
+Critical: `handler.c` never inspects the bytes around `mepc` to recognize
+the magic triple. The comment at `handler.c:4-6` admits this:
+
+> libgloss_vh routes syscalls through the RISC-V semihosting magic triple,
+> not through `ecall`, so there is no syscall-dispatch table here. Any trap
+> is treated as a fatal error.
+
+That is why CLAUDE.md and `runtime/rt_c_helpers.h:2-9` carry the Phase-2
+rule: between `enter_vsim()` and `exit_vsim()` the fixture must not call
+any libc I/O function. Phase 1 and Phase 3 print fine because both QEMUs
+are launched with `-semihosting-config enable=on,target=native`.
+
+## Why the Phase-2 Rule Exists in Code
+
+- `hybrid_vsim/hybrid/test/Makefile:22-24` -- comment explaining libgloss_vh
+  and that "vsim does not implement semihosting."
+- `hybrid_vsim/hybrid/test/runtime/rt_c_helpers.h:2-9` -- documents that
+  inside the span the magic triple would route to mtvec and loop.
+- `hybrid_vsim/src/hybrid/qemu_handback.hpp` -- launches QEMU2 with
+  `-semihosting-config` so Phase 3 I/O still works.
+- `hybrid_vsim/src/main.cpp:114` -- mentions semihosting only as part of
+  QEMU2 launch docs.
+
+Grep across `hybrid_vsim/` for `semihosting`, `sys_write`, `SYS_WRITE`,
+`SYS_READ`, `_sbrk` returns no implementation, only those references.
+
+## How QEMU Does the Same Thing (Reference)
+
+- Detect: `hybrid_qemu/target/riscv/insn_trans/trans_privileged.c.inc:28-70`
+  decodes `ebreak`, reads `[mepc-4, mepc+4]`, matches the triple, then
+  raises `RISCV_EXCP_SEMIHOST` instead of `RISCV_EXCP_BREAKPOINT`.
+- Target glue (RV-specific arg/ret regs):
+  `hybrid_qemu/target/riscv/common-semi-target.h:14-26` -- args in `a0/a1`,
+  return value placed in `a0`.
+- Dispatcher (around 20 syscalls, ARM Semihosting v2.0):
+  `hybrid_qemu/semihosting/arm-compat-semi.c` and
+  `hybrid_qemu/semihosting/syscalls.c`. Implements `SYS_OPEN`, `SYS_CLOSE`,
+  `SYS_READ`, `SYS_WRITE`, `SYS_SEEK`, `SYS_FLEN`, `SYS_STAT`, `SYS_ISTTY`,
+  `SYS_HEAPINFO`, `SYS_EXIT`, `SYS_EXIT_EXTENDED`, and more.
+
+RISC-V reuses the ARM Semihosting v2.0 spec verbatim via the magic triple;
+it is not a RISC-V-specific variant.
+
+## libgloss_vh / -mvh Details
+
+- `-mvh` is an Andes toolchain flag that selects virtual hosting mode,
+  routing I/O through the semihosting magic triple instead of through
+  ecall / proxy-kernel.
+- `hybrid_vsim/hybrid/test/Makefile:39-44` link order:
+
+  ```
+  RT_C_LIBS := -Wl,--start-group -lc -lgloss_vh -lgcc -Wl,--end-group
+  ```
+
+- `-lgloss_vh` provides `_write`, `_exit`, `_sbrk`, `_read`, ... built
+  on the magic triple. Source is not in this repo; it ships in the Andes
+  toolchain.
+
+## vsim Host-Side Hooks Available Today
+
+There is no DPI-C bridge, SystemC export, or printf-debug channel from
+guest to host. The only existing guest-to-host paths are:
+
+- The DMI bus (Debug Module) that `ResumeDriver` and `StateDrain` already
+  use to read and write GPRs / FPRs / CSRs / V-state.
+- The shared `/dev/shm` mmap region (Tier-2 fixtures) -- the host process
+  can read it concurrently while the hart runs.
+- `mtvec` running guest code that the fixture itself controls.
+
+vsim's main entry is `sc_main()` in `hybrid_vsim/src/main.cpp`. It uses
+`spdlog` and `fmt` for host-side logging; the guest cannot reach those.
+
+## Two Natural Integration Points for a Port
+
+1. Guest-side, in-trap: extend `handle_trap()` in
+   `hybrid_vsim/hybrid/test/runtime/handler.c` to detect the magic triple
+   (read bytes at `mepc-4` and `mepc+4`), emulate the syscall, write the
+   result into `a0` in the trap frame, advance `mepc` by 4, and return.
+   I/O reaches the host via the existing `/dev/shm` mmap (a tail-reader
+   on the host turns the mmap region into stdout).
+   - Pros: zero vsim core changes; isolated to the fixture runtime.
+   - Cons: needs a mmap-based stdio protocol; harder for `SYS_OPEN` /
+     `SYS_READ` against arbitrary host files; not the same path as QEMU.
+
+2. Host-side, over DMI: the `handoff_controller` watches for the
+   semihosting exception via DMI (same way it already watches CSR
+   triggers), pauses the hart, reads `a0..a7` via Abstract Commands,
+   executes the syscall on the host, writes `a0` back, advances `mepc`
+   by 4, and resumes the hart.
+   - Pros: architecturally equivalent to QEMU; full POSIX surface
+     available; no guest-side runtime changes.
+   - Cons: needs a new trigger path in `handoff_controller` and a new
+     syscall dispatcher module under `hybrid_vsim/src/hybrid/`.
+
+Next step (not in this doc): pick one of the two integration points and
+sketch it end-to-end -- syscall list, register-read order, `mepc` fixup,
+file-descriptor table.

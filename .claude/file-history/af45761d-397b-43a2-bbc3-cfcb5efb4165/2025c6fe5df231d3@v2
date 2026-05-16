@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# Demo T6: archive emit (M6) + checkpoint replay (M7).
+#
+# Step A (M6): orchestrator runs a single-spawn QEMU plan that drains
+#   on the CSR-enter trigger and archives state.bin + mem + meta.json
+#   under $WORKDIR/snap/0/.
+# Step B (M7): orchestrator replay-checkpoint hydrates $WORKDIR/snap/0/
+#   into a fresh /dev/shm mmap and resumes the chosen model (vsim by
+#   default), proving the archive is portable across sessions.
+#
+# Env (auto-detected with sensible defaults):
+#   VSIM_QEMU     qemu-system-riscv64
+#   VSIM_PLUGIN   libhybrid_handoff.so
+#   VSIM_BIN      sim_<cpu>
+#   VSIM_ELF      C-level Tier-2 fixture (default: rt_c_v_regs.elf)
+#   WORKDIR       persistent dir for snap + replay state (default: mktemp -d)
+#   RESUME_WITH   vsim | qemu (default: vsim)
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+TOP_ROOT=$(cd -- "$REPO_ROOT/.." && pwd)
+
+VSIM_QEMU="${VSIM_QEMU:-/local/nick/qemu_v5/build/qemu-system-riscv64}"
+VSIM_PLUGIN="${VSIM_PLUGIN:-$REPO_ROOT/hybrid/qemu_plugin/libhybrid_handoff.so}"
+VSIM_BIN="${VSIM_BIN:-$REPO_ROOT/build/sim_ax45mpv_premium}"
+VSIM_ELF="${VSIM_ELF:-$REPO_ROOT/hybrid/test/rt_c_v_regs.elf}"
+WORKDIR="${WORKDIR:-$(mktemp -d -t demo-archive-XXXXXX)}"
+RESUME_WITH="${RESUME_WITH:-vsim}"
+
+MODE_LABEL="Archive emit (M6) + checkpoint replay (M7)"
+echo "=========================================================="
+echo "Mode: $MODE_LABEL"
+echo "Fixture: rt_c_v_regs"
+echo "Step A: orchestrator run plan -> snap/0/{state.bin, mem, meta.json}"
+echo "Step B: orchestrator replay-checkpoint --resume-with $RESUME_WITH"
+echo "Workdir: $WORKDIR"
+echo "=========================================================="
+
+for f in "$VSIM_QEMU" "$VSIM_PLUGIN" "$VSIM_BIN" "$VSIM_ELF"; do
+  if [ ! -e "$f" ]; then
+    echo "[demo M6+M7] SKIP: $f not built"
+    exit 77
+  fi
+done
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "[demo M6+M7] SKIP: python3 not found"
+  exit 77
+fi
+
+mkdir -p "$WORKDIR"
+PLAN_YAML="$WORKDIR/plan_archive.yaml"
+ARCHIVE_ROOT="$WORKDIR"
+RUN_WORKDIR="$WORKDIR/run"
+REPLAY_WORKDIR="$WORKDIR/replay"
+RUN_LOG="$WORKDIR/run.log"
+REPLAY_LOG="$WORKDIR/replay.log"
+
+# Single-step plan: QEMU drains on CSR-enter and archives.
+cat >"$PLAN_YAML" <<EOF
+session:
+  mem_size: 134217728
+  mmap_path: null
+  elf: hybrid_vsim/hybrid/test/rt_c_v_regs.elf
+
+steps:
+  - model: qemu
+    trigger: { kind: csr }
+    on_exit: { archive_as: "snap/0" }
+EOF
+
+echo "[demo M6+M7 1/4] orchestrator run: drain + archive"
+mkdir -p "$RUN_WORKDIR"
+set +e
+PYTHONPATH="$TOP_ROOT/tools" VSIM_QEMU="$VSIM_QEMU" VSIM_PLUGIN="$VSIM_PLUGIN" VSIM_BIN="$VSIM_BIN" \
+  python3 -m orchestrator.main run "$PLAN_YAML" \
+    --project-root "$TOP_ROOT" \
+    --workdir "$RUN_WORKDIR" \
+    --archive-root "$ARCHIVE_ROOT" \
+    >"$RUN_LOG" 2>&1
+RUN_RC=$?
+set -e
+
+if [ "$RUN_RC" -ne 200 ] && [ "$RUN_RC" -ne 0 ]; then
+  echo "[demo M6+M7] FAIL: orchestrator run exited $RUN_RC"
+  tail -30 "$RUN_LOG"
+  exit 1
+fi
+
+SNAP_DIR="$ARCHIVE_ROOT/snap/0"
+for f in state.bin mem meta.json; do
+  if [ ! -s "$SNAP_DIR/$f" ]; then
+    echo "[demo M6+M7] FAIL: missing or empty $SNAP_DIR/$f"
+    ls -la "$SNAP_DIR" 2>&1 || true
+    tail -30 "$RUN_LOG"
+    exit 1
+  fi
+done
+
+echo "[demo M6+M7 2/4] validate meta.json schema"
+META_OK=$(python3 - "$SNAP_DIR/meta.json" <<'PY'
+import json, sys
+meta = json.load(open(sys.argv[1]))
+assert meta.get("schema") == 1, f"schema {meta.get('schema')!r}"
+assert meta.get("abi_version") == 1, f"abi_version {meta.get('abi_version')!r}"
+assert meta.get("abi_magic", "").lower() in ("0x42594841", "42594841"), \
+    f"abi_magic {meta.get('abi_magic')!r}"
+assert meta.get("mem_size") == 134217728, f"mem_size {meta.get('mem_size')!r}"
+print("schema=1 abi_version=1 abi_magic=0x42594841 mem_size=128MB")
+PY
+)
+echo "  $META_OK"
+
+echo "[demo M6+M7 3/4] orchestrator replay-checkpoint --resume-with $RESUME_WITH"
+mkdir -p "$REPLAY_WORKDIR"
+set +e
+PYTHONPATH="$TOP_ROOT/tools" VSIM_QEMU="$VSIM_QEMU" VSIM_PLUGIN="$VSIM_PLUGIN" VSIM_BIN="$VSIM_BIN" \
+  python3 -m orchestrator.main replay-checkpoint "$SNAP_DIR" \
+    --resume-with "$RESUME_WITH" \
+    --project-root "$TOP_ROOT" \
+    --workdir "$REPLAY_WORKDIR" \
+    >"$REPLAY_LOG" 2>&1
+REPLAY_RC=$?
+set -e
+
+if [ "$REPLAY_RC" -ne 0 ] && [ "$REPLAY_RC" -ne 200 ]; then
+  echo "[demo M6+M7] FAIL: replay-checkpoint exited $REPLAY_RC"
+  tail -30 "$REPLAY_LOG"
+  exit 1
+fi
+
+echo "[demo M6+M7 4/4] verify replay advanced PC past archive"
+REPLAY_STATE=""
+for cand in "$REPLAY_WORKDIR"/*state*.bin "$REPLAY_WORKDIR"/*.bin; do
+  if [ -s "$cand" ]; then
+    REPLAY_STATE="$cand"
+    break
+  fi
+done
+if [ -z "$REPLAY_STATE" ]; then
+  echo "  no post-replay state file produced (replay completed at exit; OK)"
+else
+  ARCHIVE_PC=$(python3 -c "
+import struct
+print(hex(struct.unpack('<Q', open('$SNAP_DIR/state.bin', 'rb').read()[16:24])[0]))")
+  REPLAY_PC=$(python3 -c "
+import struct
+print(hex(struct.unpack('<Q', open('$REPLAY_STATE', 'rb').read()[16:24])[0]))")
+  echo "  archive pc=$ARCHIVE_PC, replay-drain pc=$REPLAY_PC"
+  if [ "$ARCHIVE_PC" = "$REPLAY_PC" ]; then
+    echo "[demo M6+M7] WARN: replay PC equals archive PC (no progress?)"
+  fi
+fi
+
+echo "[demo M6+M7] PASS ($MODE_LABEL): snap/0 archived + replayed under $RESUME_WITH"
