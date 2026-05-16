@@ -1,0 +1,181 @@
+# TEST ROADMAP: Switching-Mode Demo Suite
+
+Tracks 7 independent demo e2e tests that demonstrate every switching mechanism
+(M1-M8) end-to-end. Plan source: `/home/nick/.claude/plans/spicy-juggling-puppy.md`.
+
+## Progress
+
+| Demo | Mode(s) covered | Status |
+|---|---|---|
+| T1 | M1 CSR insn match + M8 end-of-program | done |
+| T2 | M2 PC symbol resolve | done |
+| T3 | M3 icount round-trip | done |
+| T4 | M4 BBV profile + SimPoint cluster | done |
+| T5 | M5 slice-consume + M3 icount exit | done |
+| T6 | M6 archive emit + M7 checkpoint replay | done |
+| T7 | M4 -> M5 -> M6 -> M7 full SimPoint loop | done |
+| I1 | `demo.sh` runner + `make demo` target | done |
+| I2 | CTest `switching-mode` label registration | done |
+| I3 | `run_e2e.sh` integration | not-started |
+
+One session = one demo. Update status when starting (in-progress) and on
+completion (done).
+
+## Status Legend
+
+- not-started: demo has not begun
+- in-progress: currently being implemented in a session
+- done: script exists, passes locally, and CTest entry registered
+
+## Dependency DAG
+
+```
+T1 ---+
+T2 ---+
+T3 ---+
+T4 ----> T5 (T5 reuses simpts output)
+T4 ----> T7 (T7 invokes the full M4-M5-M6-M7 chain)
+T6 ----> T7 (T7 needs archive+replay primitives)
+```
+
+T1-T6 parallelise across sessions. T7 is the centerpiece and must land last.
+
+## Demos
+
+### T1 - demo_csr_oneshot.sh (M1 + M8)
+
+- Status: done
+- Type: behavioral
+- Description: Thin labeled wrapper over `rt_shared_mem.sh FIXTURE=rt_c_v_regs
+  TRIGGER_MODE=csr`. Prints a banner naming the mode, invokes the harness,
+  reports PASS/FAIL with mode label.
+- Key files:
+  - `hybrid_vsim/tests/hybrid/demo_csr_oneshot.sh`
+- Dependencies: none. The underlying e2e already passes in the suite.
+- Pass criterion: exits 0; prints "Mode: CSR insn match (M1+M8) - PASS".
+
+### T2 - demo_pc_oneshot.sh (M2)
+
+- Status: done
+- Type: behavioral
+- Description: Mirror of T1 with `TRIGGER_MODE=pc`. Symbol resolution path
+  for `_hybrid_enter_pc` / `_hybrid_exit_pc`.
+- Key files:
+  - `hybrid_vsim/tests/hybrid/demo_pc_oneshot.sh`
+- Dependencies: none.
+- Pass criterion: exits 0; prints "Mode: PC symbol resolve (M2) - PASS".
+
+### T3 - demo_icount_roundtrip.sh (M3 end-to-end)
+
+- Status: done
+- Type: behavioral
+- Description: Drives `icount_spin.elf` through plugin `icount=10000` -> drain
+  -> vsim `--hybrid-icount 5000` -> drain. Both PCs verified inside the
+  RVC loop body (0x100002 / 0x100004). QEMU2 handback is intentionally
+  skipped: icount_spin has no natural semihosting exit, and using
+  `--qemu-binary` would hang. M8 is covered by T1 / T2 / T6.
+- Key files:
+  - `hybrid_vsim/tests/hybrid/demo_icount_roundtrip.sh`
+- Dependencies: F5 (plugin icount), F6 (vsim icount trigger).
+- Pass criterion: both QEMU1 and vsim exit 200 with state files whose PC
+  lies inside the icount_spin loop.
+
+### T4 - demo_bbv_profile.sh (M4)
+
+- Status: done
+- Type: behavioral
+- Description: Plugin `bbv_out=PATH,slice=N,icount=M`; runs `tools/simpoint/bin/simpoint`
+  on the resulting `.bb` file; parses simpts + weights. Outputs persist
+  under `$WORKDIR` so T5/T7 can consume them.
+- Key files:
+  - `hybrid_vsim/tests/hybrid/demo_bbv_profile.sh`
+- Dependencies: F7 (BBV emit), F12 (simpoint binary).
+- Pass criterion: simpoint exits 0; non-empty simpts + weights; prints chosen
+  slice indices and weight sum (informational).
+
+### T5 - demo_slice_consume_roundtrip.sh (M5 + M3)
+
+- Status: done
+- Type: behavioral
+- Description: Demonstrates trigger-mode mixing on a CSR-less workload.
+  Entry via plugin `slice=N,slice_at=K` (M5); exit via vsim `--hybrid-icount`
+  (M3). Reads simpts from `$SIMPTS` env if set (T4 output); else uses
+  `SLICE_AT` env. M8 is covered by T1/T2/T6; icount_spin has no natural
+  semihosting exit.
+- Key files:
+  - `hybrid_vsim/tests/hybrid/demo_slice_consume_roundtrip.sh`
+- Dependencies: F11 (plugin slice-consume), F6 (vsim icount trigger).
+  T4 optional for SIMPTS env.
+- Pass criterion: QEMU drains at slice boundary (idx=K+1 target=K, pc in
+  loop); vsim drains after VSIM_ICOUNT insns (pc in loop); both exit 200.
+
+### T6 - demo_archive_replay.sh (M6 + M7)
+
+- Status: done
+- Type: behavioral
+- Description: Inlines a one-step plan YAML (`qemu / kind: csr / on_exit:
+  archive_as: snap/0`), runs `orchestrator run --archive-root $WORKDIR`,
+  validates `snap/0/{state.bin, mem, meta.json}` (schema=1, abi_magic,
+  mem_size=128MB), then `orchestrator replay-checkpoint snap/0
+  --resume-with vsim`. Verifies replay PC advanced past archive PC.
+- Key files:
+  - `hybrid_vsim/tests/hybrid/demo_archive_replay.sh`
+- Dependencies: F9 (archive emit), F10 (replay).
+- Pass criterion: both orchestrator invocations exit cleanly; meta.json
+  validates; replay PC differs from archive PC.
+
+### T7 - demo_simpoint_loop.sh (M4 -> M5 -> M6 -> M7, centerpiece)
+
+- Status: done
+- Type: behavioral
+- Description: Full production SimPoint pipeline on rt_c_v_regs.
+  (1) Profile: QEMU+plugin bbv_out=,slice=20,icount=2000 -> 15 BBV rows.
+  (2) Cluster: simpoint -maxK 2 -dim 2 -> 2 cluster representatives.
+  (3) Per phase: QEMU+plugin slice=20,slice_at=K -> drain; archive via
+      `orchestrator.checkpoint.write_archive` Python helper into
+      $WORKDIR/snap/K/.
+  (4) Per archive: `orchestrator replay-checkpoint --resume-with vsim`
+      hydrates the mmap, vsim drains naturally on csrwi 0x7C0,1.
+  Defaults baked for rt_c_v_regs (SLICE=20, ICOUNT=2000); other fixtures
+  may need different env overrides.
+- Key files:
+  - `hybrid_vsim/tests/hybrid/demo_simpoint_loop.sh`
+- Dependencies: T4, T5, T6 (this exercises everything they exercise).
+  Implementation note: skipped a per-phase YAML template; the
+  orchestrator's drain argv builder does not yet thread slice/slice_at,
+  so per-phase QEMU drains are direct invocations and archive writes
+  use the Python helper directly. Orchestrator IS used for replay.
+- Pass criterion: K phase archives created with valid state.bin + mem +
+  meta.json; K replays exit 0; final tally line printed.
+
+## Final Integration
+
+### I1 - demo.sh runner + make demo target
+
+- Status: done
+- Type: behavioral
+- Description: User-facing entry point. `hybrid_vsim/hybrid/test/demo.sh`
+  walks T1..T7 sequentially, prints per-mode banners, and emits a
+  pass/fail tally. Honors `FILTER=<regex>` to subset. Makefile gets a
+  `demo` phony target that runs `all` then `demo.sh`.
+- Key files:
+  - `hybrid_vsim/hybrid/test/demo.sh`
+  - `hybrid_vsim/hybrid/test/Makefile` (add `demo` target)
+
+### I2 - CTest switching-mode label registration
+
+- Status: done
+- Description: `VSIM_SWITCH_MODE_TESTS` foreach added to
+  `hybrid_vsim/cmake/HybridConfig.cmake` (mirrors the `VSIM_RT_FIXTURES`
+  pattern at lines 128-170). Seven CTest entries with labels
+  `hybrid-e2e;switching-mode` and per-demo COST (T1/T2/T4 = 30s,
+  T3/T5/T6 = 60s, T7 = 180s). `ctest -L switching-mode` runs the
+  suite; takes effect on the next `build_vsim.sh` reconfigure.
+- Key files:
+  - `hybrid_vsim/cmake/HybridConfig.cmake`
+
+### I3 - run_e2e.sh integration
+
+- Status: not-started
+- Description: Extend `run_e2e.sh` `RT_TESTS` with the seven demo entries
+  so the host-side parallel runner picks them up.

@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# Demo T7: full SimPoint pipeline (M4 -> M5 -> M6 -> M7).
+#
+# Centerpiece demo showing every switching mode in the production
+# SimPoint flow:
+#
+#   M4 - profile pass: QEMU+plugin bbv_out=,slice=N -> .bb file
+#   ---  cluster      : tools/simpoint/bin/simpoint -loadFVFile ...
+#   M5 - per-phase    : QEMU+plugin slice=N,slice_at=K,outfile= -> drain
+#   M6 - archive      : write snap/K/{state.bin, mem, meta.json}
+#   M7 - replay       : orchestrator replay-checkpoint --resume-with vsim
+#
+# Workload: rt_c_v_regs (C-level Tier-2 fixture with natural csrwi
+# 0x7C0,1 exit marker, so replay's hardcoded vsim+csr trigger drains
+# naturally without --hybrid-icount tuning).
+#
+# Env (auto-detected with sensible defaults):
+#   VSIM_QEMU     qemu-system-riscv64
+#   VSIM_PLUGIN   libhybrid_handoff.so
+#   VSIM_BIN      sim_<cpu>
+#   VSIM_ELF      Tier-2 fixture (default: rt_c_v_regs.elf)
+#   SIMPOINT_BIN  tools/simpoint/bin/simpoint
+#   WORKDIR       persistent dir (default: mktemp -d)
+#   SLICE         insns per BBV row / per slice (default: 200)
+#   PROFILE_ICOUNT plugin icount fallback for profile pass (default: 8000)
+#   PHASE_ICOUNT  plugin icount fallback per phase run (default: 8000)
+#   MAXK          simpoint -maxK (default: 2)
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+TOP_ROOT=$(cd -- "$REPO_ROOT/.." && pwd)
+
+VSIM_QEMU="${VSIM_QEMU:-/local/nick/qemu_v5/build/qemu-system-riscv64}"
+VSIM_PLUGIN="${VSIM_PLUGIN:-$REPO_ROOT/hybrid/qemu_plugin/libhybrid_handoff.so}"
+VSIM_BIN="${VSIM_BIN:-$REPO_ROOT/build/sim_ax45mpv_premium}"
+VSIM_ELF="${VSIM_ELF:-$REPO_ROOT/hybrid/test/rt_c_v_regs.elf}"
+SIMPOINT_BIN="${SIMPOINT_BIN:-$TOP_ROOT/tools/simpoint/bin/simpoint}"
+WORKDIR="${WORKDIR:-$(mktemp -d -t demo-simpoint-XXXXXX)}"
+SLICE="${SLICE:-20}"
+PROFILE_ICOUNT="${PROFILE_ICOUNT:-2000}"
+PHASE_ICOUNT="${PHASE_ICOUNT:-2000}"
+MAXK="${MAXK:-2}"
+# Defaults are tuned for rt_c_v_regs which reaches csrwi 0x7C0,0 after
+# ~200-400 insns of QEMU1 startup. slice=20 gives ~15 BBV rows, enough
+# for simpoint to find 2 clusters. Tune via env for other fixtures.
+
+MODE_LABEL="Full SimPoint loop (M4 -> M5 -> M6 -> M7)"
+echo "=========================================================="
+echo "Mode: $MODE_LABEL"
+echo "Workload: $(basename "$VSIM_ELF")"
+echo "Slice: $SLICE insns; profile icount: $PROFILE_ICOUNT; maxK: $MAXK"
+echo "Workdir: $WORKDIR"
+echo "=========================================================="
+
+for f in "$VSIM_QEMU" "$VSIM_PLUGIN" "$VSIM_BIN" "$VSIM_ELF"; do
+  if [ ! -e "$f" ]; then echo "[demo T7] SKIP: $f not built"; exit 77; fi
+done
+if [ ! -x "$SIMPOINT_BIN" ]; then
+  echo "[demo T7] SKIP: $SIMPOINT_BIN not built"; exit 77
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "[demo T7] SKIP: python3 not found"; exit 77
+fi
+
+mkdir -p "$WORKDIR"
+BBV="$WORKDIR/profile.bb"
+SIMPTS="$WORKDIR/simpts"
+WEIGHTS="$WORKDIR/weights"
+SP_LOG="$WORKDIR/simpoint.log"
+SHM_SIZE=$((128 * 1024 * 1024))
+
+# ---- M4: profile pass ----------------------------------------------------
+echo "[demo T7 1/4] M4 profile: bbv_out=,slice=$SLICE,icount=$PROFILE_ICOUNT"
+SHM_PROFILE=$(mktemp -p /dev/shm vsim-t7-profile.XXXXXX)
+PROFILE_STATE="$WORKDIR/profile_state.bin"
+PROFILE_LOG="$WORKDIR/profile_qemu.log"
+truncate -s "$SHM_SIZE" "$SHM_PROFILE"
+trap 'rm -f "$SHM_PROFILE"' EXIT
+
+set +e
+timeout 30 "$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHM_PROFILE,size=$SHM_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -semihosting-config enable=on,target=native \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$PROFILE_STATE,bbv_out=$BBV,slice=$SLICE,icount=$PROFILE_ICOUNT" \
+  >"$PROFILE_LOG" 2>&1
+PRC=$?
+set -e
+rm -f "$SHM_PROFILE"
+
+if [ "$PRC" -ne 200 ]; then
+  echo "[demo T7] FAIL: profile QEMU expected exit 200, got $PRC"
+  tail -20 "$PROFILE_LOG"; exit 1
+fi
+if [ ! -s "$BBV" ]; then
+  echo "[demo T7] FAIL: BBV file empty"; exit 1
+fi
+BBV_ROWS=$(wc -l < "$BBV")
+echo "  $BBV_ROWS BBV rows -> $BBV"
+
+# ---- M4-cluster: simpoint -----------------------------------------------
+echo "[demo T7 2/4] cluster: simpoint -maxK $MAXK -dim 2"
+set +e
+"$SIMPOINT_BIN" -loadFVFile "$BBV" -maxK "$MAXK" -dim 2 \
+  -saveSimpoints "$SIMPTS" -saveSimpointWeights "$WEIGHTS" \
+  >"$SP_LOG" 2>&1
+SP_RC=$?
+set -e
+if [ "$SP_RC" -ne 0 ] || [ ! -s "$SIMPTS" ]; then
+  echo "[demo T7] FAIL: simpoint rc=$SP_RC; simpts size=$(wc -c <"$SIMPTS" 2>/dev/null || echo 0)"
+  tail -20 "$SP_LOG"; exit 1
+fi
+NUM_PHASES=$(wc -l <"$SIMPTS")
+echo "  $NUM_PHASES cluster representatives:"
+awk '{printf "    slice=%s cluster=%s\n", $1, $2}' "$SIMPTS"
+
+# ---- M5+M6: per-phase drain + archive -----------------------------------
+echo "[demo T7 3/4] for each phase: drain at slice_at=K + archive"
+PHASE_INDICES=$(awk '{print $1}' "$SIMPTS")
+declare -a ARCHIVES=()
+for K in $PHASE_INDICES; do
+  SHM=$(mktemp -p /dev/shm "vsim-t7-phase${K}.XXXXXX")
+  truncate -s "$SHM_SIZE" "$SHM"
+  STATE="$WORKDIR/phase_${K}_state.bin"
+  Q_LOG="$WORKDIR/phase_${K}_qemu.log"
+
+  set +e
+  timeout 30 "$VSIM_QEMU" \
+    -object "memory-backend-file,id=mem,share=on,mem-path=$SHM,size=$SHM_SIZE" \
+    -machine andes_ae350,memory-backend=mem \
+    -cpu andes-ax45mpv,vlen=512 \
+    -nographic \
+    -semihosting-config enable=on,target=native \
+    -bios "$VSIM_ELF" \
+    -plugin "$VSIM_PLUGIN,outfile=$STATE,slice=$SLICE,slice_at=$K,icount=$PHASE_ICOUNT" \
+    >"$Q_LOG" 2>&1
+  QRC=$?
+  set -e
+
+  if [ "$QRC" -ne 200 ]; then
+    rm -f "$SHM"
+    echo "[demo T7] FAIL: phase $K QEMU exit $QRC"; tail -20 "$Q_LOG"; exit 1
+  fi
+
+  # M6: write snap/<K>/{state.bin, mem, meta.json} via the orchestrator's
+  # write_archive helper (the canonical M6 entry point used by F9).
+  SNAP="$WORKDIR/snap/$K"
+  set +e
+  PYTHONPATH="$TOP_ROOT/tools" python3 - <<PY
+from pathlib import Path
+from orchestrator.checkpoint import write_archive
+write_archive(
+    Path("$SNAP"),
+    state_path=Path("$STATE"),
+    mmap_path=Path("$SHM"),
+    mmap_size=$SHM_SIZE,
+    elf_path="hybrid_vsim/hybrid/test/$(basename "$VSIM_ELF")",
+    source_step_index=0,
+    cpu_variant="ax45mpv_premium",
+    region_id=f"snap/$K",
+    slice_index=$K,
+)
+PY
+  AR_RC=$?
+  set -e
+  rm -f "$SHM"
+  if [ "$AR_RC" -ne 0 ]; then
+    echo "[demo T7] FAIL: write_archive for phase $K (rc=$AR_RC)"; exit 1
+  fi
+  for f in state.bin mem meta.json; do
+    if [ ! -s "$SNAP/$f" ]; then
+      echo "[demo T7] FAIL: $SNAP/$f missing/empty"; exit 1
+    fi
+  done
+  ARCHIVES+=("$SNAP")
+  echo "  phase $K archived -> $SNAP"
+done
+
+# ---- M7: replay each archive --------------------------------------------
+echo "[demo T7 4/4] for each archive: replay-checkpoint --resume-with vsim"
+REPLAY_OK=0
+for SNAP in "${ARCHIVES[@]}"; do
+  K=$(basename "$SNAP")
+  REPLAY_WD="$WORKDIR/replay_$K"
+  R_LOG="$WORKDIR/replay_${K}.log"
+  mkdir -p "$REPLAY_WD"
+  set +e
+  PYTHONPATH="$TOP_ROOT/tools" VSIM_QEMU="$VSIM_QEMU" \
+    VSIM_PLUGIN="$VSIM_PLUGIN" VSIM_BIN="$VSIM_BIN" \
+    timeout 120 python3 -m orchestrator.main replay-checkpoint "$SNAP" \
+      --resume-with vsim --project-root "$TOP_ROOT" --workdir "$REPLAY_WD" \
+      >"$R_LOG" 2>&1
+  R_RC=$?
+  set -e
+  if [ "$R_RC" -eq 0 ] || [ "$R_RC" -eq 200 ]; then
+    echo "  phase $K: replay OK (rc=$R_RC)"
+    REPLAY_OK=$((REPLAY_OK + 1))
+  else
+    echo "  phase $K: replay FAILED (rc=$R_RC)"
+    tail -15 "$R_LOG"
+  fi
+done
+
+if [ "$REPLAY_OK" -ne "$NUM_PHASES" ]; then
+  echo "[demo T7] FAIL: $REPLAY_OK/$NUM_PHASES replays succeeded"
+  exit 1
+fi
+
+echo "[demo T7] PASS ($MODE_LABEL): bbv_rows=$BBV_ROWS phases=$NUM_PHASES replays_ok=$REPLAY_OK workdir=$WORKDIR"

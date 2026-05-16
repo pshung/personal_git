@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Demo T3: icount switching mode (M3) end-to-end.
+#
+# Both QEMU1 and vsim switch via retired-instruction count alone, with
+# no CSR markers in the workload:
+#
+#   QEMU1 + plugin icount=N1    -> drain at insn N1 (M3).
+#   vsim --hybrid-icount N2     -> drain at insn N2 (M3).
+#
+# Workload is icount_spin.elf (CSR-less tight 2-insn RVC loop at 0x100002
+# and 0x100004). Neither side could use csrwi 0x7C0 -- icount IS the
+# only available drain trigger. There is no natural semihosting exit
+# (icount_spin spins forever), so this demo asserts the round-trip
+# DRAINS correctly at both ends; M8 is exercised by T1 / T2 / T6.
+#
+# Env (auto-detected with sensible defaults):
+#   VSIM_QEMU     qemu-system-riscv64
+#   VSIM_PLUGIN   libhybrid_handoff.so
+#   VSIM_BIN      sim_<cpu>
+#   VSIM_ELF      CSR-less fixture (default: icount_spin.elf)
+#   QEMU_ICOUNT   plugin icount drain target (default: 10000)
+#   VSIM_ICOUNT   vsim icount drain target  (default: 5000)
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+
+VSIM_QEMU="${VSIM_QEMU:-/local/nick/qemu_v5/build/qemu-system-riscv64}"
+VSIM_PLUGIN="${VSIM_PLUGIN:-$REPO_ROOT/hybrid/qemu_plugin/libhybrid_handoff.so}"
+VSIM_BIN="${VSIM_BIN:-$REPO_ROOT/build/sim_ax45mpv_premium}"
+VSIM_ELF="${VSIM_ELF:-$REPO_ROOT/hybrid/test/icount_spin.elf}"
+QEMU_ICOUNT="${QEMU_ICOUNT:-10000}"
+VSIM_ICOUNT="${VSIM_ICOUNT:-5000}"
+
+MODE_LABEL="Icount switching (M3)"
+echo "=========================================================="
+echo "Mode: $MODE_LABEL"
+echo "Fixture: $(basename "$VSIM_ELF") (CSR-less tight loop)"
+echo "QEMU1 trigger: plugin icount=$QEMU_ICOUNT"
+echo "vsim  trigger: --hybrid-icount $VSIM_ICOUNT  (CSR matcher disabled)"
+echo "=========================================================="
+
+for f in "$VSIM_QEMU" "$VSIM_PLUGIN" "$VSIM_BIN" "$VSIM_ELF"; do
+  if [ ! -e "$f" ]; then echo "[demo M3] SKIP: $f not built"; exit 77; fi
+done
+
+SHM_SIZE=$((128 * 1024 * 1024))
+SHM=$(mktemp -p /dev/shm vsim-icount-rt.XXXXXX)
+STATE_Q=$(mktemp)
+STATE_V=$(mktemp)
+QEMU_LOG=$(mktemp)
+VSIM_LOG=$(mktemp)
+trap 'rm -f "$SHM" "$STATE_Q" "$STATE_V" "$QEMU_LOG" "$VSIM_LOG"' EXIT
+truncate -s "$SHM_SIZE" "$SHM"
+
+read_u64() { python3 -c "
+import struct
+with open('$1', 'rb') as f:
+    f.seek($2); print(struct.unpack('<Q', f.read(8))[0])
+"; }
+
+echo "[demo M3 1/2] QEMU1 + plugin icount=$QEMU_ICOUNT -> drain"
+set +e
+timeout 30 "$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHM,size=$SHM_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -semihosting-config enable=on,target=native \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_Q,icount=$QEMU_ICOUNT" \
+  >"$QEMU_LOG" 2>&1
+QRC=$?
+set -e
+
+if [ "$QRC" -ne 200 ]; then
+  echo "[demo M3] FAIL: QEMU1 expected exit 200, got $QRC"
+  tail -20 "$QEMU_LOG"; exit 1
+fi
+if [ ! -s "$STATE_Q" ]; then
+  echo "[demo M3] FAIL: QEMU1 state empty"; exit 1
+fi
+
+PC_Q=$(read_u64 "$STATE_Q" 16)
+PC_Q_HEX=$(printf "0x%x" "$PC_Q")
+if [ "$PC_Q_HEX" != "0x100002" ] && [ "$PC_Q_HEX" != "0x100004" ]; then
+  echo "[demo M3] FAIL: QEMU1 drained pc=$PC_Q_HEX not in icount_spin loop"; exit 1
+fi
+echo "  QEMU1 drain: pc=$PC_Q_HEX"
+
+echo "[demo M3 2/2] vsim --hybrid-icount $VSIM_ICOUNT -> drain"
+set +e
+timeout 120 "$VSIM_BIN" "$VSIM_ELF" \
+  --resume-from-qemu "$STATE_Q" \
+  --handoff-out "$STATE_V" \
+  --hybrid-icount "$VSIM_ICOUNT" \
+  >"$VSIM_LOG" 2>&1
+VRC=$?
+set -e
+
+if [ "$VRC" -ne 200 ]; then
+  echo "[demo M3] FAIL: vsim expected exit 200, got $VRC"
+  tail -20 "$VSIM_LOG"; exit 1
+fi
+if [ ! -s "$STATE_V" ]; then
+  echo "[demo M3] FAIL: vsim state empty"; exit 1
+fi
+
+PC_V=$(read_u64 "$STATE_V" 16)
+PC_V_HEX=$(printf "0x%x" "$PC_V")
+if [ "$PC_V_HEX" != "0x100002" ] && [ "$PC_V_HEX" != "0x100004" ]; then
+  echo "[demo M3] FAIL: vsim drained pc=$PC_V_HEX not in icount_spin loop"; exit 1
+fi
+echo "  vsim drain: pc=$PC_V_HEX"
+
+echo "[demo M3] PASS ($MODE_LABEL): both drains inside icount_spin ROI"
