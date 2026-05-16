@@ -1,0 +1,86 @@
+#include "bbv_emit.h"
+
+#include <glib.h>
+#include <inttypes.h>
+#include <stdio.h>
+
+struct BbvEmit {
+    FILE *fp;
+    uint64_t slice_target;
+    uint64_t slice_acc;
+    GHashTable *pc_to_id;  // key: int64_t* (heap), value: GUINT_TO_POINTER(bb_id)
+    GArray    *counts;     // index: bb_id - 1, value: uint64_t
+};
+
+BbvEmit *bbv_emit_new(const char *path, uint64_t slice_target)
+{
+    if (!path || slice_target == 0) return NULL;
+    BbvEmit *e = g_new0(BbvEmit, 1);
+    e->fp = fopen(path, "w");
+    if (!e->fp) {
+        g_free(e);
+        return NULL;
+    }
+    e->slice_target = slice_target;
+    e->slice_acc    = 0;
+    e->pc_to_id     = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                            g_free, NULL);
+    e->counts       = g_array_new(FALSE, TRUE, sizeof(uint64_t));
+    return e;
+}
+
+uint64_t bbv_emit_assign_id(BbvEmit *e, uint64_t pc)
+{
+    int64_t key = (int64_t) pc;
+    gpointer val = g_hash_table_lookup(e->pc_to_id, &key);
+    if (val) {
+        return (uint64_t) GPOINTER_TO_UINT(val);
+    }
+    uint64_t new_id = (uint64_t) e->counts->len + 1;
+    int64_t *kdup = g_new(int64_t, 1);
+    *kdup = key;
+    g_hash_table_insert(e->pc_to_id, kdup, GUINT_TO_POINTER((guint) new_id));
+    uint64_t zero = 0;
+    g_array_append_val(e->counts, zero);
+    return new_id;
+}
+
+void bbv_emit_tick(BbvEmit *e, uint64_t bb_id)
+{
+    if (bb_id == 0 || bb_id > (uint64_t) e->counts->len) return;
+    uint64_t *count_ptr = &g_array_index(e->counts, uint64_t, (guint)(bb_id - 1));
+    (*count_ptr)++;
+    e->slice_acc++;
+    if (e->slice_acc < e->slice_target) return;
+
+    // Emit one SimPoint-format row. Sparse: zero-count BBs are skipped,
+    // mirroring the sample.bb convention.
+    fputc('T', e->fp);
+    int first = 1;
+    for (guint i = 0; i < e->counts->len; i++) {
+        uint64_t c = g_array_index(e->counts, uint64_t, i);
+        if (c == 0) continue;
+        if (first) {
+            fprintf(e->fp, ":%u:%" PRIu64, i + 1, c);
+            first = 0;
+        } else {
+            fprintf(e->fp, " :%u:%" PRIu64, i + 1, c);
+        }
+        g_array_index(e->counts, uint64_t, i) = 0;
+    }
+    fputc('\n', e->fp);
+    fflush(e->fp);  // make each slice durable; the plugin may exit()
+    e->slice_acc = 0;
+}
+
+void bbv_emit_close(BbvEmit *e)
+{
+    if (!e) return;
+    if (e->fp) {
+        fclose(e->fp);
+        e->fp = NULL;
+    }
+    if (e->pc_to_id) g_hash_table_destroy(e->pc_to_id);
+    if (e->counts)   g_array_free(e->counts, TRUE);
+    g_free(e);
+}

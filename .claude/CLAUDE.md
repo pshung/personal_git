@@ -2,6 +2,7 @@ read @save_output_token.md
 read @TDD.md
 
 # My persoanl principle
+* I'm a English-as-Second-Lanaguage learner, always use simple English to explain.
 
 # Your action
 ## A good plan.
