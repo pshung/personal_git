@@ -1,0 +1,250 @@
+# ROADMAP: gem5 CPU-Switch Parity
+
+Tracks 11 independent features to extend hybrid_sim (QEMU + vsim) with the four
+CPU-switch mechanisms from `specs/hybrid-sim-gem5-switch-parity.md`. One
+session = one feature. Update status when starting (in-progress) and on
+completion (done).
+
+## Status Legend
+
+- not-started: feature has not begun
+- in-progress: currently being implemented in a session
+- done: behavioural+structural commits landed and tests pass
+
+## Dependency DAG
+
+```
+F1 ----+----> F4
+F2 ----+
+F3 ----+
+F5 ----+----> F6
+       +----> F7
+       +----> F8 ----> F9 ----> F10
+       +----> F11
+```
+
+Migration order: ship F1, F2, F3 first (infrastructure layer). After that,
+F5/F6/F7 parallelise across sessions because they touch independent files.
+
+## Features
+
+### F1 - Rebrand plugin drain-exit code 0 -> 200
+
+- Status: done
+- Type: structural
+- Description: Today `qemu_plugin/hybrid_handoff.c:261` exits 0 on drain;
+  workload completion and drain are indistinguishable. vsim already exits
+  200 (`hybrid_vsim/src/hybrid/exit_codes.hpp:7`). Bring the plugin in
+  line. The orchestrator (F2+) relies on this distinction.
+- Key files:
+  - `qemu_plugin/hybrid_handoff.c:261`
+  - `hybrid_vsim/tests/hybrid/rt_shared_mem.sh` (exit-code assertions)
+  - `hybrid_vsim/tests/hybrid/roundtrip_e2e.sh`
+- Dependencies: none
+- TDD RED: a test in `tests/hybrid/test_plugin_drain_exit_code.sh` runs
+  the plugin with a CSR fixture and asserts QEMU exits with code 200.
+  Fails on today's 0.
+
+### F2 - Orchestrator skeleton (Python package)
+
+- Status: not-started
+- Type: structural (new code)
+- Description: Create `tools/orchestrator/` Python package. CLI parsing,
+  plan loading from YAML, dry-run that prints the planned spawns. No real
+  spawn yet.
+- Key files:
+  - `tools/orchestrator/__init__.py` (new)
+  - `tools/orchestrator/main.py` (new)
+  - `tools/orchestrator/plan.py` (new)
+  - `tools/orchestrator/examples/csr_oneshot.yaml` (new)
+- Dependencies: none
+- TDD RED: `tools/orchestrator/tests/test_plan_parses.py` loads
+  `examples/csr_oneshot.yaml` and asserts the resulting `Session` has
+  three `Step` entries. Fails because no parser exists.
+
+### F3 - ctypes ABI binding + state-file validator
+
+- Status: not-started
+- Type: structural (new code)
+- Description: Mirror `include/hybrid/state_abi.h`'s `hybrid_state_v1` in
+  Python via ctypes. Field-offset asserts at import time. Add
+  `validate_state_file(path)` checking magic 0x42594841, version 1,
+  exact `sizeof(hybrid_state_v1)` bytes. Wire into orchestrator as the
+  post-spawn gate.
+- Key files:
+  - `tools/orchestrator/abi.py` (new)
+  - `include/hybrid/state_abi.h` (read-only)
+  - `include/hybrid/state_abi_check.h` (read-only; mirror its asserts)
+- Dependencies: F2
+- TDD RED: `tools/orchestrator/tests/test_abi_roundtrip.py` writes a known
+  `hybrid_state_v1` struct from a small C harness, reads it in Python,
+  asserts all fields (GPRs, FPRs, CSRs, V-state) match. Fails until
+  ctypes layout matches C.
+
+### F4 - Orchestrator runs today's CSR fixture end-to-end
+
+- Status: not-started
+- Type: behavioral
+- Description: Replace one `rt_shared_mem.sh` invocation with
+  `orchestrator run <yaml>` for `rt_c_v_regs`. Add the C++ helper
+  `tools/hybrid_apply_state` extracted from `qemu_handback.hpp`'s
+  state-restore body. Delete the in-process spawn at `main.cpp:478-490`;
+  vsim returns 200 cleanly.
+- Key files:
+  - `tools/orchestrator/spawn.py` (new)
+  - `tools/orchestrator/main.py`
+  - `tools/hybrid_apply_state/` (new C++ CLI; lifts from
+    `hybrid_vsim/src/hybrid/qemu_handback.hpp:287-335 apply_state`,
+    `:41-63 pick_free_port`)
+  - `hybrid_vsim/src/main.cpp:478-490` (delete)
+  - `hybrid_vsim/cmake/HybridConfig.cmake:108-238` (add CTest variant)
+- Dependencies: F1, F2, F3
+- TDD RED: `ctest -R rt_c_v_regs--orchestrator` is registered but the
+  orchestrator's spawn path is incomplete; test fails. Then asserts
+  exit-code parity with `rt_c_v_regs--csr` (the bash-harness version).
+
+### F5 - icount counter + trigger in QEMU plugin
+
+- Status: not-started
+- Type: behavioral
+- Description: Add `uint64_t icount_retired` incremented in a per-insn
+  callback registered alongside the CSR/PC matcher in
+  `vcpu_tb_trans()`. New plugin arg `icount=N`. When
+  `icount_retired >= icount_target`, set the should-exit flag and call
+  `on_handoff` at the same insn boundary.
+- Key files:
+  - `qemu_plugin/hybrid_handoff.c:264-300` (`vcpu_tb_trans`)
+  - `qemu_plugin/hybrid_handoff.c:302-339` (arg parser)
+- Dependencies: F1
+- TDD RED: `tests/hybrid/test_plugin_icount_trigger.sh` runs a fixture
+  with `--plugin-args icount=100000` on a CSR-less binary; asserts the
+  drained state file's `minstret >= 100000` and exit code is 200. Fails
+  because the `icount=` arg is unknown.
+
+### F6 - vsim IcountTrigger (sibling of CsrTrigger)
+
+- Status: not-started
+- Type: behavioral
+- Description: New `hybrid_vsim/src/hybrid/icount_trigger.hpp` with the
+  same duck-type surface as `CsrTrigger` (`lookup(pc) ->
+  std::optional<hit>`, plus an `observe_commit()` that increments the
+  per-hart counter). `HandoffController` is already template-parameterised
+  on trigger type (`handoff_controller.hpp:38`). Add
+  `--hybrid-icount N` to `main.cpp:466-472`. Multi-hart out of scope
+  (plan-validation rejects `hart_id != 0`).
+- Key files:
+  - `hybrid_vsim/src/hybrid/icount_trigger.hpp` (new)
+  - `hybrid_vsim/src/main.cpp:466-472`
+  - `hybrid_vsim/src/simulator.hpp:223-253` (registration)
+- Dependencies: none (parallel to F5)
+- TDD RED: `hybrid_vsim/tests/hybrid/test_icount_trigger.cpp` (doctest)
+  builds a `RecordingBus` + `IcountTrigger(N=100)`, drives 100 retire
+  ticks, asserts `on_retire` returns a drained state at exactly the
+  100th. Fails because the class does not exist.
+
+### F7 - BBV emission plugin (profile mode)
+
+- Status: not-started
+- Type: behavioral
+- Description: BBV emission as a second sub-mode of `hybrid_handoff`
+  (not a separate plugin - keeps per-insn callback cost to one
+  per insn). New plugin args `bbv_out=PATH,slice=N`. Emit one BBV row
+  per `slice` dynamic insns into a SimPoint-readable `.bb` file.
+- Key files:
+  - `qemu_plugin/hybrid_handoff.c`
+  - `qemu_plugin/bbv_emit.c` (new sub-module)
+  - `qemu_plugin/Makefile`
+- Dependencies: F5 (reuses the icount counter)
+- TDD RED: `tests/hybrid/test_bbv_emit.sh` runs a fixture with
+  `bbv_out=/tmp/x.bb,slice=10000`; asserts the file is SimPoint-format
+  and has the correct number of slice rows for the binary's dynamic
+  insn count.
+
+### F8 - Orchestrator N-way switching with YAML plan grammar
+
+- Status: not-started
+- Type: behavioral
+- Description: Parse the full `steps:` grammar. Implement the spawn
+  loop: spawn, wait, validate state file, archive (no-op if no
+  `archive_as`), advance. Pass `--state-in` from previous spawn's
+  `--state-out`. Mmap fd held open across all spawns.
+- Key files:
+  - `tools/orchestrator/plan.py`
+  - `tools/orchestrator/main.py`
+  - `tools/orchestrator/spawn.py`
+  - `tools/orchestrator/mmap_owner.py` (new)
+- Dependencies: F4
+- TDD RED: `tools/orchestrator/tests/test_two_step_session.py` runs a
+  2-step plan (QEMU -> vsim -> QEMU) on `rt_c_v_regs`; asserts both
+  intermediate state files validate. Fails until the loop exists.
+
+### F9 - Checkpoint archive write
+
+- Status: not-started
+- Type: behavioral
+- Description: When a step has `archive_as: snap/N`, after the spawn
+  exits, copy `state.bin` and the mmap into `snap/N/`; write
+  `meta.json`. Reflink-or-copy by filesystem probe (btrfs/xfs use
+  `cp --reflink=always`; ext4 falls back to sequential `cp`).
+- Key files:
+  - `tools/orchestrator/checkpoint.py` (new)
+  - `tools/orchestrator/main.py`
+- Dependencies: F8
+- TDD RED:
+  `tools/orchestrator/tests/test_checkpoint_archive.py` runs a 1-step
+  plan with `archive_as: snap/0`; asserts the three artefacts exist
+  and `state.bin` byte-matches the in-flight one.
+
+### F10 - Checkpoint replay (`replay-checkpoint <dir>`)
+
+- Status: not-started
+- Type: behavioral
+- Description: New orchestrator entry point. Validates `meta.json`
+  against the live binary's CPU variant and VLEN. Hydrates a new
+  `/dev/shm` mmap from `snap/N/mem`. Copies `state.bin` to working
+  path. Spawns the requested model. No plugin or vsim code change.
+- Key files:
+  - `tools/orchestrator/checkpoint.py`
+  - `tools/orchestrator/main.py`
+- Dependencies: F9
+- TDD RED:
+  `tools/orchestrator/tests/test_checkpoint_replay.py` writes a known
+  archive (using F9), runs `replay-checkpoint snap/0 --resume-with
+  vsim`; asserts the spawned vsim drains a state file whose GPRs
+  match the archive.
+
+### F11 - BBV slice-consume trigger
+
+- Status: not-started
+- Type: behavioral
+- Description: Third sub-mode of `hybrid_handoff` (after CSR/PC,
+  icount, BBV-emit): read a slice-index list, fire drain when the
+  icount counter hits each slice index. Orchestrator chains N
+  invocations through the plan grammar to produce K archived regions
+  per SimPoint cluster.
+- Key files:
+  - `qemu_plugin/hybrid_handoff.c`
+  - `qemu_plugin/bbv_emit.c`
+  - `tools/orchestrator/plan.py` (new trigger kind `phase`)
+- Dependencies: F5, F7, F8
+- TDD RED: `tests/hybrid/test_plugin_phase_consume.sh` supplies a
+  3-slice list; asserts the plugin drains at exactly the third slice
+  (verified by the state file's `minstret`).
+
+## Out of Scope (deferred to future waves)
+
+- Multi-hart trigger support. Plan-validation in F8 explicitly rejects
+  `hart_id != 0`.
+- Snapshot auto-pruning (`--keep-last M`). Manual disk management
+  acceptable in v1.
+- Guest-driven cancel (spec open question 5).
+- KVM/HVF-accelerated QEMU (spec section 5 row 9).
+- Cross-ISA switching (spec section 5 row 11).
+
+## References
+
+- Design archive: `specs/hybrid-sim-gem5-switch-parity.md`
+- Source-of-truth for trade-offs: `specs/gem5-cpu-model-switch.md`
+- Transport choice rationale: `docs/simpoint_transport_comparison.md`
+- Shared-memory alignment: `hybrid_plan.md` Section 9 (lines 462-590)
+- Wire format: `include/hybrid/state_abi.h`
