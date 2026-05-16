@@ -1,0 +1,186 @@
+"""F3 RED: Python ctypes mirror of `hybrid_state_v1` round-trips with C.
+
+A small C harness writes a `hybrid_state_v1` with known values. The Python
+ctypes mirror reads it back and asserts every field block (header, GPRs,
+FPRs, M-mode CSRs, PMP, V-state) byte-matches what C wrote. If any offset
+or width drifts, the ctypes layout has fallen out of sync with the wire
+format and the orchestrator will silently mis-parse state files.
+
+Also exercises `validate_state_file` on a good file plus two malformed
+inputs (bad magic, wrong size).
+"""
+from __future__ import annotations
+
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from orchestrator.abi import (
+    HYBRID_FLAG_FP,
+    HYBRID_FLAG_RV64,
+    HYBRID_FLAG_V,
+    HYBRID_PMP_ADDR_NUM,
+    HYBRID_PMP_CFG_NUM,
+    HYBRID_STATE_MAGIC,
+    HYBRID_STATE_V1_SIZE,
+    HYBRID_STATE_VERSION,
+    HYBRID_VLEN_BYTES_MAX,
+    HybridStateV1,
+    validate_state_file,
+)
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_INCLUDE_DIR = _PROJECT_ROOT / "include"
+
+_C_HARNESS = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "hybrid/state_abi.h"
+
+int main(int argc, char** argv) {
+    if (argc != 2) return 1;
+    struct hybrid_state_v1 s;
+    memset(&s, 0, sizeof(s));
+    s.magic = HYBRID_STATE_MAGIC;
+    s.version = HYBRID_STATE_VERSION;
+    s.flags = HYBRID_FLAG_RV64 | HYBRID_FLAG_FP | HYBRID_FLAG_V;
+    s.hart_id = 0;
+    s.pc = 0x80000000ULL;
+    s.priv = 3;
+    for (int i = 0; i < 32; i++) s.gpr[i] = 0x1000ULL + (uint64_t)i;
+    for (int i = 0; i < 32; i++) s.fpr[i] = 0x2000ULL + (uint64_t)i;
+    s.mstatus  = 0xabcdef01ULL;
+    s.mepc     = 0xdeadbeefULL;
+    s.mtvec    = 0x80000040ULL;
+    s.mcause   = 7;
+    s.mtval    = 0x1234;
+    s.mscratch = 0x5678;
+    s.mcycle   = 1000;
+    s.minstret = 500;
+    for (int i = 0; i < HYBRID_PMP_CFG_NUM;  i++) s.pmpcfg[i]  = 0x10ULL + (uint64_t)i;
+    for (int i = 0; i < HYBRID_PMP_ADDR_NUM; i++) s.pmpaddr[i] = 0x100ULL + (uint64_t)i;
+    s.vstart = 0;
+    s.vtype  = 0xdaULL;
+    s.vl     = 16;
+    s.vlenb  = HYBRID_VLEN_BYTES_MAX;
+    for (int i = 0; i < 32 * HYBRID_VLEN_BYTES_MAX; i++) {
+        s.vreg[i] = (uint8_t)(i & 0xff);
+    }
+    s.vxsat = 1;
+    s.vxrm  = 2;
+    s.vcsr  = 3;
+    FILE* f = fopen(argv[1], "wb");
+    if (!f) return 2;
+    if (fwrite(&s, sizeof(s), 1, f) != 1) { fclose(f); return 3; }
+    fclose(f);
+    return 0;
+}
+"""
+
+
+def _cc() -> str:
+    cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    if cc is None:
+        pytest.skip("no C compiler available")
+    return cc
+
+
+@pytest.fixture(scope="module")
+def known_state_bin(tmp_path_factory) -> Path:
+    work = tmp_path_factory.mktemp("abi_harness")
+    c_path = work / "harness.c"
+    bin_path = work / "harness"
+    out_path = work / "state.bin"
+    c_path.write_text(_C_HARNESS)
+    subprocess.run(
+        [_cc(), "-std=c11", f"-I{_INCLUDE_DIR}", str(c_path), "-o", str(bin_path)],
+        check=True,
+    )
+    subprocess.run([str(bin_path), str(out_path)], check=True)
+    return out_path
+
+
+def test_ctypes_size_matches_c(known_state_bin: Path) -> None:
+    raw = known_state_bin.read_bytes()
+    assert len(raw) == HYBRID_STATE_V1_SIZE
+
+
+def test_ctypes_header_fields(known_state_bin: Path) -> None:
+    s = HybridStateV1.from_buffer_copy(known_state_bin.read_bytes())
+    assert s.magic == HYBRID_STATE_MAGIC
+    assert s.version == HYBRID_STATE_VERSION
+    assert s.flags == (HYBRID_FLAG_RV64 | HYBRID_FLAG_FP | HYBRID_FLAG_V)
+    assert s.hart_id == 0
+    assert s.pc == 0x80000000
+    assert s.priv == 3
+
+
+def test_ctypes_gprs_fprs(known_state_bin: Path) -> None:
+    s = HybridStateV1.from_buffer_copy(known_state_bin.read_bytes())
+    for i in range(32):
+        assert s.gpr[i] == 0x1000 + i
+        assert s.fpr[i] == 0x2000 + i
+
+
+def test_ctypes_mmode_csrs(known_state_bin: Path) -> None:
+    s = HybridStateV1.from_buffer_copy(known_state_bin.read_bytes())
+    assert s.mstatus == 0xabcdef01
+    assert s.mepc == 0xdeadbeef
+    assert s.mtvec == 0x80000040
+    assert s.mcause == 7
+    assert s.mtval == 0x1234
+    assert s.mscratch == 0x5678
+    assert s.mcycle == 1000
+    assert s.minstret == 500
+
+
+def test_ctypes_pmp(known_state_bin: Path) -> None:
+    s = HybridStateV1.from_buffer_copy(known_state_bin.read_bytes())
+    for i in range(HYBRID_PMP_CFG_NUM):
+        assert s.pmpcfg[i] == 0x10 + i
+    for i in range(HYBRID_PMP_ADDR_NUM):
+        assert s.pmpaddr[i] == 0x100 + i
+
+
+def test_ctypes_v_state(known_state_bin: Path) -> None:
+    s = HybridStateV1.from_buffer_copy(known_state_bin.read_bytes())
+    assert s.vstart == 0
+    assert s.vtype == 0xda
+    assert s.vl == 16
+    assert s.vlenb == HYBRID_VLEN_BYTES_MAX
+    for i in range(32 * HYBRID_VLEN_BYTES_MAX):
+        assert s.vreg[i] == i & 0xff
+    assert s.vxsat == 1
+    assert s.vxrm == 2
+    assert s.vcsr == 3
+
+
+def test_validate_state_file_accepts_good_file(known_state_bin: Path) -> None:
+    validate_state_file(known_state_bin)
+
+
+def test_validate_state_file_rejects_bad_magic(tmp_path: Path) -> None:
+    bad = tmp_path / "bad.bin"
+    bad.write_bytes(b"\x00" * HYBRID_STATE_V1_SIZE)
+    with pytest.raises(ValueError, match="magic"):
+        validate_state_file(bad)
+
+
+def test_validate_state_file_rejects_wrong_size(tmp_path: Path) -> None:
+    bad = tmp_path / "short.bin"
+    bad.write_bytes(b"\x00" * 100)
+    with pytest.raises(ValueError, match="size"):
+        validate_state_file(bad)
+
+
+def test_validate_state_file_rejects_bad_version(tmp_path: Path) -> None:
+    bad = tmp_path / "v2.bin"
+    buf = bytearray(b"\x00" * HYBRID_STATE_V1_SIZE)
+    buf[0:4] = HYBRID_STATE_MAGIC.to_bytes(4, "little")
+    buf[4:8] = (2).to_bytes(4, "little")
+    bad.write_bytes(bytes(buf))
+    with pytest.raises(ValueError, match="version"):
+        validate_state_file(bad)

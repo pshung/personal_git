@@ -1,0 +1,327 @@
+"""GDB Remote Serial Protocol client for QEMU 2 state restore.
+
+Mirrors the C++ implementation in `hybrid_vsim/src/hybrid/gdbstub_*.hpp`
+- only the subset needed for register restore is implemented (P packet
+write-register, c continue, qXfer:features:read target/annex discovery).
+Run-length encoded responses (rare in modern stubs) are not handled.
+
+The Python port keeps the orchestrator self-contained: a C++ helper CLI
+would otherwise be needed (see ROADMAP F4 `tools/hybrid_apply_state`).
+"""
+from __future__ import annotations
+
+import re
+import socket
+import time
+from dataclasses import dataclass
+
+from orchestrator.abi import (
+    HYBRID_FLAG_FP,
+    HYBRID_FLAG_V,
+    HYBRID_PMP_ADDR_NUM,
+    HYBRID_PMP_CFG_NUM,
+    HYBRID_VLEN_BYTES_MAX,
+    HybridStateV1,
+)
+
+_GPR_NAMES = (
+    "zero", "ra",  "sp",  "gp",  "tp",  "t0", "t1", "t2",
+    "fp",   "s1",  "a0",  "a1",  "a2",  "a3", "a4", "a5",
+    "a6",   "a7",  "s2",  "s3",  "s4",  "s5", "s6", "s7",
+    "s8",   "s9",  "s10", "s11", "t3",  "t4", "t5", "t6",
+)
+_FPR_NAMES = (
+    "ft0", "ft1", "ft2",  "ft3",  "ft4", "ft5", "ft6", "ft7",
+    "fs0", "fs1", "fa0",  "fa1",  "fa2", "fa3", "fa4", "fa5",
+    "fa6", "fa7", "fs2",  "fs3",  "fs4", "fs5", "fs6", "fs7",
+    "fs8", "fs9", "fs10", "fs11", "ft8", "ft9", "ft10","ft11",
+)
+_CSR_NAMES_AND_ATTRS = (
+    ("mstatus",  "mstatus"),
+    ("mepc",     "mepc"),
+    ("mtvec",    "mtvec"),
+    ("mcause",   "mcause"),
+    ("mtval",    "mtval"),
+    ("mscratch", "mscratch"),
+    ("medeleg",  "medeleg"),
+    ("mideleg",  "mideleg"),
+    ("mip",      "mip"),
+    ("mie",      "mie"),
+    ("mcycle",   "mcycle"),
+    ("minstret", "minstret"),
+    ("satp",     "satp"),
+)
+
+
+def compute_checksum(body: bytes) -> int:
+    return sum(body) & 0xFF
+
+
+def encode_packet(body: bytes) -> bytes:
+    return b"$" + body + b"#" + f"{compute_checksum(body):02x}".encode()
+
+
+def parse_packet(raw: bytes) -> bytes:
+    """Parse `$body#cs`. Raises ValueError on bad framing or checksum."""
+    if len(raw) < 4 or raw[0:1] != b"$":
+        raise ValueError(f"bad framing: {raw!r}")
+    hash_pos = raw.find(b"#")
+    if hash_pos < 0 or len(raw) < hash_pos + 3:
+        raise ValueError(f"missing checksum: {raw!r}")
+    body = raw[1:hash_pos]
+    cs = int(raw[hash_pos + 1:hash_pos + 3], 16)
+    if cs != compute_checksum(body):
+        raise ValueError(f"checksum mismatch: {raw!r}")
+    return body
+
+
+def encode_reg_num(reg_num: int) -> bytes:
+    """Hex, minimum nibbles. CSR feature regnums can be >0xFF so 2-nibble
+    truncation (the obvious bug) is avoided."""
+    return f"{reg_num:x}".encode()
+
+
+def encode_p_body(reg_num: int, value: int) -> bytes:
+    """`P<reg-hex>=<value-le-bytes-hex>` body (no framing). 8-byte payload."""
+    le = value.to_bytes(8, "little", signed=False)
+    return b"P" + encode_reg_num(reg_num) + b"=" + le.hex().encode()
+
+
+def encode_p_body_bytes(reg_num: int, data: bytes) -> bytes:
+    return b"P" + encode_reg_num(reg_num) + b"=" + data.hex().encode()
+
+
+# Captures `<reg name="X" ... regnum="N"?>` from a feature XML.
+_RE_REG = re.compile(rb'<reg\s[^>]*\bname="([^"]+)"[^>]*>', re.IGNORECASE)
+_RE_REGNUM = re.compile(rb'\bregnum="(\d+)"', re.IGNORECASE)
+_RE_XI_INCLUDE = re.compile(rb'<xi:include\s[^>]*\bhref="([^"]+)"[^>]*/?>',
+                            re.IGNORECASE)
+
+
+def parse_target_xml(xml: bytes) -> list[str]:
+    return [m.group(1).decode() for m in _RE_XI_INCLUDE.finditer(xml)]
+
+
+def parse_feature_xml(xml: bytes, reg_map: dict[str, int],
+                      next_unnumbered: list[int]) -> None:
+    """Walk `<reg>` entries in feature `xml`, populating `reg_map`.
+
+    `next_unnumbered` is a single-element list (mutable counter); each
+    unnumbered `<reg>` consumes the current value and increments it. An
+    explicit `regnum="N"` overrides the counter for that entry but does
+    not bump it (matches the C++ semantics).
+    """
+    for m in _RE_REG.finditer(xml):
+        name = m.group(1).decode()
+        rest = xml[m.start():m.end()]
+        rn_match = _RE_REGNUM.search(rest)
+        if rn_match:
+            reg_map[name] = int(rn_match.group(1))
+        else:
+            reg_map[name] = next_unnumbered[0]
+            next_unnumbered[0] += 1
+
+
+@dataclass
+class _PendingSocket:
+    sock: socket.socket
+    buf: bytearray
+
+
+class Session:
+    """RSP session over a connected TCP socket. Mirrors the C++
+    `hybrid::gdbstub::Session`: synchronous send_command + cont."""
+
+    RECV_TIMEOUT = 10.0
+
+    def __init__(self, sock: socket.socket) -> None:
+        sock.settimeout(self.RECV_TIMEOUT)
+        self._sock = sock
+        self._buf = bytearray()
+
+    def close(self) -> None:
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+    def send_command(self, body: bytes) -> bytes:
+        self._send_raw(encode_packet(body))
+        self._expect_ack()
+        resp = self._recv_packet()
+        self._send_raw(b"+")
+        return resp
+
+    def cont(self) -> None:
+        self._send_raw(encode_packet(b"c"))
+        self._expect_ack()
+
+    def _send_raw(self, data: bytes) -> None:
+        self._sock.sendall(data)
+
+    def _recv_byte(self) -> int:
+        if not self._buf:
+            chunk = self._sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("gdbstub: peer closed")
+            self._buf.extend(chunk)
+        b = self._buf[0]
+        del self._buf[0]
+        return b
+
+    def _expect_ack(self) -> None:
+        c = self._recv_byte()
+        if c == ord("+"):
+            return
+        if c == ord("-"):
+            raise RuntimeError("gdbstub: peer requested resend")
+        raise RuntimeError(f"gdbstub: expected ack, got {chr(c)!r}")
+
+    def _recv_packet(self) -> bytes:
+        # Discard any leading out-of-frame bytes.
+        while self._recv_byte() != ord("$"):
+            pass
+        body = bytearray()
+        while True:
+            c = self._recv_byte()
+            if c == ord("#"):
+                break
+            body.append(c)
+        cs_hi = self._recv_byte()
+        cs_lo = self._recv_byte()
+        framed = b"$" + bytes(body) + b"#" + bytes([cs_hi, cs_lo])
+        return parse_packet(framed)
+
+
+def connect_loopback(port: int, timeout_sec: float,
+                     child_alive: callable | None = None) -> socket.socket:
+    """Poll-connect to 127.0.0.1:port until success or deadline.
+
+    `child_alive(): bool` lets the caller detect when the spawned QEMU
+    exited before the gdbstub became reachable (typically: bad binary
+    path); on False, raises ChildDiedDuringConnect.
+    """
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.connect(("127.0.0.1", port))
+            return s
+        except OSError:
+            s.close()
+        if child_alive is not None and not child_alive():
+            raise ChildDiedDuringConnect()
+        time.sleep(0.02)
+    raise TimeoutError(f"gdbstub: tcp::{port} unreachable in {timeout_sec}s")
+
+
+class ChildDiedDuringConnect(Exception):
+    """QEMU exited before its gdbstub became reachable."""
+
+
+def fetch_feature_xml(sess: Session, annex: str) -> bytes:
+    """Loop qXfer:features:read until the 'l' (last) marker."""
+    accum = bytearray()
+    offset = 0
+    chunk = 0x100
+    while True:
+        cmd = f"qXfer:features:read:{annex}:{offset:x},{chunk:x}".encode()
+        body = sess.send_command(cmd)
+        if not body:
+            raise RuntimeError(f"qXfer empty reply for {annex}")
+        marker = chr(body[0])
+        if marker not in ("l", "m"):
+            raise RuntimeError(f"qXfer non-l/m reply for {annex}: {marker!r}")
+        accum.extend(body[1:])
+        if marker == "l":
+            return bytes(accum)
+        offset += len(body) - 1
+
+
+def discover_reg_map(sess: Session) -> dict[str, int]:
+    reg_map: dict[str, int] = {}
+    target_xml = fetch_feature_xml(sess, "target.xml")
+    counter = [0]
+    for annex in parse_target_xml(target_xml):
+        annex_xml = fetch_feature_xml(sess, annex)
+        parse_feature_xml(annex_xml, reg_map, counter)
+    return reg_map
+
+
+def _try_write_u64(sess: Session, reg_map: dict[str, int],
+                   name: str, value: int) -> None:
+    reg = reg_map.get(name)
+    if reg is None:
+        return
+    reply = sess.send_command(encode_p_body(reg, value))
+    if reply != b"OK":
+        raise RuntimeError(f"P packet for {name} replied {reply!r}")
+
+
+def _try_write_bytes(sess: Session, reg_map: dict[str, int],
+                     name: str, data: bytes) -> None:
+    reg = reg_map.get(name)
+    if reg is None:
+        return
+    reply = sess.send_command(encode_p_body_bytes(reg, data))
+    if reply != b"OK":
+        raise RuntimeError(f"P packet for {name} replied {reply!r}")
+
+
+def apply_state(sess: Session, reg_map: dict[str, int],
+                state: HybridStateV1) -> None:
+    """Write all architectural state into QEMU 2 via P packets.
+
+    Mirrors `hybrid::detail::apply_state` in qemu_handback.hpp. Order:
+    GPRs x1..x31 by hard-coded regnum 1..31, PC by 32, then FPRs/M-CSRs/
+    PMP/V-state by name lookup (silently skipped if QEMU's stub does not
+    advertise that name - tolerates per-build CSR variation).
+    """
+    # x1..x31 (skip x0/zero, hard-wired) by fixed regnum.
+    for i in range(1, 32):
+        reply = sess.send_command(encode_p_body(i, state.gpr[i]))
+        if reply != b"OK":
+            raise RuntimeError(f"P packet for x{i} replied {reply!r}")
+    reply = sess.send_command(encode_p_body(32, state.pc))
+    if reply != b"OK":
+        raise RuntimeError(f"P32 (pc) replied {reply!r}")
+
+    if state.flags & HYBRID_FLAG_FP:
+        for i in range(32):
+            _try_write_u64(sess, reg_map, _FPR_NAMES[i], state.fpr[i])
+
+    for name, attr in _CSR_NAMES_AND_ATTRS:
+        _try_write_u64(sess, reg_map, name, getattr(state, attr))
+
+    for i in range(HYBRID_PMP_CFG_NUM):
+        _try_write_u64(sess, reg_map, f"pmpcfg{i}", state.pmpcfg[i])
+    for i in range(HYBRID_PMP_ADDR_NUM):
+        _try_write_u64(sess, reg_map, f"pmpaddr{i}", state.pmpaddr[i])
+
+    if state.flags & HYBRID_FLAG_V and 0 < state.vlenb <= HYBRID_VLEN_BYTES_MAX:
+        _try_write_u64(sess, reg_map, "vstart", state.vstart)
+        _try_write_u64(sess, reg_map, "vxsat",  state.vxsat)
+        _try_write_u64(sess, reg_map, "vxrm",   state.vxrm)
+        _try_write_u64(sess, reg_map, "vcsr",   state.vcsr)
+        _try_write_u64(sess, reg_map, "vtype",  state.vtype)
+        _try_write_u64(sess, reg_map, "vl",     state.vl)
+        vbytes = int(state.vlenb)
+        vreg_buf = bytes(state.vreg)
+        for i in range(32):
+            base = i * HYBRID_VLEN_BYTES_MAX
+            _try_write_bytes(sess, reg_map, f"v{i}",
+                             vreg_buf[base:base + vbytes])
+
+
+def restore_and_continue(port: int, state: HybridStateV1,
+                         timeout_sec: float = 10.0,
+                         child_alive: callable | None = None) -> None:
+    """Top-level: connect to QEMU 2's gdbstub, restore state, continue."""
+    sock = connect_loopback(port, timeout_sec, child_alive)
+    sess = Session(sock)
+    try:
+        reg_map = discover_reg_map(sess)
+        apply_state(sess, reg_map, state)
+        sess.cont()
+    finally:
+        sess.close()

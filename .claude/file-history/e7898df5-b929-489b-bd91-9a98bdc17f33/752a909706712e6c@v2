@@ -1,0 +1,161 @@
+"""Session runner: QEMU 1 (drain) -> vsim (drain) -> QEMU 2 (restore + finish).
+
+F4 scope: hard-codes the 3-spawn shape that today's `rt_shared_mem.sh`
+exercises for `rt_c_v_regs`. F8 will generalise to the YAML plan grammar
+(N-way switching, arbitrary trigger kinds, archive_as).
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+from orchestrator.abi import HybridStateV1, validate_state_file
+from orchestrator.gdbstub import ChildDiedDuringConnect, restore_and_continue
+from orchestrator.plan import Session
+from orchestrator.spawn import (
+    pick_free_port,
+    qemu_drain_argv,
+    qemu_resume_argv,
+    vsim_argv,
+)
+
+
+@dataclass(frozen=True)
+class Artifacts:
+    qemu: Path
+    vsim: Path
+    plugin: Path
+
+    @classmethod
+    def from_env(cls, project_root: Path) -> "Artifacts":
+        return cls(
+            qemu=Path(os.environ.get(
+                "VSIM_QEMU", project_root / "build" / "qemu"
+                / "qemu-system-riscv64",
+            )),
+            vsim=Path(os.environ.get(
+                "VSIM_BIN", project_root / "hybrid_vsim" / "build"
+                / "sim_ax45mpv_premium",
+            )),
+            plugin=Path(os.environ.get(
+                "VSIM_PLUGIN", project_root / "qemu_plugin"
+                / "libhybrid_handoff.so",
+            )),
+        )
+
+
+def _wait(proc: subprocess.Popen, timeout: float) -> int:
+    """waitpid with timeout. SIGKILLs on timeout to avoid orphans."""
+    try:
+        return proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise
+
+
+def run_session(session: Session, project_root: Path,
+                artifacts: Artifacts | None = None,
+                spawn_timeout: float = 90.0) -> int:
+    """Execute a 3-step CSR-oneshot plan. Returns the final spawn's exit
+    code (0 on workload completion).
+
+    Validates that the plan's shape is [qemu drain, vsim, qemu finish].
+    A more general planner lands in F8.
+    """
+    if len(session.steps) != 3:
+        raise ValueError(
+            f"F4 runner expects 3 steps, got {len(session.steps)}"
+        )
+    models = [s.model for s in session.steps]
+    if models != ["qemu", "vsim", "qemu"]:
+        raise ValueError(f"F4 runner expects [qemu,vsim,qemu] models, got {models}")
+
+    artifacts = artifacts or Artifacts.from_env(project_root)
+    elf = project_root / session.elf
+
+    # Allocate the shared mmap. Use NamedTemporaryFile under /dev/shm so
+    # crashed runs do not leak the file; the orchestrator owns the fd
+    # only briefly - QEMU/vsim mmap by path.
+    with tempfile.NamedTemporaryFile(
+        prefix="orch-shared-", dir="/dev/shm", delete=True,
+    ) as shm:
+        os.ftruncate(shm.fileno(), session.mem_size)
+        shm_path = Path(shm.name)
+        state_qemu = Path(tempfile.mktemp(prefix="orch-state-qemu-"))
+        state_vsim = Path(tempfile.mktemp(prefix="orch-state-vsim-"))
+        try:
+            _step_qemu_drain(artifacts, elf, shm_path, session.mem_size,
+                             state_qemu, spawn_timeout)
+            validate_state_file(state_qemu)
+            _step_vsim(artifacts, elf, state_qemu, state_vsim, shm_path,
+                       session.mem_size, spawn_timeout)
+            validate_state_file(state_vsim)
+            return _step_qemu_resume(artifacts, shm_path, session.mem_size,
+                                     state_vsim, spawn_timeout)
+        finally:
+            for p in (state_qemu, state_vsim):
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
+def _step_qemu_drain(arts: Artifacts, elf: Path, shm_path: Path,
+                     mmap_size: int, state_out: Path,
+                     timeout: float) -> None:
+    argv = qemu_drain_argv(arts.qemu, elf, arts.plugin, shm_path, mmap_size,
+                           state_out)
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    rc = _wait(proc, timeout)
+    if rc != 200:
+        raise RuntimeError(
+            f"QEMU 1 drain expected exit 200, got {rc}. argv={argv}"
+        )
+
+
+def _step_vsim(arts: Artifacts, elf: Path, state_in: Path, state_out: Path,
+               shm_path: Path, mmap_size: int, timeout: float) -> None:
+    argv = vsim_argv(arts.vsim, elf, state_in, state_out, shm_path, mmap_size)
+    # vsim chatters on stderr; forward so the user sees handoff progress
+    # if the run wedges.
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                            stdout=sys.stderr, stderr=sys.stderr)
+    rc = _wait(proc, timeout)
+    if rc != 200:
+        raise RuntimeError(
+            f"vsim expected exit 200 (drained), got {rc}. argv={argv}"
+        )
+
+
+def _step_qemu_resume(arts: Artifacts, shm_path: Path, mmap_size: int,
+                      state_in: Path, timeout: float) -> int:
+    state = _read_state(state_in)
+    port = pick_free_port()
+    argv = qemu_resume_argv(arts.qemu, shm_path, mmap_size, port)
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    try:
+        restore_and_continue(
+            port, state, timeout_sec=10.0,
+            child_alive=lambda: proc.poll() is None,
+        )
+    except ChildDiedDuringConnect:
+        return proc.wait(timeout=timeout)
+    except Exception:
+        proc.kill()
+        proc.wait()
+        raise
+    return _wait(proc, timeout)
+
+
+def _read_state(path: Path) -> HybridStateV1:
+    raw = path.read_bytes()
+    return HybridStateV1.from_buffer_copy(raw)

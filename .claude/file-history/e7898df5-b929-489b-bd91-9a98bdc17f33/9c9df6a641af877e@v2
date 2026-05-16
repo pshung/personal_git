@@ -1,0 +1,101 @@
+"""Unit tests for the GDB RSP encoding layer.
+
+The e2e test proves the protocol works end-to-end against QEMU, but it
+takes ~15s and depends on built artifacts. These pin the wire format so
+encoder bugs surface in <1s and reviewers can read the contract here.
+"""
+from __future__ import annotations
+
+from orchestrator.gdbstub import (
+    compute_checksum,
+    encode_p_body,
+    encode_p_body_bytes,
+    encode_packet,
+    parse_feature_xml,
+    parse_packet,
+    parse_target_xml,
+)
+
+
+def test_checksum_sums_ascii_bytes_mod_256() -> None:
+    assert compute_checksum(b"c") == ord("c")
+    assert compute_checksum(b"OK") == (ord("O") + ord("K")) & 0xFF
+    # Wraparound at 256.
+    assert compute_checksum(b"\xff\x01") == 0
+
+
+def test_encode_packet_wraps_with_dollar_hash_checksum() -> None:
+    assert encode_packet(b"c") == b"$c#63"
+    assert encode_packet(b"OK") == b"$OK#9a"
+
+
+def test_parse_packet_round_trips_encode() -> None:
+    body = b"qXfer:features:read:target.xml:0,100"
+    assert parse_packet(encode_packet(body)) == body
+
+
+def test_parse_packet_rejects_bad_checksum() -> None:
+    try:
+        parse_packet(b"$OK#00")
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError for bad checksum")
+
+
+def test_encode_p_body_uses_8_byte_little_endian_value() -> None:
+    # x1 = 0x0123456789ABCDEF: LE bytes are EF CD AB 89 67 45 23 01
+    assert encode_p_body(1, 0x0123456789ABCDEF) == b"P1=efcdab8967452301"
+    # Zero value still pads to 16 hex nibbles.
+    assert encode_p_body(32, 0) == b"P20=0000000000000000"
+
+
+def test_encode_p_body_uses_min_nibbles_for_reg_num() -> None:
+    """CSR regnums can exceed 0xFF; the encoder must not truncate."""
+    assert encode_p_body(0x123, 0).startswith(b"P123=")
+    assert encode_p_body(0, 0).startswith(b"P0=")
+
+
+def test_encode_p_body_bytes_emits_raw_hex_payload() -> None:
+    data = bytes(range(8))  # 00 01 02 ... 07
+    assert encode_p_body_bytes(5, data) == b"P5=0001020304050607"
+
+
+def test_parse_target_xml_extracts_xi_include_hrefs_in_order() -> None:
+    xml = b"""<?xml version="1.0"?>
+    <target>
+      <xi:include href="riscv-64bit-cpu.xml"/>
+      <xi:include href="riscv-64bit-fpu.xml"/>
+      <xi:include href="riscv-64bit-csr.xml"/>
+    </target>"""
+    assert parse_target_xml(xml) == [
+        "riscv-64bit-cpu.xml",
+        "riscv-64bit-fpu.xml",
+        "riscv-64bit-csr.xml",
+    ]
+
+
+def test_parse_feature_xml_assigns_sequential_regnums() -> None:
+    xml = b"""<feature>
+      <reg name="zero" bitsize="64"/>
+      <reg name="ra" bitsize="64"/>
+      <reg name="sp" bitsize="64"/>
+    </feature>"""
+    reg_map: dict[str, int] = {}
+    counter = [10]
+    parse_feature_xml(xml, reg_map, counter)
+    assert reg_map == {"zero": 10, "ra": 11, "sp": 12}
+    assert counter[0] == 13
+
+
+def test_parse_feature_xml_honors_explicit_regnum_without_bumping() -> None:
+    # CSR feature uses sparse regnum="N"; an explicit number should not
+    # consume a slot from the running counter (matches the C++ semantics).
+    xml = b"""<feature>
+      <reg name="mstatus" bitsize="64" regnum="4096"/>
+      <reg name="mtvec" bitsize="64" regnum="4101"/>
+    </feature>"""
+    reg_map: dict[str, int] = {}
+    counter = [33]
+    parse_feature_xml(xml, reg_map, counter)
+    assert reg_map == {"mstatus": 4096, "mtvec": 4101}
+    assert counter[0] == 33

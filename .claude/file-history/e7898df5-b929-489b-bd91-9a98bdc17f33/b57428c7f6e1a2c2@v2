@@ -1,0 +1,58 @@
+"""Unit tests pinning the QEMU/vsim argv shape.
+
+These are pure-function checks; the e2e test exercises the actual spawn.
+The point of these tests is to flag silent argv drift during refactors
+(e.g. a missing `-cpu andes-ax45mpv,vlen=512` would compile and run,
+but break vector fixtures with illegal-instruction traps).
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+from orchestrator.spawn import qemu_drain_argv, qemu_resume_argv, vsim_argv
+
+
+_QEMU = Path("/usr/local/bin/qemu-system-riscv64")
+_VSIM = Path("/repo/hybrid_vsim/build/sim_ax45mpv_premium")
+_ELF = Path("/repo/test.elf")
+_PLUGIN = Path("/repo/plugin.so")
+_MMAP = Path("/dev/shm/orch-mmap")
+_SIZE = 128 * 1024 * 1024
+_STATE_IN = Path("/tmp/state-in.bin")
+_STATE_OUT = Path("/tmp/state-out.bin")
+
+
+def test_qemu_drain_argv_loads_elf_via_bios_and_plugin() -> None:
+    argv = qemu_drain_argv(_QEMU, _ELF, _PLUGIN, _MMAP, _SIZE, _STATE_OUT)
+    assert argv[0] == str(_QEMU)
+    assert "-machine" in argv
+    machine = argv[argv.index("-machine") + 1]
+    assert machine == "andes_ae350,memory-backend=mem"
+    assert argv[argv.index("-cpu") + 1] == "andes-ax45mpv,vlen=512"
+    # -bios <elf> loads the ELF into the shared mmap on QEMU 1.
+    assert argv[argv.index("-bios") + 1] == str(_ELF)
+    plugin_arg = argv[argv.index("-plugin") + 1]
+    assert plugin_arg == f"{_PLUGIN},outfile={_STATE_OUT}"
+
+
+def test_qemu_resume_argv_omits_kernel_and_runs_halted_under_gdbstub() -> None:
+    argv = qemu_resume_argv(_QEMU, _MMAP, _SIZE, gdb_port=12345)
+    # -bios none: ELF text already in shared mmap from QEMU 1. Adding
+    # -kernel here would re-zero .bss and clobber phase-2 writes.
+    assert "-kernel" not in argv
+    assert argv[argv.index("-bios") + 1] == "none"
+    assert argv[argv.index("-gdb") + 1] == "tcp::12345"
+    assert "-S" in argv  # halt at reset; orchestrator restores then `c`s.
+
+
+def test_vsim_argv_omits_qemu_binary_so_orchestrator_owns_handback() -> None:
+    argv = vsim_argv(_VSIM, _ELF, _STATE_IN, _STATE_OUT, _MMAP, _SIZE)
+    # The bash harness passes --qemu-binary to trigger vsim's in-process
+    # QEMU 2 spawn. The orchestrator must NOT pass it - it spawns QEMU 2
+    # externally and drives the gdbstub itself.
+    assert "--qemu-binary" not in argv
+    assert argv[argv.index("--resume-from-qemu") + 1] == str(_STATE_IN)
+    assert argv[argv.index("--handoff-out") + 1] == str(_STATE_OUT)
+    assert argv[argv.index("--shared-mem-path") + 1] == str(_MMAP)
+    assert argv[argv.index("--shared-mem-size") + 1] == str(_SIZE)
+    assert argv[argv.index("--shared-mem-base") + 1] == "0x0"

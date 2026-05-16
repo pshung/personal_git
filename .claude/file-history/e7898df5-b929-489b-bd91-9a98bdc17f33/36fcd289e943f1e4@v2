@@ -1,0 +1,150 @@
+"""Python ctypes mirror of `include/hybrid/state_abi.h::hybrid_state_v1`.
+
+The C ABI is the wire contract between QEMU plugin, vsim, and the
+orchestrator. This module mirrors it in ctypes so the orchestrator can
+read and validate state files written by either CPU model.
+
+Field offsets and the total struct size are asserted at import time
+against the constants codified in `include/hybrid/state_abi_check.h`.
+If a future ABI change forgets to update one side, importing this
+module fails loudly.
+"""
+from __future__ import annotations
+
+import ctypes
+import struct
+from pathlib import Path
+
+HYBRID_STATE_MAGIC: int = 0x42594841
+HYBRID_STATE_VERSION: int = 1
+
+HYBRID_FLAG_RV64: int = 1 << 0
+HYBRID_FLAG_FP: int = 1 << 1
+HYBRID_FLAG_V: int = 1 << 2
+
+HYBRID_VLEN_BYTES_MAX: int = 64
+HYBRID_PMP_CFG_NUM: int = 16
+HYBRID_PMP_ADDR_NUM: int = 64
+
+
+class HybridStateV1(ctypes.Structure):
+    _fields_ = [
+        ("magic", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("hart_id", ctypes.c_uint32),
+        ("pc", ctypes.c_uint64),
+        ("priv", ctypes.c_uint64),
+        ("gpr", ctypes.c_uint64 * 32),
+        ("fpr", ctypes.c_uint64 * 32),
+        ("mstatus", ctypes.c_uint64),
+        ("mepc", ctypes.c_uint64),
+        ("mtvec", ctypes.c_uint64),
+        ("mcause", ctypes.c_uint64),
+        ("mtval", ctypes.c_uint64),
+        ("mscratch", ctypes.c_uint64),
+        ("medeleg", ctypes.c_uint64),
+        ("mideleg", ctypes.c_uint64),
+        ("mip", ctypes.c_uint64),
+        ("mie", ctypes.c_uint64),
+        ("mcycle", ctypes.c_uint64),
+        ("minstret", ctypes.c_uint64),
+        ("satp", ctypes.c_uint64),
+        ("pmpcfg", ctypes.c_uint64 * HYBRID_PMP_CFG_NUM),
+        ("pmpaddr", ctypes.c_uint64 * HYBRID_PMP_ADDR_NUM),
+        ("vstart", ctypes.c_uint64),
+        ("vtype", ctypes.c_uint64),
+        ("vl", ctypes.c_uint64),
+        ("vlenb", ctypes.c_uint64),
+        ("vreg", ctypes.c_uint8 * (32 * HYBRID_VLEN_BYTES_MAX)),
+        ("vxsat", ctypes.c_uint64),
+        ("vxrm", ctypes.c_uint64),
+        ("vcsr", ctypes.c_uint64),
+        ("reserved", ctypes.c_uint8 * 232),
+    ]
+
+
+HYBRID_STATE_V1_SIZE: int = ctypes.sizeof(HybridStateV1)
+
+
+# Mirror state_abi_check.h. If any of these fire, the ctypes layout has
+# drifted from C and the wire format would be silently mis-parsed.
+def _check_layout() -> None:
+    expected: dict[str, int] = {
+        "magic": 0,
+        "version": 4,
+        "flags": 8,
+        "hart_id": 12,
+        "pc": 16,
+        "priv": 24,
+        "gpr": 32,
+        "fpr": 288,
+        "mstatus": 544,
+        "mepc": 552,
+        "mtvec": 560,
+        "mcause": 568,
+        "mtval": 576,
+        "mscratch": 584,
+        "medeleg": 592,
+        "mideleg": 600,
+        "mip": 608,
+        "mie": 616,
+        "mcycle": 624,
+        "minstret": 632,
+        "satp": 640,
+        "pmpcfg": 648,
+        "pmpaddr": 776,
+        "vstart": 1288,
+        "vtype": 1296,
+        "vl": 1304,
+        "vlenb": 1312,
+        "vreg": 1320,
+    }
+    vreg_end = 1320 + 32 * HYBRID_VLEN_BYTES_MAX
+    expected["vxsat"] = vreg_end
+    expected["vxrm"] = vreg_end + 8
+    expected["vcsr"] = vreg_end + 16
+    expected["reserved"] = vreg_end + 24
+    for name, want in expected.items():
+        got = getattr(HybridStateV1, name).offset
+        if got != want:
+            raise AssertionError(
+                f"hybrid_state_v1.{name} offset mismatch: C={want} ctypes={got}"
+            )
+    want_size = vreg_end + 256
+    if HYBRID_STATE_V1_SIZE != want_size:
+        raise AssertionError(
+            f"sizeof(hybrid_state_v1) mismatch: "
+            f"C={want_size} ctypes={HYBRID_STATE_V1_SIZE}"
+        )
+
+
+_check_layout()
+
+
+def validate_state_file(path: str | Path) -> None:
+    """Raise ValueError if `path` is not a valid v1 hybrid state file.
+
+    Checks (in order):
+      - file size equals `sizeof(hybrid_state_v1)`
+      - magic header equals `HYBRID_STATE_MAGIC`
+      - version equals `HYBRID_STATE_VERSION`
+
+    Does not validate field semantics (e.g. flag bit consistency, PC
+    sanity); that is the consumer's responsibility.
+    """
+    p = Path(path)
+    raw = p.read_bytes()
+    if len(raw) != HYBRID_STATE_V1_SIZE:
+        raise ValueError(
+            f"{p}: size {len(raw)} != expected {HYBRID_STATE_V1_SIZE}"
+        )
+    magic, version = struct.unpack_from("<II", raw, 0)
+    if magic != HYBRID_STATE_MAGIC:
+        raise ValueError(
+            f"{p}: magic 0x{magic:08x} != expected 0x{HYBRID_STATE_MAGIC:08x}"
+        )
+    if version != HYBRID_STATE_VERSION:
+        raise ValueError(
+            f"{p}: version {version} != expected {HYBRID_STATE_VERSION}"
+        )
