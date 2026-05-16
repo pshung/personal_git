@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# F11 contract: QEMU plugin BBV slice-consume mode. With plugin args
+# slice=N,slice_at=K the plugin counts slice boundaries (one per N
+# retired insns) and drains at the end of slice index K (0-based). For
+# K=2, drain fires at insn 3*N -- the boundary that closes the third
+# slice. Used by the orchestrator (F8) to chain spawn invocations and
+# produce one snapshot per SimPoint cluster representative slice.
+#
+# Test binary: icount_spin.elf (CSR-less, predictable tight loop).
+# Plugin must:
+#   1. Accept slice= and slice_at= args.
+#   2. Drain at insn (slice_at+1)*slice (the END of slice index
+#      slice_at, 0-based).
+#   3. Exit 200 (drain) before any icount fallback fires.
+#
+# Required environment (auto-detected with sensible defaults):
+#   VSIM_QEMU    qemu-system-riscv64
+#   VSIM_PLUGIN  libhybrid_handoff.so
+#   VSIM_ELF     CSR-less fixture (default: icount_spin.elf)
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+
+VSIM_QEMU="${VSIM_QEMU:-/local/nick/qemu_v5/build/qemu-system-riscv64}"
+VSIM_PLUGIN="${VSIM_PLUGIN:-$REPO_ROOT/hybrid/qemu_plugin/libhybrid_handoff.so}"
+VSIM_ELF="${VSIM_ELF:-$REPO_ROOT/hybrid/test/icount_spin.elf}"
+
+for f in "$VSIM_QEMU" "$VSIM_PLUGIN" "$VSIM_ELF"; do
+  if [ ! -e "$f" ]; then
+    echo "skip: $f not built"
+    exit 77
+  fi
+done
+
+SLICE=1000
+SLICE_AT=2                                # 0-based: third slice
+ICOUNT_FALLBACK=10000                     # safety upper bound
+EXPECTED_MIN=$(( (SLICE_AT + 1) * SLICE )) # = 3000
+
+SHARED_SIZE=$((128 * 1024 * 1024))
+SHARED_MEM=$(mktemp -p /dev/shm vsim-phase-shared.XXXXXX)
+STATE_OUT=$(mktemp)
+QEMU_LOG=$(mktemp)
+trap 'rm -f "$SHARED_MEM" "$STATE_OUT" "$QEMU_LOG"' EXIT
+
+truncate -s "$SHARED_SIZE" "$SHARED_MEM"
+
+set +e
+timeout 30 "$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHARED_MEM,size=$SHARED_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -semihosting-config enable=on,target=native \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_OUT,slice=$SLICE,slice_at=$SLICE_AT,icount=$ICOUNT_FALLBACK" \
+  >"$QEMU_LOG" 2>&1
+RC=$?
+set -e
+
+if [ "$RC" -ne 200 ]; then
+  echo "FAIL[plugin_phase_consume]: expected QEMU exit=200, got $RC"
+  echo "--- qemu log ---"
+  cat "$QEMU_LOG"
+  exit 1
+fi
+
+if [ ! -s "$STATE_OUT" ]; then
+  echo "FAIL[plugin_phase_consume]: state file is empty"
+  exit 1
+fi
+
+# Verify drain timing via the plugin's own slice counter, not minstret
+# (which is a cycle-counter proxy on andes-ax45mpv). At drain the plugin
+# logs `idx=N target=K`; for slice_at=K, N must be K+1 (slices fully
+# retired). slice_at=2 -> idx=3.
+EXPECTED_IDX=$((SLICE_AT + 1))
+if ! grep -qE "slice-consume drain \(idx=$EXPECTED_IDX target=$SLICE_AT\)" "$QEMU_LOG"; then
+  echo "FAIL[plugin_phase_consume]: did not find drain at idx=$EXPECTED_IDX target=$SLICE_AT"
+  echo "--- qemu log ---"
+  cat "$QEMU_LOG"
+  exit 1
+fi
+
+# Sanity: drained PC should be inside icount_spin's tight loop body
+# (0x100004 addi, 0x100008 j). Anything outside means drain fired in the
+# wrong place. pc lives at state-file offset 16 (state_abi_check.h:18).
+PC=$(python3 -c "
+import struct
+with open('$STATE_OUT', 'rb') as f:
+    f.seek(16)
+    print(hex(struct.unpack('<Q', f.read(8))[0]))
+")
+if [ "$PC" != "0x100004" ] && [ "$PC" != "0x100008" ]; then
+  echo "FAIL[plugin_phase_consume]: drained pc=$PC not in icount_spin loop body"
+  echo "--- qemu log ---"
+  cat "$QEMU_LOG"
+  exit 1
+fi
+
+echo "[plugin_phase_consume] PASS: drain idx=$EXPECTED_IDX target=$SLICE_AT pc=$PC"
