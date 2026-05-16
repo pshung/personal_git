@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Test: QEMU plugin drains vxsat / vxrm / vcsr into the state file.
+#
+# Runs the probe_v_csr fixture (sets vxrm=1, vxsat=1 before QEMU1 drain)
+# and verifies the state binary holds those values at the ABI-locked offsets.
+#
+# Offsets from state_abi.h / state_abi_check.h (HYBRID_VLEN_BYTES_MAX=64):
+#   vxsat = 1320 + 32*64 + 0  = 3368
+#   vxrm  = 1320 + 32*64 + 8  = 3376
+#   vcsr  = 1320 + 32*64 + 16 = 3384
+#
+# Expected values after the fixture: vxsat=1, vxrm=1, vcsr=3
+#   vcsr = (vxrm << 1) | vxsat = (1 << 1) | 1 = 3
+#
+# Returns 0 (PASS) or 1 (FAIL). Exit code 77 skips when artifacts are absent.
+
+set -euo pipefail
+
+ELF_DIR="$(cd "$(dirname "$0")/../../hybrid/test" && pwd)"
+PLUGIN_DIR="$(cd "$(dirname "$0")/../../../qemu_plugin" && pwd)"
+QEMU="${QEMU:-$(cd "$(dirname "$0")/../../../build/qemu" && pwd)/qemu-system-riscv64}"
+
+ELF="$ELF_DIR/probe_v_csr.elf"
+PLUGIN="$PLUGIN_DIR/libhybrid_handoff.so"
+
+[[ -x "$QEMU" ]]    || { echo "SKIP: no QEMU at $QEMU";   exit 77; }
+[[ -f "$PLUGIN" ]]  || { echo "SKIP: no plugin at $PLUGIN"; exit 77; }
+[[ -f "$ELF" ]]     || { echo "SKIP: no ELF at $ELF";     exit 77; }
+
+STATE=$(mktemp)
+trap 'rm -f "$STATE"' EXIT
+
+"$QEMU" -M virt -cpu andes-ax45mpv,vlen=512 -bios none -nographic \
+  -kernel "$ELF" -plugin "$PLUGIN,outfile=$STATE" 2>/dev/null
+rc=$?
+if [[ $rc -ne 0 ]]; then
+  echo "FAIL: QEMU exited with rc=$rc"
+  exit 1
+fi
+
+# Read 8-byte little-endian uint64 at a byte offset from the state file.
+read_u64_le() {
+  local off=$1
+  od -A n -j "$off" -N 8 -t u8 "$STATE" | tr -d ' \n'
+}
+
+got_vxsat=$(read_u64_le 3368)
+got_vxrm=$(read_u64_le  3376)
+got_vcsr=$(read_u64_le  3384)
+
+echo "vxsat=$got_vxsat (want 1)"
+echo "vxrm=$got_vxrm  (want 1)"
+echo "vcsr=$got_vcsr   (want 3)"
+
+fail=0
+[[ "$got_vxsat" == "1" ]] || { echo "FAIL: vxsat=$got_vxsat != 1"; fail=1; }
+[[ "$got_vxrm"  == "1" ]] || { echo "FAIL: vxrm=$got_vxrm != 1";  fail=1; }
+[[ "$got_vcsr"  == "3" ]] || { echo "FAIL: vcsr=$got_vcsr != 3";   fail=1; }
+
+if [[ $fail -eq 0 ]]; then
+  echo "PASS"
+  exit 0
+else
+  exit 1
+fi
