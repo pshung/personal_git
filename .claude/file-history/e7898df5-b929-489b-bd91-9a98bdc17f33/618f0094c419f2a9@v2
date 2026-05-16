@@ -1,0 +1,103 @@
+"""F8 RED: orchestrator runs an N-step plan and validates each drain state.
+
+The F4 runner hard-codes 3 spawns and rejects any other step count. F8 turns
+the runner into a generic loop over `session.steps`, persists each drain's
+state file under a caller-provided `work_dir`, and returns a `SessionResult`
+exposing the per-step state paths.
+
+This test drives a 2-step drain plan (QEMU drains on CSR enter, vsim drains
+on CSR exit) - the minimum N-way shape that exercises step iteration without
+also exercising QEMU 2 resume. Both intermediate state files must validate.
+
+Skips with code 77 when any artifact is missing.
+"""
+from __future__ import annotations
+
+import os
+import textwrap
+from pathlib import Path
+
+import pytest
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _artifact(name: str, env_key: str, default: Path) -> Path:
+    p = Path(os.environ.get(env_key, str(default)))
+    if not p.exists():
+        pytest.skip(f"{name} not built at {p}")
+    return p
+
+
+@pytest.fixture(scope="module")
+def artifacts() -> dict[str, Path]:
+    return {
+        "vsim_bin": _artifact(
+            "VSIM_BIN", "VSIM_BIN",
+            _PROJECT_ROOT / "hybrid_vsim" / "build" / "sim_ax45mpv_premium",
+        ),
+        "vsim_qemu": _artifact(
+            "VSIM_QEMU", "VSIM_QEMU",
+            _PROJECT_ROOT / "build" / "qemu" / "qemu-system-riscv64",
+        ),
+        "vsim_plugin": _artifact(
+            "VSIM_PLUGIN", "VSIM_PLUGIN",
+            _PROJECT_ROOT / "qemu_plugin" / "libhybrid_handoff.so",
+        ),
+        "elf": _artifact(
+            "VSIM_ELF", "VSIM_ELF",
+            _PROJECT_ROOT / "hybrid_vsim" / "hybrid" / "test"
+            / "rt_c_v_regs.elf",
+        ),
+    }
+
+
+_TWO_STEP_YAML = textwrap.dedent("""\
+    session:
+      mem_size: 134217728
+      mmap_path: null
+      elf: hybrid_vsim/hybrid/test/rt_c_v_regs.elf
+    steps:
+      - model: qemu
+        trigger: { kind: csr }
+      - model: vsim
+        trigger: { kind: csr }
+""")
+
+
+def test_two_step_drain_session_validates_intermediates(
+    artifacts: dict[str, Path], tmp_path: Path,
+) -> None:
+    from orchestrator.abi import validate_state_file
+    from orchestrator.plan import load_plan
+    from orchestrator.runner import run_session
+
+    # Plumb env so runner.Artifacts.from_env() picks up the right binaries.
+    for key, path in (
+        ("VSIM_BIN", artifacts["vsim_bin"]),
+        ("VSIM_QEMU", artifacts["vsim_qemu"]),
+        ("VSIM_PLUGIN", artifacts["vsim_plugin"]),
+    ):
+        os.environ[key] = str(path)
+
+    plan_path = tmp_path / "two_step.yaml"
+    plan_path.write_text(_TWO_STEP_YAML)
+    session = load_plan(plan_path)
+    assert len(session.steps) == 2  # sanity
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    result = run_session(session, _PROJECT_ROOT, work_dir=work_dir)
+
+    assert result.exit_code == 0, (
+        f"non-zero rc from N-step run: {result.exit_code}"
+    )
+
+    # Both spawns drain -> two state files, each must pass ABI validation.
+    assert len(result.state_paths) == 2, (
+        f"expected 2 state paths, got {result.state_paths}"
+    )
+    for p in result.state_paths:
+        assert p.exists(), f"missing state file: {p}"
+        validate_state_file(p)
