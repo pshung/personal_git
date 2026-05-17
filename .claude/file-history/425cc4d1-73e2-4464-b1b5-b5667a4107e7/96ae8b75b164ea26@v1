@@ -1,0 +1,98 @@
+// StateDrain halts the hart via the Debug Module and populates a
+// hybrid_state_v1 with the architectural register file. Reuses
+// ResumeDriver's DM register constants and DmiBus interface.
+
+#pragma once
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/dmi_poll.hpp"
+#include "hybrid/resume_driver.hpp"
+#include "hybrid/state_abi.h"
+
+#include <algorithm>
+#include <cstdint>
+
+namespace hybrid
+{
+
+class StateDrain
+{
+public:
+  using RD = ResumeDriver;
+
+  explicit StateDrain(DmiBus& bus)
+      : bus_{bus}
+  {}
+
+  // Drain x1..x31 + PC. FP/CSR/V slots remain zero; merge them in via
+  // drain_with_passthrough when the QEMU 1 snapshot is available.
+  auto drain() -> hybrid_state_v1
+  {
+    bus_.write(RD::kDmcontrol, RD::kDmcontrolDmactive);
+    bus_.write(RD::kDmcontrol, RD::kDmcontrolDmactive | RD::kDmcontrolHaltreq);
+    poll_until_set(bus_, RD::kDmstatus, RD::kDmstatusAllhalted,
+                   "StateDrain halt");
+
+    hybrid_state_v1 state{};
+    state.magic   = HYBRID_STATE_MAGIC;
+    state.version = HYBRID_STATE_VERSION;
+    state.flags   = HYBRID_FLAG_RV64;
+    state.priv    = 3;
+
+    for (uint16_t i = 1; i < 32; ++i)
+      state.gpr[i] = read_64bit_register(regno_gpr(i));
+
+    state.pc = read_64bit_register(regno_csr(RD::kCsrDpc));
+    return state;
+  }
+
+  // Returns the input snapshot with x1..x31 and PC overwritten by a fresh
+  // DM read. When HYBRID_FLAG_V is set, also freshly reads the six V CSRs
+  // (vstart/vxsat/vxrm/vcsr/vtype/vl) so post-vsim modifications are
+  // captured. vlenb and vreg remain pass-through (read-only / too large).
+  auto drain_with_passthrough(const hybrid_state_v1& input) -> hybrid_state_v1
+  {
+    auto state       = input;
+    const auto fresh = drain();
+    std::copy(std::begin(fresh.gpr) + 1, std::end(fresh.gpr),
+              std::begin(state.gpr) + 1);
+    state.pc = fresh.pc;
+
+    if (input.flags & HYBRID_FLAG_V) {
+      state.vstart = read_64bit_register(regno_csr(RD::kCsrVstart));
+      state.vxsat  = read_64bit_register(regno_csr(RD::kCsrVxsat));
+      state.vxrm   = read_64bit_register(regno_csr(RD::kCsrVxrm));
+      state.vcsr   = read_64bit_register(regno_csr(RD::kCsrVcsr));
+      state.vtype  = read_64bit_register(regno_csr(RD::kCsrVtype));
+      state.vl     = read_64bit_register(regno_csr(RD::kCsrVl));
+    }
+
+    return state;
+  }
+
+private:
+  auto read_64bit_register(uint16_t regno) -> uint64_t
+  {
+    bus_.write(RD::kCommand, access_register_command(regno, AarSize::Bits64,
+                                                     /*write=*/false));
+    poll_until_clear(bus_, RD::kAbstractcs, RD::kAbstractcsBusy,
+                     "StateDrain read_register");
+    // If the hardware DM does not implement Abstract access for this
+    // register, cmderr is set sticky and DATA0/DATA1 hold stale bytes.
+    // Clear the error and report 0 for that field so the next read can
+    // proceed - a missing CSR mirrors as zero rather than corrupting the
+    // adjacent slot.
+    const auto status = bus_.read(RD::kAbstractcs);
+    if ((status & RD::kAbstractcsCmderrMask) != 0u) {
+      bus_.write(RD::kAbstractcs, RD::kAbstractcsCmderrMask);
+      return 0u;
+    }
+    const uint64_t lo = bus_.read(RD::kData0);
+    const uint64_t hi = bus_.read(RD::kData1);
+    return lo | (hi << 32);
+  }
+
+  DmiBus& bus_;
+};
+
+}  // namespace hybrid

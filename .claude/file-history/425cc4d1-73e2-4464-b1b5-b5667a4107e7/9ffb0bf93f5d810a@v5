@@ -1,0 +1,306 @@
+# TODO: Failure Modes Backlog
+
+Prioritized list of conditions under which the hybrid QEMU+vsim simulator
+will silently fail or hang on real workloads. Derived from a 2026-05-17
+audit of `qemu_plugin/`, `hybrid_vsim/src/hybrid/`,
+`include/hybrid/state_abi.h`, and the test suite at
+`hybrid_vsim/tests/hybrid/`.
+
+Format: one row per failure mode.
+
+- Trigger: the production scenario that exposes the bug
+- Breaks: the observable symptom
+- Source: file(s) where the gap lives
+- Fix: the most feasible proposed solution
+- Status: not-started | in-progress | done
+
+## Tier 1 - Will fail on the next real workload
+
+### F-T1.1 Semihosting inside ROI
+
+- Trigger: Any C fixture calling `printf`, `malloc`, `_exit`, or any
+  libgloss-routed syscall between `enter_vsim()` and `exit_vsim()`.
+- Breaks: libgloss_vh emits the semihosting magic triple
+  (`slli x0,x0,0x1f; ebreak; srai x0,x0,0x7`); vsim's trap handler
+  `runtime/trap.S` falls into `handler.c` which calls `_exit(mcause)`,
+  itself a semihosting ebreak. Infinite trap loop / test timeout.
+- Source: `docs/vsim_semihosting_investigation.md` (unsolved);
+  `hybrid_vsim/hybrid/test/runtime/{trap.S,handler.c}`
+- Fix: Drop libgloss_vh inside ROI. Compile a custom crt0 + handler.c
+  that provides a local `_exit` (writes status word to an MMIO debug
+  console region, then spins) and a minimal `printf` routed through
+  the same MMIO. vsim's interconnect snoops the region and forwards
+  bytes to stderr. Phase-1/3 in QEMU still uses libgloss_vh unchanged.
+- Status: not-started
+
+### F-T1.2 FP state not restored to vsim
+
+- Trigger: Any workload using f0..f31 inside ROI.
+- Breaks: QEMU1 plugin drains FPRs into `state.bin`. ResumeDriver does
+  not write FPRs. vsim FPRs remain at RTL reset value. StateDrain
+  passes through the stale QEMU1 snapshot to QEMU2 unchanged.
+  FP computations in ROI silently corrupt register contents.
+- Source: `hybrid_vsim/src/hybrid/resume_driver.hpp`,
+  `hybrid_vsim/src/hybrid/state_drain.hpp`
+- Fix: Shipped in commit `59be1af` (2026-05-17). ResumeDriver writes
+  f0..f31 via DM Abstract Commands after gating mstatus.FS;
+  StateDrain.drain_with_passthrough freshly reads f0..f31 when
+  HYBRID_FLAG_FP is set.
+- Status: done
+
+### F-T1.3 PMP state not restored to vsim
+
+- Trigger: Any workload depending on PMP-enforced memory regions
+  inside ROI.
+- Breaks: Plugin drains pmpcfg[0..15] and pmpaddr[0..63] but
+  ResumeDriver writes none. vsim sees zeroed PMP entries; any
+  write-protect or execute-lock setup from QEMU1 evaporates.
+- Source: `hybrid_vsim/src/hybrid/resume_driver.hpp`
+- Fix: Mirror the FP pattern from F-T1.2. ResumeDriver writes
+  pmpaddr[0..63] (CSRs 0x3B0..0x3EF) first, then pmpcfg[0..15] (CSRs
+  0x3A0..0x3AF) via `write_csr_abstract_or_pb`; addr-before-cfg so
+  lock bits apply last. StateDrain.drain_with_passthrough adds the
+  mirror read loop. ABI fields already exist; no version bump.
+- Status: not-started
+
+### F-T1.4 Exception state lost across vsim ROI
+
+- Trigger: Any trap (illegal-insn, page-fault, alignment, ebreak) fires
+  inside ROI.
+- Breaks: StateDrain returns the QEMU1 snapshot for mcause/mtval/mepc
+  instead of vsim's current trap state. QEMU2 receives stale values;
+  any post-handoff trap diagnostic logic is wrong.
+- Source: `hybrid_vsim/src/hybrid/state_drain.hpp` (passthrough path)
+- Fix: In StateDrain.drain_with_passthrough, always freshly read
+  mcause (0x342), mtval (0x343), mepc (0x341), and mstatus (0x300)
+  via the existing read_64bit_register helper. Overwrite the
+  pass-through values unconditionally; no flag gate needed.
+- Status: not-started
+
+### F-T1.5 LR/SC reservation not transferred
+
+- Trigger: An lr.{w,d} retires before the trigger and the matching
+  sc.{w,d} retires after - or any atomic across the handoff.
+- Breaks: Reservation is not in the ABI struct, never round-trips.
+  sc.* always fails on re-entry, so any `__atomic_compare_exchange`
+  loop spins forever.
+- Source: `include/hybrid/state_abi.h` (missing field); resume/drain
+  both
+- Fix: Enforce trigger discipline rather than round-tripping the
+  reservation. QEMU plugin checks `env->load_res.valid` at drain time
+  and aborts with a clear diagnostic if a reservation is pending,
+  asking the workload to place the trigger after a `fence rw,rw` or
+  outside any lr/sc-bracketed region. Matches the existing "trigger
+  is a sync point" assumption; no ABI bump.
+- Status: not-started
+
+## Tier 2 - Will fail when scaling
+
+### F-T2.1 priv mode hardcoded to M
+
+- Trigger: Linux/kernel workload running in S- or U-mode at the
+  trigger boundary.
+- Breaks: `state_drain.hpp:40` and `resume_driver.hpp:40` force
+  `priv=3`; DCSR.prv never written. `dret` always resumes in M-mode.
+  S/U code raises illegal-insn -> trap loop.
+- Source: `hybrid_vsim/src/hybrid/resume_driver.hpp`,
+  `hybrid_vsim/src/hybrid/state_drain.hpp`
+- Fix: Drain - replace `state.priv = 3` with a DCSR read (CSR 0x7B0,
+  mask bits 1:0). Resume - before `request_resume()`, write DCSR.prv
+  from state.priv via `write_csr_abstract_or_pb` so the subsequent
+  `dret` restores the recorded mode. ABI `priv` field already exists.
+- Status: not-started
+
+### F-T2.2 Workload exceeding 128MB mmap
+
+- Trigger: Heap, stack, or static data extending past the default 128MB
+  shared mmap.
+- Breaks: vsim's SimpleMemory bounds reject the access or silently
+  truncate; QEMU sees MMIO instead of RAM. No startup-time bounds
+  check on ELF segments against mmap size.
+- Source: `hybrid_vsim/src/platform/simple_memory.hpp`,
+  orchestrator mmap sizing
+- Fix: Orchestrator startup parses the ELF PHDRs; sums max(vaddr +
+  memsz) across LOAD segments; aborts with a diagnostic if the value
+  exceeds the mmap size. Expose mmap size via env var
+  `HYBRID_MMAP_BYTES` (default 128MB) so large workloads opt in.
+- Status: not-started
+
+### F-T2.3 Multi-hart resume path
+
+- Trigger: `_NDS_NHART=2` configuration; workload using hart 1, atomic
+  fences, IPIs, or hart-to-hart sync.
+- Breaks: ABI carries `hart_id` and per-hart arrays but ResumeDriver
+  and StateDrain only handle hart 0. Resuming hart 1 from hart 0's
+  state corrupts both.
+- Source: `hybrid_vsim/src/hybrid/{resume_driver,state_drain}.hpp`,
+  `hybrid_vsim/src/hybrid/qemu_handback.hpp` (thread selection)
+- Fix: Wrap ResumeDriver/StateDrain in a per-hart loop. Before each
+  pass, write DMCONTROL.hartsello (bits 16:25) to select the hart;
+  re-poll allhalted, then run the existing single-hart code.
+  qemu_handback prefixes each per-hart P-packet block with `Hg
+  <thread-id>`. Gated by hart_count > 1 so single-hart path is
+  unchanged.
+- Status: not-started
+
+### F-T2.4 mcycle/minstret monotonicity
+
+- Trigger: Long-running workload; or any consumer reading these CSRs
+  across the handoff.
+- Breaks: No test asserts monotonicity. If the icount trigger is off
+  by one, vsim's mcycle could be less than QEMU1's exit mcycle and
+  nothing would catch it.
+- Source: gap in test suite; ABI does carry mcycle/minstret
+- Fix: Add a CTest case that captures QEMU1's drained mcycle/minstret
+  from state.bin, then queries QEMU2's gdbstub for the same CSRs
+  immediately on connect; assert strictly increasing. Wire into
+  `run_e2e.sh` so every Tier-2 fixture exercises it.
+- Status: not-started
+
+### F-T2.5 MMIO inside ROI
+
+- Trigger: Workload calls `putchar`, touches UART/PLIC, accesses ROM,
+  or hits aliased memory inside ROI.
+- Breaks: Phase-5 interconnect watch (`hybrid_plan.md` Section 5) was
+  never implemented. Writes to MMIO ranges either vanish or hit
+  SimpleMemory as if they were RAM. QEMU2 device state desyncs from
+  vsim's view.
+- Source: `hybrid_vsim/src/platform/interconnect.hpp` (no watch);
+  `hybrid_plan.md` Phase 5
+- Fix: Define a single allowlist of RAM + permitted-MMIO ranges in
+  `src/platform/interconnect.hpp`. SimpleMemory::read/write checks
+  every access against the allowlist; out-of-range aborts with a
+  diagnostic logging the offending PC + address. Implements the
+  Phase-5 interconnect watch.
+- Status: not-started
+
+## Tier 3 - Bug surfaces invisible to current suite
+
+### F-T3.1 State-value opacity in M3-M7 demos
+
+- Trigger: Any bug that copies the wrong register, byte-swaps, or
+  truncates a 64-bit value during M3 (icount), M4 (BBV), M5
+  (slice-consume), M6 (archive), or M7 (replay).
+- Breaks: Demos `demo_icount_roundtrip.sh`,
+  `demo_bbv_profile.sh`, `demo_slice_consume_roundtrip.sh`,
+  `demo_archive_replay.sh`, `demo_simpoint_loop.sh` only assert exit
+  code + PC range. A wrong register value passes all of them.
+- Source: `hybrid_vsim/tests/hybrid/demo_*.sh`
+- Fix: In each demo, after QEMU2 connects via gdbstub, issue a single
+  `g` packet to read the full register file; parse and memcmp byte
+  by byte against the corresponding fields in state.bin. Fail the
+  demo on mismatch. ~30 lines of bash per demo via a shared helper.
+- Status: not-started
+
+### F-T3.2 Untested trigger-mode combinations
+
+- Trigger: csr-entry + icount-exit; slice-entry + pc-exit;
+  BBV-emit with simultaneous icount; etc. ~32 entry/exit pairings
+  exist; suite tests CSR+CSR and PC+PC only.
+- Breaks: Plugin or vsim bug in a cross-mode path is invisible until
+  hit in production.
+- Source: gap in `run_e2e.sh` mode coverage
+- Fix: Parameterize `run_e2e.sh` with separate `ENTRY_MODE` and
+  `EXIT_MODE` env vars (default = MODE if unset). Add a top-level
+  `matrix` mode that iterates the cross-product across one canonical
+  fixture, skipping pairings the plugin rejects up front.
+- Status: not-started
+
+### F-T3.3 Submodule version drift
+
+- Trigger: Upstream QEMU 9.x changes TCG plugin ABI; vsim refactors
+  the DM; SimPoint pinned to 17783e5 stays unmaintained.
+- Breaks: Plugin silently produces wrong state, or fails to build,
+  with no CI gate.
+- Source: `.gitmodules`; no CI matrix against upstream snapshots
+- Fix: Add `scripts/check_upstream_drift.sh` that, for each submodule,
+  `git fetch`es the upstream remote and reports commits since the
+  pinned SHA. Schedule a weekly CI job that runs the script and
+  attaches the report to an auto-filed GitHub issue when non-empty.
+- Status: not-started
+
+### F-T3.4 vlenb mismatch silent
+
+- Trigger: Fixture built with `--march=rv64gcv` for VLEN=512 (vlenb=64)
+  runs on a vsim configured for VLEN=256 (vlenb=32) - or vice versa.
+- Breaks: No cross-check that `vlenb_qemu == vlenb_vsim`. ResumeDriver
+  reads only `vlenb` bytes of V-reg payload; upper bytes left as
+  uninitialized scratch. Garbage in V regs.
+- Source: gap in `hybrid_vsim/src/hybrid/v_regfile_xfer.hpp` and ABI
+  validator
+- Fix: At handoff entry, before any V transport, ResumeDriver reads
+  the hart's `vlenb` CSR (0xC22) via Abstract Command and compares
+  against `state.vlenb`. Mismatch aborts with a clear error naming
+  both values. Same check on qemu_handback ingress side.
+- Status: not-started
+
+### F-T3.5 Failure-injection holes
+
+- Trigger: Partial state drain mid-handoff; SIGKILL; disk full; mmap
+  truncated to wrong size; corrupt magic with valid struct size.
+- Breaks: Existing negative drivers cover only 4 scenarios
+  (corrupt-state-short-read, no-qemu-binary, gdbstub-timeout,
+  pty-handback). Subtle resource-exhaustion or race-condition paths
+  unguarded.
+- Source: `hybrid_vsim/tests/hybrid/rt_{corrupt_state,no_qemu_binary,gdbstub_timeout,pty_handback}.sh`
+- Fix: Add three negative drivers: `rt_fault_partial_drain.sh`
+  (truncate state.bin to half its size mid-handoff),
+  `rt_fault_disk_full.sh` (run on a size-capped tmpfs smaller than
+  state size), `rt_fault_mmap_resize.sh` (truncate the shared mmap
+  while vsim is mid-execution). Each asserts a clean diagnostic exit.
+- Status: not-started
+
+### F-T3.6 Determinism across re-runs
+
+- Trigger: Run the same ELF twice; diff the drained state files.
+- Breaks: No guarantee of byte-identical output. `reserved[]` bytes,
+  CSR drain order, and FP rounding sources could vary. Any test using
+  exact-equality assertion is flaky.
+- Source: `qemu_plugin/hybrid_handoff.c` drain order; ABI reserved
+  bytes
+- Fix: Add an e2e test that runs the same fixture twice and asserts
+  `sha256sum state1.bin == sha256sum state2.bin`. Audit drain path:
+  zero-initialise `reserved[]` explicitly in the plugin and in
+  StateDrain; serialise CSR writes in canonical CSR-number order.
+- Status: not-started
+
+### F-T3.7 Self-modifying code
+
+- Trigger: JIT or workload writes to .text inside ROI.
+- Breaks: Shared mmap is live so the write is visible immediately,
+  but QEMU1 has cached the old insn in TCG and vsim's icache starts
+  cold. Same binary -> different trace.
+- Source: documented out-of-scope in `hybrid_plan.md` Section 2.5;
+  not detected
+- Fix: At orchestrator startup, parse the ELF for `.text` PHDRs and
+  call `mprotect(..., PROT_READ)` on the corresponding mmap pages.
+  Any write fault becomes a clean SIGSEGV with a diagnostic naming
+  the offending PC. SMC stays out-of-scope but is now detected
+  instead of silently corrupting traces.
+- Status: not-started
+
+### F-T3.8 GDB handshake timeout / zombie QEMU2
+
+- Trigger: QEMU2 launches but its gdbstub does not respond within 5s,
+  or responds then hangs mid-P-packet.
+- Breaks: `qemu_handback::connect_loopback` may time out but the
+  spawned QEMU2 child can be left as a zombie if the orchestrator
+  has no SIGALRM watchdog.
+- Source: `hybrid_vsim/src/hybrid/qemu_handback.hpp`
+- Fix: In `connect_loopback`, install a `setitimer`-based watchdog
+  before the gdb handshake. On SIGALRM, `kill(child_pid, SIGKILL)`
+  then `waitpid(child_pid, ..., 0)` to reap, then throw. RAII guard
+  ensures reap happens on any throw path.
+- Status: not-started
+
+## Highest-leverage next moves
+
+1. **Add register-readback assertions to demos T3-T7** - cheapest fix
+   for F-T3.1. Single gdbstub `g` packet at QEMU2 entry, memcmp
+   against the drained `state.bin`.
+2. **Land `docs/v_csr_plan.md`** - already a 9-step TDD sequence;
+   partially addresses F-T1.2 and F-T1.3 by establishing the
+   ResumeDriver pattern for Tier-A and Tier-B CSRs.
+3. **Promote `hybrid_plan.md` Phase 5 hardening to a tracked ROADMAP** -
+   covers F-T1.2, F-T1.3, F-T1.4, F-T1.5, F-T2.1, F-T2.3, F-T2.5 in
+   one scoped effort. Currently never scheduled.
