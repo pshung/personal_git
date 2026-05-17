@@ -1,0 +1,58 @@
+# Continue Next Phase in TEST_ROADMAP.md
+
+## Context
+
+User requested: "continue the next phase in TEST_ROADMAP.md if all
+dependence are ready".
+
+After scanning `/home/nick/work/hybrid_sim/TEST_ROADMAP.md`, the result
+is: **there is no next phase to continue**. Every entry is `done`.
+
+## Status Audit
+
+Reading the progress table in `TEST_ROADMAP.md:8-19`:
+
+| Entry | Status |
+|---|---|
+| T1 demo_csr_oneshot.sh (M1+M8) | done |
+| T2 demo_pc_oneshot.sh (M2) | done |
+| T3 demo_icount_roundtrip.sh (M3) | done |
+| T4 demo_bbv_profile.sh (M4) | done |
+| T5 demo_slice_consume_roundtrip.sh (M5+M3) | done |
+| T6 demo_archive_replay.sh (M6+M7) | done |
+| T7 demo_simpoint_loop.sh (M4->M5->M6->M7) | done |
+| I1 demo.sh runner + make demo target | done |
+| I2 CTest switching-mode label | done |
+| I3 run_e2e.sh integration | done |
+
+Confirmed by git log: T1..T7 + I1..I3 all landed in commits
+`281b26c..0b0bc51` (most recent: "behavioral: add switching-mode
+tutorial + exercises" at `ee88ac5`).
+
+The sibling roadmap `ROADMAP.md` (F1-F12 gem5 switch-parity features)
+is also fully done.
+
+## Recommendation
+
+No action to take inside `TEST_ROADMAP.md`. If the user wants the next
+unit of work, candidates from the workspace are:
+
+- `docs/v_csr_plan.md` (untracked) - Full V-CSR support across the
+  hybrid handoff. Has its own 9-step TDD sequence (steps 1..9).
+  Currently the highest-leverage unstarted plan in tree.
+- `docs/vsim_semihosting_investigation.md` (untracked) - investigation
+  notes; may produce follow-up items but not a roadmap yet.
+- `specs/hybrid-sim-gem5-switch-parity.md` (untracked) - the source
+  spec for ROADMAP.md; nothing new to schedule.
+- `hybrid_plan.md` (untracked) Section 5 Phase 5 hardening items
+  (vector regfile, FP, PMP, priv-mode, traps, MMIO watch, mcycle, lr/sc,
+  multi-hart) - never scoped into a roadmap.
+
+Ask the user which (if any) of these should be promoted to the next
+active roadmap before any code changes.
+
+## Verification
+
+Confirm by re-reading `TEST_ROADMAP.md:8-19` (the progress table) and
+`git log --oneline` showing every TEST_ROADMAP entry has a matching
+"behavioral: TEST_ROADMAP TX done" commit.
