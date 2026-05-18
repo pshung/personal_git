@@ -1,0 +1,256 @@
+# ROADMAP: Relocate cross-cutting e2e tests to top-level `hybrid_sim/`
+
+Tracks the migration of the e2e test tree (fixtures, harness, drivers, plugin
+shell tests, demos) out of the `verilator/` submodule and into the top-level
+`hybrid_sim/` repo, so the wire format (`include/hybrid/state_abi.h`) and the
+tests that exercise it live in the same repo.
+
+One session = one feature. Update status when starting (in-progress) and on
+completion (done).
+
+## Status Legend
+
+- not-started: feature has not begun
+- in-progress: currently being implemented in a session
+- done: structural+behavioral commits landed and Phase-0 baseline pass list matches
+
+## Global Invariant
+
+After every feature lands, this must hold:
+
+```
+JOBS=8 MODE=both bash scripts/run_e2e.sh
+# pass list == /tmp/baseline-pass.txt from F0
+```
+
+Any divergence blocks the next feature.
+
+## Dependency DAG
+
+```
+F0 ----> F1 ----> F2 ----> F3 ----> F4 ----> F5 ----> F6 ----> F7
+                  (RED/GREEN/REFACTOR
+                   sub-loop inside F2)
+```
+
+Strict serial order from F1..F6. F7 (docs) can land any time after F6.
+
+## Pre-flight decisions (answer before F1)
+
+1. **History preservation** - cross-repo `cp` loses per-file `git blame` in the
+   new home. If blame matters, do F1 via `git filter-repo --path hybrid/test
+   --path tests/hybrid` on a clone of `verilator` and merge with
+   `--allow-unrelated-histories`. Adds ~half a day. Default: plain copy,
+   accept that blame for moved files starts fresh in `hybrid_sim/`.
+2. **Submodule CI** - any pipeline in `verilator` that runs
+   `ctest -L hybrid-e2e` silently passes with 0 tests after F4. Decide:
+   delete the CI job, or have it clone the parent repo.
+3. **`runtime/` headers** - confirm `core_v5.h`, `memory_map.h`, `platform.h`
+   under `verilator/hybrid/test/runtime/` are standalone fixture files, not
+   sync-mirrors of vsim CPU description headers. If they mirror, add a
+   regenerate step or keep them in the submodule.
+
+## Features
+
+### F0 - Capture baseline pass list
+
+- Status: in-progress
+- Type: no commit (safety net)
+- Description: Snapshot the current green test list so every later phase can
+  diff against it. Runs both CSR and PC trigger modes.
+- Steps:
+  ```
+  JOBS=8 MODE=both bash scripts/run_e2e.sh 2>&1 | tee /tmp/e2e-baseline.log
+  grep '^\[ok\]'   /tmp/e2e-baseline.log | sort > /tmp/baseline-pass.txt
+  grep '^\[FAIL\]' /tmp/e2e-baseline.log | sort > /tmp/baseline-fail.txt
+  ```
+- Output: `/tmp/baseline-pass.txt` is the diff target for F1..F6.
+- Dependencies: none
+- TDD RED: n/a (no code change).
+
+### F1 - Lay down top-level `tests/` tree (copy-only)
+
+- Status: not-started
+- Type: structural (top-level repo)
+- Description: Copy the e2e tree into `hybrid_sim/tests/` WITHOUT touching the
+  originals in the submodule and WITHOUT touching `scripts/run_e2e.sh`. Both layouts
+  coexist after this commit. Old path is still authoritative.
+- Target layout:
+  ```
+  hybrid_sim/tests/
+    e2e.sh           <- cp verilator/tests/hybrid/e2e.sh
+    fixtures/        <- cp -r verilator/hybrid/test/       (Makefile, *.S, *.c, runtime/, test.ld, semihost_exit.inc)
+    drivers/         <- cp verilator/tests/hybrid/rt_{corrupt_state,gdbstub_timeout,no_qemu_binary,pty_handback}.sh
+    plugin/          <- cp test_plugin_*.sh probe_vcsr_drain.sh qemu_silent_stub.py
+    demos/           <- cp demo_*.sh
+  ```
+- Key files:
+  - `tests/e2e.sh` (new, identical bytes to submodule original)
+  - `tests/fixtures/*` (new)
+  - `tests/drivers/*.sh` (new)
+  - `tests/plugin/*.sh` (new)
+  - `tests/demos/*.sh` (new)
+- Dependencies: F0
+- TDD RED: n/a - pure copy, no behavior change. Verification = baseline pass
+  list still matches (`scripts/run_e2e.sh` still uses old paths).
+- Commit: `structural: copy e2e harness + fixtures to top-level tests/`
+
+### F2 - Rewire path resolution in new copies (RED/GREEN/REFACTOR)
+
+- Status: not-started
+- Type: behavioral (top-level repo)
+- Description: The copied `tests/e2e.sh` still computes
+  `REPO_ROOT=$SCRIPT_DIR/../..` which assumes it lives inside the submodule,
+  so its `VSIM_BIN`/`VSIM_PLUGIN`/`VSIM_ELF` paths are wrong from the new
+  location. Drive the fix by TDD: failing smoke test first, then minimal edit
+  to make it green, then dedupe.
+- Sub-features (each = one commit):
+  - **F2a (RED)**: Add `tests/smoke_e2e_paths.sh` that calls the new
+    `tests/e2e.sh` with `FIXTURE=rt_c_hello TRIGGER_MODE=csr`. Expect failure
+    because path resolution lands in the wrong directory.
+    - Commit: `behavioral: add failing smoke test for top-level tests/e2e.sh`
+  - **F2b (GREEN)**: Edit `tests/e2e.sh` minimally so `TOP_ROOT=$SCRIPT_DIR/..`
+    and the four resolved paths point at top-level locations:
+    | Path        | New value                                            |
+    |-------------|------------------------------------------------------|
+    | `VSIM_BIN`    | `$TOP_ROOT/verilator/build/sim_ax45mpv_premium`    |
+    | `VSIM_QEMU`   | `$TOP_ROOT/build/qemu/qemu-system-riscv64`           |
+    | `VSIM_PLUGIN` | `$TOP_ROOT/qemu_plugin/libhybrid_handoff.so`         |
+    | `VSIM_ELF`    | `$TOP_ROOT/tests/fixtures/${FIXTURE}.elf`            |
+    - Commit: `behavioral: resolve harness paths from top-level tests/ root`
+  - **F2c (REFACTOR)**: Extract the now-duplicated env-var resolution block
+    into `tests/lib/paths.sh`; source it from `e2e.sh`. Baseline still green.
+    - Commit: `structural: dedupe harness path resolution into tests/lib/paths.sh`
+  - **F2d**: Apply the same RED/GREEN/REFACTOR cycle to `drivers/rt_*.sh`,
+    `plugin/test_plugin_*.sh`, `plugin/probe_vcsr_drain.sh`, `demos/demo_*.sh`.
+    Each file family = one commit using the F2c helper.
+    - Commits:
+      - `behavioral: rewire negative drivers (drivers/rt_*.sh) to top-level paths`
+      - `behavioral: rewire plugin-only shell tests to top-level paths`
+      - `behavioral: rewire switching-mode demo scripts to top-level paths`
+- Key files:
+  - `tests/e2e.sh`
+  - `tests/lib/paths.sh` (new)
+  - `tests/drivers/rt_*.sh`
+  - `tests/plugin/*.sh`
+  - `tests/demos/demo_*.sh`
+  - `tests/smoke_e2e_paths.sh` (new, deleted at end of F2 or kept as part of suite)
+- Dependencies: F1
+- TDD RED: F2a writes the failing smoke test before any non-test edit.
+
+### F3 - Point `scripts/run_e2e.sh` at the new tree
+
+- Status: not-started
+- Type: behavioral (top-level repo)
+- Description: Switch the parallel runner's `HARNESS` and `TEST_DIR` variables
+  to the new top-level locations. Fixture-build call moves from
+  `make -C verilator/hybrid/test` to `make -C tests/fixtures`. After this
+  commit, the old paths inside `verilator/` are unreachable from
+  `scripts/run_e2e.sh` but still physically present (cleanup is F5).
+- Key files:
+  - `scripts/run_e2e.sh:24-25` (HARNESS, TEST_DIR)
+  - `scripts/run_e2e.sh` fixture-build invocation
+- Dependencies: F2
+- TDD RED: `JOBS=8 bash scripts/run_e2e.sh` already covers the change - run it
+  before the edit, expect identical pass list to baseline (old paths still
+  work); run it after, expect identical pass list (new paths take over).
+  No new test file needed; the suite itself is the test.
+- Commit: `behavioral: point scripts/run_e2e.sh at top-level tests/ tree`
+
+### F4 - Drop e2e CTest block from submodule
+
+- Status: not-started
+- Type: structural (verilator repo, not top-level)
+- Description: In `verilator/cmake/HybridConfig.cmake`, remove the
+  `if(VSIM_ENABLE_HYBRID) ... foreach(entry ${VSIM_E2E_FIXTURES}) ...` block.
+  Keep every `vsim_add_test(test_*` doctest registration - those are the
+  hybrid-layer unit tests and they stay in the submodule (they use
+  `recording_bus.hpp` duck-types, depend on vsim's `vsim_add_test` macro, and
+  don't cross the QEMU/vsim boundary).
+- Key files:
+  - `verilator/cmake/HybridConfig.cmake` (delete the e2e foreach block,
+    keep all `vsim_add_test` lines)
+- Dependencies: F3
+- TDD RED: n/a - CTest registration removal. Verification:
+  `ctest --test-dir verilator/build -L hybrid-unit` runs the same doctest
+  set as before; `ctest -L hybrid-e2e` returns 0 tests.
+- Commit (in submodule): `structural: drop e2e CTest registration (moved to parent)`
+
+### F5 - Delete originals from submodule
+
+- Status: not-started
+- Type: structural (verilator repo)
+- Description: Two commits, separated by file family, so each is independently
+  revertible.
+- Steps:
+  - **F5a**: `git rm -r hybrid/test` (Andes-toolchain fixture sources +
+    `runtime/`)
+    - Commit: `structural: remove e2e fixtures (moved to parent)`
+    - Verify: `ctest --test-dir build -L hybrid-unit` still green.
+  - **F5b**: `git rm tests/hybrid/{e2e.sh,rt_*.sh,test_plugin_*.sh,probe_vcsr_drain.sh,demo_*.sh,qemu_silent_stub.py}`
+    - Commit: `structural: remove e2e shell drivers (moved to parent)`
+    - Verify: `ctest --test-dir build -L hybrid-unit` still green; remaining
+      files under `tests/hybrid/` are only doctest `.test.cpp` units + the
+      `recording_bus.hpp` / `insn_encoders.hpp` headers.
+- Key files (all deleted):
+  - `verilator/hybrid/test/` (entire directory)
+  - `verilator/tests/hybrid/e2e.sh`
+  - `verilator/tests/hybrid/rt_*.sh`
+  - `verilator/tests/hybrid/test_plugin_*.sh`
+  - `verilator/tests/hybrid/probe_vcsr_drain.sh`
+  - `verilator/tests/hybrid/demo_*.sh`
+  - `verilator/tests/hybrid/qemu_silent_stub.py`
+- Dependencies: F4
+- TDD RED: n/a - deletion. Submodule CI's unit-test job is the regression net.
+
+### F6 - Submodule pointer bump
+
+- Status: not-started
+- Type: structural (top-level repo)
+- Description: Update the `verilator` submodule pointer in `hybrid_sim/` to
+  the commit produced by F5. This is the cut-over: after this commit, the
+  e2e tree lives at top-level only.
+- Steps:
+  ```
+  git -C verilator checkout <HEAD-after-F5b>
+  git add verilator
+  git commit -m "structural: bump verilator after e2e relocation"
+  ```
+- Key files:
+  - `verilator` (submodule pointer)
+- Dependencies: F5
+- TDD RED: n/a. Verification: `JOBS=8 bash scripts/run_e2e.sh` matches
+  `/tmp/baseline-pass.txt` from F0; `ctest --test-dir verilator/build
+  -L hybrid-unit` matches pre-migration unit-test list.
+
+### F7 - Docs
+
+- Status: not-started
+- Type: structural (top-level repo)
+- Description: Update every doc that references the old path layout. Touch
+  only files that actually contain a stale path - do not rewrite unrelated
+  prose.
+- Key files:
+  - `CLAUDE.md` - "Key Files" table (rewrite the `verilator/...` entries
+    that moved); "Test Fixtures" section path; "Running Tests" section if
+    it cites the submodule path
+  - `docs/USER_GUIDE.md` - fixture-build invocation, e2e invocation
+  - `README.md` - any path references
+  - `ROADMAP.md` / `TEST_ROADMAP.md` - mark this migration as complete if
+    they tracked it
+  - `e2e_ROADMAP.md` - mark all F0..F7 as done
+- Dependencies: F6
+- TDD RED: n/a (docs).
+- Commit: `structural: docs: reflect relocated e2e tree`
+
+## Compound-effect payoff
+
+After F7:
+- Adding a new fixture = 1 commit in `hybrid_sim/`. No submodule pointer
+  bump cascade across `QEMU`/`verilator`.
+- e2e harness edits don't leak to other consumers of `verilator` (e.g. the
+  standalone vsim demo).
+- `include/hybrid/state_abi.h` (top-level) and `tests/fixtures/` (top-level)
+  are co-located - wire format and exercising fixtures live together.
+- The submodule shrinks to its actual responsibility: vsim sources + hybrid
+  orchestration headers + hybrid-layer unit tests.
