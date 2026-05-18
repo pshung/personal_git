@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Demo T5: slice-consume entry (M5) + icount exit (M3) on a CSR-less workload.
+#
+# Demonstrates that the orchestrator can use DIFFERENT trigger modes for
+# the entry and exit of the same vsim window:
+#
+#   QEMU + plugin: slice=N,slice_at=K -> drains at end of slice K (M5).
+#   vsim         : --hybrid-icount M  -> drains after M retired insns (M3).
+#
+# Workload is icount_spin.elf (CSR-less, predictable tight loop), so neither
+# side can use the csrwi 0x7C0 marker. There is no natural QEMU2 exit
+# because the workload spins forever; this demo asserts the round-trip
+# DRAINS correctly at both ends. M8 is covered by T1 / T2 / T6.
+#
+# Env (auto-detected with sensible defaults):
+#   VSIM_QEMU     qemu-system-riscv64
+#   VSIM_PLUGIN   libhybrid_handoff.so
+#   VSIM_BIN      sim_<cpu>
+#   VSIM_ELF      CSR-less fixture (default: icount_spin.elf)
+#   SLICE         insns per slice    (default: 1000)
+#   SLICE_AT      0-based slice index for drain (default: 1)
+#   ICOUNT_FALLBACK QEMU plugin safety upper bound (default: 10000)
+#   VSIM_ICOUNT   insns vsim runs before exit drain (default: 5000)
+#   SIMPTS        optional simpts file from T4; if set, slice_at picked
+#                 from its first row (first column) instead of SLICE_AT env.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+
+VSIM_QEMU="${VSIM_QEMU:-/local/nick/qemu_v5/build/qemu-system-riscv64}"
+VSIM_PLUGIN="${VSIM_PLUGIN:-$REPO_ROOT/hybrid/qemu_plugin/libhybrid_handoff.so}"
+VSIM_BIN="${VSIM_BIN:-$REPO_ROOT/build/sim_ax45mpv_premium}"
+VSIM_ELF="${VSIM_ELF:-$REPO_ROOT/hybrid/test/icount_spin.elf}"
+SLICE="${SLICE:-1000}"
+SLICE_AT_ENV="${SLICE_AT:-1}"
+ICOUNT_FALLBACK="${ICOUNT_FALLBACK:-10000}"
+VSIM_ICOUNT="${VSIM_ICOUNT:-5000}"
+SIMPTS="${SIMPTS:-}"
+
+# If a SIMPTS file from T4 is provided, pick the first listed slice index.
+# Otherwise fall back to SLICE_AT env (default 1).
+if [ -n "$SIMPTS" ] && [ -s "$SIMPTS" ]; then
+  SLICE_AT=$(awk 'NR==1{print $1}' "$SIMPTS")
+  SLICE_AT_SRC="simpts(first row of $SIMPTS)"
+else
+  SLICE_AT="$SLICE_AT_ENV"
+  SLICE_AT_SRC="env SLICE_AT"
+fi
+
+MODE_LABEL="Slice-consume entry (M5) + icount exit (M3)"
+echo "=========================================================="
+echo "Mode: $MODE_LABEL"
+echo "Workload: icount_spin (CSR-less tight loop)"
+echo "Entry: QEMU plugin slice=$SLICE slice_at=$SLICE_AT (from $SLICE_AT_SRC)"
+echo "Exit : vsim --hybrid-icount $VSIM_ICOUNT"
+echo "=========================================================="
+
+for f in "$VSIM_QEMU" "$VSIM_PLUGIN" "$VSIM_BIN" "$VSIM_ELF"; do
+  if [ ! -e "$f" ]; then
+    echo "[demo M5] SKIP: $f not built"
+    exit 77
+  fi
+done
+
+EXPECTED_QEMU_INSN=$(( (SLICE_AT + 1) * SLICE ))
+SHARED_SIZE=$((128 * 1024 * 1024))
+SHARED_MEM=$(mktemp -p /dev/shm vsim-slice-shared.XXXXXX)
+STATE_Q=$(mktemp)
+STATE_V=$(mktemp)
+QEMU_LOG=$(mktemp)
+VSIM_LOG=$(mktemp)
+trap 'rm -f "$SHARED_MEM" "$STATE_Q" "$STATE_V" "$QEMU_LOG" "$VSIM_LOG"' EXIT
+truncate -s "$SHARED_SIZE" "$SHARED_MEM"
+
+echo "[demo M5 1/2] QEMU + plugin: drain at end of slice $SLICE_AT (insn $EXPECTED_QEMU_INSN)"
+set +e
+timeout 30 "$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHARED_MEM,size=$SHARED_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -semihosting-config enable=on,target=native \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_Q,slice=$SLICE,slice_at=$SLICE_AT,icount=$ICOUNT_FALLBACK" \
+  >"$QEMU_LOG" 2>&1
+QRC=$?
+set -e
+
+if [ "$QRC" -ne 200 ]; then
+  echo "[demo M5] FAIL: QEMU expected exit 200, got $QRC"
+  tail -20 "$QEMU_LOG"
+  exit 1
+fi
+if [ ! -s "$STATE_Q" ]; then
+  echo "[demo M5] FAIL: QEMU state file empty"
+  exit 1
+fi
+
+# Verify drain happened at the slice boundary (plugin logs idx=K+1 target=K).
+EXPECTED_IDX=$((SLICE_AT + 1))
+if ! grep -qE "slice-consume drain \(idx=$EXPECTED_IDX target=$SLICE_AT\)" "$QEMU_LOG"; then
+  echo "[demo M5] FAIL: QEMU drain not at slice boundary idx=$EXPECTED_IDX target=$SLICE_AT"
+  tail -20 "$QEMU_LOG"
+  exit 1
+fi
+
+# Drained PC must be inside icount_spin loop body (0x100004 / 0x100008).
+PC_Q=$(python3 -c "
+import struct
+with open('$STATE_Q', 'rb') as f:
+    f.seek(16); print(hex(struct.unpack('<Q', f.read(8))[0]))
+")
+if [ "$PC_Q" != "0x100002" ] && [ "$PC_Q" != "0x100004" ]; then
+  echo "[demo M5] FAIL: QEMU drained pc=$PC_Q not in icount_spin loop"
+  exit 1
+fi
+echo "  QEMU drain: idx=$EXPECTED_IDX target=$SLICE_AT pc=$PC_Q"
+
+echo "[demo M5 2/2] vsim: resume + drain after $VSIM_ICOUNT retired insns"
+set +e
+timeout 60 "$VSIM_BIN" "$VSIM_ELF" \
+  --resume-from-qemu "$STATE_Q" \
+  --handoff-out "$STATE_V" \
+  --hybrid-icount "$VSIM_ICOUNT" \
+  >"$VSIM_LOG" 2>&1
+VRC=$?
+set -e
+
+if [ "$VRC" -ne 200 ]; then
+  echo "[demo M5] FAIL: vsim expected exit 200, got $VRC"
+  tail -20 "$VSIM_LOG"
+  exit 1
+fi
+if [ ! -s "$STATE_V" ]; then
+  echo "[demo M5] FAIL: vsim state file empty"
+  exit 1
+fi
+
+PC_V=$(python3 -c "
+import struct
+with open('$STATE_V', 'rb') as f:
+    f.seek(16); print(hex(struct.unpack('<Q', f.read(8))[0]))
+")
+if [ "$PC_V" != "0x100002" ] && [ "$PC_V" != "0x100004" ]; then
+  echo "[demo M5] FAIL: vsim drained pc=$PC_V not in icount_spin loop"
+  exit 1
+fi
+echo "  vsim drain: after $VSIM_ICOUNT insns pc=$PC_V"
+
+echo "[demo M5] PASS ($MODE_LABEL): both drains inside icount_spin ROI"
