@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""hsim - end-user entry point for the Andes hybrid simulator.
+
+Single-file driver. Wraps the developer-grade scripts (setup.sh,
+tests/e2e.sh, scripts/run_e2e.sh) behind four subcommands:
+
+    ./hsim build [--what TARGET]
+    ./hsim run <elf-or-fixture> --mode csr|pc
+    ./hsim test [--filter REGEX] [--mode csr|pc|both]
+    ./hsim list <fixtures|demos|modes>
+
+Python 3 stdlib only; no pip deps.
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parent
+
+
+# --- F1: list ---------------------------------------------------------------
+
+# M1..M8 short table. Authoritative source: docs/USER_GUIDE.md sections 3-4.
+# Kept here so `./hsim list modes` does not need to grep USER_GUIDE at runtime.
+MODES = [
+    ("M1", "csr",           "csrwi 0x7C0, {0,1} insn match (default)"),
+    ("M2", "pc",            "ELF symbols _hybrid_enter_pc / _hybrid_exit_pc"),
+    ("M3", "icount",        "retired-insn count trigger"),
+    ("M4", "bbv",           "basic-block vector profiling"),
+    ("M5", "slice",         "slice-consume; vsim resumes from a captured slice"),
+    ("M6", "archive",       "checkpoint archive replay"),
+    ("M7", "replay",        "deterministic re-execution of a captured run"),
+    ("M8", "end-of-program", "natural program exit terminates the round-trip"),
+]
+
+
+def parse_fixtures(makefile: Path) -> list[tuple[str, str]]:
+    """Extract fixture names + family from tests/fixtures/Makefile.
+
+    Returns rows (name, family) in stable, family-grouped order. Family is
+    the variable they came from (RT_FIXTURES, RT_C_FIXTURES, ...).
+    """
+    text = makefile.read_text()
+    rows: list[tuple[str, str]] = []
+    # Variable definitions look like:
+    #   RT_FIXTURES := rt_all_gprs rt_abi_aliases \
+    #                  rt_long_roi
+    # We capture everything up to a non-continuation newline.
+    var_pattern = re.compile(
+        r"^(?P<var>[A-Z_][A-Z0-9_]*)\s*:?=\s*(?P<body>(?:[^\n]*\\\n)*[^\n]*)$",
+        re.MULTILINE,
+    )
+    interesting = {
+        "RT_FIXTURES":      "asm",
+        "RT_C_FIXTURES":    "c",
+        "RT_C_V_FIXTURES":  "c+rvv",
+        "PROBE_V_FIXTURES": "probe",
+    }
+    seen: set[str] = set()
+    for m in var_pattern.finditer(text):
+        var = m.group("var")
+        if var not in interesting:
+            continue
+        family = interesting[var]
+        body = m.group("body").replace("\\\n", " ")
+        for name in body.split():
+            if name and name not in seen:
+                rows.append((name, family))
+                seen.add(name)
+    # Pick up the legacy hand-listed ELF targets.
+    for name in ("handoff_roundtrip",):
+        if name not in seen:
+            rows.append((name, "asm"))
+            seen.add(name)
+    return rows
+
+
+def list_fixtures() -> int:
+    makefile = REPO_ROOT / "tests" / "fixtures" / "Makefile"
+    if not makefile.is_file():
+        print(f"hsim: missing {makefile}", file=sys.stderr)
+        return 2
+    rows = parse_fixtures(makefile)
+    width = max(len(name) for name, _ in rows)
+    print(f"{'FIXTURE'.ljust(width)}  FAMILY")
+    for name, family in rows:
+        print(f"{name.ljust(width)}  {family}")
+    return 0
+
+
+def list_demos() -> int:
+    demo_dir = REPO_ROOT / "tests" / "demos"
+    if not demo_dir.is_dir():
+        print(f"hsim: missing {demo_dir}", file=sys.stderr)
+        return 2
+    names = sorted(p.stem for p in demo_dir.glob("demo_*.sh"))
+    if not names:
+        print(f"hsim: no demos found under {demo_dir}", file=sys.stderr)
+        return 2
+    for name in names:
+        print(name)
+    return 0
+
+
+def list_modes() -> int:
+    width_id = max(len(m[0]) for m in MODES)
+    width_key = max(len(m[1]) for m in MODES)
+    print(f"{'ID'.ljust(width_id)}  {'KEY'.ljust(width_key)}  DESCRIPTION")
+    for mode_id, key, desc in MODES:
+        print(f"{mode_id.ljust(width_id)}  {key.ljust(width_key)}  {desc}")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    return {
+        "fixtures": list_fixtures,
+        "demos":    list_demos,
+        "modes":    list_modes,
+    }[args.target]()
+
+
+# --- main -------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="hsim",
+        description="End-user driver for the Andes hybrid simulator (QEMU + vsim).",
+    )
+    sub = parser.add_subparsers(dest="cmd", metavar="<cmd>")
+    sub.required = True
+
+    p_list = sub.add_parser(
+        "list",
+        help="list available fixtures, demos, or trigger modes",
+    )
+    p_list.add_argument(
+        "target",
+        choices=("fixtures", "demos", "modes"),
+        help="what to list",
+    )
+    p_list.set_defaults(func=cmd_list)
+
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
