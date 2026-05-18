@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# F7 contract: QEMU plugin BBV-emit mode. With plugin args
+# bbv_out=PATH,slice=N the plugin writes one SimPoint-format BBV row
+# per N retired insns into PATH. Combine with icount=M for a clean
+# exit at M insns; expected row count = M/N.
+#
+# Test binary: icount_spin.elf (tight 2-insn loop; predictable BBV
+# pattern; CSR-less so no other trigger fires). Plugin must:
+#   1. Accept bbv_out= and slice= args.
+#   2. Emit M/N rows into the .bb file before drain.
+#   3. Each row starts with 'T' (SimPoint .bb format prefix).
+#   4. The shipped SimPoint binary (tools/simpoint/bin/simpoint) parses
+#      the file without error.
+#
+# Required environment (auto-detected with sensible defaults):
+#   VSIM_QEMU     qemu-system-riscv64
+#   VSIM_PLUGIN   libhybrid_handoff.so
+#   VSIM_ELF      a CSR-less fixture (default: icount_spin.elf)
+#   SIMPOINT_BIN  the built simpoint clustering binary (optional;
+#                 if missing the SimPoint-parse step is skipped)
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+TOP_ROOT=$(cd -- "$REPO_ROOT/.." && pwd)
+
+VSIM_QEMU="${VSIM_QEMU:-/local/nick/qemu_v5/build/qemu-system-riscv64}"
+VSIM_PLUGIN="${VSIM_PLUGIN:-$REPO_ROOT/hybrid/qemu_plugin/libhybrid_handoff.so}"
+VSIM_ELF="${VSIM_ELF:-$REPO_ROOT/hybrid/test/icount_spin.elf}"
+SIMPOINT_BIN="${SIMPOINT_BIN:-$TOP_ROOT/tools/simpoint/bin/simpoint}"
+
+for f in "$VSIM_QEMU" "$VSIM_PLUGIN" "$VSIM_ELF"; do
+  if [ ! -e "$f" ]; then
+    echo "skip: $f not built"
+    exit 77
+  fi
+done
+
+SLICE=1000
+ICOUNT=10000
+EXPECTED_ROWS=$((ICOUNT / SLICE))
+
+SHARED_SIZE=$((128 * 1024 * 1024))
+SHARED_MEM=$(mktemp -p /dev/shm vsim-bbv-shared.XXXXXX)
+BBV_OUT=$(mktemp -t bbv.XXXXXX.bb)
+STATE_OUT=$(mktemp)
+QEMU_LOG=$(mktemp)
+SIMPTS=$(mktemp -t simpts.XXXXXX)
+WEIGHTS=$(mktemp -t weights.XXXXXX)
+SP_LOG=$(mktemp)
+trap 'rm -f "$SHARED_MEM" "$BBV_OUT" "$STATE_OUT" "$QEMU_LOG" "$SIMPTS" "$WEIGHTS" "$SP_LOG"' EXIT
+
+truncate -s "$SHARED_SIZE" "$SHARED_MEM"
+
+set +e
+timeout 30 "$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHARED_MEM,size=$SHARED_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -semihosting-config enable=on,target=native \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_OUT,icount=$ICOUNT,bbv_out=$BBV_OUT,slice=$SLICE" \
+  >"$QEMU_LOG" 2>&1
+RC=$?
+set -e
+
+if [ "$RC" -ne 200 ]; then
+  echo "FAIL[plugin_bbv_emit]: expected QEMU exit=200, got $RC"
+  echo "--- qemu log ---"
+  cat "$QEMU_LOG"
+  exit 1
+fi
+
+if [ ! -s "$BBV_OUT" ]; then
+  echo "FAIL[plugin_bbv_emit]: BBV file is empty: $BBV_OUT"
+  echo "--- qemu log ---"
+  cat "$QEMU_LOG"
+  exit 1
+fi
+
+ROWS=$(wc -l < "$BBV_OUT")
+if [ "$ROWS" -ne "$EXPECTED_ROWS" ]; then
+  echo "FAIL[plugin_bbv_emit]: expected $EXPECTED_ROWS BBV rows, got $ROWS"
+  head -5 "$BBV_OUT"
+  exit 1
+fi
+
+# Every row must start with 'T' (SimPoint .bb format prefix).
+NON_T_ROWS=$(grep -cv '^T' "$BBV_OUT" || true)
+if [ "$NON_T_ROWS" -ne 0 ]; then
+  echo "FAIL[plugin_bbv_emit]: $NON_T_ROWS rows do not start with 'T'"
+  exit 1
+fi
+
+# If SimPoint binary is built, verify it parses the .bb file and
+# produces non-empty simpts/weights output.
+if [ -x "$SIMPOINT_BIN" ]; then
+  # For tiny BBVs, both dim and maxK must be conservative.
+  DIM=2
+  MAXK=2
+  set +e
+  "$SIMPOINT_BIN" -loadFVFile "$BBV_OUT" -maxK "$MAXK" -dim "$DIM" \
+    -saveSimpoints "$SIMPTS" -saveSimpointWeights "$WEIGHTS" \
+    >"$SP_LOG" 2>&1
+  SP_RC=$?
+  set -e
+
+  if [ "$SP_RC" -ne 0 ]; then
+    echo "FAIL[plugin_bbv_emit]: simpoint failed to parse BBV (rc=$SP_RC)"
+    tail -20 "$SP_LOG"
+    exit 1
+  fi
+
+  if [ ! -s "$SIMPTS" ] || [ ! -s "$WEIGHTS" ]; then
+    echo "FAIL[plugin_bbv_emit]: simpoint produced empty output"
+    exit 1
+  fi
+  SP_NOTE="simpoint OK"
+else
+  SP_NOTE="simpoint not built; parse check skipped"
+fi
+
+echo "[plugin_bbv_emit] PASS: rows=$ROWS (target $EXPECTED_ROWS), $SP_NOTE"

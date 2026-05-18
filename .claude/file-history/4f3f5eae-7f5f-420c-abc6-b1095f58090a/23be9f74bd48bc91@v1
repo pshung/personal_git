@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# F5 contract: QEMU plugin icount-trigger mode. With plugin arg `icount=N`
+# the plugin drains and exits 200 after N retired insns - even on a binary
+# that never executes the magic CSR. Foundation for SimPoint slice-consume
+# (F11) and the orchestrator's icount-based switching (F8).
+#
+# Test binary: icount_spin.elf (no csrwi 0x7C0; linked at 0x80000000 for
+# andes_ae350). Today's plugin would run forever; the new icount path
+# must fire the drain.
+#
+# Required environment (auto-detected with sensible defaults):
+#   VSIM_QEMU    qemu-system-riscv64
+#   VSIM_PLUGIN  libhybrid_handoff.so
+#   VSIM_ELF     a CSR-less fixture (default: icount_spin.elf)
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+
+VSIM_QEMU="${VSIM_QEMU:-/local/nick/qemu_v5/build/qemu-system-riscv64}"
+VSIM_PLUGIN="${VSIM_PLUGIN:-$REPO_ROOT/hybrid/qemu_plugin/libhybrid_handoff.so}"
+VSIM_ELF="${VSIM_ELF:-$REPO_ROOT/hybrid/test/icount_spin.elf}"
+
+for f in "$VSIM_QEMU" "$VSIM_PLUGIN" "$VSIM_ELF"; do
+  if [ ! -e "$f" ]; then
+    echo "skip: $f not built"
+    exit 77
+  fi
+done
+
+ICOUNT_TARGET=100000
+SHARED_SIZE=$((128 * 1024 * 1024))
+SHARED_MEM=$(mktemp -p /dev/shm vsim-icount-shared.XXXXXX)
+STATE_QEMU=$(mktemp)
+QEMU_LOG=$(mktemp)
+trap 'rm -f "$SHARED_MEM" "$STATE_QEMU" "$QEMU_LOG"' EXIT
+
+truncate -s "$SHARED_SIZE" "$SHARED_MEM"
+
+set +e
+timeout 30 "$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHARED_MEM,size=$SHARED_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -semihosting-config enable=on,target=native \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_QEMU,icount=$ICOUNT_TARGET" \
+  >"$QEMU_LOG" 2>&1
+RC=$?
+set -e
+
+if [ "$RC" -ne 200 ]; then
+  echo "FAIL[plugin_icount_trigger]: expected QEMU exit=200 on drain, got $RC"
+  echo "--- qemu log ---"
+  cat "$QEMU_LOG"
+  exit 1
+fi
+
+if [ ! -s "$STATE_QEMU" ]; then
+  echo "FAIL[plugin_icount_trigger]: state file is empty"
+  exit 1
+fi
+
+# minstret lives at offset 632 (state_abi_check.h:35), little-endian uint64.
+MINSTRET=$(python3 -c "
+import struct, sys
+with open('$STATE_QEMU', 'rb') as f:
+    f.seek(632)
+    print(struct.unpack('<Q', f.read(8))[0])
+")
+
+if [ "$MINSTRET" -lt "$ICOUNT_TARGET" ]; then
+  echo "FAIL[plugin_icount_trigger]: minstret=$MINSTRET < icount=$ICOUNT_TARGET"
+  echo "--- qemu log ---"
+  cat "$QEMU_LOG"
+  exit 1
+fi
+
+echo "[plugin_icount_trigger] PASS: QEMU exit=$RC, minstret=$MINSTRET (target=$ICOUNT_TARGET)"
