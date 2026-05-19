@@ -1,0 +1,133 @@
+# Build tiny RV64 fixtures used by hybrid smoke tests.
+#
+# Toolchain location comes from the repo-root config.env (loaded by
+# `source ./setup.sh`, which exports HYBRID_TOOLCHAIN). Override on the
+# command line with `make TOOLCHAIN=/path/to/toolchain ...` if you want
+# to bypass the env var.
+
+TOOLCHAIN ?= $(HYBRID_TOOLCHAIN)
+ifeq ($(strip $(TOOLCHAIN)),)
+$(error HYBRID_TOOLCHAIN is not set. Run `source ./setup.sh` from the repo root, or pass `TOOLCHAIN=/path/to/toolchain` on the command line)
+endif
+CC        := $(TOOLCHAIN)/bin/riscv64-unknown-elf-gcc
+LD        := $(TOOLCHAIN)/bin/riscv64-unknown-elf-ld
+OBJDUMP   := $(TOOLCHAIN)/bin/riscv64-unknown-elf-objdump
+
+CFLAGS  := -march=rv64gc -mabi=lp64d -nostdlib -static -Wall
+LDFLAGS := -T test.ld -nostdlib -static
+
+# All fixtures share test.ld (load base 0x00100000, andes_ae350 DRAM).
+RT_FIXTURES := rt_all_gprs rt_abi_aliases rt_sign_bits rt_pc_jump \
+               rt_long_roi rt_mem_loadstore rt_unaligned_lh \
+               rt_shared_mem rt_csr_survival
+
+# C-level fixtures: standard newlib stdio (printf, fputs, ...) linked
+# against the Andes virtual-hosting libgloss (libgloss_vh.a), which
+# implements _write / _exit / _sbrk / _read / ... via the RISC-V
+# semihosting magic triple. QEMU1 and QEMU2 are launched with
+# -semihosting-config enable=on,target=native and intercept the triple
+# before it reaches mtvec. vsim does not implement semihosting -- phase
+# 2 (the span between enter_vsim and exit_vsim)
+# is therefore syscall-free by rule (see runtime/rt_c_helpers.h).
+RT_C_FIXTURES    := rt_c_hello rt_c_printf rt_c_matmul rt_c_static_buf \
+                    no_trigger_exit
+RT_C_V_FIXTURES  := rt_c_v_regs rt_c_v_csrs rt_c_v_matmul
+# Probe fixtures: QEMU1-only, no vsim/QEMU2 phase. Used by shell tests
+# that inspect the raw state file to verify plugin drain behavior.
+PROBE_V_FIXTURES := probe_v_csr
+
+RUNTIME_DIR     := runtime
+RUNTIME_SRCS    := $(RUNTIME_DIR)/crt0.S $(RUNTIME_DIR)/trap.S \
+                   $(RUNTIME_DIR)/handler.c
+# V fixtures additionally need the V regfile boundary helpers
+# (v_regfile_reload_all / v_regfile_dump_all). Bodies live in a
+# separate TU so the compiler treats each call as opaque and will not
+# reorder vector compute across the handoff boundary.
+RT_C_V_RUNTIME_SRCS := $(RUNTIME_SRCS) $(RUNTIME_DIR)/v_regfile_xfer.c
+# -nodefaultlibs suppresses the toolchain's default -lc/-lgloss/-lgcc;
+# we re-add them inside --start-group so -lgloss_vh's semihosting stubs
+# resolve newlib's _write / _exit / _sbrk / ... before -lgloss (the
+# proxy-kernel ecall variant) is even searched. Order matters:
+# -lgloss_vh must precede the fallback -lgloss path.
+RT_C_LIBS       := -Wl,--start-group -lc -lgloss_vh -lgcc -Wl,--end-group
+RT_C_CFLAGS     := -march=rv64gc -mabi=lp64d -O1 -static -nostartfiles \
+                   -nodefaultlibs -I$(RUNTIME_DIR) -Wall
+# RVV-using fixtures need -march=rv64gcv. The crt0 already sets
+# mstatus.VS to Initial, so V instructions don't trap.
+RT_C_V_CFLAGS   := -march=rv64gcv -mabi=lp64d -O1 -static -nostartfiles \
+                   -nodefaultlibs -I$(RUNTIME_DIR) -Wall
+
+.PHONY: all clean dump demo
+
+all: spin.elf icount_spin.elf handoff.elf handoff_exit.elf handoff_roundtrip.elf \
+     $(RT_FIXTURES:%=%.elf) $(RT_C_FIXTURES:%=%.elf) \
+     $(RT_C_V_FIXTURES:%=%.elf) \
+     $(PROBE_V_FIXTURES:%=%.elf)
+
+# Note: handoff.elf, handoff_exit.elf, spin.elf are legacy (referenced only
+# by EXCLUDE_FROM_ALL handoff_smoke.cpp). They still build for completeness
+# but are not in active CTest. All targets now share test.ld at 0x00100000.
+
+# Switching-mode demo runner: builds the fixtures if needed, then walks
+# T1..T7 from $(DEMO_DIR), printing a banner per mode and a final
+# pass/fail tally. Honors FILTER=<regex> to subset the run.
+demo: all
+	@bash demo.sh
+
+spin.elf: spin.S test.ld
+	$(CC) $(CFLAGS) -c spin.S -o spin.o
+	$(LD) $(LDFLAGS) spin.o -o $@
+
+# CSR-less spin for F5 plugin-icount e2e. Linked at 0x00100000 (test.ld)
+# so andes_ae350's MROM at 0x80000000 stays clear when loaded via -bios.
+icount_spin.elf: icount_spin.S test.ld
+	$(CC) $(CFLAGS) -c icount_spin.S -o icount_spin.o
+	$(LD) $(LDFLAGS) icount_spin.o -o $@
+
+handoff.elf: handoff.S test.ld
+	$(CC) $(CFLAGS) -c handoff.S -o handoff.o
+	$(LD) $(LDFLAGS) handoff.o -o $@
+
+handoff_exit.elf: handoff_exit.S test.ld
+	$(CC) $(CFLAGS) -c handoff_exit.S -o handoff_exit.o
+	$(LD) $(LDFLAGS) handoff_exit.o -o $@
+
+handoff_roundtrip.elf: handoff_roundtrip.S test.ld semihost_exit.inc
+	$(CC) $(CFLAGS) -c handoff_roundtrip.S -o handoff_roundtrip.o
+	$(LD) $(LDFLAGS) handoff_roundtrip.o -o $@
+
+$(RT_FIXTURES:%=%.elf): %.elf: %.S test.ld semihost_exit.inc
+	$(CC) $(CFLAGS) -c $< -o $*.o
+	$(LD) $(LDFLAGS) $*.o -o $@
+
+# C-level fixtures: compile+link via gcc (newlib pulled). crt0.S is
+# passed FIRST so _start lands at the load address (0x00100000) -- ld
+# preserves input order within the .text wildcard.
+$(RT_C_FIXTURES:%=%.elf): %.elf: %.c $(RUNTIME_SRCS) test.ld $(RUNTIME_DIR)/rt_c_helpers.h
+	$(CC) $(RT_C_CFLAGS) -T test.ld \
+	  $(RUNTIME_SRCS) $< $(RT_C_LIBS) -o $@
+
+# RVV-enabled fixtures: same runtime + v_regfile_xfer.c, different
+# -march. Listed separately so changes to RT_C_CFLAGS don't accidentally
+# drop V.
+$(RT_C_V_FIXTURES:%=%.elf): %.elf: %.c $(RT_C_V_RUNTIME_SRCS) test.ld $(RUNTIME_DIR)/rt_c_helpers.h $(RUNTIME_DIR)/v_regfile_xfer.h
+	$(CC) $(RT_C_V_CFLAGS) -T test.ld \
+	  $(RT_C_V_RUNTIME_SRCS) $< $(RT_C_LIBS) -o $@
+
+# Probe fixtures: pure asm, -march=rv64gcv (need V CSR names), no C runtime.
+PROBE_V_CFLAGS := -march=rv64gcv -mabi=lp64d -nostdlib -static -Wall
+$(PROBE_V_FIXTURES:%=%.elf): %.elf: %.S test.ld
+	$(CC) $(PROBE_V_CFLAGS) -c $< -o $*.o
+	$(LD) $(LDFLAGS) $*.o -o $@
+
+dump: spin.elf handoff.elf handoff_exit.elf
+	$(OBJDUMP) -d spin.elf
+	$(OBJDUMP) -d handoff.elf
+	$(OBJDUMP) -d handoff_exit.elf
+
+clean:
+	rm -f spin.o spin.elf handoff.o handoff.elf handoff_exit.o handoff_exit.elf \
+	      handoff_roundtrip.o handoff_roundtrip.elf \
+	      $(RT_FIXTURES:%=%.o) $(RT_FIXTURES:%=%.elf) \
+	      $(RT_C_FIXTURES:%=%.elf) $(RT_C_V_FIXTURES:%=%.elf) \
+	      $(PROBE_V_FIXTURES:%=%.o) $(PROBE_V_FIXTURES:%=%.elf)

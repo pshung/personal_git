@@ -1,0 +1,564 @@
+# ROADMAP: `./hsim` end-user driver
+
+Tracks the rollout of a single, end-user-friendly entry point
+(`./hsim`) that hides the developer-grade plumbing currently exposed
+by `setup.sh`, `tests/e2e.sh`, and `scripts/run_e2e.sh`.
+
+Plan source-of-truth: `/home/nick/.claude/plans/i-need-to-design-purring-kahan.md`.
+
+One session = one feature. Update status when starting (in-progress)
+and on completion (done). Each feature is its own commit (or a small
+structural-then-behavioral pair), never mixed.
+
+## Status Legend
+
+- not-started: feature has not begun
+- in-progress: currently being implemented in a session
+- done: RED test was written, GREEN landed, and the feature's done-criteria pass
+
+## Global Invariant
+
+After every feature lands, this must hold:
+
+```
+JOBS=8 MODE=both bash scripts/run_e2e.sh
+# pass list == 45 PASS / 0 FAIL  (baseline from e2e_ROADMAP.md F0)
+```
+
+`./hsim` only WRAPS the existing scripts; it MUST NOT change their
+behavior. Any divergence from the e2e baseline blocks the next feature.
+
+## Dependency DAG
+
+```
+F1 (list) --> F2 (build) --> F3 (run) --> F4 (test) --> F5 (docs) --> F6 (verify)
+                                                            |
+                                                            +-- can also land any time after F4
+                                                            +-- F7 (doctor)             [post-F6, reuses F3/F4 helpers]
+                                                            +-- F8 (demo)               [post-F6, reuses F3 helpers]
+                                                            +-- F9 (profile + cluster)  [post-F6, reuses F3 helpers]
+                                                            +-- F10 (archive + replay)  [post-F6, reuses F3 helpers]
+                                                            +-- F11 (run --mode icount/slice) [post-F9, reuses _qemu_drain_argv]
+                                                            +-- F12 (estimate)          [post-F9+F11, composes profile/cluster/slice]
+                                                            +-- F13 (mmap-size + HSIM_MMAP_DIR) [post-F12, factors out allocate() helper]
+                                                            +-- F14 (estimate --icount 0 = drain at exit) [post-F12, plugin atexit cb + minstret]
+```
+
+Strict serial order F1 -> F4 because each later feature reuses the
+`Paths` / `run_subprocess` helpers introduced by the earlier ones.
+F5 (docs) may land between F4 and F6 or after F6. F7 (doctor) reuses
+`_resolve_artifacts` (F3) and `_DEFAULT_JOBS` (F4); F8 (demo) reuses
+`_resolve_artifacts` (F3); F9 (profile/cluster) also reuses
+`_resolve_artifacts` (F3); F10 (archive/replay) reuses
+`_resolve_artifacts` (F3) and imports `orchestrator.checkpoint`
+in-process; F11 (run --mode icount/slice) extends F3's `cmd_run`
+and reuses `_qemu_drain_argv` introduced by the F9->F11 structural
+refactor; F12 (estimate) composes F9's `cmd_profile` + `cmd_cluster`
+with a slice-mode drain pair and reads mcycle via
+`orchestrator.abi.HybridStateV1`; F13 (mmap-size + HSIM_MMAP_DIR)
+extracts the three duplicated mkstemp+truncate alloc sites into
+`tools/hsim_shm.allocate()` and adds a `--mmap-size SPEC` flag plus
+env-driven backend dir. None of these have a runtime dependency on
+the e2e path, so they can land any time after F6.
+
+## Pre-flight decisions (locked at plan time)
+
+1. **Entry point name** -- `./hsim` at repo root (executable Python script).
+2. **Language** -- Python 3, stdlib only (no pip deps).
+3. **Run scope** -- accepts both fixture-by-name and arbitrary ELF paths.
+4. **Missing artifacts** -- fail with one-line hint, no auto-build.
+5. **Trigger mode** -- explicit `--mode csr|pc` required in v1.
+6. **Output style** -- quiet by default, `--verbose` flag exists.
+7. **Out of scope for v1** -- `demo`, `doctor`, auto-detect mode, M3..M8.
+
+## Features
+
+### F1 - `./hsim list <fixtures|demos|modes>`
+
+- Status: done
+- Type: behavioral (new code)
+- Description: Lowest-risk subcommand -- pure parsing, no subprocess.
+  Lets the user discover fixture names without grepping the Makefile.
+- Key files:
+  - **Create:** `hsim` (Python 3 script, ~80 lines for this feature only).
+  - **Create:** `tests/hsim/test_hsim_list.sh` (RED test).
+- Dependencies: none.
+- Done criteria:
+  - `./hsim list fixtures` exits 0 and outputs `rt_c_hello` and `rt_all_gprs`.
+  - `./hsim list demos` exits 0 and outputs `demo_csr_oneshot` and `demo_pc_oneshot`.
+  - `./hsim list modes` exits 0 and outputs `M1` and `M8`.
+  - `./hsim list bogus` exits 2 with a usage hint.
+  - The RED test in `tests/hsim/test_hsim_list.sh` is green.
+
+### F2 - `./hsim build [--what TARGET]`
+
+- Status: done
+- Type: behavioral
+- Description: One entry point for all artifact builds. Wraps
+  `setup.sh` (qemu, vsim, plugin, simpoint) and
+  `make -C tests/fixtures` (ELF fixtures). No reimplementation -- the
+  subprocess delegates to the existing scripts.
+- Key files:
+  - **Modify:** `hsim` (add `build` subparser).
+  - **Create:** `tests/hsim/test_hsim_build_dry.sh` (RED test with `--dry-run`).
+- Dependencies: F1 (shares argparse skeleton + `Paths` helper).
+- Done criteria:
+  - `./hsim build --dry-run` prints the underlying `bash setup.sh` /
+    `make -C tests/fixtures` commands without executing.
+  - `./hsim build --what qemu --dry-run` prints only the QEMU build line.
+  - `./hsim build` from a clean checkout produces all four artifacts +
+    fixtures and exits 0.
+  - `setup.sh` is unchanged on disk.
+
+### F3 - `./hsim run <elf-path> --mode csr|pc`
+
+- Status: done
+- Type: behavioral
+- Description: One-shot round-trip runner. Wraps `tests/e2e.sh` with
+  the right env vars. Path-only contract: the positional arg is always
+  an ELF path (relative resolves against CWD, absolute is honored).
+  No bare-fixture-name shortcut. Quiet 3-line progress output by
+  default; `--verbose` prefixes the resolved env + command line.
+- Key files:
+  - **Modify:** `hsim` (add `run` subparser + path-resolution helper +
+    artifact pre-flight).
+  - **Create:** `tests/hsim/test_hsim_run_smoke.sh` (RED test).
+- Dependencies: F1 (Paths helper), F2 (so artifacts can be built first).
+- Done criteria:
+  - `./hsim run tests/fixtures/rt_c_hello.elf` (no `--mode`) exits 2
+    with usage hint mentioning `--mode`.
+  - `./hsim run tests/fixtures/rt_c_hello.elf --mode csr` on a clean
+    build exits 0 in <30s.
+  - `./hsim run /abs/path/foo.elf --mode pc` resolves the path and runs.
+  - `VSIM_BIN=/no/such/vsim ./hsim run tests/fixtures/rt_c_hello.elf --mode csr`
+    exits 2 with `hsim: vsim not built -- run ./hsim build`.
+  - `--verbose` prints the resolved FIXTURE/TRIGGER_MODE/VSIM_ELF and
+    the `bash tests/e2e.sh` command before launching it.
+
+### F4 - `./hsim test [--filter REGEX] [--mode csr|pc|both] [--jobs N]`
+
+- Status: done
+- Type: behavioral
+- Description: Wraps `scripts/run_e2e.sh` with the JOBS=8 cap pre-set
+  (per project memory for the 128-core host). Parses the script's
+  `results.tsv` and prints a summary line `PASS X, FAIL Y, SKIP Z`.
+  On failure, prints the per-test log paths.
+- Key files:
+  - **Modify:** `hsim` (add `test` subparser, results.tsv parser).
+  - **Create:** `tests/hsim/test_hsim_test_small.sh` (RED test that
+    runs `./hsim test --jobs 1 --filter rt_c_hello --mode csr`).
+- Dependencies: F1, F2, F3.
+- Done criteria:
+  - `./hsim test --jobs 1 --filter rt_c_hello --mode csr` exits 0 and
+    prints `PASS 1, FAIL 0, SKIP 0` (plus elapsed time).
+  - `./hsim test` (no args) caps at JOBS=8 by default.
+  - `./hsim test --jobs 4` overrides the cap.
+  - `scripts/run_e2e.sh` is unchanged on disk.
+
+### F5 - Docs: README + USER_GUIDE + CLAUDE.md
+
+- Status: done
+- Type: structural (no code change; doc edits)
+- Description: Make `./hsim` the canonical entry point in every
+  user-visible doc. The dev-facing env-var surface stays documented
+  but is demoted to "escape hatch" sections.
+- Key files:
+  - **Modify:** `README.md` -- replace the stale `./build.sh`
+    quickstart block (lines 12-22) with `./hsim` quickstart.
+  - **Modify:** `docs/USER_GUIDE.md` -- prepend a new
+    "Section 0.5: Quick start with `./hsim`" before the existing
+    Section 1 build instructions. Keep Sections 1-7 unchanged.
+  - **Modify:** `CLAUDE.md` -- under "Build Commands" add `./hsim build`
+    and `./hsim test` as the primary path; mark raw scripts as
+    developer escape hatch.
+- Dependencies: F1..F4 (so the examples in docs work).
+- Done criteria:
+  - README quickstart is 3 lines and uses only `./hsim` commands.
+  - USER_GUIDE Section 0.5 has a copy-pastable 4-command worked
+    example.
+  - CLAUDE.md still lists the underlying scripts for developers but
+    points to `./hsim` first.
+
+### F6 - End-to-end verification
+
+- Status: done
+- Type: no commit (safety net)
+- Description: Run the 11-step smoke sequence from the plan against a
+  clean checkout. Tick each step.
+- Steps:
+  ```
+  ./hsim                                                          # help
+  ./hsim list fixtures                                            # ~17 fixtures
+  ./hsim run tests/fixtures/rt_c_hello.elf --mode csr             # exit 2 if no build
+  ./hsim build                                                    # ~5 min cold
+  ./hsim list fixtures                                            # unchanged
+  ./hsim run tests/fixtures/rt_c_hello.elf --mode csr             # PASS ~6s
+  ./hsim run tests/fixtures/rt_c_hello.elf --mode csr -v          # verbose
+  ./hsim run tests/fixtures/rt_all_gprs.elf --mode csr            # arbitrary path
+  ./hsim run tests/fixtures/rt_c_v_regs.elf --mode pc             # PC trigger
+  ./hsim test --filter rt_c --mode csr                            # ~7 tests
+  ./hsim test                                                     # full suite
+  ```
+- Dependencies: F1..F5.
+- Done criteria: all 11 steps exit as expected; the full-suite line
+  reports the same 45 PASS / 0 FAIL as the e2e baseline.
+
+### F7 - `./hsim doctor`
+
+- Status: done
+- Type: behavioral (new code + RED test)
+- Description: Read-only env-health diagnoser. Prints four sections
+  (artifacts, submodules, toolchain, runtime), each row tagged
+  PASS / FAIL / WARN / INFO. Exit code = 1 if any FAIL row, else 0.
+  Reuses `_resolve_artifacts` (F3) and `_DEFAULT_JOBS` (F4); does not
+  touch `tests/e2e.sh` or `scripts/run_e2e.sh`.
+- Key files:
+  - **Modify:** `hsim` (add `_doctor_*` helpers, `cmd_doctor`,
+    `p_doctor` subparser).
+  - **Create:** `tests/hsim/test_hsim_doctor.sh` (RED test, 6
+    assertions).
+- Dependencies: F3 (artifact resolver), F4 (JOBS constant).
+- Done criteria:
+  - `./hsim doctor` on the built repo exits 0 and prints the four
+    section headers plus a `Summary:` line.
+  - `VSIM_BIN=/no/such/vsim ./hsim doctor` exits 1 with a FAIL row
+    mentioning `vsim`.
+  - `HYBRID_TOOLCHAIN` is honored from the env or parsed from
+    `config.env` (no hardcoded toolchain path).
+  - Doctor completes in <=5 s (no subprocess shell-outs to QEMU/vsim).
+  - The RED test `tests/hsim/test_hsim_doctor.sh` is green.
+
+### F8 - `./hsim demo <T1..T7|short-name> [-- KEY=VAL ...]`
+
+- Status: done
+- Type: behavioral (new code + RED test)
+- Description: One subcommand wraps the seven demo scripts under
+  `tests/demos/demo_*.sh`. Selector accepts three forms:
+  - T-id: `T1..T7` (mirrors `docs/switching_modes_tutorial.md`).
+  - Short name: `csr_oneshot`, `simpoint_loop`, etc.
+  - Full filename stem: `demo_csr_oneshot` (copy-paste from
+    `./hsim list demos`).
+  Passthrough `-- KEY=VAL ...` injects per-run env overrides (e.g.
+  `./hsim demo T7 -- SLICE=400 MAXK=4`) so users can tune SLICE,
+  MAXK, etc. without bypassing the wrapper.
+- Key files:
+  - **Modify:** `hsim` (add `_DEMO_ORDER`, `_resolve_demo`,
+    `_parse_demo_passthrough`, `cmd_demo`, `p_demo` subparser;
+    split `argv` on first `--` in `main()` so argparse never sees
+    the passthrough tail).
+  - **Create:** `tests/hsim/test_hsim_demo.sh` (RED test, 7
+    assertions).
+- Dependencies: F3 (`_resolve_artifacts` for pre-flight).
+- Done criteria:
+  - `./hsim demo --help` lists the T1..T7 mapping.
+  - `./hsim demo` (no selector) exits 2 with usage hint.
+  - `./hsim demo bogus` exits 2 with `unknown demo` hint.
+  - `./hsim demo T1 --dry-run` prints
+    `bash .../tests/demos/demo_csr_oneshot.sh`.
+  - `./hsim demo csr_oneshot --dry-run` resolves to the same
+    script (short-name form).
+  - `VSIM_BIN=/no/such/vsim ./hsim demo T1` exits 2 with the
+    `vsim not built -- run ./hsim build` hint (mirrors `./hsim run`).
+  - `./hsim demo T7 --dry-run -- SLICE=400 MAXK=4` shows
+    `SLICE=400` + `MAXK=4` in the resolved env.
+  - The RED test `tests/hsim/test_hsim_demo.sh` is green.
+
+### F9 - `./hsim profile <elf>` + `./hsim cluster <bbv>` (M4 pair)
+
+- Status: done
+- Type: behavioral (new code + RED test)
+- Description: First-class subcommands for the M4 BBV profile +
+  SimPoint clustering steps. Two commands because the output of
+  the first is the input of the second; users can inspect the
+  BBV row count between them.
+  - `./hsim profile <elf> --slice N --icount M -o BBV` runs one
+    QEMU+plugin pass with `bbv_out=,slice=N,icount=M` and writes
+    a SimPoint-compatible `.bb` file.
+  - `./hsim cluster <bbv> --max-k K --simpts P --weights P`
+    shells to `tools/simpoint/bin/simpoint` and writes per-cluster
+    slice indices + weights.
+  Plumbing: `profile` inlines the QEMU argv (mirrors
+  `orchestrator.spawn.qemu_drain_argv` plus the M4 plugin extras),
+  manages a `/dev/shm`-backed mmap via `tempfile.mkstemp` +
+  `os.truncate`, expects QEMU exit 200 (drain). `cluster` uses
+  `-dim 2` to match the demo; widen to a flag if larger fixtures
+  need it later. Pre-flight: `profile` checks qemu + plugin only
+  (vsim is not invoked); `cluster` checks the SimPoint binary.
+- Key files:
+  - **Modify:** `hsim` (add `_qemu_profile_argv`, `cmd_profile`,
+    `cmd_cluster`, `p_profile`, `p_cluster` subparsers, `_SIMPOINT_BIN`
+    constant).
+  - **Create:** `tests/hsim/test_hsim_profile_cluster.sh` (RED test,
+    9 assertions).
+- Dependencies: F3 (`_resolve_artifacts`).
+- Done criteria:
+  - `./hsim profile --help` mentions `--slice`, `--icount`, `-o`.
+  - `./hsim cluster --help` mentions `--max-k`, `--simpts`, `--weights`.
+  - `./hsim profile` with no ELF -> rc=2 with usage hint.
+  - `./hsim profile /no/such.elf` -> rc=2 with `not found` hint.
+  - `./hsim profile <elf> --dry-run` prints the resolved QEMU cmd
+    and does NOT write the output file.
+  - `VSIM_QEMU=/no/such/qemu ./hsim profile ...` -> rc=2 with
+    `qemu not built` hint.
+  - `./hsim profile tests/fixtures/icount_spin.elf --slice 1000 --icount 10000 -o /tmp/foo.bb` exits 0 and writes 10 BBV rows.
+  - `./hsim cluster /no/such.bb` -> rc=2 with `not found` hint.
+  - `./hsim cluster /tmp/foo.bb --max-k 2 --simpts S --weights W` exits 0 with non-empty outputs.
+  - The RED test `tests/hsim/test_hsim_profile_cluster.sh` is green.
+  - `JOBS=8 MODE=both bash scripts/run_e2e.sh` still 45 PASS / 0 FAIL.
+
+### F10 - `./hsim archive` + `./hsim replay` (M6 + M7 pair)
+
+- Status: done
+- Type: behavioral (new code + RED test)
+- Description: First-class subcommands for M6 (checkpoint archive)
+  and M7 (checkpoint replay). Two commands because the output of the
+  first is the input of the second; users can inspect or relocate
+  the snap directory between them.
+  - `./hsim archive --state S --mmap M --elf E -o snap/N` imports
+    `orchestrator.checkpoint.write_archive` in-process and writes
+    `snap/N/{state.bin, mem, meta.json}`. `--mmap-size` defaults to
+    128 MiB (matches every fixture and demo).
+  - `./hsim replay snap/N --resume-with {vsim,qemu}` spawns
+    `python3 -m orchestrator.main replay-checkpoint` with
+    `PYTHONPATH=tools/` and the resolved hybrid artifacts.
+  Plumbing rationale: archive runs in-process because hsim and the
+  orchestrator are both Python (subprocess just adds ~100 ms startup
+  and obscures tracebacks); replay shells out because the resume
+  pipeline is long-running and the existing CLI already streams
+  stdout correctly. Pre-flight: archive validates `--state` +
+  `--mmap` files exist; replay validates the snap dir AND the three
+  hybrid artifacts (vsim/qemu/plugin).
+- Key files:
+  - **Modify:** `hsim` (add `_load_checkpoint_module`, `cmd_archive`,
+    `cmd_replay`, `p_archive`, `p_replay` subparsers,
+    `_DEFAULT_MMAP_SIZE` constant).
+  - **Create:** `tests/hsim/test_hsim_archive_replay.sh` (RED test,
+    11 assertions; synthesises a valid state.bin via
+    `orchestrator.abi` so the test is self-contained).
+- Dependencies: F3 (`_resolve_artifacts`).
+- Done criteria:
+  - `./hsim archive --help` mentions `--state`, `--mmap`, `--elf`, `-o`.
+  - `./hsim replay --help` mentions `--resume-with` and the snap dir.
+  - `./hsim archive` with no args -> rc=2 (argparse required-flag).
+  - `./hsim archive --state /no/such ...` -> rc=2 with `not found` hint.
+  - `./hsim archive --mmap /no/such ...` -> rc=2 with `not found` hint.
+  - `./hsim archive ... --dry-run` prints state/mmap/elf, does NOT
+    create the snap dir.
+  - Real `./hsim archive` writes `state.bin + mem + meta.json`,
+    meta.json contains the correct `flags` list from state.bin.
+  - `./hsim replay /no/such` -> rc=2 with `not found` hint.
+  - `./hsim replay snap/N --dry-run` prints the resolved
+    `orchestrator.main replay-checkpoint ... --resume-with vsim` argv.
+  - `VSIM_BIN=/no/such/vsim ./hsim replay snap/N` -> rc=2 with
+    `vsim not built` hint.
+  - The RED test `tests/hsim/test_hsim_archive_replay.sh` is green.
+  - `JOBS=8 MODE=both bash scripts/run_e2e.sh` still 45 PASS / 0 FAIL.
+
+### F11 - `./hsim run --mode {icount, slice}` (M3 + M5 pair)
+
+- Status: done
+- Type: structural (extract `_qemu_drain_argv` helper) +
+  behavioral (cmd_run branching + new --mode choices + new flags +
+  RED test). Landed as two commits in TDD order: structural first
+  (no behavior change; verified by re-running F9's RED test),
+  behavioral second.
+- Description: Extend F3's `cmd_run` with two new `--mode` choices
+  for CSR-less workloads where `csrwi 0x7C0,{0,1}` markers are not
+  available. csr/pc paths remain byte-identical (delegate to
+  `tests/e2e.sh`); icount/slice spawn QEMU + vsim directly because
+  `tests/e2e.sh` only recognises csr/pc triggers.
+  - `--mode icount`: QEMU plugin `icount=N` drain -> vsim
+    `--hybrid-icount M` drain. Flags: `--qemu-icount` (default
+    10000), `--vsim-icount` (default 5000).
+  - `--mode slice`: QEMU plugin `slice=N,slice_at=K,icount=fallback`
+    drain -> vsim `--hybrid-icount M` drain. Flags: `--slice`
+    (default 1000), `--slice-at` (default 1), plus the icount flags.
+  Plumbing: the structural refactor extracts `_qemu_drain_argv`
+  (with a `plugin_extras` tuple) from `_qemu_profile_argv`; both
+  modes call it with mode-specific extras. vsim spawn uses a new
+  `_vsim_drain_argv` helper (no `--shared-mem-*` flags, matching
+  the demos for CSR-less workloads). Both spawns must exit 200.
+- Key files:
+  - **Modify:** `hsim` (split `cmd_run` into `_run_via_e2e` for
+    csr/pc and `_run_drain_pair` for icount/slice; add
+    `_vsim_drain_argv`, `_VSIM_DRAIN_TIMEOUT_S`; extend p_run
+    choices + flags; refactor `_qemu_profile_argv` to call
+    `_qemu_drain_argv`).
+  - **Create:** `tests/hsim/test_hsim_run_icount_slice.sh` (RED
+    test, 6 assertions).
+- Dependencies: F3 (`cmd_run`, `_resolve_artifacts`); reuses F9's
+  `_SHM_SIZE`, `_PROFILE_TIMEOUT_S`, `_QEMU_DRAIN_RC`.
+- Done criteria:
+  - `./hsim run --help` lists `csr`, `pc`, `icount`, `slice` as
+    `--mode` choices.
+  - `./hsim run --help` mentions `--qemu-icount`, `--vsim-icount`,
+    `--slice`, `--slice-at`.
+  - `./hsim run /no/such --mode icount` -> rc=2 with path hint.
+  - `VSIM_BIN=/no/such ./hsim run X --mode icount` -> rc=2 with
+    `not built` hint.
+  - `./hsim run tests/fixtures/icount_spin.elf --mode icount
+    --qemu-icount 10000 --vsim-icount 5000` exits 0.
+  - `./hsim run tests/fixtures/icount_spin.elf --mode slice
+    --slice 1000 --slice-at 1 --vsim-icount 5000` exits 0.
+  - The pre-F11 RED test `tests/hsim/test_hsim_run_smoke.sh` is
+    still green (csr/pc path unchanged).
+  - The RED test `tests/hsim/test_hsim_run_icount_slice.sh` is green.
+  - `JOBS=8 MODE=both bash scripts/run_e2e.sh` still 45 PASS / 0 FAIL.
+
+### F12 - `./hsim estimate <elf>` (SimPoint cycle estimator)
+
+- Status: done
+- Type: behavioral (new code + RED test).
+- Description: End-to-end SimPoint cycle estimator. Composes F9
+  (`cmd_profile` + `cmd_cluster`) with a slice-mode QEMU+vsim drain
+  pair, reads `mcycle` at both ends, and aggregates a weighted CPI:
+  ```
+  CPI_i           = delta_mcycle_i / vsim_icount
+  weighted_CPI    = sum_i ( w_i * CPI_i )
+  estimated_cycles = N_total_insns * weighted_CPI
+  ```
+  Plumbing rationale:
+  - profile / cluster reuse F9's `cmd_profile` and `cmd_cluster`
+    by synthesizing `argparse.Namespace` and calling them directly
+    (no subprocess re-spawn).
+  - per-phase drain pair mirrors `_run_drain_pair` from F11 but
+    keeps state files long enough to call `_read_state_mcycle`
+    at both ends; light intentional duplication for surgical scope.
+  - `_read_state_mcycle` lazy-imports `orchestrator.abi.HybridStateV1`
+    so unrelated subcommands don't pay the ctypes layout check at
+    startup.
+  - default `--vsim-icount = --slice` (when user passes 0) so each
+    phase simulates exactly one slice of insns, giving
+    SimPoint-correct CPI math by default.
+- Key files:
+  - **Modify:** `hsim` (add `_read_state_mcycle`,
+    `_estimate_one_phase`, `cmd_estimate`, `p_estimate` subparser).
+  - **Create:** `tests/hsim/test_hsim_estimate.sh` (RED test, 6
+    assertions).
+- Dependencies: F9 (`cmd_profile`, `cmd_cluster`, `_SIMPOINT_BIN`),
+  F11 (`_qemu_drain_argv`, `_vsim_drain_argv`, `_QEMU_DRAIN_RC`,
+  `_PROFILE_TIMEOUT_S`, `_VSIM_DRAIN_TIMEOUT_S`).
+- Done criteria:
+  - `./hsim estimate --help` mentions `--slice`, `--icount`,
+    `--max-k`, `--vsim-icount`.
+  - `./hsim estimate` with no ELF -> rc=2.
+  - `./hsim estimate /no/such` -> rc=2 with `not found` hint.
+  - `VSIM_BIN=/no/such ./hsim estimate X` -> rc=2 with `not built`
+    hint.
+  - `./hsim estimate tests/fixtures/icount_spin.elf --slice 1000
+    --icount 10000 --max-k 2` exits 0; output contains
+    `estimated_cycles=<int>` with integer > 0.
+  - Per-phase rows show `delta_mcycle=<int>` with each delta > 0.
+  - The RED test `tests/hsim/test_hsim_estimate.sh` is green.
+  - `JOBS=8 MODE=both bash scripts/run_e2e.sh` still 45 PASS / 0 FAIL.
+
+### F13 - `./hsim {run,profile,estimate} --mmap-size SPEC` + `HSIM_MMAP_DIR`
+
+- Type: behavioral.
+- Description: user-facing knobs for requesting an mmap larger than
+  `/dev/shm` capacity. Adds `--mmap-size SPEC` (suffix `K|M|G|T` or
+  raw bytes; default `128M`) to the four subparsers that allocate
+  shared mmaps: `run`, `profile`, `archive` (already had it as
+  `type=int`; converted to SPEC parsing for compatibility), `estimate`.
+  Adds `HSIM_MMAP_DIR=/path` env var to override the backing
+  directory. Selection policy is one rule: honor the env var if set
+  (else `/dev/shm`), validate via `os.statvfs`, error rc=2 with a
+  clear hint if the pinned dir cannot hold `size + 256 MiB margin`.
+  No filesystem-type probing, no fallback chain -- the user owns
+  disk topology. Status line printed on every allocation:
+  `[hsim mmap] 8.0 GiB at /scratch (free: 64.0 GiB)`.
+- Plumbing:
+  - **Create:** `tools/hsim_shm.py` -- `parse_size(spec) -> int`,
+    `select_mmap_dir(size) -> Path`, `allocate(size, prefix) -> Path`.
+    Single source of truth; replaces three duplicated
+    `mkstemp(dir="/dev/shm") + os.truncate(_, _SHM_SIZE)` blocks in
+    `hsim`.
+  - **Modify:** `hsim` -- add `_load_hsim_shm()` lazy importer +
+    `_parse_mmap_size(spec)` argparse wrapper. Migrate
+    `_run_drain_pair`, `cmd_profile`, `_estimate_one_phase` to
+    `allocate()`. Delete duplicate `_SHM_SIZE`; keep
+    `_DEFAULT_MMAP_SIZE` as the canonical 128 MiB constant. Add
+    `--mmap-size SPEC` to `p_run`, `p_profile`, `p_estimate`;
+    convert `p_archive`'s `type=int` to `type=_parse_mmap_size`.
+  - **Create:** `tests/hsim/test_hsim_mmap_backend.sh` (RED test,
+    8 assertions).
+- Dependencies: F9 (`cmd_profile`), F11 (`_run_drain_pair`,
+  `_qemu_drain_argv`), F12 (`_estimate_one_phase`, `cmd_estimate`).
+- Done criteria:
+  - `./hsim {run,profile,estimate} --help` all mention `--mmap-size`.
+  - `--mmap-size 8XBG` -> rc=2 with parse-error hint.
+  - `--mmap-size 999T` -> rc=2 with NoSpace hint.
+  - `HSIM_MMAP_DIR=/no/such` -> rc=2 with directory hint.
+  - `HSIM_MMAP_DIR=$tmp --mmap-size 128M --dry-run` -> rc=0 with
+    `[hsim mmap]` status line referencing `$tmp`.
+  - Default (no flag, no env) still uses `/dev/shm` at 128 MiB.
+  - All F9..F12 RED tests pass byte-identically.
+  - `JOBS=8 MODE=both bash scripts/run_e2e.sh` still 45 PASS / 0 FAIL.
+
+### F14 - `./hsim estimate` --icount 0 (drain at program exit)
+
+- Status: done
+- Type: structural (factor `on_handoff` drain body into a reusable helper)
+  + behavioral (plugin `drain_at_exit=1` mode + atexit cb + plugin-side insn
+  counter; hsim `cmd_estimate` default `--icount 0` + new helper). Lands as
+  two commits in TDD order: structural first (no behavior change), behavioral
+  second.
+- Description: Today `./hsim estimate <elf>` requires the user to know
+  N_total = `args.icount` upfront. For typical workloads (e.g. user's
+  `gemm.elf`) this is impractical. F14 makes `./hsim estimate gemm.elf`
+  "just work" by running the workload to its natural semihosting EXIT and
+  reading N_total from the drained state.
+  - Plugin: new mode `drain_at_exit=1` registers a per-insn exec callback
+    that increments a global counter, plus a
+    `qemu_plugin_register_atexit_cb` that drains state (overriding
+    `s.minstret` with the plugin counter so it's a true retired-insn count,
+    not QEMU's host-tick PMU value) and `_exit(200)`. A `drained_already`
+    guard ensures no double-drain when a CSR/PC/icount trigger fires first.
+  - hsim: `cmd_estimate`'s `--icount` default changes `10000` -> `0`. New
+    helper `_run_estimate_profile_pass(...)` returns `(rc, n_total)`:
+    icount>0 keeps the legacy path (calls `cmd_profile`, n_total=icount);
+    icount=0 inlines the profile-pass argv with `drain_at_exit=1`, reads
+    `minstret` from the drained state file via `orchestrator.abi.HybridStateV1`,
+    returns that as n_total.
+- Key files:
+  - **Modify:** `qemu_plugin/hybrid_handoff.c` (drain_at_exit mode + atexit
+    cb + insn counter; refactor `on_handoff` body into reusable helper).
+  - **Modify:** `hsim` (cmd_estimate default 0 + helper + minstret read).
+  - **Create:** `tests/fixtures/no_trigger_exit.c` (small fixture: no
+    csrwi 0x7C0, exits naturally via libgloss_vh).
+  - **Modify:** `tests/fixtures/Makefile` (add no_trigger_exit.elf target).
+  - **Create:** `tests/hsim/test_hsim_estimate_drain_at_exit.sh` (RED test).
+  - **Modify:** `docs/USER_GUIDE.md` (note `--icount 0` default).
+- Dependencies: F12 (cmd_estimate scaffold), F9 (`_qemu_drain_argv`).
+- Done criteria:
+  - `./hsim estimate --help` notes `--icount 0` = run to program exit.
+  - `./hsim estimate tests/fixtures/no_trigger_exit.elf --slice 1000 --max-k 2`
+    (no `--icount`) exits 0 with `estimated_cycles=<int>` > 0.
+  - Per-phase rows show `delta_mcycle=<int>` with each > 0.
+  - The drained state file from the atexit path has `pc == 0` and
+    `minstret == plugin_counter` (matches expected loop iteration count
+    within libgloss startup overhead).
+  - The fixture binary contains zero `csrwi 0x7c0,*` insns
+    (verified via `riscv64-unknown-elf-objdump -d`).
+  - The pre-F14 RED test `tests/hsim/test_hsim_estimate.sh` is still green
+    when called with explicit `--icount 10000`.
+  - The new RED test `tests/hsim/test_hsim_estimate_drain_at_exit.sh` is green.
+  - `JOBS=8 MODE=both bash scripts/run_e2e.sh` still 45 PASS / 0 FAIL.
+
+## Out of scope (deferred to a future driver_ROADMAP_v2)
+
+- Threading plugin params (`bbv_out=`, `slice=`, `icount=`,
+  `slice_at=`) through `orchestrator.spawn.qemu_drain_argv` so the
+  M3..M5 demos and `./hsim {profile,run --mode icount,run --mode
+  slice,estimate}` share one argv builder via the orchestrator.
+  F9 + F11 + F12 inline the argv as an interim step
+  (`_qemu_drain_argv` in hsim itself).
+- Bash-completion file.
+- Multi-fixture batch mode for `./hsim estimate`.
+- Caching of profile output across `./hsim estimate` runs.
+- Migrating the 14 hardcoded `mktemp -p /dev/shm` shell sites
+  (`tests/e2e.sh`, `tests/demos/*.sh`, `tests/drivers/*.sh`,
+  `tests/plugin/*.sh`) to call `tools/hsim_shm.allocate`. F13
+  exposes the helper but only the Python entry points use it; the
+  shell harnesses all default to 128 MiB which always fits
+  `/dev/shm`. Mechanical sweep when needed.

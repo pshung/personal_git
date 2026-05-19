@@ -1,0 +1,1561 @@
+#!/usr/bin/env python3
+"""hsim - end-user entry point for the Andes hybrid simulator.
+
+Single-file driver. Wraps the developer-grade scripts (setup.sh,
+tests/e2e.sh, scripts/run_e2e.sh) behind four subcommands:
+
+    ./hsim build [--what TARGET]
+    ./hsim run <elf-path> --mode csr|pc|icount|slice [--verbose]
+    ./hsim test [--filter REGEX] [--mode csr|pc|both]
+    ./hsim list <fixtures|demos|modes>
+    ./hsim doctor
+    ./hsim demo <T1..T7|short-name> [-- KEY=VAL ...]
+    ./hsim profile <elf> --slice N --icount M -o BBV
+    ./hsim cluster <bbv> --max-k K --simpts P --weights P
+    ./hsim archive --state S --mmap M --elf E -o snap/N
+    ./hsim replay snap/N [--resume-with vsim|qemu]
+    ./hsim estimate <elf> --slice N --icount M --max-k K
+
+Python 3 stdlib only; no pip deps.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parent
+
+
+# --- F1: list ---------------------------------------------------------------
+
+# M1..M8 short table. Authoritative source: docs/USER_GUIDE.md sections 3-4.
+# Kept here so `./hsim list modes` does not need to grep USER_GUIDE at runtime.
+MODES = [
+    ("M1", "csr",           "csrwi 0x7C0, {0,1} insn match (default)"),
+    ("M2", "pc",            "ELF symbols _hybrid_enter_pc / _hybrid_exit_pc"),
+    ("M3", "icount",        "retired-insn count trigger"),
+    ("M4", "bbv",           "basic-block vector profiling"),
+    ("M5", "slice",         "slice-consume; vsim resumes from a captured slice"),
+    ("M6", "archive",       "checkpoint archive replay"),
+    ("M7", "replay",        "deterministic re-execution of a captured run"),
+    ("M8", "end-of-program", "natural program exit terminates the round-trip"),
+]
+
+
+def parse_fixtures(makefile: Path) -> list[tuple[str, str]]:
+    """Extract fixture names + family from tests/fixtures/Makefile.
+
+    Returns rows (name, family) in stable, family-grouped order. Family is
+    the variable they came from (RT_FIXTURES, RT_C_FIXTURES, ...).
+    """
+    text = makefile.read_text()
+    rows: list[tuple[str, str]] = []
+    # Variable definitions look like:
+    #   RT_FIXTURES := rt_all_gprs rt_abi_aliases \
+    #                  rt_long_roi
+    # We capture everything up to a non-continuation newline.
+    var_pattern = re.compile(
+        r"^(?P<var>[A-Z_][A-Z0-9_]*)\s*:?=\s*(?P<body>(?:[^\n]*\\\n)*[^\n]*)$",
+        re.MULTILINE,
+    )
+    interesting = {
+        "RT_FIXTURES":      "asm",
+        "RT_C_FIXTURES":    "c",
+        "RT_C_V_FIXTURES":  "c+rvv",
+        "PROBE_V_FIXTURES": "probe",
+    }
+    seen: set[str] = set()
+    for m in var_pattern.finditer(text):
+        var = m.group("var")
+        if var not in interesting:
+            continue
+        family = interesting[var]
+        body = m.group("body").replace("\\\n", " ")
+        for name in body.split():
+            if name and name not in seen:
+                rows.append((name, family))
+                seen.add(name)
+    # Pick up the legacy hand-listed ELF targets.
+    for name in ("handoff_roundtrip",):
+        if name not in seen:
+            rows.append((name, "asm"))
+            seen.add(name)
+    return rows
+
+
+def list_fixtures() -> int:
+    makefile = REPO_ROOT / "tests" / "fixtures" / "Makefile"
+    if not makefile.is_file():
+        print(f"hsim: missing {makefile}", file=sys.stderr)
+        return 2
+    rows = parse_fixtures(makefile)
+    width = max(len(name) for name, _ in rows)
+    print(f"{'FIXTURE'.ljust(width)}  FAMILY")
+    for name, family in rows:
+        print(f"{name.ljust(width)}  {family}")
+    return 0
+
+
+def list_demos() -> int:
+    demo_dir = REPO_ROOT / "tests" / "demos"
+    if not demo_dir.is_dir():
+        print(f"hsim: missing {demo_dir}", file=sys.stderr)
+        return 2
+    names = sorted(p.stem for p in demo_dir.glob("demo_*.sh"))
+    if not names:
+        print(f"hsim: no demos found under {demo_dir}", file=sys.stderr)
+        return 2
+    for name in names:
+        print(name)
+    return 0
+
+
+def list_modes() -> int:
+    width_id = max(len(m[0]) for m in MODES)
+    width_key = max(len(m[1]) for m in MODES)
+    print(f"{'ID'.ljust(width_id)}  {'KEY'.ljust(width_key)}  DESCRIPTION")
+    for mode_id, key, desc in MODES:
+        print(f"{mode_id.ljust(width_id)}  {key.ljust(width_key)}  {desc}")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    return {
+        "fixtures": list_fixtures,
+        "demos":    list_demos,
+        "modes":    list_modes,
+    }[args.target]()
+
+
+# --- F2: build --------------------------------------------------------------
+
+# Each target maps to a list of subprocess argv lists. We delegate to the
+# existing scripts (setup.sh, scripts/build_*.sh, Makefiles) -- no logic
+# duplicated here.
+def _build_steps(target: str) -> list[list[str]]:
+    qemu     = ["bash", "scripts/build_qemu.sh"]
+    vsim     = ["bash", "scripts/build_vsim.sh"]
+    plugin   = ["make", "-C", "qemu_plugin", "QEMU_ROOT=./QEMU"]
+    simpoint = ["bash", "scripts/build_simpoint.sh"]
+    fixtures = ["make", "-C", "tests/fixtures"]
+    setup    = ["bash", "setup.sh"]
+    return {
+        "all":      [setup, fixtures],
+        "qemu":     [qemu],
+        "vsim":     [vsim],
+        "plugin":   [plugin],
+        "simpoint": [simpoint],
+        "fixtures": [fixtures],
+    }[target]
+
+
+def cmd_build(args: argparse.Namespace) -> int:
+    try:
+        steps = _build_steps(args.what)
+    except KeyError:
+        print(f"hsim: unknown build target: {args.what}", file=sys.stderr)
+        return 2
+    for argv in steps:
+        line = shlex.join(argv)
+        if args.dry_run:
+            print(line)
+            continue
+        print(f"[hsim] {line}")
+        rc = subprocess.run(argv, cwd=REPO_ROOT).returncode
+        if rc != 0:
+            print(f"hsim: build step failed (rc={rc}): {line}", file=sys.stderr)
+            return rc
+    return 0
+
+
+# --- F3: run ----------------------------------------------------------------
+
+# Default build-artifact locations. Honored as env-var overrides so the
+# F3 RED test can simulate a missing vsim binary without disturbing the
+# real one.
+_DEFAULT_ARTIFACTS = {
+    "vsim":   REPO_ROOT / "verilator" / "build" / "sim_ax45mpv_premium",
+    "qemu":   REPO_ROOT / "build" / "qemu" / "qemu-system-riscv64",
+    "plugin": REPO_ROOT / "qemu_plugin" / "libhybrid_handoff.so",
+}
+_ARTIFACT_ENV = {"vsim": "VSIM_BIN", "qemu": "VSIM_QEMU", "plugin": "VSIM_PLUGIN"}
+
+
+def _resolve_artifacts() -> dict[str, Path]:
+    return {
+        label: Path(os.environ.get(_ARTIFACT_ENV[label]) or default)
+        for label, default in _DEFAULT_ARTIFACTS.items()
+    }
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    elf = Path(args.elf)
+    if not elf.is_absolute():
+        elf = (Path.cwd() / elf).resolve()
+    if not elf.is_file():
+        print(f"hsim: ELF not found: {args.elf}", file=sys.stderr)
+        return 2
+
+    artifacts = _resolve_artifacts()
+    for label, path in artifacts.items():
+        if not path.is_file():
+            print(f"hsim: {label} not built -- run ./hsim build", file=sys.stderr)
+            return 2
+
+    if args.mode in ("csr", "pc"):
+        return _run_via_e2e(elf, artifacts, args)
+    if args.mode == "icount":
+        return _run_drain_pair(
+            elf, artifacts,
+            plugin_extras=(f"icount={args.qemu_icount}",),
+            vsim_icount=args.vsim_icount,
+            label="icount",
+            mmap_size=args.mmap_size,
+        )
+    if args.mode == "slice":
+        return _run_drain_pair(
+            elf, artifacts,
+            plugin_extras=(
+                f"slice={args.slice}",
+                f"slice_at={args.slice_at}",
+                f"icount={args.qemu_icount}",
+            ),
+            vsim_icount=args.vsim_icount,
+            label="slice",
+            mmap_size=args.mmap_size,
+        )
+    print(f"hsim: unsupported mode: {args.mode}", file=sys.stderr)
+    return 2
+
+
+def _run_via_e2e(elf: Path, artifacts: dict[str, Path],
+                 args: argparse.Namespace) -> int:
+    """csr/pc path: delegate to tests/e2e.sh (unchanged from F3)."""
+    env = os.environ.copy()
+    env["FIXTURE"]      = elf.stem
+    env["TRIGGER_MODE"] = args.mode
+    env["VSIM_ELF"]     = str(elf)
+    env["VSIM_BIN"]     = str(artifacts["vsim"])
+    env["VSIM_QEMU"]    = str(artifacts["qemu"])
+    env["VSIM_PLUGIN"]  = str(artifacts["plugin"])
+
+    cmd = ["bash", str(REPO_ROOT / "tests" / "e2e.sh")]
+    if args.verbose:
+        print(f"[hsim] FIXTURE={env['FIXTURE']} TRIGGER_MODE={env['TRIGGER_MODE']} "
+              f"VSIM_ELF={env['VSIM_ELF']}", flush=True)
+        print(f"[hsim] exec: {shlex.join(cmd)}", flush=True)
+    return subprocess.run(cmd, cwd=REPO_ROOT, env=env).returncode
+
+
+# F11: inline QEMU + vsim drain pair for --mode icount and --mode slice.
+# e2e.sh only knows about csr/pc triggers; these CSR-less modes need a
+# direct two-spawn path. Mirrors demo_icount_roundtrip.sh +
+# demo_slice_consume_roundtrip.sh: both drain at exit code 200, vsim
+# uses --hybrid-icount as the exit trigger.
+_VSIM_DRAIN_TIMEOUT_S = 120
+
+
+def _vsim_drain_argv(vsim: Path, elf: Path, state_in: Path,
+                     state_out: Path, hybrid_icount: int) -> list[str]:
+    """vsim drain argv with --hybrid-icount trigger.
+
+    No --shared-mem-* flags: the CSR-less workloads exercised by
+    --mode icount and --mode slice (e.g. icount_spin.elf) re-derive
+    their tight loop from the resumed state alone, matching
+    demo_icount_roundtrip.sh and demo_slice_consume_roundtrip.sh.
+    """
+    return [
+        str(vsim), str(elf),
+        "--resume-from-qemu", str(state_in),
+        "--handoff-out", str(state_out),
+        "--hybrid-icount", str(hybrid_icount),
+    ]
+
+
+def _run_drain_pair(elf: Path, artifacts: dict[str, Path],
+                    plugin_extras: tuple[str, ...],
+                    vsim_icount: int, label: str,
+                    mmap_size: int) -> int:
+    """Two-step QEMU + vsim drain round-trip.
+
+    QEMU drains at its plugin trigger -> state file. vsim resumes from
+    that state, drains after `vsim_icount` retired insns. Both spawns
+    must exit `_QEMU_DRAIN_RC` (200). Used by --mode icount/slice.
+    """
+    try:
+        shm_path = _load_hsim_shm().allocate(
+            mmap_size, prefix=f"hsim-{label}-shm.",
+        )
+    except Exception as exc:
+        print(f"hsim: {exc}", file=sys.stderr)
+        return 2
+
+    state_q_fd, state_q_name = tempfile.mkstemp(prefix=f"hsim-{label}-qstate.")
+    os.close(state_q_fd)
+    state_q = Path(state_q_name)
+
+    state_v_fd, state_v_name = tempfile.mkstemp(prefix=f"hsim-{label}-vstate.")
+    os.close(state_v_fd)
+    state_v = Path(state_v_name)
+
+    try:
+        qemu_argv = _qemu_drain_argv(
+            artifacts["qemu"], elf, artifacts["plugin"],
+            shm_path, mmap_size, state_q,
+            plugin_extras=plugin_extras,
+        )
+        print(f"[hsim {label} 1/2] QEMU drain ({','.join(plugin_extras)})",
+              flush=True)
+        proc = subprocess.run(
+            qemu_argv, cwd=REPO_ROOT,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=_PROFILE_TIMEOUT_S,
+        )
+        if proc.returncode != _QEMU_DRAIN_RC:
+            tail = proc.stdout.decode("utf-8", "replace").splitlines()[-20:]
+            print(f"hsim: QEMU {label} expected exit {_QEMU_DRAIN_RC}, "
+                  f"got {proc.returncode}", file=sys.stderr)
+            for line in tail:
+                print(line, file=sys.stderr)
+            return 1
+
+        print(f"[hsim {label} 2/2] vsim --hybrid-icount {vsim_icount} drain",
+              flush=True)
+        vsim_argv = _vsim_drain_argv(
+            artifacts["vsim"], elf, state_q, state_v, vsim_icount,
+        )
+        proc = subprocess.run(
+            vsim_argv, cwd=REPO_ROOT,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=_VSIM_DRAIN_TIMEOUT_S,
+        )
+        if proc.returncode != _QEMU_DRAIN_RC:
+            tail = proc.stdout.decode("utf-8", "replace").splitlines()[-20:]
+            print(f"hsim: vsim {label} expected exit {_QEMU_DRAIN_RC}, "
+                  f"got {proc.returncode}", file=sys.stderr)
+            for line in tail:
+                print(line, file=sys.stderr)
+            return 1
+
+        print(f"PASS: --mode {label} ({elf.name})")
+        return 0
+    finally:
+        for p in (shm_path, state_q, state_v):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+
+
+# --- F4: test ---------------------------------------------------------------
+
+# Default JOBS cap. The 128-core dev host saturates if scripts/run_e2e.sh's
+# default (~nproc) is used, so we pin to 8. --jobs N overrides.
+_DEFAULT_JOBS = 8
+
+
+def _summarize_results(log_dir: Path) -> tuple[int, int, int, list[Path]]:
+    results = log_dir / "results.tsv"
+    p = f = s = 0
+    failed_logs: list[Path] = []
+    if not results.is_file():
+        return p, f, s, failed_logs
+    for line in results.read_text().splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        mode, name, status = parts[0], parts[1], parts[2]
+        if status == "PASS":
+            p += 1
+        elif status == "FAIL":
+            f += 1
+            failed_logs.append(log_dir / f"{mode}--{name}.log")
+        elif status == "SKIP":
+            s += 1
+    return p, f, s, failed_logs
+
+
+def cmd_test(args: argparse.Namespace) -> int:
+    artifacts = _resolve_artifacts()
+    log_dir = Path(tempfile.mkdtemp(prefix="hsim-test-"))
+
+    env = os.environ.copy()
+    env["JOBS"]    = str(args.jobs)
+    env["MODE"]    = args.mode
+    env["LOG_DIR"] = str(log_dir)
+    env["FILTER"]  = args.filter or ""
+    env["VSIM_BIN"]    = str(artifacts["vsim"])
+    env["VSIM_QEMU"]   = str(artifacts["qemu"])
+    env["VSIM_PLUGIN"] = str(artifacts["plugin"])
+
+    cmd = ["bash", str(REPO_ROOT / "scripts" / "run_e2e.sh")]
+    if args.dry_run:
+        print(f"JOBS={env['JOBS']}")
+        print(f"MODE={env['MODE']}")
+        print(f"FILTER={env['FILTER']}")
+        print(f"LOG_DIR={env['LOG_DIR']}")
+        print(f"exec: {shlex.join(cmd)}")
+        return 0
+
+    start = time.monotonic()
+    rc = subprocess.run(cmd, cwd=REPO_ROOT, env=env).returncode
+    elapsed = time.monotonic() - start
+
+    p, f, s, failed_logs = _summarize_results(log_dir)
+    print(f"PASS {p}, FAIL {f}, SKIP {s} (elapsed: {elapsed:.1f}s)")
+    if failed_logs:
+        print("Failed test logs:")
+        for fp in failed_logs:
+            print(f"  {fp}")
+    return rc
+
+
+# --- F7: doctor (env-health diagnoser) --------------------------------------
+
+# Each check returns rows of (name, status, detail). Statuses:
+#   PASS - the resource exists and is usable.
+#   FAIL - missing/broken; exit code 1 if any present.
+#   WARN - degraded but does not block build/test.
+#   INFO - informational (host facts), never affects exit code.
+_DoctorRow = tuple[str, str, str]
+
+
+def _read_hybrid_toolchain() -> str | None:
+    """Locate HYBRID_TOOLCHAIN: env first, then config.env fallback."""
+    tc = os.environ.get("HYBRID_TOOLCHAIN")
+    if tc:
+        return tc
+    cfg = REPO_ROOT / "config.env"
+    if not cfg.is_file():
+        return None
+    pattern = re.compile(r"^\s*(?:export\s+)?HYBRID_TOOLCHAIN\s*=\s*(.+?)\s*$")
+    for line in cfg.read_text().splitlines():
+        m = pattern.match(line)
+        if m:
+            return m.group(1).strip().strip('"').strip("'")
+    return None
+
+
+def _doctor_artifacts() -> list[_DoctorRow]:
+    rows: list[_DoctorRow] = []
+    for label, path in _resolve_artifacts().items():
+        if path.is_file():
+            rows.append((label, "PASS", str(path)))
+        else:
+            rows.append((label, "FAIL",
+                         f"missing {path} -- run ./hsim build"))
+    simpoint = REPO_ROOT / "tools" / "simpoint" / "bin" / "simpoint"
+    if simpoint.is_file():
+        rows.append(("simpoint", "PASS", str(simpoint)))
+    else:
+        rows.append(("simpoint", "FAIL",
+                     f"missing {simpoint} -- run ./hsim build --what simpoint"))
+    fix_dir = REPO_ROOT / "tests" / "fixtures"
+    elfs = sorted(fix_dir.glob("*.elf")) if fix_dir.is_dir() else []
+    if elfs:
+        rows.append(("fixtures", "PASS", f"{len(elfs)} ELFs in {fix_dir}"))
+    else:
+        rows.append(("fixtures", "FAIL",
+                     f"no *.elf in {fix_dir} -- run make -C tests/fixtures"))
+    return rows
+
+
+def _doctor_submodules() -> list[_DoctorRow]:
+    markers = [
+        ("QEMU/",           REPO_ROOT / "QEMU" / "configure"),
+        ("verilator/",      REPO_ROOT / "verilator" / "CMakeLists.txt"),
+        ("tools/simpoint/", REPO_ROOT / "tools" / "simpoint" / "Makefile"),
+    ]
+    rows: list[_DoctorRow] = []
+    for name, marker in markers:
+        if marker.is_file():
+            rows.append((name, "PASS", str(marker.relative_to(REPO_ROOT))))
+        else:
+            rows.append((name, "FAIL",
+                         f"missing {marker} -- "
+                         f"run 'git submodule update --init --recursive'"))
+    return rows
+
+
+def _doctor_toolchain() -> list[_DoctorRow]:
+    rows: list[_DoctorRow] = []
+    for tool in ("ninja", "make", "podman"):
+        found = shutil.which(tool)
+        if found:
+            rows.append((tool, "PASS", found))
+        else:
+            severity = "WARN" if tool == "podman" else "FAIL"
+            hint = {
+                "ninja":  "needed by ./hsim build of QEMU",
+                "make":   "needed by ./hsim build of fixtures + simpoint",
+                "podman": "needed by ./hsim build of vsim (or docker shim)",
+            }[tool]
+            rows.append((tool, severity, f"not on PATH -- {hint}"))
+    tc = _read_hybrid_toolchain()
+    if not tc:
+        rows.append(("HYBRID_TOOLCHAIN", "WARN",
+                     "not set -- needed for fixture build "
+                     "(see config.env)"))
+    else:
+        gcc = Path(tc) / "bin" / "riscv64-unknown-elf-gcc"
+        if gcc.is_file():
+            rows.append(("riscv64-unknown-elf-gcc", "PASS", str(gcc)))
+        else:
+            rows.append(("riscv64-unknown-elf-gcc", "FAIL",
+                         f"missing {gcc} -- check HYBRID_TOOLCHAIN={tc}"))
+    return rows
+
+
+def _doctor_runtime() -> list[_DoctorRow]:
+    rows: list[_DoctorRow] = []
+    nproc = os.cpu_count() or 1
+    rows.append(("nproc", "INFO", str(nproc)))
+    shm = Path("/dev/shm")
+    if shm.is_dir():
+        free_gb = shutil.disk_usage(shm).free // (1024 ** 3)
+        status = "PASS" if free_gb >= 4 else "WARN"
+        rows.append(("/dev/shm free", status, f"{free_gb} GB"))
+    else:
+        rows.append(("/dev/shm", "WARN",
+                     "not present -- e2e fixtures will fall back to $TMPDIR"))
+    suggested = min(nproc, _DEFAULT_JOBS)
+    rows.append(("JOBS suggestion", "INFO",
+                 f"{suggested} (default cap = {_DEFAULT_JOBS})"))
+    return rows
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    sections: list[tuple[str, list[_DoctorRow]]] = [
+        ("artifacts",  _doctor_artifacts()),
+        ("submodules", _doctor_submodules()),
+        ("toolchain",  _doctor_toolchain()),
+        ("runtime",    _doctor_runtime()),
+    ]
+    name_width = max(len(name)
+                     for _, rows in sections
+                     for name, _, _ in rows)
+    totals = {"PASS": 0, "FAIL": 0, "WARN": 0, "INFO": 0}
+    for title, rows in sections:
+        print(f"{title}:")
+        for name, status, detail in rows:
+            totals[status] = totals.get(status, 0) + 1
+            print(f"  [{status:<4}] {name.ljust(name_width)}  {detail}")
+        print()
+    print(f"Summary: {totals['PASS']} PASS, {totals['FAIL']} FAIL, "
+          f"{totals['WARN']} WARN")
+    return 1 if totals["FAIL"] > 0 else 0
+
+
+# --- F8: demo ---------------------------------------------------------------
+
+# T1..T7 -> short-name contract. Source of truth: docs/switching_modes_tutorial.md
+# (T-id table near the top). Filename is derived as `demo_<short>.sh` so a
+# rename only edits one place.
+_DEMO_ORDER = [
+    ("T1", "csr_oneshot"),
+    ("T2", "pc_oneshot"),
+    ("T3", "icount_roundtrip"),
+    ("T4", "bbv_profile"),
+    ("T5", "slice_consume_roundtrip"),
+    ("T6", "archive_replay"),
+    ("T7", "simpoint_loop"),
+]
+
+
+def _demo_script(short: str) -> Path:
+    return REPO_ROOT / "tests" / "demos" / f"demo_{short}.sh"
+
+
+def _resolve_demo(selector: str) -> tuple[str, Path] | tuple[None, None]:
+    """Map T-id, short name, or `demo_<short>` to (short, script-path).
+
+    Returns (None, None) if no match. The triple form lets users copy-paste
+    from `./hsim list demos` (which emits `demo_<short>`) too.
+    """
+    sel = selector.strip()
+    for tid, short in _DEMO_ORDER:
+        if sel == tid or sel == short or sel == f"demo_{short}":
+            return short, _demo_script(short)
+    return None, None
+
+
+def _parse_demo_passthrough(items: list[str]) -> dict[str, str] | None:
+    """Parse `-- KEY=VAL KEY=VAL ...` trailing args. Returns None on bad form."""
+    env_extra: dict[str, str] = {}
+    for it in items or []:
+        if it == "--":
+            continue
+        if "=" not in it or it.startswith("="):
+            return None
+        k, v = it.split("=", 1)
+        env_extra[k] = v
+    return env_extra
+
+
+def cmd_demo(args: argparse.Namespace) -> int:
+    if not args.selector:
+        print(
+            "hsim: missing demo selector -- run ./hsim list demos",
+            file=sys.stderr,
+        )
+        return 2
+
+    short, script = _resolve_demo(args.selector)
+    if script is None:
+        print(
+            f"hsim: unknown demo: {args.selector} -- "
+            "run ./hsim list demos (or use T1..T7)",
+            file=sys.stderr,
+        )
+        return 2
+    if not script.is_file():
+        print(f"hsim: demo script not found: {script}", file=sys.stderr)
+        return 2
+
+    env_extra = _parse_demo_passthrough(args.extras)
+    if env_extra is None:
+        print(
+            "hsim: passthrough args must be KEY=VAL form (after `--`)",
+            file=sys.stderr,
+        )
+        return 2
+
+    artifacts = _resolve_artifacts()
+    for label, path in artifacts.items():
+        if not path.is_file():
+            print(f"hsim: {label} not built -- run ./hsim build", file=sys.stderr)
+            return 2
+
+    env = os.environ.copy()
+    env["VSIM_BIN"]    = str(artifacts["vsim"])
+    env["VSIM_QEMU"]   = str(artifacts["qemu"])
+    env["VSIM_PLUGIN"] = str(artifacts["plugin"])
+    env.update(env_extra)
+
+    cmd = ["bash", str(script)]
+    if args.dry_run:
+        for k, v in env_extra.items():
+            print(f"{k}={v}")
+        print(f"exec: {shlex.join(cmd)}")
+        return 0
+    return subprocess.run(cmd, cwd=REPO_ROOT, env=env).returncode
+
+
+# --- F9: profile + cluster (M4) ---------------------------------------------
+
+# SimPoint clustering binary. Path is fixed by tools/simpoint/Makefile;
+# kept as a constant here so a future build-output relocation only edits
+# one place. No env override -- VSIM_QEMU/_PLUGIN/_BIN cover the hybrid
+# artifacts; SimPoint is a separate, host-only tool with no e2e knob.
+_SIMPOINT_BIN = REPO_ROOT / "tools" / "simpoint" / "bin" / "simpoint"
+
+# Profile pass exit contract: the plugin drains at the icount limit and
+# QEMU exits 200 (drain code). Same contract used by demo_bbv_profile.sh
+# and the orchestrator's runner._qemu_drain.
+_QEMU_DRAIN_RC = 200
+_PROFILE_TIMEOUT_S = 30        # matches demo_bbv_profile.sh
+
+
+def _load_hsim_shm():
+    """Lazy-load tools/hsim_shm with parse_size / allocate / NoSpaceError."""
+    tools_dir = str(REPO_ROOT / "tools")
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    import hsim_shm
+    return hsim_shm
+
+
+def _parse_mmap_size(spec: str) -> int:
+    """argparse type= callable; lazy-wraps hsim_shm.parse_size."""
+    return _load_hsim_shm().parse_size(spec)
+
+
+def _qemu_drain_argv(qemu: Path, elf: Path, plugin: Path,
+                     shm_path: Path, shm_size: int, state_out: Path,
+                     plugin_extras: tuple[str, ...] = ()) -> list[str]:
+    """Build the QEMU + plugin drain argv shared by M3/M4/M5 paths.
+
+    `plugin_extras` are `key=value` strings appended after `outfile=`.
+    Same base flags as orchestrator.spawn.qemu_drain_argv (the upstream
+    source of truth); inlined here because that helper bakes only
+    `outfile=` and does not yet thread plugin params through
+    `trigger.params` (deferred orchestrator refactor; see
+    driver_ROADMAP.md).
+    """
+    mem_obj = (
+        f"memory-backend-file,id=mem,share=on,"
+        f"mem-path={shm_path},size={shm_size}"
+    )
+    plugin_pairs = [f"outfile={state_out}", *plugin_extras]
+    return [
+        str(qemu),
+        "-object", mem_obj,
+        "-machine", "andes_ae350,memory-backend=mem",
+        "-cpu", "andes-ax45mpv,vlen=512",
+        "-nographic",
+        "-semihosting-config", "enable=on,target=native",
+        "-bios", str(elf),
+        "-plugin", f"{plugin}," + ",".join(plugin_pairs),
+    ]
+
+
+def _qemu_profile_argv(qemu: Path, elf: Path, plugin: Path,
+                       shm_path: Path, shm_size: int, state_out: Path,
+                       bbv_out: Path, slice_n: int, icount: int) -> list[str]:
+    """M4 profile pass argv: `_qemu_drain_argv` + the BBV plugin extras."""
+    return _qemu_drain_argv(
+        qemu, elf, plugin, shm_path, shm_size, state_out,
+        plugin_extras=(
+            f"bbv_out={bbv_out}",
+            f"slice={slice_n}",
+            f"icount={icount}",
+        ),
+    )
+
+
+def cmd_profile(args: argparse.Namespace) -> int:
+    elf = Path(args.elf)
+    if not elf.is_absolute():
+        elf = (Path.cwd() / elf).resolve()
+    if not elf.is_file():
+        print(f"hsim: ELF not found: {args.elf}", file=sys.stderr)
+        return 2
+
+    artifacts = _resolve_artifacts()
+    # Profile pass uses qemu + plugin only; vsim is not invoked.
+    for label in ("qemu", "plugin"):
+        if not artifacts[label].is_file():
+            print(f"hsim: {label} not built -- run ./hsim build",
+                  file=sys.stderr)
+            return 2
+
+    bbv = Path(args.output)
+    bbv.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        shm_path = _load_hsim_shm().allocate(
+            args.mmap_size, prefix="hsim-profile-shm.",
+        )
+    except Exception as exc:
+        print(f"hsim: {exc}", file=sys.stderr)
+        return 2
+
+    state_fd, state_name = tempfile.mkstemp(prefix="hsim-profile-state.")
+    os.close(state_fd)
+    state_out = Path(state_name)
+
+    try:
+        argv = _qemu_profile_argv(
+            qemu=artifacts["qemu"], elf=elf, plugin=artifacts["plugin"],
+            shm_path=shm_path, shm_size=args.mmap_size, state_out=state_out,
+            bbv_out=bbv, slice_n=args.slice, icount=args.icount,
+        )
+
+        if args.dry_run:
+            print(f"exec: {shlex.join(argv)}")
+            return 0
+
+        proc = subprocess.run(
+            argv, cwd=REPO_ROOT,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=_PROFILE_TIMEOUT_S,
+        )
+        if proc.returncode != _QEMU_DRAIN_RC:
+            tail = proc.stdout.decode("utf-8", "replace").splitlines()[-20:]
+            print(f"hsim: QEMU profile expected exit {_QEMU_DRAIN_RC}, "
+                  f"got {proc.returncode}", file=sys.stderr)
+            for line in tail:
+                print(line, file=sys.stderr)
+            return 1
+
+        if not bbv.is_file() or bbv.stat().st_size == 0:
+            print(f"hsim: profile produced empty BBV: {bbv}", file=sys.stderr)
+            return 1
+        rows = sum(1 for _ in bbv.open())
+        print(f"profile: {rows} BBV rows -> {bbv}")
+        return 0
+    finally:
+        for p in (shm_path, state_out):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def cmd_cluster(args: argparse.Namespace) -> int:
+    bbv = Path(args.bbv)
+    if not bbv.is_file():
+        print(f"hsim: BBV file not found: {args.bbv}", file=sys.stderr)
+        return 2
+    if not _SIMPOINT_BIN.is_file():
+        print(f"hsim: simpoint not built -- run ./hsim build", file=sys.stderr)
+        return 2
+
+    simpts  = Path(args.simpts)
+    weights = Path(args.weights)
+    simpts.parent.mkdir(parents=True, exist_ok=True)
+    weights.parent.mkdir(parents=True, exist_ok=True)
+
+    # -dim 2 matches the demo (small fixtures with simple control flow).
+    # If we add larger fixtures later, expose --dim as a flag.
+    argv = [
+        str(_SIMPOINT_BIN),
+        "-loadFVFile", str(bbv),
+        "-maxK", str(args.max_k),
+        "-dim", "2",
+        "-saveSimpoints", str(simpts),
+        "-saveSimpointWeights", str(weights),
+    ]
+    if args.dry_run:
+        print(f"exec: {shlex.join(argv)}")
+        return 0
+
+    proc = subprocess.run(argv, cwd=REPO_ROOT,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if proc.returncode != 0:
+        print(f"hsim: simpoint exited {proc.returncode}", file=sys.stderr)
+        sys.stderr.write(proc.stdout.decode("utf-8", "replace"))
+        return 1
+    if simpts.stat().st_size == 0 or weights.stat().st_size == 0:
+        print("hsim: simpoint produced empty simpts or weights",
+              file=sys.stderr)
+        return 1
+    n_clusters = sum(1 for _ in simpts.open())
+    print(f"cluster: {n_clusters} phases -> {simpts}, {weights}")
+    return 0
+
+
+# --- F10: archive + replay (M6 + M7) ---------------------------------------
+
+# Default mmap size used by every e2e fixture and demo. Exposed via
+# --mmap-size for unusual workloads.
+_DEFAULT_MMAP_SIZE = 128 * 1024 * 1024
+
+
+def _load_checkpoint_module():
+    """Lazy-add tools/ to sys.path and return orchestrator.checkpoint.
+
+    Kept lazy so an unrelated subcommand (e.g. `./hsim list`) does not
+    pay the ctypes layout check at module load time.
+    """
+    tools_dir = str(REPO_ROOT / "tools")
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    from orchestrator import checkpoint
+    return checkpoint
+
+
+def cmd_archive(args: argparse.Namespace) -> int:
+    state = Path(args.state)
+    mmap_file = Path(args.mmap)
+    if not state.is_file():
+        print(f"hsim: state file not found: {args.state}", file=sys.stderr)
+        return 2
+    if not mmap_file.is_file():
+        print(f"hsim: mmap file not found: {args.mmap}", file=sys.stderr)
+        return 2
+
+    snap = Path(args.output)
+    if args.dry_run:
+        print(
+            f"archive: state={state} mmap={mmap_file} elf={args.elf} "
+            f"mmap_size={args.mmap_size} -> {snap}"
+        )
+        return 0
+
+    # In-process import: hsim and orchestrator are both Python, so a
+    # `python3 -c` subprocess wrapper (as the bash demos use) just adds
+    # interpreter startup latency and obscures tracebacks.
+    checkpoint = _load_checkpoint_module()
+    try:
+        checkpoint.write_archive(
+            snap,
+            state_path=state,
+            mmap_path=mmap_file,
+            mmap_size=args.mmap_size,
+            elf_path=args.elf,
+            source_step_index=0,
+        )
+    except Exception as exc:
+        print(f"hsim: write_archive failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"archive: {snap}/{{state.bin,mem,meta.json}}")
+    return 0
+
+
+def cmd_replay(args: argparse.Namespace) -> int:
+    snap = Path(args.snap)
+    if not snap.is_dir():
+        print(f"hsim: snapshot directory not found: {args.snap}",
+              file=sys.stderr)
+        return 2
+
+    artifacts = _resolve_artifacts()
+    for label, path in artifacts.items():
+        if not path.is_file():
+            print(f"hsim: {label} not built -- run ./hsim build",
+                  file=sys.stderr)
+            return 2
+
+    argv = [
+        sys.executable, "-m", "orchestrator.main", "replay-checkpoint",
+        str(snap),
+        "--resume-with", args.resume_with,
+        "--project-root", str(REPO_ROOT),
+    ]
+    if args.dry_run:
+        print(f"exec: {shlex.join(argv)}")
+        return 0
+
+    env = os.environ.copy()
+    existing_pp = env.get("PYTHONPATH", "")
+    tools_dir = str(REPO_ROOT / "tools")
+    env["PYTHONPATH"] = (
+        tools_dir + os.pathsep + existing_pp if existing_pp else tools_dir
+    )
+    env["VSIM_BIN"]    = str(artifacts["vsim"])
+    env["VSIM_QEMU"]   = str(artifacts["qemu"])
+    env["VSIM_PLUGIN"] = str(artifacts["plugin"])
+    return subprocess.run(argv, env=env, cwd=REPO_ROOT).returncode
+
+
+# --- F12: estimate (SimPoint cycle aggregator) -----------------------------
+
+# End-to-end: M4 profile (F9) -> SimPoint cluster (F9) -> per-phase
+# QEMU+vsim drain (mirrors --mode slice from F11 but keeps state files
+# long enough to read mcycle). Aggregator math:
+#     CPI_i = delta_mcycle_i / vsim_icount
+#     CPI   = sum_i ( w_i * CPI_i )
+#     cycles_estimate = N_total_insns * CPI
+
+
+def _read_state_mcycle(state_path: Path) -> int:
+    """Read the mcycle field from a hybrid_state_v1 file via orchestrator.abi.
+
+    Lazy import keeps `./hsim list` etc. from paying the ctypes layout
+    check at startup.
+    """
+    tools_dir = str(REPO_ROOT / "tools")
+    if tools_dir not in sys.path:
+        sys.path.insert(0, tools_dir)
+    from orchestrator.abi import HybridStateV1
+    state = HybridStateV1.from_buffer_copy(state_path.read_bytes())
+    return int(state.mcycle)
+
+
+def _estimate_one_phase(elf: Path, artifacts: dict[str, Path],
+                        slice_n: int, slice_at: int,
+                        qemu_icount_fallback: int,
+                        vsim_icount: int,
+                        mmap_size: int) -> tuple[int, int]:
+    """Run one slice-consume QEMU + vsim drain pair, return mcycle pair.
+
+    Mirrors _run_drain_pair (--mode slice in cmd_run) but keeps the
+    state files long enough to read mcycle from both ends. Raises
+    RuntimeError on drain rc != 200; caller handles cleanup of any
+    partial output.
+    """
+    label = f"phase{slice_at}"
+    shm_path = _load_hsim_shm().allocate(
+        mmap_size, prefix=f"hsim-{label}-shm.",
+    )
+    state_q_fd, state_q_name = tempfile.mkstemp(prefix=f"hsim-{label}-qstate.")
+    os.close(state_q_fd)
+    state_q = Path(state_q_name)
+    state_v_fd, state_v_name = tempfile.mkstemp(prefix=f"hsim-{label}-vstate.")
+    os.close(state_v_fd)
+    state_v = Path(state_v_name)
+    try:
+        # F14: when qemu_icount_fallback == 0, omit the icount= plugin extra
+        # (plugin rejects icount=0). slice_consume is the primary trigger;
+        # icount= is only a safety fallback for misconfigured slice_at.
+        extras: tuple[str, ...] = (
+            f"slice={slice_n}",
+            f"slice_at={slice_at}",
+        )
+        if qemu_icount_fallback > 0:
+            extras = (*extras, f"icount={qemu_icount_fallback}")
+        qemu_argv = _qemu_drain_argv(
+            artifacts["qemu"], elf, artifacts["plugin"],
+            shm_path, mmap_size, state_q,
+            plugin_extras=extras,
+        )
+        proc = subprocess.run(
+            qemu_argv, cwd=REPO_ROOT,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=_PROFILE_TIMEOUT_S,
+        )
+        if proc.returncode != _QEMU_DRAIN_RC:
+            tail = proc.stdout.decode("utf-8", "replace").splitlines()[-10:]
+            raise RuntimeError(
+                f"QEMU phase slice_at={slice_at} expected exit "
+                f"{_QEMU_DRAIN_RC}, got {proc.returncode}: "
+                + "; ".join(tail)
+            )
+        mcycle_before = _read_state_mcycle(state_q)
+
+        vsim_argv = _vsim_drain_argv(
+            artifacts["vsim"], elf, state_q, state_v, vsim_icount,
+        )
+        proc = subprocess.run(
+            vsim_argv, cwd=REPO_ROOT,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=_VSIM_DRAIN_TIMEOUT_S,
+        )
+        if proc.returncode != _QEMU_DRAIN_RC:
+            tail = proc.stdout.decode("utf-8", "replace").splitlines()[-10:]
+            raise RuntimeError(
+                f"vsim phase slice_at={slice_at} expected exit "
+                f"{_QEMU_DRAIN_RC}, got {proc.returncode}: "
+                + "; ".join(tail)
+            )
+        mcycle_after = _read_state_mcycle(state_v)
+        return mcycle_before, mcycle_after
+    finally:
+        for p in (shm_path, state_q, state_v):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _run_drain_at_exit_profile(elf: Path, artifacts: dict[str, Path],
+                                bbv: Path, slice_n: int,
+                                mmap_size: int) -> tuple[int, int]:
+    """F14: run a profile pass that drains at program exit (no icount cap).
+
+    Returns (rc, n_total_insns). On rc != 0, n_total_insns is 0.
+
+    The plugin's drain_at_exit=1 mode counts every retired insn via a
+    per-insn exec cb and overrides the drained state file's `minstret`
+    field with that count (QEMU's PMU minstret is host-tick-derived on
+    system-mode without -icount, which is why we use the plugin counter).
+    """
+    shm_path = _load_hsim_shm().allocate(
+        mmap_size, prefix="hsim-profile-shm.",
+    )
+    state_fd, state_name = tempfile.mkstemp(prefix="hsim-profile-state.")
+    os.close(state_fd)
+    state_out = Path(state_name)
+    try:
+        argv = _qemu_drain_argv(
+            artifacts["qemu"], elf, artifacts["plugin"],
+            shm_path, mmap_size, state_out,
+            plugin_extras=(
+                f"bbv_out={bbv}",
+                f"slice={slice_n}",
+                "drain_at_exit=1",
+            ),
+        )
+        proc = subprocess.run(
+            argv, cwd=REPO_ROOT,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=_PROFILE_TIMEOUT_S,
+        )
+        if proc.returncode != _QEMU_DRAIN_RC:
+            tail = proc.stdout.decode("utf-8", "replace").splitlines()[-20:]
+            print(f"hsim: QEMU profile expected exit {_QEMU_DRAIN_RC}, "
+                  f"got {proc.returncode}", file=sys.stderr)
+            for line in tail:
+                print(line, file=sys.stderr)
+            return 1, 0
+
+        if not bbv.is_file() or bbv.stat().st_size == 0:
+            print(f"hsim: profile produced empty BBV: {bbv}", file=sys.stderr)
+            return 1, 0
+        rows = sum(1 for _ in bbv.open())
+
+        # Read N_total from the drained state file's minstret field
+        # (overridden by the plugin's atexit counter).
+        tools_dir = str(REPO_ROOT / "tools")
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        from orchestrator.abi import HybridStateV1
+        state = HybridStateV1.from_buffer_copy(state_out.read_bytes())
+        n_total = int(state.minstret)
+        if n_total <= 0:
+            print(f"hsim: drain-at-exit produced minstret={n_total} "
+                  f"(plugin counter unexpectedly zero)", file=sys.stderr)
+            return 1, 0
+
+        print(f"profile: {rows} BBV rows -> {bbv} (N_total={n_total})")
+        return 0, n_total
+    finally:
+        for p in (shm_path, state_out):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def cmd_estimate(args: argparse.Namespace) -> int:
+    elf = Path(args.elf)
+    if not elf.is_absolute():
+        elf = (Path.cwd() / elf).resolve()
+    if not elf.is_file():
+        print(f"hsim: ELF not found: {args.elf}", file=sys.stderr)
+        return 2
+
+    artifacts = _resolve_artifacts()
+    for label, path in artifacts.items():
+        if not path.is_file():
+            print(f"hsim: {label} not built -- run ./hsim build",
+                  file=sys.stderr)
+            return 2
+    if not _SIMPOINT_BIN.is_file():
+        print("hsim: simpoint not built -- run ./hsim build",
+              file=sys.stderr)
+        return 2
+
+    # SimPoint-correct default: vsim simulates exactly one slice's
+    # insns per phase, so CPI_i = delta_mcycle / slice. 0 = "auto".
+    vsim_icount = args.vsim_icount if args.vsim_icount > 0 else args.slice
+
+    with tempfile.TemporaryDirectory(prefix="hsim-estimate-") as tmpdir:
+        tmp = Path(tmpdir)
+        bbv = tmp / "profile.bb"
+        simpts = tmp / "simpts"
+        weights = tmp / "weights"
+
+        # F14: --icount 0 means run-to-program-exit; the plugin counts every
+        # retired insn via atexit and writes it as minstret in the drained
+        # state. --icount N > 0 keeps the legacy icount-cap path.
+        if args.icount == 0:
+            rc, n_total = _run_drain_at_exit_profile(
+                elf, artifacts, bbv, args.slice, args.mmap_size,
+            )
+            if rc != 0:
+                return rc
+        else:
+            rc = cmd_profile(argparse.Namespace(
+                elf=str(elf), slice=args.slice, icount=args.icount,
+                output=str(bbv), dry_run=False,
+                mmap_size=args.mmap_size,
+            ))
+            if rc != 0:
+                return rc
+            n_total = args.icount
+
+        rc = cmd_cluster(argparse.Namespace(
+            bbv=str(bbv), max_k=args.max_k,
+            simpts=str(simpts), weights=str(weights), dry_run=False,
+        ))
+        if rc != 0:
+            return rc
+
+        slice_indices = [int(line.split()[0])
+                         for line in simpts.read_text().splitlines()
+                         if line.strip()]
+        weight_vals = [float(line.split()[0])
+                       for line in weights.read_text().splitlines()
+                       if line.strip()]
+        if len(slice_indices) != len(weight_vals):
+            print(f"hsim: simpts/weights row mismatch "
+                  f"({len(slice_indices)} vs {len(weight_vals)})",
+                  file=sys.stderr)
+            return 1
+
+        phases = []
+        for K, w in zip(slice_indices, weight_vals):
+            print(f"[hsim estimate] phase slice_at={K} weight={w:.3f}",
+                  flush=True)
+            try:
+                mc_before, mc_after = _estimate_one_phase(
+                    elf, artifacts, args.slice, K,
+                    args.icount, vsim_icount,
+                    mmap_size=args.mmap_size,
+                )
+            except RuntimeError as exc:
+                print(f"hsim: estimate failed: {exc}", file=sys.stderr)
+                return 1
+            delta = mc_after - mc_before
+            cpi = delta / vsim_icount if vsim_icount > 0 else 0.0
+            phases.append({"K": K, "w": w, "delta": delta, "cpi": cpi})
+
+        weighted_cpi = sum(p["w"] * p["cpi"] for p in phases)
+        estimated_cycles = int(n_total * weighted_cpi)
+
+        print(f"M4 profile: {len(slice_indices)} BBV rows ({bbv.name})")
+        print(f"cluster: {len(phases)} phases")
+        for p in phases:
+            print(f"phase K={p['K']} w={p['w']:.3f} "
+                  f"delta_mcycle={p['delta']} CPI={p['cpi']:.3f}")
+        print(f"estimated_cycles={estimated_cycles}  "
+              f"(N={n_total}, weighted_CPI={weighted_cpi:.3f})")
+        return 0
+
+
+# --- main -------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="hsim",
+        description="End-user driver for the Andes hybrid simulator (QEMU + vsim).",
+    )
+    sub = parser.add_subparsers(dest="cmd", metavar="<cmd>")
+    sub.required = True
+
+    p_list = sub.add_parser(
+        "list",
+        help="list available fixtures, demos, or trigger modes",
+    )
+    p_list.add_argument(
+        "target",
+        choices=("fixtures", "demos", "modes"),
+        help="what to list",
+    )
+    p_list.set_defaults(func=cmd_list)
+
+    p_build = sub.add_parser(
+        "build",
+        help="build artifacts (qemu, vsim, plugin, simpoint, ELF fixtures)",
+    )
+    p_build.add_argument(
+        "--what",
+        choices=("all", "qemu", "vsim", "plugin", "simpoint", "fixtures"),
+        default="all",
+        help="which target to build (default: all)",
+    )
+    p_build.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the underlying commands without executing",
+    )
+    p_build.set_defaults(func=cmd_build)
+
+    p_run = sub.add_parser(
+        "run",
+        help="run one ELF through the QEMU -> vsim -> QEMU round-trip",
+    )
+    p_run.add_argument(
+        "elf",
+        help="path to a RISC-V ELF (relative or absolute)",
+    )
+    p_run.add_argument(
+        "--mode",
+        choices=("csr", "pc", "icount", "slice"),
+        required=True,
+        help=(
+            "trigger mode: csr (csrwi 0x7C0,{0,1}) or pc (ELF symbols) "
+            "use tests/e2e.sh; icount and slice spawn QEMU+vsim directly "
+            "for CSR-less workloads"
+        ),
+    )
+    p_run.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="print resolved env and command before launching",
+    )
+    p_run.add_argument(
+        "--qemu-icount", dest="qemu_icount", type=int, default=10000,
+        help=(
+            "QEMU plugin icount target (default: 10000; --mode icount uses "
+            "this as the drain target, --mode slice uses it as the safety "
+            "upper bound)"
+        ),
+    )
+    p_run.add_argument(
+        "--vsim-icount", dest="vsim_icount", type=int, default=5000,
+        help=(
+            "vsim --hybrid-icount drain target (default: 5000; "
+            "--mode icount and --mode slice only)"
+        ),
+    )
+    p_run.add_argument(
+        "--slice", dest="slice", type=int, default=1000,
+        help="insns per slice (default: 1000; --mode slice only)",
+    )
+    p_run.add_argument(
+        "--slice-at", dest="slice_at", type=int, default=1,
+        help="0-based slice index to drain at (default: 1; --mode slice only)",
+    )
+    p_run.add_argument(
+        "--mmap-size", dest="mmap_size", type=_parse_mmap_size,
+        default=_DEFAULT_MMAP_SIZE,
+        help=(
+            f"shared mmap size (default: 128M; accepts SPEC like 8G, 512M, "
+            f"1024). Honored for --mode icount/slice; csr/pc use tests/e2e.sh "
+            f"which has its own 128 MiB default. Set HSIM_MMAP_DIR=/path to "
+            f"redirect the backing file off /dev/shm."
+        ),
+    )
+    p_run.set_defaults(func=cmd_run)
+
+    p_test = sub.add_parser(
+        "test",
+        help="run the e2e test suite (wraps scripts/run_e2e.sh)",
+    )
+    p_test.add_argument(
+        "--filter",
+        default=None,
+        help="regex; only run tests whose name matches",
+    )
+    p_test.add_argument(
+        "--mode",
+        choices=("csr", "pc", "both"),
+        default="both",
+        help="trigger mode for round-trip fixtures (default: both)",
+    )
+    p_test.add_argument(
+        "--jobs",
+        type=int,
+        default=_DEFAULT_JOBS,
+        help=f"parallel job slots (default: {_DEFAULT_JOBS})",
+    )
+    p_test.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print resolved env and command without executing",
+    )
+    p_test.set_defaults(func=cmd_test)
+
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="env-health diagnoser (artifacts, submodules, toolchain, runtime)",
+        description=(
+            "Run a read-only env-health diagnose: artifacts, submodules, "
+            "toolchain, runtime. Exit 0 if no FAIL row; 1 otherwise."
+        ),
+    )
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    demo_list = ", ".join(f"{tid}={short}" for tid, short in _DEMO_ORDER)
+    p_demo = sub.add_parser(
+        "demo",
+        help="run a milestone demo by T-id or short name (T1..T7)",
+        description=(
+            "Run one demo from tests/demos/demo_*.sh. Selector accepts "
+            f"T-id (T1..T7), short name, or `demo_<short>`. Mapping: {demo_list}. "
+            "Pass per-run env overrides after `--`, e.g. "
+            "`./hsim demo T7 -- SLICE=400 MAXK=4`."
+        ),
+    )
+    p_demo.add_argument(
+        "selector",
+        nargs="?",
+        help="demo selector: T1..T7 or short name (e.g. csr_oneshot)",
+    )
+    p_demo.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the resolved env + command without executing",
+    )
+    p_demo.set_defaults(func=cmd_demo)
+    # `extras` is populated by main() after splitting argv on the first `--`,
+    # so argparse never sees the passthrough KEY=VAL tail. This avoids the
+    # argparse.REMAINDER gotcha that swallows `--dry-run` typed after the
+    # selector.
+
+    p_profile = sub.add_parser(
+        "profile",
+        help="M4: QEMU + plugin BBV profile pass (writes a SimPoint .bb file)",
+        description=(
+            "Run one QEMU+plugin profile pass: drain at the icount limit "
+            "while emitting one BBV row per `--slice` retired instructions. "
+            "Output is a SimPoint-compatible .bb file ready for "
+            "`./hsim cluster`."
+        ),
+    )
+    p_profile.add_argument(
+        "elf",
+        help="path to a RISC-V ELF (relative or absolute)",
+    )
+    p_profile.add_argument(
+        "--slice", dest="slice", type=int, default=1000,
+        help="retired insns per BBV row (default: 1000)",
+    )
+    p_profile.add_argument(
+        "--icount", type=int, default=10000,
+        help="total retired insns before drain (default: 10000)",
+    )
+    p_profile.add_argument(
+        "-o", "--output", required=True,
+        help="BBV output file (e.g. /tmp/profile.bb)",
+    )
+    p_profile.add_argument(
+        "--dry-run", action="store_true",
+        help="print the resolved QEMU command without executing",
+    )
+    p_profile.add_argument(
+        "--mmap-size", dest="mmap_size", type=_parse_mmap_size,
+        default=_DEFAULT_MMAP_SIZE,
+        help=(
+            f"shared mmap size (default: 128M; accepts SPEC like 8G, 512M, "
+            f"1024). Set HSIM_MMAP_DIR=/path to redirect off /dev/shm."
+        ),
+    )
+    p_profile.set_defaults(func=cmd_profile)
+
+    p_cluster = sub.add_parser(
+        "cluster",
+        help="M4: run SimPoint on a BBV file to pick representative phases",
+        description=(
+            "Cluster a BBV (.bb) file with tools/simpoint/bin/simpoint. "
+            "Writes one slice-index per cluster to --simpts and one "
+            "weight per cluster to --weights."
+        ),
+    )
+    p_cluster.add_argument(
+        "bbv",
+        help="path to a BBV (.bb) file produced by `./hsim profile`",
+    )
+    p_cluster.add_argument(
+        "--max-k", dest="max_k", type=int, default=2,
+        help="SimPoint -maxK (default: 2; tiny BBVs need conservative K)",
+    )
+    p_cluster.add_argument(
+        "--simpts", required=True,
+        help="output: slice-index per cluster",
+    )
+    p_cluster.add_argument(
+        "--weights", required=True,
+        help="output: weight per cluster (sums to ~1.0)",
+    )
+    p_cluster.add_argument(
+        "--dry-run", action="store_true",
+        help="print the resolved simpoint command without executing",
+    )
+    p_cluster.set_defaults(func=cmd_cluster)
+
+    p_archive = sub.add_parser(
+        "archive",
+        help="M6: archive a drained state into snap/N (state.bin + mem + meta.json)",
+        description=(
+            "Bundle a drained QEMU/vsim state file plus its /dev/shm mmap "
+            "into a portable snapshot directory. Counterpart to `./hsim replay`. "
+            "The state file must satisfy the v1 ABI (magic + version + size); "
+            "synthesise one with `./hsim run` or `./hsim profile`."
+        ),
+    )
+    p_archive.add_argument(
+        "--state", required=True,
+        help="path to a hybrid_state_v1 .bin file (from a prior drain)",
+    )
+    p_archive.add_argument(
+        "--mmap", required=True,
+        help="path to the /dev/shm mmap file used during the drain",
+    )
+    p_archive.add_argument(
+        "--elf", required=True,
+        help="ELF path stored in meta.json (e.g. tests/fixtures/rt_c_v_regs.elf)",
+    )
+    p_archive.add_argument(
+        "--mmap-size", dest="mmap_size", type=_parse_mmap_size,
+        default=_DEFAULT_MMAP_SIZE,
+        help=(
+            f"mmap size for the meta.json record (default: 128M; accepts "
+            f"SPEC like 8G, 512M, 1024)"
+        ),
+    )
+    p_archive.add_argument(
+        "-o", "--output", required=True,
+        help="snapshot directory (will be created if absent)",
+    )
+    p_archive.add_argument(
+        "--dry-run", action="store_true",
+        help="print resolved write_archive args without writing",
+    )
+    p_archive.set_defaults(func=cmd_archive)
+
+    p_replay = sub.add_parser(
+        "replay",
+        help="M7: replay a snap/N archive (resume with vsim or qemu)",
+        description=(
+            "Hydrate a snapshot directory and resume the chosen model. "
+            "vsim resumes from state.bin and drains on its CSR-exit trigger; "
+            "qemu resumes via gdbstub and continues to workload completion."
+        ),
+    )
+    p_replay.add_argument(
+        "snap",
+        help="path to a snap/N directory written by `./hsim archive`",
+    )
+    p_replay.add_argument(
+        "--resume-with", dest="resume_with",
+        choices=("vsim", "qemu"), default="vsim",
+        help="model to resume the archive with (default: vsim)",
+    )
+    p_replay.add_argument(
+        "--dry-run", action="store_true",
+        help="print the resolved orchestrator command without executing",
+    )
+    p_replay.set_defaults(func=cmd_replay)
+
+    p_estimate = sub.add_parser(
+        "estimate",
+        help="SimPoint cycle estimator: profile + cluster + per-phase mcycle delta",
+        description=(
+            "End-to-end SimPoint cycle estimator. Runs an M4 BBV profile "
+            "pass, clusters the result with SimPoint, drains QEMU + vsim "
+            "for each cluster representative slice, and aggregates a "
+            "weighted CPI to produce an estimated cycle count: "
+            "estimated_cycles = N_total * sum_i(w_i * CPI_i). Composes "
+            "F9 (profile + cluster) and F11 (slice mode) end to end."
+        ),
+    )
+    p_estimate.add_argument(
+        "elf",
+        help="path to a RISC-V ELF (relative or absolute)",
+    )
+    p_estimate.add_argument(
+        "--slice", dest="slice", type=int, default=1000,
+        help="insns per BBV row / per slice (default: 1000)",
+    )
+    p_estimate.add_argument(
+        "--icount", type=int, default=0,
+        help=(
+            "total retired insns for the M4 profile pass "
+            "(default: 0 means run to program exit and read minstret "
+            "from the plugin atexit drain; pass a positive N to cap "
+            "the profile pass at N insns and use N as the multiplier)"
+        ),
+    )
+    p_estimate.add_argument(
+        "--max-k", dest="max_k", type=int, default=2,
+        help="SimPoint -maxK (default: 2; tiny BBVs need conservative K)",
+    )
+    p_estimate.add_argument(
+        "--vsim-icount", dest="vsim_icount", type=int, default=0,
+        help=(
+            "vsim --hybrid-icount per phase (default: 0 -> use --slice "
+            "for SimPoint-correct CPI math)"
+        ),
+    )
+    p_estimate.add_argument(
+        "--mmap-size", dest="mmap_size", type=_parse_mmap_size,
+        default=_DEFAULT_MMAP_SIZE,
+        help=(
+            f"shared mmap size for the profile + per-phase drain pairs "
+            f"(default: 128M; accepts SPEC like 8G, 512M, 1024). "
+            f"Set HSIM_MMAP_DIR=/path to redirect off /dev/shm."
+        ),
+    )
+    p_estimate.set_defaults(func=cmd_estimate)
+
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    if "--" in argv:
+        idx = argv.index("--")
+        head, tail = argv[:idx], argv[idx + 1:]
+    else:
+        head, tail = argv, []
+    parser = build_parser()
+    args = parser.parse_args(head)
+    args.extras = tail
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
