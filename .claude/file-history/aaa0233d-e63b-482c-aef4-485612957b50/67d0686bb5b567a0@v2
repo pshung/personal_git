@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# RED test for F13: --mmap-size SPEC + HSIM_MMAP_DIR backend selection.
+#
+# Adds the user-facing knobs for requesting an mmap size beyond the
+# default 128 MiB. Selection logic is one rule: honor HSIM_MMAP_DIR
+# if set (else /dev/shm), validate via statvfs, error rc=2 with a clear
+# hint if the pinned dir cannot hold the request.
+#
+# All assertions use `./hsim profile ... --dry-run` because cmd_profile
+# allocates the mmap BEFORE the dry-run check, so the status line + size
+# validation are observable without spawning QEMU.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+HSIM="$ROOT/hsim"
+
+fail() { echo "[FAIL] $*" >&2; exit 1; }
+ok()   { echo "[ok] $*"; }
+
+[ -x "$HSIM" ] || fail "missing executable: $HSIM"
+ELF="$ROOT/tests/fixtures/icount_spin.elf"
+[ -f "$ELF" ] || fail "missing fixture: $ELF (run ./hsim build first)"
+
+WORK=$(mktemp -d -t hsim-mmap-backend.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+
+cd "$ROOT"
+
+# 1. run --help mentions --mmap-size.
+out=$("$HSIM" run --help 2>&1) || fail "run --help non-zero: $out"
+echo "$out" | grep -qE -- '--mmap-size' \
+  || fail "run --help missing --mmap-size:"$'\n'"$out"
+ok "run --help mentions --mmap-size"
+
+# 2. profile --help mentions --mmap-size.
+out=$("$HSIM" profile --help 2>&1) || fail "profile --help non-zero: $out"
+echo "$out" | grep -qE -- '--mmap-size' \
+  || fail "profile --help missing --mmap-size:"$'\n'"$out"
+ok "profile --help mentions --mmap-size"
+
+# 3. estimate --help mentions --mmap-size.
+out=$("$HSIM" estimate --help 2>&1) || fail "estimate --help non-zero: $out"
+echo "$out" | grep -qE -- '--mmap-size' \
+  || fail "estimate --help missing --mmap-size:"$'\n'"$out"
+ok "estimate --help mentions --mmap-size"
+
+# 4. --mmap-size with bogus suffix -> rc=2 with parse-error hint.
+set +e
+out=$("$HSIM" profile "$ELF" --slice 1000 --icount 10000 \
+        -o "$WORK/foo.bb" --mmap-size 8XBG --dry-run 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "bogus --mmap-size rc=$rc (expected 2):"$'\n'"$out"
+echo "$out" | grep -qiE 'invalid|size|suffix' \
+  || fail "bogus --mmap-size missing parse-error hint:"$'\n'"$out"
+ok "--mmap-size 8XBG -> rc=2 with parse-error hint"
+
+# 5. --mmap-size 999T (1 PiB-ish) won't fit any host -> rc=2 with hint.
+set +e
+out=$("$HSIM" profile "$ELF" --slice 1000 --icount 10000 \
+        -o "$WORK/foo.bb" --mmap-size 999T --dry-run 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "oversize --mmap-size rc=$rc (expected 2):"$'\n'"$out"
+echo "$out" | grep -qiE 'free|space|HSIM_MMAP_DIR' \
+  || fail "oversize --mmap-size missing NoSpace hint:"$'\n'"$out"
+ok "--mmap-size 999T -> rc=2 with NoSpace hint"
+
+# 6. HSIM_MMAP_DIR=/no/such/dir -> rc=2 with hint.
+set +e
+out=$(HSIM_MMAP_DIR=/no/such/hsim-dir "$HSIM" profile "$ELF" \
+        --slice 1000 --icount 10000 -o "$WORK/foo.bb" \
+        --mmap-size 128M --dry-run 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "bad HSIM_MMAP_DIR rc=$rc (expected 2):"$'\n'"$out"
+echo "$out" | grep -qiE 'directory|HSIM_MMAP_DIR|not.*exist|no such' \
+  || fail "bad HSIM_MMAP_DIR missing hint:"$'\n'"$out"
+ok "HSIM_MMAP_DIR=/no/such/dir -> rc=2 with hint"
+
+# 7. HSIM_MMAP_DIR=$WORK + --mmap-size 128M --dry-run -> rc=0, status line.
+out=$(HSIM_MMAP_DIR="$WORK" "$HSIM" profile "$ELF" \
+        --slice 1000 --icount 10000 -o "$WORK/foo.bb" \
+        --mmap-size 128M --dry-run 2>&1) \
+  || fail "HSIM_MMAP_DIR=$WORK --dry-run non-zero:"$'\n'"$out"
+echo "$out" | grep -qE '\[hsim mmap\]' \
+  || fail "missing [hsim mmap] status line:"$'\n'"$out"
+echo "$out" | grep -qF "$WORK" \
+  || fail "status line should reference $WORK:"$'\n'"$out"
+ok "HSIM_MMAP_DIR=$WORK + --mmap-size 128M -> rc=0 with [hsim mmap] line at $WORK"
+
+# 8. Default (no flag, no env) still uses /dev/shm at 128 MiB (regression guard).
+out=$("$HSIM" profile "$ELF" --slice 1000 --icount 10000 \
+        -o "$WORK/foo.bb" --dry-run 2>&1) \
+  || fail "default profile --dry-run non-zero:"$'\n'"$out"
+echo "$out" | grep -qE '\[hsim mmap\]' \
+  || fail "default missing [hsim mmap] status line:"$'\n'"$out"
+echo "$out" | grep -qE '/dev/shm' \
+  || fail "default status line should reference /dev/shm:"$'\n'"$out"
+ok "default --dry-run uses /dev/shm with [hsim mmap] line"
+
+echo "PASS test_hsim_mmap_backend"

@@ -1,0 +1,112 @@
+"""Shared-mmap allocation for the hsim driver (F13).
+
+One module, one rule: the caller asks for `size` bytes; we honor
+HSIM_MMAP_DIR if set (else /dev/shm), check free space via statvfs,
+allocate a sparse file there with `mkstemp + truncate`, and print one
+status line to stdout. No fallback chain, no filesystem-type probing.
+
+If the pinned directory cannot hold the request, raise NoSpaceError --
+the caller turns it into rc=2 with the hint baked into the message.
+
+Public surface:
+
+    parse_size(spec)      -> int      # "8G" -> 8 * 1024**3
+    select_mmap_dir(size) -> Path     # honors HSIM_MMAP_DIR, statvfs-checks
+    allocate(size, prefix) -> Path    # mkstemp + truncate + status line
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+
+_SAFETY_MARGIN = 256 * 1024 * 1024  # 256 MiB headroom on top of `size`
+_SUFFIXES = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+_SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGT]?)\s*$", re.IGNORECASE)
+
+
+class NoSpaceError(RuntimeError):
+    """Pinned mmap directory does not have enough free space."""
+
+
+def parse_size(spec: str) -> int:
+    """Parse "8G", "512M", "1024", "1.5G" into a positive byte count.
+
+    Raises argparse.ArgumentTypeError so argparse converts the failure
+    into a clean rc=2 with the error text.
+    """
+    m = _SIZE_RE.match(str(spec))
+    if not m:
+        raise argparse.ArgumentTypeError(
+            f"invalid mmap size {spec!r}: expected <number>[K|M|G|T] "
+            f"(e.g. '128M', '8G', '1024')"
+        )
+    num, suffix = m.group(1), m.group(2).upper()
+    multiplier = _SUFFIXES.get(suffix, 1)
+    size = int(float(num) * multiplier)
+    if size <= 0:
+        raise argparse.ArgumentTypeError(
+            f"invalid mmap size {spec!r}: must be > 0"
+        )
+    return size
+
+
+def select_mmap_dir(size: int) -> Path:
+    """Resolve the pinned mmap directory and validate free space.
+
+    HSIM_MMAP_DIR overrides; default is /dev/shm. No fallback if the
+    pinned dir cannot hold (size + _SAFETY_MARGIN): we raise NoSpaceError
+    with a hint pointing at the env var.
+    """
+    pinned = os.environ.get("HSIM_MMAP_DIR")
+    target = Path(pinned) if pinned else Path("/dev/shm")
+    label = f"HSIM_MMAP_DIR={pinned!r}" if pinned else "/dev/shm (default)"
+    if not target.is_dir():
+        raise NoSpaceError(
+            f"mmap directory does not exist: {target} ({label}); "
+            f"set HSIM_MMAP_DIR=/path/to/existing/dir"
+        )
+    st = os.statvfs(target)
+    free = st.f_bavail * st.f_frsize
+    need = size + _SAFETY_MARGIN
+    if free < need:
+        raise NoSpaceError(
+            f"{target} has {free} bytes free, need {need} "
+            f"(size={size} + 256 MiB margin); "
+            f"set HSIM_MMAP_DIR to a directory with more free space"
+        )
+    return target
+
+
+def _format_bytes(n: int) -> str:
+    for suffix, mul in (("TiB", 1024**4), ("GiB", 1024**3),
+                        ("MiB", 1024**2), ("KiB", 1024)):
+        if n >= mul:
+            return f"{n / mul:.1f} {suffix}"
+    return f"{n} B"
+
+
+def allocate(size: int, prefix: str = "hsim-shm.") -> Path:
+    """Allocate a sparse mmap file of `size` bytes in the pinned dir.
+
+    Prints one status line to stdout:
+        [hsim mmap] 8.0 GiB at /scratch (free: 64.0 GiB)
+    Caller owns lifetime (unlink when done).
+    """
+    target = select_mmap_dir(size)
+    fd, name = tempfile.mkstemp(prefix=prefix, dir=str(target))
+    os.close(fd)
+    path = Path(name)
+    os.truncate(path, size)
+    st = os.statvfs(target)
+    free = st.f_bavail * st.f_frsize
+    print(
+        f"[hsim mmap] {_format_bytes(size)} at {target} "
+        f"(free: {_format_bytes(free)})",
+        file=sys.stdout, flush=True,
+    )
+    return path
