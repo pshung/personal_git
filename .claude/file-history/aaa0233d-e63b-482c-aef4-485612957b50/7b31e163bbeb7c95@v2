@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# RED test for `./hsim profile` (M4 BBV emit) and `./hsim cluster`
+# (SimPoint clustering of a BBV file). Same shape as test_hsim_demo.sh.
+#
+# profile : QEMU + plugin with bbv_out=,slice=N,icount=M  -> writes BBV file.
+# cluster : tools/simpoint/bin/simpoint -loadFVFile <bbv> -> writes simpts + weights.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+HSIM="$ROOT/hsim"
+
+fail() { echo "[FAIL] $*" >&2; exit 1; }
+ok()   { echo "[ok] $*"; }
+
+[ -x "$HSIM" ] || fail "missing executable: $HSIM"
+
+WORK=$(mktemp -d -t hsim-profile-cluster.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+
+BBV="$WORK/profile.bb"
+SIMPTS="$WORK/simpts"
+WEIGHTS="$WORK/weights"
+ELF="$ROOT/tests/fixtures/icount_spin.elf"
+
+# 1. profile --help mentions key flags.
+out=$("$HSIM" profile --help 2>&1) || fail "profile --help non-zero: $out"
+echo "$out" | grep -qE -- '--slice' \
+  || fail "profile --help missing --slice:"$'\n'"$out"
+echo "$out" | grep -qE -- '--icount' \
+  || fail "profile --help missing --icount:"$'\n'"$out"
+echo "$out" | grep -qE -- '-o|--output' \
+  || fail "profile --help missing -o/--output:"$'\n'"$out"
+ok "profile --help mentions --slice, --icount, -o"
+
+# 2. cluster --help mentions key flags.
+out=$("$HSIM" cluster --help 2>&1) || fail "cluster --help non-zero: $out"
+echo "$out" | grep -qE -- '--max-k' \
+  || fail "cluster --help missing --max-k:"$'\n'"$out"
+echo "$out" | grep -qE -- '--simpts' \
+  || fail "cluster --help missing --simpts:"$'\n'"$out"
+echo "$out" | grep -qE -- '--weights' \
+  || fail "cluster --help missing --weights:"$'\n'"$out"
+ok "cluster --help mentions --max-k, --simpts, --weights"
+
+# 3. profile with no ELF -> rc=2.
+set +e
+out=$("$HSIM" profile 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "profile (no arg) rc=$rc (expected 2):"$'\n'"$out"
+ok "profile without ELF -> rc=2"
+
+# 4. profile <bogus.elf> -> rc=2 with 'not found' hint.
+set +e
+out=$("$HSIM" profile "/no/such/file.elf" -o "$BBV" 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "profile bogus rc=$rc (expected 2):"$'\n'"$out"
+echo "$out" | grep -qiE 'not found|no such' \
+  || fail "profile bogus missing 'not found' hint:"$'\n'"$out"
+ok "profile bogus ELF -> rc=2 with hint"
+
+# 5. profile --dry-run prints resolved cmd without executing.
+out=$("$HSIM" profile "$ELF" --slice 1000 --icount 10000 -o "$BBV" --dry-run 2>&1) \
+  || fail "profile --dry-run rc != 0: $out"
+echo "$out" | grep -qE "bbv_out=.*profile\.bb" \
+  || fail "dry-run missing bbv_out= in resolved cmd:"$'\n'"$out"
+echo "$out" | grep -qE 'slice=1000' \
+  || fail "dry-run missing slice=1000:"$'\n'"$out"
+echo "$out" | grep -qE 'icount=10000' \
+  || fail "dry-run missing icount=10000:"$'\n'"$out"
+[ ! -f "$BBV" ] || fail "dry-run wrote $BBV (should not execute)"
+ok "profile --dry-run shows resolved cmd, no side effect"
+
+# 6. Missing qemu artifact -> rc=2 with 'not built' hint.
+set +e
+out=$(VSIM_QEMU=/no/such/qemu "$HSIM" profile "$ELF" -o "$BBV" 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "missing-qemu profile rc=$rc (expected 2):"$'\n'"$out"
+echo "$out" | grep -qE 'qemu.*not built' \
+  || fail "no 'not built' hint for qemu:"$'\n'"$out"
+ok "missing qemu artifact -> rc=2 with 'not built' hint"
+
+# 7. Real profile run on icount_spin.elf writes a non-empty BBV with the
+#    expected row count (icount / slice).
+[ -f "$ELF" ] || fail "missing fixture: $ELF (run ./hsim build first)"
+out=$("$HSIM" profile "$ELF" --slice 1000 --icount 10000 -o "$BBV" 2>&1) \
+  || fail "profile real run rc != 0:"$'\n'"$out"
+[ -s "$BBV" ] || fail "profile real run produced empty BBV"
+ROWS=$(wc -l < "$BBV")
+[ "$ROWS" -eq 10 ] \
+  || fail "expected 10 BBV rows (icount/slice=10), got $ROWS:"$'\n'"$(head -5 "$BBV")"
+ok "profile real run on icount_spin.elf -> $ROWS BBV rows"
+
+# 8. cluster on bogus BBV -> rc=2 with hint.
+set +e
+out=$("$HSIM" cluster "/no/such/file.bb" --max-k 2 --simpts "$SIMPTS" --weights "$WEIGHTS" 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "cluster bogus rc=$rc (expected 2):"$'\n'"$out"
+echo "$out" | grep -qiE 'not found|no such' \
+  || fail "cluster bogus missing 'not found' hint:"$'\n'"$out"
+ok "cluster bogus BBV -> rc=2 with hint"
+
+# 9. Real cluster: BBV from step 7 -> non-empty simpts + weights.
+out=$("$HSIM" cluster "$BBV" --max-k 2 --simpts "$SIMPTS" --weights "$WEIGHTS" 2>&1) \
+  || fail "cluster real run rc != 0:"$'\n'"$out"
+[ -s "$SIMPTS" ]  || fail "simpts empty"
+[ -s "$WEIGHTS" ] || fail "weights empty"
+ok "cluster real run -> non-empty simpts + weights"
+
+echo "PASS test_hsim_profile_cluster"

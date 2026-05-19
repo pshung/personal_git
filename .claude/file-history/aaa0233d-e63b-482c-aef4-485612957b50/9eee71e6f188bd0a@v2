@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# RED test for `./hsim archive` (M6) and `./hsim replay` (M7).
+# Same shape as test_hsim_profile_cluster.sh.
+#
+# archive : wraps orchestrator.checkpoint.write_archive; takes a drained
+#           state.bin + mmap file + elf, writes snap/{state.bin, mem, meta.json}.
+# replay  : wraps `python3 -m orchestrator.main replay-checkpoint`;
+#           hydrates the snap dir and resumes with vsim or qemu.
+#
+# The "real run" replay path is NOT exercised here -- that needs the full
+# QEMU + vsim pipeline and is already covered by demo T7 (simpoint_loop).
+# We test the CLI surface: input validation, --dry-run, archive happy
+# path with a synthesized state.bin.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+HSIM="$ROOT/hsim"
+
+fail() { echo "[FAIL] $*" >&2; exit 1; }
+ok()   { echo "[ok] $*"; }
+
+[ -x "$HSIM" ] || fail "missing executable: $HSIM"
+
+WORK=$(mktemp -d -t hsim-archive-replay.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+
+STATE="$WORK/state.bin"
+MMAP="$WORK/mmap.bin"
+SNAP="$WORK/snap/0"
+ELF="$ROOT/tests/fixtures/rt_c_v_regs.elf"
+
+# 1. archive --help mentions --state, --mmap, --elf, -o.
+out=$("$HSIM" archive --help 2>&1) || fail "archive --help non-zero: $out"
+echo "$out" | grep -qE -- '--state' \
+  || fail "archive --help missing --state:"$'\n'"$out"
+echo "$out" | grep -qE -- '--mmap' \
+  || fail "archive --help missing --mmap:"$'\n'"$out"
+echo "$out" | grep -qE -- '--elf' \
+  || fail "archive --help missing --elf:"$'\n'"$out"
+echo "$out" | grep -qE -- '-o|--output' \
+  || fail "archive --help missing -o/--output:"$'\n'"$out"
+ok "archive --help mentions --state, --mmap, --elf, -o"
+
+# 2. replay --help mentions --resume-with and snap_dir.
+out=$("$HSIM" replay --help 2>&1) || fail "replay --help non-zero: $out"
+echo "$out" | grep -qE -- '--resume-with' \
+  || fail "replay --help missing --resume-with:"$'\n'"$out"
+echo "$out" | grep -qiE 'snap' \
+  || fail "replay --help missing snap mention:"$'\n'"$out"
+ok "replay --help mentions --resume-with and snap"
+
+# 3. archive with no args -> rc=2.
+set +e
+out=$("$HSIM" archive 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "archive (no arg) rc=$rc (expected 2):"$'\n'"$out"
+ok "archive without args -> rc=2"
+
+# 4. archive missing --state file -> rc=2 with 'not found' hint.
+touch "$MMAP"
+set +e
+out=$("$HSIM" archive --state "/no/such/state.bin" --mmap "$MMAP" \
+        --elf "$ELF" -o "$SNAP" 2>&1)
+rc=$?
+set -e
+rm -f "$MMAP"
+[ "$rc" -eq 2 ] || fail "archive bogus state rc=$rc (expected 2):"$'\n'"$out"
+echo "$out" | grep -qiE 'not found|no such' \
+  || fail "archive bogus state missing 'not found' hint:"$'\n'"$out"
+ok "archive missing --state -> rc=2 with hint"
+
+# 5. archive missing --mmap file -> rc=2 with hint.
+touch "$STATE"
+set +e
+out=$("$HSIM" archive --state "$STATE" --mmap "/no/such/mmap" \
+        --elf "$ELF" -o "$SNAP" 2>&1)
+rc=$?
+set -e
+rm -f "$STATE"
+[ "$rc" -eq 2 ] || fail "archive bogus mmap rc=$rc (expected 2):"$'\n'"$out"
+echo "$out" | grep -qiE 'not found|no such' \
+  || fail "archive bogus mmap missing 'not found' hint:"$'\n'"$out"
+ok "archive missing --mmap -> rc=2 with hint"
+
+# Synthesize a minimal valid state.bin + a 1 MiB mmap for steps 6 + 7.
+# The state must satisfy validate_state_file: correct size, magic, version.
+# vlenb is set so meta.json carries a real number.
+PYTHONPATH="$ROOT/tools" python3 - <<PY
+import struct
+from orchestrator.abi import (
+    HYBRID_STATE_V1_SIZE,
+    HYBRID_STATE_MAGIC,
+    HYBRID_STATE_VERSION,
+    HYBRID_FLAG_RV64,
+    HYBRID_FLAG_V,
+)
+buf = bytearray(HYBRID_STATE_V1_SIZE)
+# magic (offset 0), version (offset 4), flags (offset 8)
+struct.pack_into("<III", buf, 0,
+                 HYBRID_STATE_MAGIC, HYBRID_STATE_VERSION,
+                 HYBRID_FLAG_RV64 | HYBRID_FLAG_V)
+# vlenb at offset 1312
+struct.pack_into("<Q", buf, 1312, 64)
+with open("$STATE", "wb") as f:
+    f.write(bytes(buf))
+PY
+[ -s "$STATE" ] || fail "could not synthesize state.bin"
+MMAP_SIZE=$((1 * 1024 * 1024))
+truncate -s "$MMAP_SIZE" "$MMAP"
+
+# 6. archive --dry-run prints resolved args without writing.
+out=$("$HSIM" archive --state "$STATE" --mmap "$MMAP" --elf "$ELF" \
+        --mmap-size "$MMAP_SIZE" -o "$SNAP" --dry-run 2>&1) \
+  || fail "archive --dry-run rc != 0:"$'\n'"$out"
+echo "$out" | grep -qE "state=.*state\.bin" \
+  || fail "dry-run missing state=...state.bin:"$'\n'"$out"
+echo "$out" | grep -qE "mmap=.*mmap\.bin" \
+  || fail "dry-run missing mmap=...mmap.bin:"$'\n'"$out"
+echo "$out" | grep -qE "elf=.*rt_c_v_regs\.elf" \
+  || fail "dry-run missing elf=...rt_c_v_regs.elf:"$'\n'"$out"
+[ ! -d "$SNAP" ] || fail "dry-run wrote $SNAP (should not execute)"
+ok "archive --dry-run shows resolved args, no side effect"
+
+# 7. Real archive: state + mmap synthesized above -> snap/{state.bin, mem, meta.json}.
+out=$("$HSIM" archive --state "$STATE" --mmap "$MMAP" --elf "$ELF" \
+        --mmap-size "$MMAP_SIZE" -o "$SNAP" 2>&1) \
+  || fail "archive real run rc != 0:"$'\n'"$out"
+[ -s "$SNAP/state.bin" ] || fail "archive: missing/empty state.bin"
+[ -s "$SNAP/mem" ]       || fail "archive: missing/empty mem"
+[ -s "$SNAP/meta.json" ] || fail "archive: missing/empty meta.json"
+# Spot-check meta.json: it must mention RV64 + V flags from our synth state.
+grep -q '"RV64"' "$SNAP/meta.json" \
+  || fail "meta.json missing RV64 flag:"$'\n'"$(cat "$SNAP/meta.json")"
+grep -q '"V"' "$SNAP/meta.json" \
+  || fail "meta.json missing V flag:"$'\n'"$(cat "$SNAP/meta.json")"
+ok "archive real run wrote state.bin + mem + meta.json"
+
+# 8. replay with no args -> rc=2.
+set +e
+out=$("$HSIM" replay 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "replay (no arg) rc=$rc (expected 2):"$'\n'"$out"
+ok "replay without args -> rc=2"
+
+# 9. replay on missing snap dir -> rc=2 with hint.
+set +e
+out=$("$HSIM" replay "/no/such/snap" 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "replay bogus rc=$rc (expected 2):"$'\n'"$out"
+echo "$out" | grep -qiE 'not found|no such' \
+  || fail "replay bogus missing 'not found' hint:"$'\n'"$out"
+ok "replay missing snap -> rc=2 with hint"
+
+# 10. replay --dry-run prints orchestrator argv.
+out=$("$HSIM" replay "$SNAP" --resume-with vsim --dry-run 2>&1) \
+  || fail "replay --dry-run rc != 0:"$'\n'"$out"
+echo "$out" | grep -qE 'orchestrator\.main' \
+  || fail "dry-run missing orchestrator.main module ref:"$'\n'"$out"
+echo "$out" | grep -qE 'replay-checkpoint' \
+  || fail "dry-run missing replay-checkpoint subcommand:"$'\n'"$out"
+echo "$out" | grep -qE -- '--resume-with vsim' \
+  || fail "dry-run missing --resume-with vsim:"$'\n'"$out"
+ok "replay --dry-run shows orchestrator argv"
+
+# 11. Missing vsim artifact -> rc=2 with 'not built' hint (non-dry-run path).
+set +e
+out=$(VSIM_BIN=/no/such/vsim "$HSIM" replay "$SNAP" --resume-with vsim 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "missing-vsim replay rc=$rc (expected 2):"$'\n'"$out"
+echo "$out" | grep -qE 'vsim.*not built' \
+  || fail "no 'not built' hint for vsim:"$'\n'"$out"
+ok "missing vsim artifact -> rc=2 with 'not built' hint"
+
+echo "PASS test_hsim_archive_replay"
