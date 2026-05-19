@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# RED test for F11: `./hsim run <elf> --mode {icount, slice}`.
+# Extends F3's cmd_run with two new --mode choices. csr/pc paths are
+# preserved byte-identically (test_hsim_run_smoke.sh still passes).
+#
+# Workload: icount_spin.elf (CSR-less tight 2-insn loop). Neither side
+# could use csrwi 0x7C0 -- the icount/slice triggers ARE the only
+# available drain mechanism for this fixture.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+HSIM="$ROOT/hsim"
+
+fail() { echo "[FAIL] $*" >&2; exit 1; }
+ok()   { echo "[ok] $*"; }
+
+[ -x "$HSIM" ] || fail "missing executable: $HSIM"
+ELF="$ROOT/tests/fixtures/icount_spin.elf"
+[ -f "$ELF" ] || fail "missing fixture: $ELF (run ./hsim build first)"
+
+cd "$ROOT"
+
+# 1. run --help lists all four --mode choices.
+out=$("$HSIM" run --help 2>&1) || fail "run --help non-zero: $out"
+for choice in csr pc icount slice; do
+  echo "$out" | grep -qE "$choice" \
+    || fail "run --help missing --mode choice '$choice':"$'\n'"$out"
+done
+ok "run --help lists csr, pc, icount, slice"
+
+# 2. run --help mentions icount/slice flags.
+for flag in --qemu-icount --vsim-icount --slice --slice-at; do
+  echo "$out" | grep -qE -- "$flag" \
+    || fail "run --help missing $flag:"$'\n'"$out"
+done
+ok "run --help mentions --qemu-icount, --vsim-icount, --slice, --slice-at"
+
+# 3. icount with bogus ELF -> rc=2 with path hint.
+set +e
+out=$("$HSIM" run /no/such/foo.elf --mode icount 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "bogus-ELF icount rc=$rc (expected 2):"$'\n'"$out"
+echo "$out" | grep -q "/no/such/foo.elf" \
+  || fail "bogus-ELF missing path hint:"$'\n'"$out"
+ok "bogus ELF --mode icount -> rc=2 with hint"
+
+# 4. icount with missing vsim -> rc=2 with 'not built' hint.
+set +e
+out=$(VSIM_BIN=/no/such/vsim "$HSIM" run "$ELF" --mode icount 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "missing-vsim icount rc=$rc (expected 2):"$'\n'"$out"
+echo "$out" | grep -qi "vsim not built" \
+  || fail "missing-vsim missing hint:"$'\n'"$out"
+ok "missing vsim --mode icount -> rc=2 with hint"
+
+# 5. Real icount run on icount_spin -> rc=0.
+set +e
+out=$(timeout 60 "$HSIM" run "$ELF" --mode icount \
+        --qemu-icount 10000 --vsim-icount 5000 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "icount real run rc=$rc:"$'\n'"$out"
+echo "$out" | grep -qiE 'pass|drain' \
+  || fail "icount run missing PASS/drain marker:"$'\n'"$out"
+ok "real ./hsim run --mode icount on icount_spin -> rc=0"
+
+# 6. Real slice run on icount_spin -> rc=0.
+set +e
+out=$(timeout 60 "$HSIM" run "$ELF" --mode slice \
+        --slice 1000 --slice-at 1 --vsim-icount 5000 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "slice real run rc=$rc:"$'\n'"$out"
+echo "$out" | grep -qiE 'pass|drain' \
+  || fail "slice run missing PASS/drain marker:"$'\n'"$out"
+ok "real ./hsim run --mode slice on icount_spin -> rc=0"
+
+echo "PASS test_hsim_run_icount_slice"
