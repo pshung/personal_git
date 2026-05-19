@@ -1,219 +1,156 @@
-# Plan: promote M3..M7 + add SimPoint cycle estimator
+# Plan: F13 -- user-specified mmap size with explicit backend dir
 
 ## Context
 
-`driver_ROADMAP.md:252` lists this as deferred:
+Today the QEMU+vsim shared mmap is hardcoded to 128 MiB under `/dev/shm`
+in 5 places (`hsim:660`, `hsim:822`, `tests/e2e.sh:56`, two test fixtures).
+The choice is invisible to users; there is no way to request a larger
+mmap, and no way to redirect the backing file off tmpfs.
 
-> M3..M8 (icount, BBV, slice, archive, replay) -- currently only
-> reachable via the demo scripts.
+Workloads with a memory footprint > /dev/shm capacity (typically RAM/2)
+have no escape hatch today. This feature adds two knobs and one rule:
 
-The plumbing already works (QEMU plugin, vsim, `tools/orchestrator/`),
-but to drive M3..M7 today a user must either edit a `tests/demos/demo_*.sh`
-env knob, hand-write QEMU+plugin argv, or author a YAML plan and call
-`python -m orchestrator.main run`. There is no typed-flag `./hsim`
-entry point.
+- `--mmap-size SPEC` -- per-invocation request ("8G", "512M", "1024").
+- `HSIM_MMAP_DIR=/path` -- env override of the backing directory.
+- Hard rule: we never auto-fall-back to a different filesystem. If the
+  pinned directory does not have space, we error rc=2 with a clear hint
+  pointing at `HSIM_MMAP_DIR`. No tmpfs/disk probing. No surprises.
 
-Goal: expose each mode as a first-class `./hsim` subcommand with proper
-argparse flags, reusing the orchestrator. Then on top of those primitives,
-add a separate `./hsim estimate` command that does the classical SimPoint
-cycle aggregation:
-
-    estimated_cycles = N_total_insns * sum_k ( w_k * delta_mcycle_k / slice )
-
-M8 (natural csrwi-exit / PC-exit) is already covered by `./hsim run`.
+Rationale for the hard rule: filesystem type cannot be inferred safely.
+On most Arch hosts `/tmp` is itself tmpfs (systemd's `tmp.mount`), so a
+"fall back to /tmp" heuristic is cosmetic. The user owns disk topology;
+we just honor their choice and validate it.
 
 ## Surface
 
-| Mode  | New `./hsim` entry                                                            |
-|-------|-------------------------------------------------------------------------------|
-| M3    | `./hsim run <elf> --mode icount --qemu-icount N --vsim-icount M`              |
-| M4    | `./hsim profile <elf> --slice N --icount M -o BBV`                            |
-| M4*   | `./hsim cluster BBV --max-k K --simpts P --weights P`                         |
-| M5    | `./hsim run <elf> --mode slice --slice N --slice-at K`                        |
-| M6    | `./hsim archive --state S --mmap M --elf E -o snap/K`                         |
-| M7    | `./hsim replay snap/K --resume-with {vsim,qemu}`                              |
-| -     | `./hsim estimate <elf> --slice N --icount M --max-k K`                        |
-
-M3 and M5 fold into F3's `cmd_run` as new `--mode` choices. M4 / M6 / M7 /
-estimate are new top-level subcommands. No new QEMU / vsim argv code:
-all five reuse `tools/orchestrator/`.
-
-## Features (one session each, F9..F12)
-
-### F9 - `./hsim profile` + `./hsim cluster` (M4 pair)
-
-- Type: behavioral.
-- Description: `profile` runs one QEMU+plugin pass with
-  `bbv_out=,slice=N,icount=M`. `cluster` calls
-  `tools/simpoint/bin/simpoint` directly on a BBV file and writes
-  the `simpts` + `weights` outputs. Two subcommands because the
-  output of the first is the input of the second.
-- Pivot from plan v1: today's orchestrator `qemu_drain_argv`
-  (`tools/orchestrator/spawn.py:17`) does not thread plugin params
-  from `trigger.params` -- it bakes only `outfile=`. Rather than
-  expand F9 to a cross-component orchestrator extension, F9 imports
-  `qemu_drain_argv` and APPENDS the BBV plugin extras to the last
-  `-plugin` argv slot. 90% of the QEMU flags stay DRY; the orchestrator
-  extension is deferred to a future session that gets to refactor
-  all three demo scripts at once.
-- Key files:
-  - **Modify** `hsim` -- add `cmd_profile`, `cmd_cluster`, two
-    subparsers. `cmd_profile` reuses `qemu_drain_argv` then mutates
-    the last argv element to append `bbv_out=...,slice=...,icount=...`,
-    spawns QEMU directly via `subprocess.Popen`, manages the shared
-    `/dev/shm` mmap with `tempfile.NamedTemporaryFile` + `os.truncate`.
-    `cmd_cluster` shells out to the SimPoint binary.
-  - **Create** `tests/hsim/test_hsim_profile_cluster.sh` -- RED test.
-- Dependencies: F3 (`_resolve_artifacts`).
-- Done criteria:
-  - `./hsim profile tests/fixtures/icount_spin.elf --slice 1000 --icount 10000 -o /tmp/foo.bb` exits 0 and writes 10 BBV rows.
-  - `./hsim cluster /tmp/foo.bb --max-k 2 --simpts /tmp/s --weights /tmp/w` exits 0 with non-empty outputs.
-  - `--dry-run` on both prints resolved cmds without execution.
-  - Missing artifact -> rc=2 with the existing `not built` hint.
-  - `JOBS=8 MODE=both bash scripts/run_e2e.sh` still 45 PASS / 0 FAIL.
-
-### F10 - `./hsim archive` + `./hsim replay` (M6 + M7 pair)
-
-- Type: behavioral.
-- Description: `archive` wraps
-  `orchestrator.checkpoint.write_archive(...)` via a tiny
-  `python3 -c` (matches the pattern in `demo_simpoint_loop.sh:148`).
-  `replay` wraps `python3 -m orchestrator.main replay-checkpoint`
-  (already implemented; just expose it as a sibling of `./hsim run`).
-- Key files:
-  - **Modify** `hsim` -- add `cmd_archive`, `cmd_replay`, two subparsers.
-  - **Create** `tests/hsim/test_hsim_archive_replay.sh` -- RED test.
-- Dependencies: F3 (`_resolve_artifacts`).
-- Done criteria:
-  - `./hsim archive --state /tmp/q.bin --mmap /tmp/shm --elf rt_c_v_regs.elf -o /tmp/snap/0` writes `state.bin` + `mem` + `meta.json`.
-  - `./hsim replay /tmp/snap/0 --resume-with vsim` exits 0 in <60s.
-  - `--dry-run` prints resolved cmd without execution.
-  - 45 PASS / 0 FAIL holds.
-
-### F11 - extend `./hsim run --mode {icount, slice}` (M3 + M5)
-
-- Type: behavioral.
-- Description: Add two new `--mode` choices to F3's `cmd_run`.
-  New flags only bind when the matching mode is selected:
-  - `--mode icount`: `--qemu-icount N` (default 10000), `--vsim-icount M` (default 5000).
-  - `--mode slice`:  `--slice N` (default 1000), `--slice-at K` (default 1), `--vsim-icount M` (default 5000).
-  csr / pc keep the current `tests/e2e.sh` path (no regression risk).
-  icount / slice build a two-step orchestrator YAML inline and call
-  `orchestrator.main run`.
-- Key files:
-  - **Modify** `hsim` -- extend `p_run` choices, add new optional
-    flags, branch in `cmd_run` on `args.mode`.
-  - **Create** `tests/hsim/test_hsim_run_icount_slice.sh` -- RED test.
-- Dependencies: F3 (`cmd_run`).
-- Done criteria:
-  - `./hsim run tests/fixtures/icount_spin.elf --mode icount --qemu-icount 10000 --vsim-icount 5000` exits 0.
-  - `./hsim run tests/fixtures/icount_spin.elf --mode slice  --slice 1000 --slice-at 1` exits 0.
-  - csr / pc paths still pass the existing F3 RED test
-    `tests/hsim/test_hsim_run_smoke.sh` byte-identically.
-  - 45 PASS / 0 FAIL holds.
-
-### F12 - `./hsim estimate` (SimPoint cycle estimator, the separate item)
-
-- Type: behavioral. Depends on F9 + F10 + F11.
-- Description: One end-to-end command:
-  1. Run profile (M4): emit BBV with `slice=N`, `icount=M`.
-  2. Run cluster: get `simpts` + `weights` files, K rows.
-  3. For each cluster representative slice K_i:
-     a. Run `--mode slice --slice-at K_i` to drain QEMU + run vsim.
-     b. Read `mcycle` from the post-vsim state file via
-        `orchestrator.abi.hybrid_state_v1` (ctypes struct already
-        defined at `tools/orchestrator/abi.py:50`).
-     c. delta_mcycle_i = mcycle_after - mcycle_before.
-  4. Aggregate:
-     ```
-     CPI_i  = delta_mcycle_i / slice_insns
-     CPI    = sum_i ( w_i * CPI_i )
-     cycles = N_total_insns * CPI
-     ```
-  5. Print one-line summary plus per-phase table.
-- Key files:
-  - **Modify** `hsim` -- add `cmd_estimate`. Calls the F9/F11
-    functions in-process (no re-shelling) so the aggregator stays
-    in one Python process.
-  - **Create** `tests/hsim/test_hsim_estimate.sh` -- RED test.
-- Dependencies: F9, F10, F11.
-- Done criteria:
-  - `./hsim estimate tests/fixtures/icount_spin.elf --slice 1000 --icount 10000 --max-k 2` exits 0.
-  - Output contains `estimated_cycles=` and an integer > 0.
-  - Per-phase rows show non-zero `delta_mcycle` values.
-  - Missing simpoint binary -> rc=2 with `not built` hint.
-  - 45 PASS / 0 FAIL holds.
-
-## Existing helpers to reuse (no re-implementation)
-
-- `_resolve_artifacts()` (`hsim:188`) -- VSIM_BIN / QEMU / PLUGIN env override.
-- `_DEFAULT_ARTIFACTS` (`hsim:180`) -- default artifact paths.
-- argv split on `--` in `main()` (`hsim:647`) -- already in place.
-- `orchestrator.checkpoint.write_archive(...)` (`tools/orchestrator/checkpoint.py:105`) -- M6.
-- `orchestrator.main replay-checkpoint` (`tools/orchestrator/main.py:68`) -- M7.
-- `orchestrator.main run <plan.yaml>` (`tools/orchestrator/main.py:48`) -- generic N-step runner; F9 + F11 build a YAML in a temp file and call this.
-- `orchestrator.abi.hybrid_state_v1` (`tools/orchestrator/abi.py:50`) -- ctypes struct for reading `mcycle` from `state.bin`.
-- `tools/simpoint/bin/simpoint` -- clustering binary (already built by `./hsim build`).
-- `tests/fixtures/icount_spin.elf` -- CSR-less fixture all five demos use.
-
-## TDD ordering (per feature, matches F7 / F8 cadence)
-
-For each F9..F12:
-
-1. **RED + GREEN (one behavioral commit)**:
-   - Write `tests/hsim/test_hsim_<feature>.sh`. Make it executable.
-   - Run it -> assertions fail (new subcmd does not exist yet).
-   - Add the new subparser + `cmd_*` to `hsim`.
-   - Re-run the test until all assertions pass.
-   - Run `JOBS=8 MODE=both bash scripts/run_e2e.sh`. Confirm 45 PASS / 0 FAIL.
-   - Commit with `behavioral:` prefix.
-
-2. **STRUCTURAL (one doc commit)**:
-   - Update `driver_ROADMAP.md`: add the F-section, extend the DAG.
-     After F12 lands, remove M3..M8 from the "Out of scope" list.
-   - Commit with `structural:` prefix.
-
-## driver_ROADMAP.md updates (the structural commits)
-
-DAG gains four nodes downstream of F8:
-
 ```
-F8 (demo) --> F9 (profile/cluster) -+
-              F10 (archive/replay) -+--> F12 (estimate)
-              F11 (run --mode icount/slice) -+
+./hsim run      <elf> --mmap-size 8G      # already has --mode; gains --mmap-size
+./hsim archive  --state S --mmap M --mmap-size 8G ...   # already has --mmap-size; wire it
+./hsim profile  <elf> --mmap-size 8G ...
+./hsim estimate <elf> --mmap-size 8G ...
+HSIM_MMAP_DIR=/scratch ./hsim run <elf> --mmap-size 64G  # disk-backed
 ```
 
-After F12 lands, the "Out of scope" list (`driver_ROADMAP.md:250-254`) shrinks to:
+Default behavior is unchanged: no flag => 128 MiB on `/dev/shm`. Existing
+shell scripts that hardcode `mktemp -p /dev/shm` are untouched (they all
+use the 128 MiB default, which always fits).
+
+On every allocation, one status line lands on stdout:
 
 ```
-## Out of scope (deferred to a future driver_ROADMAP_v2)
-
-- Bash-completion file.
+[hsim mmap] 8.0 GiB at /scratch (free: 64.0 GiB)
 ```
 
-## Verification (after each feature)
+## Selection logic (the entire policy)
+
+```python
+def select_mmap_dir(size: int) -> Path:
+    margin = 256 * 1024 * 1024  # 256 MiB safety
+    pinned = os.environ.get("HSIM_MMAP_DIR")
+    target = Path(pinned) if pinned else Path("/dev/shm")
+    if not target.is_dir():
+        raise NoSpaceError(f"{target} is not a directory; set HSIM_MMAP_DIR")
+    st = os.statvfs(target)
+    free = st.f_bavail * st.f_frsize
+    if free < size + margin:
+        raise NoSpaceError(
+            f"{target} has {free} bytes free, need {size + margin}; "
+            f"set HSIM_MMAP_DIR=/path/with/more/space"
+        )
+    return target
+```
+
+One pinned location. One capacity check. One error path. That is the
+whole feature.
+
+## Critical files
+
+| File | Change |
+|------|--------|
+| `tools/hsim_shm.py` (new, ~80 lines) | `parse_size(spec)`, `select_mmap_dir(size)`, `allocate(size, prefix)` -> `Path`. Single source of truth for size parsing + backend selection + sparse-file allocation. |
+| `hsim` | Add `--mmap-size SPEC` to subparsers `p_run`, `p_archive`, `p_profile`, `p_estimate`. Replace the three hardcoded `tempfile.mkstemp(dir="/dev/shm") + os.truncate(..., _SHM_SIZE)` blocks with `tools.hsim_shm.allocate(size, prefix=...)`. Consolidate the 128 MiB constant to one place: `_DEFAULT_MMAP_SIZE` in `hsim` already exists; remove `_SHM_SIZE` duplicate at line 660. |
+| `tools/orchestrator/mmap_owner.py` | `MmapOwner.allocate()` already accepts `dir=...`; no code change, but its default `"/dev/shm"` becomes a fallback the new helper bypasses. Document in module docstring. |
+| `docs/USER_GUIDE.md` | New subsection "Requesting more memory" under each affected command, plus a top-level note on `HSIM_MMAP_DIR`. |
+| `tests/hsim/test_hsim_mmap_backend.sh` (new) | RED test. |
+
+## Out of scope (deferred, F14)
+
+- Migrating 14 shell scripts (`tests/e2e.sh`, `tests/demos/*.sh`,
+  `tests/drivers/*.sh`, `tests/plugin/*.sh`) to call `tools/hsim_shm`.
+  They all use the 128 MiB default and always fit /dev/shm, so no
+  immediate need. Mechanical sweep when someone wants it.
+- Hugetlbfs auto-detection. Power users set
+  `HSIM_MMAP_DIR=/mnt/huge` themselves.
+- `./hsim doctor --mmap-size 8G` dry-run capacity probe. Easy to add
+  later; not required for the core feature.
+
+## TDD ordering
+
+One behavioral commit, one structural commit (Tidy First).
+
+### Behavioral commit (RED + GREEN)
+
+1. Write `tests/hsim/test_hsim_mmap_backend.sh`:
+   - `./hsim run --help` mentions `--mmap-size`.
+   - `--mmap-size 8XBG` (bogus suffix) -> rc=2 with parse error hint.
+   - `--mmap-size 999P` (1 PB, won't fit anywhere) -> rc=2 with NoSpace hint.
+   - `HSIM_MMAP_DIR=/no/such/dir` -> rc=2 with hint.
+   - `HSIM_MMAP_DIR=$tmpdir --mmap-size 128M --dry-run` succeeds; status line `[hsim mmap]` appears.
+   - Default (no flag, no env) still uses 128 MiB on `/dev/shm` (regression guard).
+   - Set executable, run -> assertions fail.
+2. Implement `tools/hsim_shm.py` with `parse_size`, `select_mmap_dir`, `allocate`.
+3. Wire into `hsim` (4 commands, 1 doctor row).
+4. Re-run the new test until green.
+5. Run `bash tests/hsim/test_hsim_run_smoke.sh`,
+   `test_hsim_archive_replay.sh`, `test_hsim_profile_cluster.sh`,
+   `test_hsim_estimate.sh` -- all must still pass byte-identically (default 128 MiB path).
+6. Run `JOBS=8 MODE=both bash scripts/run_e2e.sh` -- must hold 45 PASS / 0 FAIL.
+7. Commit `behavioral: add --mmap-size + HSIM_MMAP_DIR to ./hsim`.
+
+### Structural commit (docs + roadmap)
+
+1. Update `docs/USER_GUIDE.md` with the new flag + env var.
+2. Update `driver_ROADMAP.md`: add F13 section, extend DAG.
+3. Commit `structural: doc F13 (mmap size + backend dir)`.
+
+## Existing helpers to reuse
+
+- `os.statvfs` -- free space probe (no new deps).
+- `tempfile.mkstemp(dir=...)` -- already used at `hsim:728`.
+- `os.truncate(path, size)` -- already used at `hsim:731`.
+- `_resolve_artifacts()` (`hsim:188`) -- artifact lookup, unchanged.
+- `tools/orchestrator/mmap_owner.MmapOwner.allocate(size, dir=...)`
+  (`tools/orchestrator/mmap_owner.py:40`) -- already accepts `dir`.
+
+## Verification
 
 ```sh
-bash tests/hsim/test_hsim_<feature>.sh        # feature's own RED test
-JOBS=8 MODE=both bash scripts/run_e2e.sh      # global invariant: 45 / 0
-./hsim --help                                 # new subcommand listed
-./hsim <new-subcmd> --help                    # flags documented
+# Feature's own RED test
+bash tests/hsim/test_hsim_mmap_backend.sh
+
+# F9/F10/F11/F12 regression guards (must stay byte-identical)
+bash tests/hsim/test_hsim_run_smoke.sh
+bash tests/hsim/test_hsim_archive_replay.sh
+bash tests/hsim/test_hsim_profile_cluster.sh
+bash tests/hsim/test_hsim_run_icount_slice.sh
+bash tests/hsim/test_hsim_estimate.sh
+
+# Global invariant
+JOBS=8 MODE=both bash scripts/run_e2e.sh    # 45 PASS / 0 FAIL
+
+# Manual eyeball: small request on /dev/shm (default backend)
+./hsim run tests/fixtures/rt_c_v_regs.elf --mmap-size 64M
+# Manual eyeball: large request on disk-backed dir
+HSIM_MMAP_DIR=/var/tmp ./hsim run tests/fixtures/rt_c_v_regs.elf --mmap-size 256M
+# Manual eyeball: error when /dev/shm cannot hold the request
+./hsim run tests/fixtures/rt_c_v_regs.elf --mmap-size 999P
+#   -> rc=2, hint "set HSIM_MMAP_DIR=..."
 ```
 
-Final F12 eyeball:
+## What this plan deliberately does NOT do
 
-```
-$ ./hsim estimate tests/fixtures/icount_spin.elf --slice 1000 --icount 10000 --max-k 2
-M4 profile     ... 10 BBV rows  -> /tmp/.../profile.bb
-cluster        ... 2 phases  weights=[0.7, 0.3]
-M5+M7 phase 0  ... slice_at=0  delta_mcycle=12345  CPI=12.35
-M5+M7 phase 1  ... slice_at=5  delta_mcycle=67890  CPI=67.89
-estimated_cycles=287077  (N=10000, CPI=28.71)
-```
-
-## Out of scope for this plan
-
-- Bash completion (still deferred).
-- `./hsim profile --cluster` short-circuit (force two-step so user can inspect BBV between).
-- Multi-fixture batch mode for `./hsim estimate`.
-- Caching of profile output across estimate runs.
+- No auto-discovery of "the best disk." The user owns layout.
+- No filesystem-type probing. Free bytes is the only signal.
+- No silent fallback chain. One pinned dir, one statvfs check, one error.
+- No shell-script migration. The hardcoded 128 MiB sites always fit.
+- No hugetlbfs special-casing. `HSIM_MMAP_DIR=/mnt/huge` is enough.
