@@ -1,0 +1,194 @@
+// Unit tests for hybrid/program_buffer.hpp.
+// Pure compile-time and recording-bus tests -- no SystemC, no hardware.
+
+#include "hybrid/program_buffer.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <array>
+#include <cstdint>
+#include <stdexcept>
+#include <vector>
+
+using namespace hybrid;
+
+// ---- Recording DmiBus stub -------------------------------------------------
+// Captures all writes; returns configurable values per register address.
+struct RecBus
+{
+    struct Op { uint8_t reg; uint32_t val; };
+
+    std::vector<Op> writes;
+    // Per-register read sequences: each call pops the front value.
+    // If the list is empty, returns 0.
+    std::map<uint8_t, std::vector<uint32_t>> read_seq;
+
+    void write(uint8_t reg, uint32_t val) { writes.push_back({reg, val}); }
+
+    uint32_t read(uint8_t reg)
+    {
+        auto it = read_seq.find(reg);
+        if (it == read_seq.end() || it->second.empty()) return 0u;
+        uint32_t v = it->second.front();
+        it->second.erase(it->second.begin());
+        return v;
+    }
+};
+
+// ---- kExecProgbufCmd constant tests ----------------------------------------
+
+TEST_CASE("kExecProgbufCmd: postexec=1, transfer=0, cmdtype=AccessRegister")
+{
+    CHECK(((kExecProgbufCmd >> 18) & 1u) == 1u);   // postexec set
+    CHECK(((kExecProgbufCmd >> 17) & 1u) == 0u);   // transfer NOT set (unlike access_register_command)
+    CHECK(((kExecProgbufCmd >> 24) & 0xFFu) == 0u); // cmdtype = AccessRegister (0)
+}
+
+TEST_CASE("kEbreak encodes a standard ebreak instruction")
+{
+    // ebreak = funct12=000000000001, rs1=0, funct3=0, rd=0, opcode=SYSTEM(0x73)
+    CHECK(kEbreak == 0x00100073u);
+}
+
+TEST_CASE("kProgbufMaxInsns leaves room for ebreak")
+{
+    // 16 slots total (progbuf0..progbuf15); 15 for payload, 1 for ebreak
+    CHECK(kProgbufMaxInsns == 15u);
+    CHECK(kProgbuf0 == 0x20u);
+}
+
+// ---- Instruction encoder tests ---------------------------------------------
+
+TEST_CASE("encode_vsetvl: known encodings")
+{
+    // vsetvl x0, t0, t1  (rd=0, rs1=5, rs2=6)
+    // RVV 1.0: funct7=1000000, opcode=1010111(0x57), funct3=111
+    // 1|000000|00110|00101|111|00000|1010111 = 0x8062F057
+    CHECK(encode_vsetvl(0, 5, 6) == 0x8062F057u);
+
+    // vsetvl x1, a0, a1  (rd=1, rs1=10, rs2=11)
+    // 1|000000|01011|01010|111|00001|1010111 = 0x80B570D7
+    CHECK(encode_vsetvl(1, 10, 11) == 0x80B570D7u);
+
+    // vsetvl x0, x0, x0  (all-zero registers)
+    // 1|000000|00000|00000|111|00000|1010111 = 0x80007057
+    CHECK(encode_vsetvl(0, 0, 0) == 0x80007057u);
+}
+
+TEST_CASE("encode_csrrw: known encodings")
+{
+    // csrrw x0, mstatus(0x300), t0(x5)
+    // [31:20]=0x300, [19:15]=5, [14:12]=001, [11:7]=0, [6:0]=0x73
+    // = 0x30029073
+    CHECK(encode_csrrw(0, 0x300, 5) == 0x30029073u);
+
+    // csrrw x0, vstart(0x008), t1(x6)
+    // [31:20]=0x008, [19:15]=6, [14:12]=001, [11:7]=0, [6:0]=0x73
+    // = 0x00831073
+    CHECK(encode_csrrw(0, 0x008, 6) == 0x00831073u);
+
+    // csrrw x0, vxsat(0x009), t0(x5)
+    // [31:20]=0x009, [19:15]=5, [14:12]=001, [11:7]=0, [6:0]=0x73
+    // = 0x00929073
+    CHECK(encode_csrrw(0, 0x009, 5) == 0x00929073u);
+}
+
+// ---- exec_progbuf behavioral tests -----------------------------------------
+
+TEST_CASE("exec_progbuf: single instruction - writes insn, ebreak, exec command")
+{
+    RecBus bus;
+    const std::array<uint32_t, 1> insns{0xDEADBEEFu};
+    const bool ok = exec_progbuf(bus, insns);
+
+    REQUIRE(ok == true);
+
+    // Writes (in order):
+    //   progbuf0 = insn
+    //   progbuf1 = ebreak
+    //   command  = kExecProgbufCmd
+    // (no pre-clear because bus returns 0 for abstractcs -> no cmderr)
+    REQUIRE(bus.writes.size() == 3u);
+    CHECK(bus.writes[0].reg == kProgbuf0);
+    CHECK(bus.writes[0].val == 0xDEADBEEFu);
+    CHECK(bus.writes[1].reg == kProgbuf0 + 1);
+    CHECK(bus.writes[1].val == kEbreak);
+    CHECK(bus.writes[2].reg == 0x17u);       // kCommandReg
+    CHECK(bus.writes[2].val == kExecProgbufCmd);
+}
+
+TEST_CASE("exec_progbuf: max instructions fills progbuf0..14, ebreak at progbuf15")
+{
+    RecBus bus;
+    std::array<uint32_t, 15> insns{};
+    for (uint32_t i = 0; i < 15; ++i) insns[i] = 0xAA000000u | i;
+
+    const bool ok = exec_progbuf(bus, insns);
+    REQUIRE(ok == true);
+
+    // 15 payload writes + ebreak + exec command = 17 writes
+    REQUIRE(bus.writes.size() == 17u);
+    for (std::size_t i = 0; i < 15; ++i) {
+        CHECK(bus.writes[i].reg == kProgbuf0 + i);
+        CHECK(bus.writes[i].val == (0xAA000000u | i));
+    }
+    CHECK(bus.writes[15].reg == kProgbuf0 + 15u);
+    CHECK(bus.writes[15].val == kEbreak);
+    CHECK(bus.writes[16].reg == 0x17u);
+    CHECK(bus.writes[16].val == kExecProgbufCmd);
+}
+
+TEST_CASE("exec_progbuf: 16 instructions throws - no bus writes happen")
+{
+    RecBus bus;
+    std::array<uint32_t, 16> insns{};
+    CHECK_THROWS_AS(exec_progbuf(bus, insns), std::runtime_error);
+    CHECK(bus.writes.empty());
+}
+
+TEST_CASE("exec_progbuf: clears sticky cmderr before issuing exec command")
+{
+    RecBus bus;
+    // abstractcs returns cmderr=set on the first read (pre-exec check),
+    // then 0 thereafter (poll + final check)
+    constexpr uint32_t kCmderrMask = 0x7u << 8;
+    bus.read_seq[0x16u] = {kCmderrMask, 0u, 0u};
+
+    const std::array<uint32_t, 1> insns{0x1u};
+    const bool ok = exec_progbuf(bus, insns);
+    REQUIRE(ok == true);
+
+    // Expected writes: progbuf0=insn, progbuf1=ebreak,
+    //                  abstractcs=kCmderrMask (W1C clear),
+    //                  command=kExecProgbufCmd
+    REQUIRE(bus.writes.size() == 4u);
+    CHECK(bus.writes[2].reg == 0x16u);
+    CHECK(bus.writes[2].val == kCmderrMask);
+    CHECK(bus.writes[3].reg == 0x17u);
+    CHECK(bus.writes[3].val == kExecProgbufCmd);
+}
+
+TEST_CASE("exec_progbuf: returns false when cmderr set after execution")
+{
+    RecBus bus;
+    constexpr uint32_t kCmderrMask = 0x7u << 8;
+    // reads: [pre-exec cmderr check=0], [busy poll=0], [final cmderr check=set]
+    bus.read_seq[0x16u] = {0u, 0u, kCmderrMask};
+
+    const std::array<uint32_t, 1> insns{0x1u};
+    const bool ok = exec_progbuf(bus, insns);
+    CHECK(ok == false);
+}
+
+TEST_CASE("exec_progbuf: polls while busy before returning")
+{
+    RecBus bus;
+    constexpr uint32_t kBusy = 1u << 12;
+    // abstractcs: no pre-cmderr, busy once, then clear, then no post-cmderr
+    bus.read_seq[0x16u] = {0u, kBusy, 0u, 0u};
+
+    const std::array<uint32_t, 1> insns{0x1u};
+    const bool ok = exec_progbuf(bus, insns);
+    CHECK(ok == true);
+}
