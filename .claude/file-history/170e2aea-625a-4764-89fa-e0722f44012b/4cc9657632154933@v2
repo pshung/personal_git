@@ -1,0 +1,900 @@
+# Hybrid Simulator User Guide
+
+Audience: a new engineer who wants to RUN the Andes hybrid simulator,
+not study its internals. After this guide you can:
+
+1. Build every artifact from a fresh clone.
+2. Configure QEMU, vsim, and the orchestrator for a workload.
+3. Pick a switching mode (M1..M8) and run one round-trip end-to-end
+   with a concrete worked example.
+
+For internals, read `docs/HYBRID_OVERVIEW.md`. For per-mode drill-down,
+read `docs/switching_modes_tutorial.md`.
+
+---
+
+## 0. The one-paragraph mental model
+
+QEMU runs the boring parts at MHz. vsim (Verilator + SystemC) runs the
+small region-of-interest at cycle accuracy. They share RAM via an
+`mmap` file. A magic trigger (CSR write, PC, or instruction count)
+hands control between them. One run is three legs:
+
+```
+   QEMU1  -- state.bin + shared mmap -->  vsim  -- same files -->  QEMU2
+   (fast)                                 (cycle accurate)         (fast)
+```
+
+The thing you choose per run is the TRIGGER that decides where each
+leg drains and the next leg resumes. That choice is the "switching
+mode".
+
+---
+
+## 0.5 Quick start with `./hsim`
+
+`./hsim` is the canonical end-user entry point. It wraps the
+developer-grade scripts documented in Sections 1-5 (`setup.sh`,
+`tests/e2e.sh`, `scripts/run_e2e.sh`) behind four subcommands.
+
+Four-command worked example - cold checkout to passing suite:
+
+```sh
+./hsim build                                            # qemu, vsim, plugin, simpoint, fixtures
+./hsim list fixtures                                    # discover available fixtures
+./hsim run tests/fixtures/rt_c_hello.elf --mode csr     # one CSR-mode round-trip
+./hsim test                                             # full e2e suite (defaults: MODE=both, JOBS=8)
+```
+
+Expected last line of `./hsim test`:
+
+```
+PASS 45, FAIL 0, SKIP 0 (elapsed: <Ns>)
+```
+
+Subcommand cheat sheet:
+
+| Command                                                          | What it does                                                        |
+|------------------------------------------------------------------|---------------------------------------------------------------------|
+| `./hsim list <fixtures|demos|modes>`                             | List available fixtures, demos, or trigger modes (M1..M8).          |
+| `./hsim build [--what TARGET] [--dry-run]`                       | Build artifacts; targets: `all`, `qemu`, `vsim`, `plugin`, `simpoint`, `fixtures`. |
+| `./hsim run <elf> --mode csr|pc|icount|slice [-v]`               | Run one ELF through the QEMU -> vsim -> QEMU round-trip.            |
+| `./hsim test [--filter REGEX] [--mode csr|pc|both] [--jobs N]`   | Run the e2e suite; defaults `--mode both --jobs 8`.                 |
+
+Run `./hsim <cmd> -h` for the full flag list of a subcommand. The rest
+of this guide (Sections 1-7) documents the underlying scripts and is
+useful when you need to bypass `./hsim` (custom env vars, single-leg
+debugging, alternative CPU YAML, etc.).
+
+---
+
+## 1. Build and environment setup
+
+### 1.1 Host prerequisites
+
+Install these on the host once:
+
+| Package          | Notes                                                |
+|------------------|------------------------------------------------------|
+| `git`            | clone the repo and its submodules                    |
+| C/C++ toolchain  | clang or gcc; needed by QEMU and the plugin          |
+| `cmake` >= 3.20  | vsim build                                           |
+| `ninja`          | vsim default generator                               |
+| `python3`        | orchestrator, plugin tests, demo scripts             |
+| `glib-2.0` dev   | QEMU plugin link line                                |
+| `pkg-config`     | QEMU configure                                       |
+| `podman`         | runs vsim builds inside `vsim-env:latest` container  |
+| Verilator        | auto-detected; set `VSIM_VERILATOR_EXECUTABLE` if needed |
+| QEMU's own deps  | pixman, slirp, ... see `QEMU/README.rst`      |
+| RISC-V toolchain | `riscv64-unknown-elf-{gcc,nm,objdump}` (Andes v5d)   |
+
+The Andes RISC-V toolchain is needed to build the fixtures and to
+resolve symbols for PC-mode. The harness scripts default to
+`/local/nick/SW_Release/build-ast540/.../bin/riscv64-unknown-elf-nm`;
+override with `NM=/your/path/to/nm` if you keep it elsewhere.
+
+### 1.2 Clone with submodules
+
+```sh
+git clone --recursive https://gitea.andestech.com/nick/hybrid_sim
+cd hybrid_sim
+```
+
+If you forgot `--recursive`:
+
+```sh
+git submodule update --init --recursive
+```
+
+Submodules under this repo:
+
+| Path             | What it is                                          |
+|------------------|-----------------------------------------------------|
+| `QEMU/`   | QEMU 9.x fork that hosts the TCG plugin (branch: `hybrid`) |
+| `verilator/`   | vsim sources (CMake + SystemC + Verilator)          |
+| `tools/simpoint/`| SimPoint 3.2 clustering binary (UCSD)               |
+
+### 1.3 Per-host config (`config.env`)
+
+The repo ships a template `config.env.example` listing per-host paths
+that cannot live in the build system (notably the Andes RISC-V
+toolchain root, which `setup.sh` does NOT build).
+
+On the first `source ./setup.sh`, the template is copied to
+`./config.env` (gitignored) so your edits never touch git history. If
+the toolchain lives somewhere other than the default, edit
+`config.env`:
+
+```sh
+# config.env
+HYBRID_TOOLCHAIN=/local/nick/SW_Release/build-ast540/build-toolchain/linux/nds64le-elf-newlib-v5d
+```
+
+The single variable today is:
+
+| Variable          | What it points at                                                  |
+|-------------------|--------------------------------------------------------------------|
+| `HYBRID_TOOLCHAIN`| Toolchain root. `$HYBRID_TOOLCHAIN/bin/` must contain `riscv64-unknown-elf-{gcc,ld,nm,objdump,...}`. |
+
+How it propagates:
+
+- `setup.sh` sources `config.env`, validates `$HYBRID_TOOLCHAIN/bin/`
+  exists, and `export`s the variable so all child processes see it.
+- The fixture `Makefile` (`tests/fixtures/Makefile`) defaults
+  `TOOLCHAIN` to `$(HYBRID_TOOLCHAIN)` and aborts with a clear error if
+  the variable is missing.
+- The unified `e2e.sh` test harness loads `config.env` itself when run
+  without prior `source ./setup.sh`, then derives
+  `NM=$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-nm`.
+
+Override per-invocation without editing the file:
+
+```sh
+HYBRID_TOOLCHAIN=/opt/my-toolchain make -C tests/fixtures
+HYBRID_TOOLCHAIN=/opt/my-toolchain bash tests/demos/demo_pc_oneshot.sh
+```
+
+### 1.4 Build everything
+
+One command builds all four artifacts and exports the env vars the
+test harness expects:
+
+```sh
+source ./setup.sh
+```
+
+`source` (not `bash`) is required so the script can prepend the build
+dirs to PATH and export `VSIM_QEMU`, `VSIM_PLUGIN`, `VSIM_BIN`,
+`SIMPOINT_BIN`, `HYBRID_TOOLCHAIN` into the current shell. The steps it
+runs:
+
+```
+0/4 config     -> auto-copy config.env.example -> config.env (first run);
+                  source it; export HYBRID_TOOLCHAIN
+1/4 QEMU       -> build/qemu/qemu-system-riscv64
+2/4 vsim       -> verilator/build/sim_ax45mpv_premium    (in container)
+3/4 plugin     -> qemu_plugin/libhybrid_handoff.so
+4/4 SimPoint   -> tools/simpoint/bin/simpoint
+```
+
+To rebuild just one component:
+
+```sh
+./scripts/build_qemu.sh
+./scripts/build_vsim.sh        # uses podman + Dockerfile (target `env`)
+make -C qemu_plugin QEMU_ROOT=./QEMU
+./scripts/build_simpoint.sh
+```
+
+To clean:
+
+```sh
+source ./setup.sh clean         # all four
+source ./setup.sh clean qemu    # just QEMU build/
+source ./setup.sh clean vsim
+source ./setup.sh clean plugin
+source ./setup.sh clean simpoint
+```
+
+### 1.5 Build the test fixtures (RISC-V ELFs)
+
+Fixtures are small RISC-V programs that exercise specific transport
+paths. They are NOT built by `setup.sh`; build them once:
+
+```sh
+make -C tests/fixtures -j
+```
+
+One fixture at a time:
+
+```sh
+make -C tests/fixtures rt_c_v_regs.elf
+```
+
+Output ELFs land next to the sources under
+`tests/fixtures/*.elf`. The fixtures depend on the Andes
+RISC-V GCC + the `libgloss_vh` semihosting library. The toolchain path
+comes from `$HYBRID_TOOLCHAIN` (see section 1.3); to override for one
+invocation:
+
+```sh
+make -C tests/fixtures TOOLCHAIN=/opt/my-toolchain
+```
+
+### 1.6 Sanity check the build
+
+```sh
+# All four artifacts present?
+ls build/qemu/qemu-system-riscv64
+ls verilator/build/sim_ax45mpv_premium
+ls qemu_plugin/libhybrid_handoff.so
+ls tools/simpoint/bin/simpoint
+
+# Smallest possible end-to-end - one CSR-mode round-trip:
+FIXTURE=rt_c_v_regs TRIGGER_MODE=csr EXPECT_RC=0 \
+  bash tests/e2e.sh
+```
+
+Expected last line:
+
+```
+[rt_c_v_regs 3/3 mode=csr] PASS: round-trip exit code 0
+```
+
+If you see `skip: ... not built`, redo `source ./setup.sh` and
+re-build fixtures (`make -C tests/fixtures`).
+
+---
+
+## 2. Configuring the simulator
+
+There are four configuration surfaces. Most users only touch the env
+vars in 2.1.
+
+### 2.1 Environment variables (the only ones you usually set)
+
+`setup.sh` exports these for you. Override only if your artifacts live
+somewhere non-default.
+
+| Variable        | Default                                          | Used by                  |
+|-----------------|--------------------------------------------------|--------------------------|
+| `HYBRID_TOOLCHAIN` | From `config.env` (sec 1.3); toolchain root  | Makefile, NM derivation  |
+| `VSIM_QEMU`     | `build/qemu/qemu-system-riscv64`                 | every harness            |
+| `VSIM_PLUGIN`   | `qemu_plugin/libhybrid_handoff.so`               | every harness            |
+| `VSIM_BIN`      | first `verilator/build/sim_*`                  | every harness            |
+| `VSIM_ELF`      | `tests/fixtures/$FIXTURE.elf`           | harness scripts          |
+| `SIMPOINT_BIN`  | `tools/simpoint/bin/simpoint`                    | M4/T7 demos              |
+| `NM`            | `$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-nm`   | PC-mode symbol resolve   |
+| `TIMEOUT`       | 60 s (some demos use 120)                        | per-leg `timeout` cap    |
+| `FIXTURE`       | `rt_shared_mem`                                  | which `.elf` to load     |
+| `EXPECT_RC`     | 0                                                | expected QEMU2 exit code |
+| `TRIGGER_MODE`  | `csr`                                            | `csr` or `pc`            |
+| `JOBS`          | auto-cap on this 128-core host: set to 8         | parallel test runner     |
+| `HSIM_MMAP_DIR` | `/dev/shm`                                       | backing dir for `--mmap-size`; redirect when /dev/shm too small |
+
+Example: override the QEMU binary for one run:
+
+```sh
+VSIM_QEMU=/opt/qemu-9.0/qemu-system-riscv64 \
+  bash tests/demos/demo_csr_oneshot.sh
+```
+
+### 2.2 The vsim CPU configuration YAML
+
+`verilator/config.yaml` selects which Andes core to verilate. The
+default is `ax45mpv_premium`:
+
+```yaml
+cpus:
+  ax45mpv_premium:
+    cpu_series: 45
+    rtl_package: ax45mpv_premium
+    cpp_wrapper: ax45mpv_premium_cpu_cluster_subsystem
+    config: data/configs/ax45mpv_premium.cfg
+    config_dir: andes_ip/kv_core/top/hdl
+    config_inc_filter: grep '^`define NDS_'
+    extra_verilator_flags: --threads 8 --unroll-count 256
+```
+
+Switch CPU by pointing CMake at a different YAML:
+
+```sh
+cd verilator
+cmake -S . -B build -G Ninja -DVSIM_CONFIG_FILE=my_other_cpu.yaml
+cmake --build build -j
+```
+
+`-DVSIM_ENABLE_HYBRID=ON` registers the e2e fixtures with CTest;
+`-DVSIM_NO_VERILATOR=ON` skips Verilator (use a prebuilt model).
+
+### 2.3 QEMU plugin args
+
+The plugin reads `arg=value` tokens after `-plugin <path>,`. They
+select WHICH switching mode QEMU1 runs in:
+
+| Plugin arg           | Effect                                                                 |
+|----------------------|------------------------------------------------------------------------|
+| `outfile=PATH`       | REQUIRED. Drained `hybrid_state_v1` is written here.                   |
+| `enter_pc=0xADDR`    | M2: drain when PC == ADDR. Bypasses the CSR-insn matcher.              |
+| `icount=N`           | M3: drain on the N-th retired insn (per vcpu).                         |
+| `bbv_out=PATH`       | M4: emit one SimPoint BBV row per `slice=N` insns into PATH.           |
+| `slice=N`            | Insns per slice (used by M4 and M5). Must be > 0.                      |
+| `slice_at=K`         | M5: drain at the end of the K-th slice. Requires `slice=N`.            |
+| `drain_at_exit=1`    | F14: drain when QEMU exits naturally; overrides `minstret` with a plugin-side per-insn counter. Used by `./hsim estimate --icount 0`. |
+
+If no mode arg is given, the default is CSR-insn match (M1): the
+plugin matches `csrwi 0x7C0, 0` at retire.
+
+Example invocation (CSR mode, just the minimal arg):
+
+```
+-plugin libhybrid_handoff.so,outfile=/tmp/state.bin
+```
+
+Example (icount mode):
+
+```
+-plugin libhybrid_handoff.so,outfile=/tmp/state.bin,icount=10000
+```
+
+### 2.4 vsim CLI flags
+
+`sim_ax45mpv_premium <elf> [flags]`. The hybrid-relevant subset:
+
+| Flag                          | Purpose                                                  |
+|-------------------------------|----------------------------------------------------------|
+| `--resume-from-qemu FILE`     | Read drained state, restore into hart, run from PC.     |
+| `--handoff-out FILE`          | Drain back into FILE when the exit trigger fires.       |
+| `--shared-mem-path FILE`      | mmap FILE as RAM (zero-copy share with QEMU).           |
+| `--shared-mem-size BYTES`     | Size of the shared region. Match QEMU `-m`.             |
+| `--shared-mem-base HEX`       | Guest physical address where file offset 0 lands.       |
+| `--qemu-binary PATH`          | After drain, spawn this QEMU as Phase 3 (QEMU2).        |
+| `--hybrid-exit-pc 0xADDR`     | M2 exit: drain when this PC retires.                    |
+| `--hybrid-icount N`           | M3 exit: drain after N committed insns (vsim side).     |
+| `--jtag-port N`               | Open the JTAG bitbang port (e.g. OpenOCD).              |
+| `--log-level N`               | 0=trace .. 5=critical .. 6=off (default 2=info)         |
+
+Defaults for `--shared-mem-base` is `0x80000000` (the QEMU `virt` /
+`andes_ae350` RAM base). Most users never override it.
+
+Run `$VSIM_BIN --help` for the full list (waveform/save/restore are
+license-gated and off by default).
+
+### 2.5 Requesting more memory (`--mmap-size` + `HSIM_MMAP_DIR`)
+
+By default every `./hsim` invocation that needs a shared mmap allocates
+a 128 MiB sparse file under `/dev/shm` (tmpfs, RAM-backed). When your
+workload's memory footprint exceeds `/dev/shm` capacity (typically
+RAM/2 on Linux), two knobs let you redirect:
+
+| Knob              | Where             | What it does |
+|-------------------|-------------------|--------------|
+| `--mmap-size SPEC` | flag on `run`, `profile`, `archive`, `estimate` | request a larger mmap (`SPEC` = `128M`, `8G`, `1.5G`, `2T`, or raw bytes). Default `128M`. |
+| `HSIM_MMAP_DIR=/path` | env var | override the backing directory (default `/dev/shm`). |
+
+Selection rule is deliberately simple: if `HSIM_MMAP_DIR` is set we
+use it, otherwise `/dev/shm`. We check free space via `statvfs` and
+error rc=2 with a clear hint if the pinned dir can't hold the request.
+There is **no fallback chain** -- we never silently switch directories
+on you.
+
+Examples:
+
+```sh
+# Small request; default backend is /dev/shm.
+./hsim run tests/fixtures/rt_c_hello.elf --mode csr --mmap-size 256M
+
+# 8 GiB request that won't fit /dev/shm: redirect to a disk-backed dir.
+HSIM_MMAP_DIR=/scratch/hsim \
+  ./hsim run tests/fixtures/rt_c_hello.elf --mode icount --mmap-size 8G
+
+# Each allocation prints one status line:
+#   [hsim mmap] 8.0 GiB at /scratch/hsim (free: 64.0 GiB)
+```
+
+If your `/tmp` is mounted as tmpfs (Arch default), pointing
+`HSIM_MMAP_DIR=/tmp` is fine **only** if `/tmp` has enough free bytes;
+otherwise pick a directory on a non-tmpfs filesystem (`/var/tmp`,
+`$HOME/.cache/hsim`, `/scratch`, etc.).
+
+The hardcoded `mktemp -p /dev/shm` paths in the shell harnesses
+(`tests/e2e.sh`, `tests/demos/*.sh`, `tests/drivers/*.sh`,
+`tests/plugin/*.sh`) all use 128 MiB and are unaffected.
+
+### 2.6 Orchestrator plan YAML (used by M6/M7)
+
+For checkpoint workflows you describe a multi-step plan in YAML and
+hand it to the orchestrator:
+
+```yaml
+session:
+  mem_size: 134217728            # 128 MB shared mmap
+  mmap_path: null                # null -> mktemp in /dev/shm
+  elf: tests/fixtures/rt_c_v_regs.elf
+
+steps:
+  - model: qemu
+    trigger: { kind: csr }       # M1 trigger; can also be { kind: pc, enter: 0x... } or { kind: icount, n: 5000 }
+    on_exit: { archive_as: "snap/0" }
+```
+
+Run it:
+
+```sh
+python3 -m orchestrator.main run plan.yaml \
+  --project-root . --workdir /tmp/run --archive-root /tmp/archives
+```
+
+Replay:
+
+```sh
+python3 -m orchestrator.main replay-checkpoint /tmp/archives/snap/0 \
+  --resume-with vsim --project-root . --workdir /tmp/replay
+```
+
+---
+
+## 3. Switching modes - which trigger to use
+
+| ID  | Trigger                                | Where        | When to pick it                                                |
+|-----|----------------------------------------|--------------|-----------------------------------------------------------------|
+| M1  | `csrwi 0x7C0, 0/1` insn match          | QEMU1 + vsim | Default. Your binary can embed `csrwi` markers.                |
+| M2  | PC equals `_hybrid_{enter,exit}_pc`    | QEMU1 + vsim | Binary is yours, but you cannot insert CSR markers.            |
+| M3  | Retired-instruction count              | QEMU1 + vsim | Binary is NOT yours (no CSR/symbol). Use a spin loop / blob.   |
+| M4  | BBV emit + offline SimPoint cluster    | QEMU1 only   | Phase identification before the real run.                      |
+| M5  | Drain at end of slice K                | QEMU1        | Replay one cluster representative slice on vsim.               |
+| M6  | Archive state.bin + mem + meta after drain | orchestrator | Capture a portable, shippable checkpoint.                     |
+| M7  | Replay a snap/K archive                | orchestrator | Resume the same checkpoint hours / days / hosts later.         |
+| M8  | QEMU2 exits naturally via semihosting  | QEMU2        | Always. End-of-program signal.                                 |
+
+M1/M2/M3 are the three ways to delimit the ROI. M4..M7 stack on top
+of them for SimPoint-style phase replay. M8 is automatic.
+
+Decision flow:
+
+```
+Can you edit the binary?
+  yes -> insert csrwi 0x7C0, 0/1 around the ROI -> M1
+  no  -> Does it export _hybrid_enter_pc / _hybrid_exit_pc?
+           yes -> M2
+           no  -> Use icount  -> M3
+You want phase-aware replay?  -> M4 + M5 + M6 + M7   (the T7 demo automates this)
+```
+
+> **Writing a kernel for cycle measurement (M1/M2):** keep the measured
+> kernel anchored inside the `csrwi 0x7C0,0/1` span -- read its inputs and
+> write its outputs through memory inside the span, or wrap the kernel in a
+> `__attribute__((noinline))` function called between the markers. The
+> markers' `"memory"` clobber pins memory I/O but not register-only compute,
+> so a kernel that carries live vector values in registers across the
+> boundary may be hoisted/sunk out of the measured window. See
+> `tests/fixtures/runtime/rt_c_helpers.h`.
+
+---
+
+## 4. Walk-through: one round-trip in each mode
+
+Each section is copy-pastable. They all share the same setup.
+
+### 4.0 Common setup (do once per shell)
+
+```sh
+cd /home/nick/work/hybrid_sim
+source ./setup.sh                         # builds + exports env vars
+make -C tests/fixtures -j        # builds .elf fixtures
+```
+
+Quick env check:
+
+```sh
+echo "$VSIM_QEMU"
+echo "$VSIM_PLUGIN"
+echo "$VSIM_BIN"
+ls tests/fixtures/rt_c_v_regs.elf
+```
+
+### 4.1 M1 - CSR insn match (the default)
+
+Goal: run a vector fixture through QEMU1 -> vsim -> QEMU2 using the
+two `csrwi 0x7C0, *` markers that the fixture already contains.
+
+```sh
+bash tests/demos/demo_csr_oneshot.sh
+```
+
+Expected last line:
+
+```
+[demo M1] PASS (CSR insn match (M1+M8))
+```
+
+The demo is a thin wrapper around the generic harness:
+
+```sh
+FIXTURE=rt_c_v_regs TRIGGER_MODE=csr EXPECT_RC=0 \
+  bash tests/e2e.sh
+```
+
+Inside, the three legs are:
+
+```
+1) QEMU1 with -plugin libhybrid_handoff.so,outfile=$STATE
+        -> drain at csrwi 0x7C0,0   -> exit 200
+2) sim_ax45mpv_premium $ELF \
+        --resume-from-qemu $STATE --handoff-out $STATE_V \
+        --shared-mem-path $SHM --shared-mem-size 128MB \
+        --qemu-binary $VSIM_QEMU
+        -> ROI runs in vsim, drains at csrwi 0x7C0,1, spawns QEMU2
+3) QEMU2 (spawned by vsim) restores state via gdbstub, continues,
+        exits 0 via semihosting (M8).
+```
+
+Try a different fixture:
+
+```sh
+FIXTURE=rt_c_matmul TRIGGER_MODE=csr EXPECT_RC=0 TIMEOUT=120 \
+  bash tests/e2e.sh
+```
+
+### 4.2 M2 - PC symbol resolve
+
+Same workload, but the trigger is a PC value from the symbol table.
+
+```sh
+bash tests/demos/demo_pc_oneshot.sh
+```
+
+To see what the demo passes under the hood:
+
+```sh
+NM=/path/to/riscv64-unknown-elf-nm   # default in $NM if you ran setup.sh
+
+ENTER_PC=$("$NM" --defined-only tests/fixtures/rt_c_v_regs.elf \
+            | awk '$3=="_hybrid_enter_pc"{print $1}')
+EXIT_PC=$("$NM" --defined-only tests/fixtures/rt_c_v_regs.elf \
+            | awk '$3=="_hybrid_exit_pc"{print $1}')
+
+echo "enter=$ENTER_PC  exit=$EXIT_PC"
+
+# QEMU1 leg
+"$VSIM_QEMU" \
+  -object memory-backend-file,id=mem,share=on,mem-path=/dev/shm/share,size=134217728 \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic -semihosting-config enable=on,target=native \
+  -bios tests/fixtures/rt_c_v_regs.elf \
+  -plugin "$VSIM_PLUGIN,outfile=/tmp/q1.bin,enter_pc=0x$ENTER_PC"
+
+# vsim leg
+"$VSIM_BIN" tests/fixtures/rt_c_v_regs.elf \
+  --resume-from-qemu /tmp/q1.bin \
+  --handoff-out /tmp/v.bin \
+  --shared-mem-path /dev/shm/share \
+  --shared-mem-size 134217728 \
+  --qemu-binary "$VSIM_QEMU" \
+  --hybrid-exit-pc "0x$EXIT_PC"
+```
+
+The fixture binary is unchanged from M1; only the orchestrator
+arguments are different.
+
+### 4.3 M3 - icount round-trip (no markers)
+
+For workloads you cannot edit. Both legs drain on a retired-insn count
+target.
+
+```sh
+bash tests/demos/demo_icount_roundtrip.sh
+```
+
+Override the targets:
+
+```sh
+QEMU_ICOUNT=20000 VSIM_ICOUNT=8000 \
+  bash tests/demos/demo_icount_roundtrip.sh
+```
+
+What you can verify by hand: the demo extracts the drained PC from
+`state.bin` at byte offset 16, little-endian u64. For `icount_spin.elf`
+the loop is two RVC insns at `0x100002` and `0x100004`:
+
+```sh
+python3 -c "
+import struct
+print(hex(struct.unpack('<Q', open('/tmp/icount_state.bin','rb').read()[16:24])[0]))
+"
+```
+
+### 4.4 M4 - SimPoint BBV profile pass
+
+QEMU1 emits one BBV row per slice; the offline `simpoint` tool
+clusters them. No vsim leg.
+
+```sh
+WORKDIR=/tmp/m4-profile bash tests/demos/demo_bbv_profile.sh
+```
+
+Plugin args under the hood:
+
+```
+-plugin libhybrid_handoff.so,outfile=$STATE,bbv_out=$WORKDIR/profile.bb,slice=1000,icount=10000
+```
+
+That writes 10 BBV rows (`icount / slice`). Then:
+
+```
+simpoint -loadFVFile $WORKDIR/profile.bb -maxK 2 -dim 2 \
+         -saveSimpoints $WORKDIR/simpts \
+         -saveSimpointWeights $WORKDIR/weights
+```
+
+`simpts` lines: `<slice_idx> <cluster_id>`. `weights` lines:
+`<mass> <cluster_id>`. Tune `SLICE`, `ICOUNT`, `MAXK` via env vars.
+
+### 4.5 M5 - slice-consume replay entry
+
+Given a `K` chosen from M4's `simpts` output, drain QEMU at the END of
+slice K so vsim resumes from exactly that point.
+
+```sh
+WORKDIR=/tmp/m4-profile bash tests/demos/demo_bbv_profile.sh
+SIMPTS=/tmp/m4-profile/simpts \
+  bash tests/demos/demo_slice_consume_roundtrip.sh
+```
+
+Manual K:
+
+```sh
+SLICE=1000 SLICE_AT=3 bash tests/demos/demo_slice_consume_roundtrip.sh
+```
+
+Plugin args:
+
+```
+-plugin libhybrid_handoff.so,outfile=$STATE,slice=1000,slice_at=3,icount=10000
+```
+
+`icount=` is a safety fallback if K is invalid.
+
+### 4.6 M6 + M7 - archive checkpoint and replay
+
+Capture a portable archive `snap/0/{state.bin, mem, meta.json}` from a
+single QEMU drain, then resume it on vsim (or QEMU) in a separate
+process.
+
+```sh
+WORKDIR=/tmp/m6m7 bash tests/demos/demo_archive_replay.sh
+```
+
+Replay on QEMU instead of vsim:
+
+```sh
+RESUME_WITH=qemu WORKDIR=/tmp/m6m7-qemu \
+  bash tests/demos/demo_archive_replay.sh
+```
+
+The orchestrator commands you can run by hand:
+
+```sh
+python3 -m orchestrator.main run plan.yaml \
+  --project-root . \
+  --workdir /tmp/m6m7/run \
+  --archive-root /tmp/m6m7
+# -> /tmp/m6m7/snap/0/{state.bin, mem, meta.json}
+
+python3 -m orchestrator.main replay-checkpoint /tmp/m6m7/snap/0 \
+  --resume-with vsim \
+  --project-root . \
+  --workdir /tmp/m6m7/replay
+```
+
+### 4.6.5 `./hsim estimate` - SimPoint cycle estimator
+
+`./hsim estimate <elf>` runs the full pipeline (M4 BBV profile -> SimPoint
+cluster -> per-phase QEMU+vsim drain) and aggregates a weighted CPI to
+project a cycle count for the whole program:
+
+```sh
+./hsim estimate gemm.elf --slice 5000 --max-k 4
+```
+
+Default `--icount 0` means **run the program to its natural exit** (e.g.
+libgloss_vh semihosting EXIT). The plugin counts every retired insn via a
+per-insn TCG callback and writes that count into the drained state file's
+`minstret` field; hsim uses it as `N_total` in:
+
+```
+CPI_i           = delta_mcycle_i / vsim_icount
+weighted_CPI    = sum_i ( w_i * CPI_i )
+estimated_cycles = N_total * weighted_CPI
+```
+
+Pass `--icount N` (positive) to instead cap the profile pass at N insns
+and use N as the multiplier (useful for very long-running workloads
+where you only want to characterize the first N insns).
+
+Example output (gemm.elf, ~254K insns):
+
+```
+profile: 4 BBV rows -> .../profile.bb (N_total=254391)
+cluster: 4 phases
+phase K=0 w=0.020 delta_mcycle=48105 CPI=9.621
+phase K=4 w=0.940 delta_mcycle=58621 CPI=11.724
+...
+estimated_cycles=2955387  (N=254391, weighted_CPI=11.617)
+```
+
+Caveats:
+
+- The fixture must reach `_exit` (return from `main`, or call `exit(0)`).
+  Programs that hang in an infinite loop will hit the QEMU 30s profile
+  timeout; pass `--icount N` instead.
+- The ELF must be linked at the andes_ae350 `-bios` load address
+  (`0x00100000`); use the linker script `tests/fixtures/test.ld` or the
+  fixture Makefile. ELFs at other addresses won't execute.
+
+#### How to pick `--slice` and `--max-k`
+
+These two flags trade profile granularity against vsim cost. Here is the
+short version; the rest of this section explains why.
+
+```
+slice  ~= N_total / 20         # aim for ~20 BBV rows
+max-k  =  2                    # start simple, increase only if needed
+```
+
+**Two-step workflow.** First run with defaults to learn N_total, then
+re-run with a tuned slice:
+
+```sh
+./hsim estimate myprog.elf
+# read the line:  profile: <rows> BBV rows ... (N_total=<N>)
+# then:
+./hsim estimate myprog.elf --slice $((N/20))
+```
+
+**Picking `--slice`** (insns per BBV row). One BBV row is the smallest
+unit SimPoint can cluster. Too few rows -> k-means cannot find structure.
+Too many rows -> long profile pass and long clustering. Aim for ~20.
+
+| Program size (N_total) | Pick `--slice`  |
+|------------------------|-----------------|
+| < 10K (toy)            | 500             |
+| 10K..100K              | 1000..5000      |
+| 100K..1M               | 5000..50000     |
+| > 1M                   | 50000+          |
+
+**Picking `--max-k`** (number of phases). Each phase costs **one extra
+QEMU+vsim drain pair** (~5..10s). SimPoint will sometimes pick fewer
+phases than `--max-k` if the workload is uniform, so `max-k` is an upper
+bound, not a fixed count.
+
+| Workload structure              | Pick `--max-k` |
+|---------------------------------|----------------|
+| Single loop kernel              | 2 (init + body) |
+| Init + kernel + cleanup         | 3              |
+| Multi-kernel (e.g. 2 GEMMs)     | 4..6           |
+| Large benchmark mix             | 8..16          |
+
+**Sanity checks after a run.** Read the per-phase rows and apply:
+
+1. `BBV rows >= 2 * max_k`. If fewer, drop `--slice` so more rows fit.
+2. Weights add to ~1.0 and are not all small. If all `--max-k` phases
+   have similar weights, the workload is uniform and you can drop `max_k`.
+3. CPIs differ across phases. If every phase reports the same CPI, you
+   are paying for vsim time without gaining accuracy. Drop `max_k`.
+
+**Worked example: gemm.elf** (N_total = 254391):
+
+```sh
+./hsim estimate gemm.elf --slice 5000 --max-k 4
+# Output:
+# profile: 4 BBV rows -> .../profile.bb (N_total=254391)
+# phase K=0 w=0.020 ...   phase K=1 w=0.020 ...
+# phase K=2 w=0.020 ...   phase K=4 w=0.940 CPI=11.724
+```
+
+`slice=5000` gave only 4 BBV rows -- too few for `max_k=4`. The weights
+also tell you one phase (K=4, the GEMM kernel) accounts for 94% of the
+program; the other three are startup. A cleaner setup:
+
+```sh
+./hsim estimate gemm.elf --slice 10000 --max-k 2
+# slice=10000 -> ~25 BBV rows; max_k=2 -> startup + kernel only
+```
+
+**One-line rule.** Start with `--slice $((N_total/20)) --max-k 2`. Raise
+`max_k` only when a single dominant phase (w > 0.8) hides sub-phase
+detail you care about.
+
+### 4.7 T7 - the centerpiece (M4 -> M5 -> M6 -> M7)
+
+One command chains all four phases on `rt_c_v_regs.elf`:
+
+```sh
+WORKDIR=/tmp/t7 bash tests/demos/demo_simpoint_loop.sh
+```
+
+Expected last line:
+
+```
+[demo T7] PASS (Full SimPoint loop (M4 -> M5 -> M6 -> M7)): bbv_rows=15 phases=2 replays_ok=2 workdir=/tmp/t7
+```
+
+To run a different fixture, set `VSIM_ELF` and tune `SLICE` so the
+BBV pass yields 10..30 rows:
+
+```sh
+VSIM_ELF=tests/fixtures/rt_c_matmul.elf \
+  SLICE=50 PROFILE_ICOUNT=4000 MAXK=3 \
+  WORKDIR=/tmp/t7-matmul \
+  bash tests/demos/demo_simpoint_loop.sh
+```
+
+---
+
+## 5. Running the full test suite
+
+After any change to the simulator or plugin, run the suite:
+
+```sh
+JOBS=8 bash scripts/run_e2e.sh
+```
+
+`JOBS=8` is the practical cap on this 128-core host (vsim Verilator
+processes are CPU-hungry; the default cap of 128 saturates the box and
+times out). Logs go to `/tmp/e2e-<RAND>/`; failed-test logs are
+streamed at the end.
+
+Run a subset:
+
+```sh
+FILTER=demo  JOBS=8 bash scripts/run_e2e.sh         # only the M1..M8 demos
+FILTER=rt_c_v JOBS=8 bash scripts/run_e2e.sh        # only V-related fixtures
+MODE=csr     JOBS=8 bash scripts/run_e2e.sh         # skip the pc-mode iterations
+JOBS=1                     bash scripts/run_e2e.sh  # sequential for debugging
+LOG_DIR=/tmp/my-logs       bash scripts/run_e2e.sh
+```
+
+Single-test sequential demo runner (one banner per test):
+
+```sh
+cd tests/fixtures
+make demo
+# or
+FILTER='csr|pc' bash demo.sh
+```
+
+CTest entry per demo:
+
+```sh
+ctest --test-dir verilator/build -L switching-mode --output-on-failure
+ctest --test-dir verilator/build -R demo_csr      # one demo
+```
+
+---
+
+## 6. Common failures and how to read them
+
+| Symptom                                                | Cause / fix                                                          |
+|--------------------------------------------------------|----------------------------------------------------------------------|
+| `skip: ... not built; run 'make' ...`                  | `source ./setup.sh` and `make -C tests/fixtures`            |
+| `QEMU 1 expected exit 200, got 0`                      | Trigger never fired. Wrong mode / wrong PC / wrong icount value.     |
+| `QEMU 1 expected exit 200, got 124`                    | `timeout` killed the plugin. Increase `TIMEOUT` or tune the target.  |
+| `missing _hybrid_enter_pc/_hybrid_exit_pc symbols`     | M2 needs a fixture with those labels. Rebuild or use M1.             |
+| `vsim drained pc=0x... not in icount_spin loop`        | `VSIM_ICOUNT` too small / wrong fixture for M3.                      |
+| Whole suite times out under `scripts/run_e2e.sh`               | Set `JOBS=8`. Default 128 saturates a 128-core host.                 |
+| `[FAIL] [N/M] ... -> /tmp/e2e-XXXX/...log`             | Open that log; it is the full stdout+stderr of the failing leg.      |
+
+---
+
+## 7. Where to go next
+
+- `docs/HYBRID_OVERVIEW.md` - architecture deep-dive (state ABI,
+  Debug Module transport, V-scratch trick, passthrough rationale).
+- `docs/switching_modes_tutorial.md` - one exercise per M1..M8 with
+  drill-down on the underlying CLI invocations.
+- `CLAUDE.md` - file-level pointers (key files, build commands,
+  fixture authoring rules).
+- `tests/fixtures/rt_c_v_regs.c` - reference fixture
+  combining V regfile + V scalar CSRs + shared memory.
