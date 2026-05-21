@@ -4,3 +4,4 @@
 - [run_e2e.sh JOBS cap](feedback_e2e_jobs.md) - Use JOBS=8 on this 128-core host; default of 128 causes timeouts from vsim CPU saturation
 - [Propose, don't defer](feedback_propose_dont_defer.md) - For design questions, state the recommendation first; AskUserQuestion is for info only the user has
 - [Hybrid unit test host build](reference_hybrid_unit_test_host_build.md) - Fast host g++ command to build+run hybrid doctest tests without the container; vsim rebuild + e2e commands
+- [Verify codegen with objdump](feedback_verify_codegen_with_objdump.md) - Barriers/spills don't pin instruction position, only data deps do; check nm/objdump before asserting compiler behavior

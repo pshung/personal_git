@@ -1,0 +1,64 @@
+/* ROI-boundary hardening fixture (no force-live guards).
+ *
+ * Purpose: prove the enter_vsim()/exit_vsim() boundary is a hard
+ * optimization barrier. A benchmark's vector kernel written between the
+ * markers MUST stay between the enter and exit trigger sites in the
+ * compiled binary; if the compiler may hoist it before enter or sink it
+ * after exit, a cycle-measuring run attributes the work to the wrong phase.
+ *
+ * Unlike rt_c_v_regs.c this fixture uses NO `asm volatile("":: "vr"(..))`
+ * guards. The boundary itself must do the pinning. The kernel reads `x`
+ * (produced in phase 1, so it crosses enter) and produces `y` (consumed in
+ * phase 3, so it crosses exit); the distinctive `vmul` op marks the kernel
+ * in the disassembly. test_roi_barrier.sh asserts the vmul address falls
+ * between _hybrid_enter_pc and _hybrid_exit_pc.
+ *
+ * Phase split:
+ *   QEMU 1   x = [1, 2, ..., N]
+ *   vsim     y = 3 * x + 7          (the measured kernel)
+ *   QEMU 2   store y, verify
+ *
+ * Phase-2 rule: no syscalls between enter_vsim and exit_vsim.
+ */
+#include "runtime/rt_c_helpers.h"
+
+#include <riscv_vector.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#define N 16
+
+int main(void)
+{
+  const size_t vl = __riscv_vsetvl_e32m1((size_t) N);
+
+  /* Phase 1 (QEMU 1): x = [1, 2, ..., N] via vid + 1. */
+  const vuint32m1_t x =
+      __riscv_vadd_vx_u32m1(__riscv_vid_v_u32m1(vl), 1, vl);
+
+  enter_vsim();
+
+  /* Phase 2 (vsim), the measured kernel: y = 3 * x + 7.
+   * No force-live guards -- the out-of-line boundary must keep this here. */
+  const vuint32m1_t y =
+      __riscv_vadd_vx_u32m1(__riscv_vmul_vx_u32m1(x, 3, vl), 7, vl);
+
+  exit_vsim();
+
+  /* Phase 3 (QEMU 2): store y and verify against the closed form. */
+  uint32_t out[N];
+  __riscv_vse32_v_u32m1(out, y, vl);
+
+  for (int i = 0; i < N; i++) {
+    const uint32_t expected = 3u * (uint32_t) (i + 1) + 7u;
+    if (out[i] != expected) {
+      printf("rt_c_roi_barrier: FAIL i=%d got=%u expected=%u\n", i,
+             (unsigned) out[i], (unsigned) expected);
+      fflush(stdout);
+      return 1;
+    }
+  }
+  printf("rt_c_roi_barrier: PASS\n");
+  fflush(stdout);
+  return 0;
+}
