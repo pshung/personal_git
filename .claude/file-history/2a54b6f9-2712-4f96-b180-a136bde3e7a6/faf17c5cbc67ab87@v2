@@ -1,0 +1,113 @@
+# gem5 Warmup Before O3: Marker Mode vs SimPoint Mode
+
+> Notes archive | Author: Nick Hung | Date: 2026-05-22
+> Companion to gem5-cpu-model-switch.md (trigger source 3.6).
+
+## TL;DR
+
+There is no fixed warmup instruction count. Both modes run a `TimingSimpleCPU`
+to warm the cache hierarchy, then switch to `DerivO3CPU` (O3). The only
+difference is who decides the warmup length:
+
+- Marker mode (m5op): warmup length = the instructions your guest code runs
+  between the marker that switches in the warmup CPU and the marker that
+  switches in O3. You decide it by where you place the m5ops. gem5 does not
+  compute or default it.
+- SimPoint mode: warmup length = the `warmup_interval` you pass (e.g.
+  1,000,000 insts), placed right before each SimPoint. If fewer instructions
+  exist before the SimPoint, it shrinks to all available. Default is 0 (no
+  warmup unless you ask).
+
+## How the warmup works (same primitive for both modes)
+
+The warmup CPU is a `TimingSimpleCPU`: in-order, non-speculative, but it issues
+real timed memory requests. So it fills the shared cache hierarchy (L1/L2/...)
+with realistic contents. Caches are shared state (see model-switch spec 3.3) and
+survive the CPU switch untouched. That is the whole point of warmup.
+
+What is NOT warmed: `TimingSimpleCPU` has no branch predictor configured in this
+path, so O3's branch predictor, ROB, LSQ, and per-CPU TLB start COLD after the
+switch. They are CPU-private state and are created fresh.
+
+```
+fast model (KVM/Atomic)  --->  TimingSimpleCPU  --->  DerivO3CPU (O3)
+   skip boot/init             warms CACHES           measure here
+                              (predictor stays cold across this arrow)
+                          ^                       ^
+                     switch #1               switch #2
+                                          (reset stats here)
+```
+
+## Marker mode (m5op)
+
+m5ops raise exit events. Stdlib handlers: `src/python/gem5/simulate/exit_handler.py`.
+
+- `m5_work_begin` -> WORKBEGIN (hypercall 4), default = reset stats (:291-303)
+- `m5_work_end`   -> WORKEND   (hypercall 5), default = dump stats  (:306-318)
+- `m5_switch_cpu` -> SWITCHCPU, default = `processor.switch()`
+  (`src/python/gem5/simulate/simulator.py:522`)
+
+By default, work_begin / work_end do NOT switch CPUs and do NOT warm up. You
+build warmup yourself:
+
+1. Place a marker to switch Atomic/KVM -> Timing.
+2. Run your code. That run IS the warmup (caches fill).
+3. A second marker (often `m5_work_begin`) switches Timing -> O3 and resets
+   stats.
+
+Warmup count = the dynamic instruction count of the code between those two
+markers. It is in your hands, not a gem5 parameter.
+
+## SimPoint mode
+
+Warmup length math: `src/python/gem5/utils/simpoint.py:161-184`
+(`set_warmup_intervals`):
+
+```python
+warmup_inst = start_inst - warmup_interval
+if warmup_inst < 0:
+    warmup_inst = start_inst        # not enough room: warm all available
+else:
+    warmup_inst = warmup_interval   # full requested warmup
+self._simpoint_start_insts[index] = start_inst - warmup_inst  # back up the start
+```
+
+Restore flow:
+`configs/example/gem5_library/checkpoints/simpoints-se-restore.py:138-167`
+
+1. `schedule_max_insts(warmup_list[0])` -> run the warmup instructions.
+2. At that MAX_INSTS exit: `dump(); reset()` stats, then
+   `schedule_max_insts(simpoint_interval)`. To enter O3 instead of just
+   resetting, call `processor.switch()` here. Same boundary, same count.
+3. At the next MAX_INSTS exit: end of the measured interval.
+
+Classic equivalent: `--standard-switch N` plus `--warmup-insts N`
+(`configs/common/Simulation.py:631-632, 757-773`). `--warmup-insts` is the exact
+warmup instruction count on the `TimingSimpleCPU` before switching to
+`DerivO3CPU`. Default is None (off). Requires `--standard-switch` and `--caches`.
+
+## Summary table
+
+| Mode           | Warmup CPU      | Warmup count                              | Who sets it              | Default |
+| -------------- | --------------- | ----------------------------------------- | ------------------------ | ------- |
+| Marker (m5op)  | TimingSimpleCPU | insts between the two markers             | you, via code placement  | none    |
+| SimPoint       | TimingSimpleCPU | `warmup_interval` (capped at insts before the SimPoint) | `warmup_interval` param  | 0 (off) |
+
+## Key caveat for both modes
+
+Warmup warms CACHES only. O3's branch predictor and pipeline structures start
+cold, so a too-short warmup gives optimistic-cache but cold-predictor results.
+Pick a warmup length long enough to also fill the predictor history you care
+about, even though gem5 will not do that part for you.
+
+## Source references
+
+- `configs/common/Simulation.py:595-644`  - standard_switch builds
+  TimingSimpleCPU (warmup) + DerivO3CPU (detail)
+- `configs/common/Simulation.py:757-773`  - the two switchCpus calls around the
+  warmup window
+- `configs/common/Options.py:610-630`      - `--standard-switch`, `--warmup-insts`
+- `src/python/gem5/utils/simpoint.py:161-184` - warmup length calculation
+- `src/python/gem5/simulate/exit_handler.py:291-318` - WorkBegin / WorkEnd
+- `configs/example/gem5_library/checkpoints/simpoints-se-restore.py:138-167` -
+  warmup -> reset -> measure loop
