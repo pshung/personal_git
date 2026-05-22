@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# RED->GREEN: resolve_pc maps an ROI boundary (a symbol name OR a 0x-hex
+# address) to a bare hex address, resolving symbols against `nm` output.
+# This is the primitive that lets pc mode point at ANY symbol/address
+# instead of the planted _hybrid_enter_pc / _hybrid_exit_pc markers.
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/roi.sh"
+
+fail() { echo "FAIL[roi_resolve]: $1"; exit 1; }
+
+# Fake `nm --defined-only` output (columns: addr type name).
+NM_FIXTURE='0000000000100002 T _hybrid_enter_pc
+0000000000100020 T _hybrid_exit_pc
+0000000000100040 T vmatmul_kernel
+0000000000100000 T main'
+
+# 1. hex passthrough strips the 0x prefix, keeps the digits.
+got=$(resolve_pc "0x100abc" "$NM_FIXTURE")
+[ "$got" = "100abc" ] || fail "hex passthrough: want 100abc got '$got'"
+
+# 2. uppercase 0X prefix also stripped.
+got=$(resolve_pc "0X1f" "$NM_FIXTURE")
+[ "$got" = "1f" ] || fail "0X prefix: want 1f got '$got'"
+
+# 3. arbitrary symbol name resolves via nm output (not just the markers).
+got=$(resolve_pc "vmatmul_kernel" "$NM_FIXTURE")
+[ "$got" = "0000000000100040" ] || fail "symbol resolve: want ...100040 got '$got'"
+
+# 4. the default marker symbol still resolves (backward compat).
+got=$(resolve_pc "_hybrid_enter_pc" "$NM_FIXTURE")
+[ "$got" = "0000000000100002" ] || fail "marker resolve: want ...100002 got '$got'"
+
+# 5. unknown symbol -> empty (caller turns this into a FAIL).
+got=$(resolve_pc "nope" "$NM_FIXTURE")
+[ -z "$got" ] || fail "unknown symbol: want empty got '$got'"
+
+# --- roi_resolve_pair: env defaulting + dual resolve, as e2e.sh uses it ---
+
+# 6. no ROI_START/ROI_END -> defaults to the planted marker symbols.
+unset ROI_START ROI_END
+roi_resolve_pair "$NM_FIXTURE" t || fail "default pair: returned nonzero"
+[ "$ENTER_PC" = "0000000000100002" ] || fail "default ENTER_PC: got '$ENTER_PC'"
+[ "$EXIT_PC"  = "0000000000100020" ] || fail "default EXIT_PC: got '$EXIT_PC'"
+
+# 7. ROI_START symbol + ROI_END hex override the defaults.
+ROI_START=vmatmul_kernel ROI_END=0x100100 roi_resolve_pair "$NM_FIXTURE" t \
+  || fail "override pair: returned nonzero"
+[ "$ENTER_PC" = "0000000000100040" ] || fail "override ENTER_PC: got '$ENTER_PC'"
+[ "$EXIT_PC"  = "100100" ]            || fail "override EXIT_PC: got '$EXIT_PC'"
+
+# 8. an unresolvable boundary fails loudly and names the offender.
+out=$(ROI_START=ghost ROI_END=main roi_resolve_pair "$NM_FIXTURE" myfix 2>&1)
+[ $? -ne 0 ] || fail "bad start: expected nonzero return"
+case "$out" in *"myfix"*"ghost"*) ;; *) fail "bad start: message missing label/symbol: '$out'";; esac
+
+echo "[roi_resolve] PASS"

@@ -1,0 +1,601 @@
+# Switching-Mode Tutorial and Exercises
+
+Status: draft for review
+Audience: engineer running the hybrid co-simulator for the first time
+Scope: every switching mode (M1-M8) the repo ships, with copy-paste
+commands and one exercise per mode.
+
+---
+
+## 0. What "switching mode" means
+
+The hybrid simulator runs a program across three phases:
+
+```
+   QEMU1  --(state file + shared mmap)-->  vsim  --(state file + same mmap)-->  QEMU2
+   (fast)                                 (cycle accurate)                       (fast)
+```
+
+A "switching mode" is the RULE that decides WHEN each leg drains its
+state and hands off. The codebase ships eight rules (M1-M8). They
+plug into the same harness; you pick the rule with plugin args and
+vsim CLI flags. The fixture binary does NOT need to change between
+rules (one fixture can be driven by several modes).
+
+This document teaches one mode at a time, then exercises that
+combine modes.
+
+### Quick map
+
+| ID | Name                           | Drain trigger                                   | Used at        |
+|----|--------------------------------|-------------------------------------------------|----------------|
+| M1 | CSR insn match (default)       | `csrwi 0x7C0, 0` (enter) / `csrwi 0x7C0, 1` (exit) | QEMU1, vsim    |
+| M2 | PC symbol resolve              | PC equals `_hybrid_enter_pc` / `_hybrid_exit_pc`   | QEMU1, vsim    |
+| M3 | icount                         | N retired instructions                          | QEMU1, vsim    |
+| M4 | BBV profile + SimPoint cluster | Plugin emits 1 row per slice; offline clustering | QEMU1 + tool   |
+| M5 | slice-consume                  | End of slice index K                             | QEMU1          |
+| M6 | archive emit                   | After drain, write `snap/K/{state.bin, mem, meta.json}` | orchestrator |
+| M7 | checkpoint replay              | Hydrate `snap/K/` into a fresh mmap, resume      | orchestrator   |
+| M8 | end-of-program                 | QEMU2 exits via semihosting `SYS_EXIT_EXTENDED`  | QEMU2          |
+
+M1/M2/M3 are entry/exit triggers (the "boundary" question).
+M4/M5/M6/M7 are pipeline stages for the full SimPoint flow.
+M8 is the natural end-of-run signal (always at the tail).
+
+---
+
+## 1. One-time prerequisites
+
+Build everything once. Each command is idempotent.
+
+```sh
+cd /home/nick/work/hybrid_sim
+source ./setup.sh         # qemu + vsim + plugin + simpoint
+```
+
+You should now have:
+
+| Artifact                                  | Purpose                           |
+|-------------------------------------------|-----------------------------------|
+| `build/qemu/qemu-system-riscv64`          | QEMU binary (phase 1 and phase 3) |
+| `verilator/build/sim_ax45mpv_premium`   | vsim binary (phase 2)             |
+| `qemu_plugin/libhybrid_handoff.so`        | TCG plugin (state drainer)        |
+| `tools/simpoint/bin/simpoint`             | SimPoint clustering tool (M4)     |
+| `tests/fixtures/*.elf`           | Test fixtures (e.g. rt_c_v_regs)  |
+
+Common env vars (auto-detected by every demo; override only if you
+keep these elsewhere):
+
+```sh
+export VSIM_QEMU=/home/nick/work/hybrid_sim/build/qemu/qemu-system-riscv64
+export VSIM_PLUGIN=/home/nick/work/hybrid_sim/qemu_plugin/libhybrid_handoff.so
+export VSIM_BIN=/home/nick/work/hybrid_sim/verilator/build/sim_ax45mpv_premium
+```
+
+---
+
+## 2. M1 + M8 - CSR insn match (the default path)
+
+### What it does
+
+QEMU1's plugin pattern-matches the encoding `csrwi 0x7C0, 0` at retire
+time. On hit it drains state to `outfile` and exits 200. vsim does the
+same on `csrwi 0x7C0, 1`. CSR 0x7C0 is a benign vendor write on Andes
+ax45mp, so the fixture binary embeds these two `csrwi` instructions
+at the ROI boundaries.
+
+M8 is automatic: after vsim hands back, QEMU2 finishes the workload
+and exits via `SYS_EXIT_EXTENDED` semihosting.
+
+### Inputs
+
+- Fixture ELF with `csrwi 0x7C0, 0` and `csrwi 0x7C0, 1` in its source.
+  Every C-level fixture (rt_c_v_regs, rt_c_matmul, etc.) has these.
+
+### Output
+
+- Phase-by-phase log line + final `exit 0`.
+
+### Run it
+
+```sh
+cd /home/nick/work/hybrid_sim
+bash tests/demos/demo_csr_oneshot.sh
+```
+
+Expected last line:
+
+```
+[demo M1] PASS (CSR insn match (M1+M8))
+```
+
+### Drill-down (what the demo does internally)
+
+Inside, the demo calls the generic harness:
+
+```sh
+FIXTURE=rt_c_v_regs TRIGGER_MODE=csr EXPECT_RC=0 \
+  bash tests/e2e.sh
+```
+
+The plugin gets `outfile=<state.bin>` and nothing else - that is the
+M1 default. vsim is launched without `--hybrid-exit-pc` and without
+`--hybrid-icount`, so its ELF pre-scanner watches for `csrwi 0x7C0, 1`
+PCs at retire.
+
+### Exercise 1
+
+Switch fixture from `rt_c_v_regs` to `rt_c_matmul`. The script is
+fixture-parameterized:
+
+```sh
+FIXTURE=rt_c_matmul TRIGGER_MODE=csr EXPECT_RC=0 \
+  bash tests/e2e.sh
+```
+
+Verify the last line says `PASS: round-trip exit code 0`. Then read
+`tests/fixtures/rt_c_matmul.c` and confirm where the two
+`csrwi 0x7C0, *` markers live (`enter_vsim()` / `exit_vsim()` helpers).
+
+---
+
+## 3. M2 - PC symbol resolve
+
+### What it does
+
+Same round-trip as M1 but the trigger is a PC value (not an opcode
+match). The orchestrator runs `nm` on the ELF to resolve symbols
+`_hybrid_enter_pc` and `_hybrid_exit_pc`, then passes:
+
+- `enter_pc=0x<addr>` to the QEMU plugin (QEMU1 drains there)
+- `--hybrid-exit-pc 0x<addr>` to vsim (vsim drains there)
+
+CSR-mode matchers are bypassed; the `csrwi 0x7C0, *` instructions in
+the binary become inert (CSR 0x7C0 is a benign vendor-defined write).
+
+This proves you can hand off WITHOUT modifying the source.
+
+### Inputs
+
+- Same fixture as M1 (`rt_c_v_regs`), but the ELF must define
+  `_hybrid_enter_pc` and `_hybrid_exit_pc` symbols. The C-level
+  fixtures all do.
+
+### Output
+
+- `exit 0`, last log line `[demo M2] PASS`.
+
+### Run it
+
+```sh
+bash tests/demos/demo_pc_oneshot.sh
+```
+
+### Drill-down
+
+```sh
+ENTER_PC=$(riscv64-unknown-elf-nm --defined-only \
+              tests/fixtures/rt_c_v_regs.elf | \
+              awk '$3=="_hybrid_enter_pc"{print $1}')
+EXIT_PC=$(riscv64-unknown-elf-nm --defined-only \
+              tests/fixtures/rt_c_v_regs.elf | \
+              awk '$3=="_hybrid_exit_pc"{print $1}')
+
+# QEMU plugin arg
+... -plugin libhybrid_handoff.so,outfile=$STATE,enter_pc=0x$ENTER_PC
+
+# vsim arg
+... --hybrid-exit-pc 0x$EXIT_PC
+```
+
+### Exercise 2
+
+Compare exit values: run the demo with TRIGGER_MODE=csr and again
+with TRIGGER_MODE=pc on the same fixture. Both must exit 0 and
+both must drain the same PC. Use:
+
+```sh
+xxd state_csr.bin | head -4
+xxd state_pc.bin  | head -4
+```
+
+The PC field is at offset 16 (`hybrid_state_v1::pc`). For most
+fixtures `pc(csr) == pc(pc)` because both modes drain right after
+the entry trigger retires.
+
+---
+
+## 4. M3 - icount round-trip
+
+### What it does
+
+Both legs drain on retired-instruction count alone. No CSR, no PC
+symbol. Suitable for CSR-less workloads (an infinite spin loop, a
+benchmark you cannot edit, etc.).
+
+- QEMU plugin: `icount=N1` -> drain at the N1-th retired insn
+- vsim: `--hybrid-icount N2` -> drain N2 insns after resume
+
+### Inputs
+
+- Any ELF; `icount_spin.elf` is the canonical CSR-less fixture.
+
+### Output
+
+- Both QEMU1 and vsim exit 200 with a non-empty state file. There is
+  no QEMU2 phase because `icount_spin` spins forever (no natural
+  semihosting exit).
+
+### Run it
+
+```sh
+bash tests/demos/demo_icount_roundtrip.sh
+```
+
+Override targets:
+
+```sh
+QEMU_ICOUNT=20000 VSIM_ICOUNT=8000 \
+  bash tests/demos/demo_icount_roundtrip.sh
+```
+
+### Exercise 3
+
+Predict where the drained PC will land for `icount_spin.elf`. The
+loop body has two RVC instructions at PCs `0x100002` and `0x100004`.
+Run with VSIM_ICOUNT=5000. The drained PC should be one of those
+two values. Read the demo's `read_u64` helper to confirm how the PC
+is extracted from the state file (offset 16, little-endian 8 bytes).
+
+---
+
+## 5. M4 - BBV profile + SimPoint cluster
+
+### What it does
+
+QEMU plugin emits one Basic-Block-Vector (BBV) row per slice of N
+retired insns. The output is a SimPoint `.bb` file. Offline,
+`tools/simpoint/bin/simpoint` reads it and clusters the rows into K
+representative phases.
+
+This is the SimPoint "profile" pass. It produces:
+
+- `simpts` file: 1 line per cluster, `<slice_idx> <cluster_id>`
+- `weights` file: 1 line per cluster, `<weight> <cluster_id>`
+
+Later, M5+M6+M7 replay just those representative slices.
+
+### Inputs
+
+- Any ELF. CSR-less or not - the plugin emits BBV rows regardless.
+
+### Output
+
+- `WORKDIR/<elf>.bb`, `WORKDIR/simpts`, `WORKDIR/weights` persist on
+  disk so that M5/M7 can consume them.
+
+### Run it
+
+```sh
+WORKDIR=/tmp/m4-profile \
+  bash tests/demos/demo_bbv_profile.sh
+```
+
+Override the slice and total count:
+
+```sh
+WORKDIR=/tmp/m4-bigger SLICE=2000 ICOUNT=20000 MAXK=4 \
+  bash tests/demos/demo_bbv_profile.sh
+```
+
+Expected rows = `ICOUNT / SLICE`. The demo asserts this.
+
+### Drill-down: plugin args
+
+```
+-plugin libhybrid_handoff.so,\
+        outfile=$STATE,\
+        bbv_out=$WORKDIR/profile.bb,\
+        slice=1000,\
+        icount=10000
+```
+
+`slice` is shared with M5; `bbv_out=` is what activates emit mode.
+
+### Exercise 4
+
+Run the demo with WORKDIR=/tmp/m4-ex SLICE=500 ICOUNT=10000 MAXK=3.
+Inspect `simpts` and `weights`. The number of lines in each file
+must be equal and at most `MAXK`. Sum the first column of `weights`
+- it should be approximately 1.0 (SimPoint may emit unnormalised on
+small inputs; the demo prints this sum for sanity-check).
+
+---
+
+## 6. M5 - slice-consume entry
+
+### What it does
+
+QEMU plugin drains at the end of slice K (0-based), where each slice
+is N retired insns. This is the SimPoint "replay" entry: you ran M4
+once, picked phase K, and now you want vsim to start from the END of
+slice K (the QEMU drain leaves you with exactly that architectural
+state).
+
+Plugin args:
+
+- `slice=N` (insns per slice; SAME N as the profile pass)
+- `slice_at=K` (drain at the end of the K-th slice, 0-based)
+- `icount=M` (safety fallback - if K is invalid, drain at M anyway)
+
+### Inputs
+
+- Same ELF as the profile pass. Same `slice=N`.
+- K from `simpts` (T4 output) OR from env `SLICE_AT`.
+
+### Output
+
+- State file drained at the slice boundary. PC inside the ROI.
+
+### Run it
+
+Using M4's output directly:
+
+```sh
+WORKDIR=/tmp/m4-profile bash tests/demos/demo_bbv_profile.sh
+SIMPTS=/tmp/m4-profile/simpts \
+  bash tests/demos/demo_slice_consume_roundtrip.sh
+```
+
+Manual K choice:
+
+```sh
+SLICE=1000 SLICE_AT=3 \
+  bash tests/demos/demo_slice_consume_roundtrip.sh
+```
+
+Inside, the demo combines two modes: M5 for entry (QEMU side) and
+M3 for exit (vsim side, `--hybrid-icount`). They are independent;
+each side picks its own mode.
+
+### Exercise 5
+
+Pipeline M4 -> M5 by hand (no demo script):
+
+1. Run M4 with `SLICE=1000 ICOUNT=10000 MAXK=2`. Note `WORKDIR`.
+2. `cat $WORKDIR/simpts` and pick the first cluster's slice index, K.
+3. Run vsim manually:
+   - QEMU plugin `slice=1000,slice_at=K,outfile=...`
+   - vsim `--resume-from-qemu STATE --hybrid-icount 5000 --handoff-out STATE_V`
+4. Confirm both legs exit 200.
+
+This is exactly what `demo_slice_consume_roundtrip.sh` automates.
+
+---
+
+## 7. M6 + M7 - archive emit and checkpoint replay
+
+### What it does
+
+M6 packages a drained state plus its shared mmap into a portable
+archive directory:
+
+```
+snap/K/
+  state.bin    # hybrid_state_v1 (8.5 KB)
+  mem          # full shared mmap (128 MB by default)
+  meta.json    # schema=1, abi_version=1, mmap_size, slice_index, etc.
+```
+
+M7 replays an archive: hydrate `mem` into a fresh `/dev/shm` file,
+hand `state.bin` to vsim (or QEMU), let it run to natural exit.
+
+Together they decouple "where the simulation ran" from "where the
+simulation is replayed" - you can email an archive to a colleague.
+
+### Inputs
+
+- For M6: a plan YAML pointing at a fixture and a drain trigger.
+- For M7: an existing archive directory and a target model
+  (`--resume-with vsim` or `--resume-with qemu`).
+
+### Output
+
+- M6: `$ARCHIVE_ROOT/snap/0/{state.bin, mem, meta.json}`
+- M7: replay exits 0 (or 200 if the replay also drains); PC advances
+  past the archive's PC.
+
+### Run it
+
+```sh
+WORKDIR=/tmp/m6m7 \
+  bash tests/demos/demo_archive_replay.sh
+```
+
+Switch the replay target to QEMU:
+
+```sh
+RESUME_WITH=qemu WORKDIR=/tmp/m6m7-qemu \
+  bash tests/demos/demo_archive_replay.sh
+```
+
+### Drill-down: the plan YAML
+
+```yaml
+session:
+  mem_size: 134217728
+  mmap_path: null
+  elf: tests/fixtures/rt_c_v_regs.elf
+
+steps:
+  - model: qemu
+    trigger: { kind: csr }
+    on_exit: { archive_as: "snap/0" }
+```
+
+The orchestrator parses this, spawns QEMU+plugin with `outfile=`,
+waits for the drain (exit 200), then writes the archive.
+
+### Exercise 6
+
+Use M6 to capture two archives from the same workload at different
+slice points, then M7 to replay both. Skeleton:
+
+1. Run T4 (M4) to get simpts.
+2. For each `K` in simpts:
+   - QEMU+plugin `slice=N,slice_at=K`, capture state.bin.
+   - Python: `orchestrator.checkpoint.write_archive(...)` -> snap/K/
+3. For each `snap/K/`:
+   - `python3 -m orchestrator.main replay-checkpoint <snap/K>
+       --resume-with vsim`
+
+This is exactly what T7 (`demo_simpoint_loop.sh`) automates.
+
+---
+
+## 8. Putting it all together: T7 (the centerpiece)
+
+`demo_simpoint_loop.sh` chains M4 -> M5 -> M6 -> M7 on
+`rt_c_v_regs.elf`:
+
+```
+M4  profile pass    : QEMU+plugin bbv_out=,slice=20,icount=2000
+                      -> 15 BBV rows
+---  cluster        : simpoint -maxK 2 -dim 2
+                      -> 2 representative slice indices
+M5  per phase       : QEMU+plugin slice=20,slice_at=K
+                      -> state.bin drained at slice K
+M6  per phase       : orchestrator.checkpoint.write_archive(...)
+                      -> snap/K/{state.bin, mem, meta.json}
+M7  per archive     : orchestrator.main replay-checkpoint --resume-with vsim
+                      -> vsim resumes, drains naturally on csrwi 0x7C0,1 (M1+M8)
+```
+
+Run it:
+
+```sh
+WORKDIR=/tmp/t7 bash tests/demos/demo_simpoint_loop.sh
+```
+
+Expected last line:
+
+```
+[demo T7] PASS (Full SimPoint loop (M4 -> M5 -> M6 -> M7)): \
+   bbv_rows=15 phases=2 replays_ok=2 workdir=/tmp/t7
+```
+
+### Exercise 7 (capstone)
+
+Pick a fixture other than `rt_c_v_regs` (e.g. `rt_c_matmul`). Tune
+`SLICE` and `PROFILE_ICOUNT` so that the BBV pass yields between 10
+and 30 rows, then re-run T7. Goals:
+
+- Find the SLICE that gives a good cluster count (try 20, 50, 200).
+- Confirm replays exit 0 for every cluster.
+- Compare wall-clock against the M1+M8 baseline. (T7 should be
+  similar for small fixtures; the speedup shows on real workloads.)
+
+---
+
+## 9. Running the whole suite
+
+### Sequential runner (with banners)
+
+```sh
+cd /home/nick/work/hybrid_sim/tests/fixtures
+make demo
+# or
+bash demo.sh
+# subset:
+FILTER='csr|pc'  bash demo.sh
+FILTER=simpoint  bash demo.sh
+```
+
+Output ends with a tally like:
+
+```
+Demo Suite Summary  (elapsed 142s)
+  T1  demo_csr_oneshot.sh                PASS
+  T2  demo_pc_oneshot.sh                 PASS
+  T3  demo_icount_roundtrip.sh           PASS
+  T4  demo_bbv_profile.sh                PASS
+  T5  demo_slice_consume_roundtrip.sh    PASS
+  T6  demo_archive_replay.sh             PASS
+  T7  demo_simpoint_loop.sh              PASS
+  ----
+  PASS=7  FAIL=0  SKIP=0
+```
+
+### CTest
+
+```sh
+ctest --test-dir verilator/build -L switching-mode --output-on-failure
+```
+
+Each demo is one CTest entry. Use `-R demo_csr` to run a single one.
+
+### Parallel runner (scripts/run_e2e.sh)
+
+```sh
+JOBS=8 FILTER=demo bash scripts/run_e2e.sh
+```
+
+This runs every `demo_*.sh` (and every other e2e fixture matching the
+default suite) in parallel under a FIFO job pool. The summary line
+gets a `demo Np/Mf/Ks` column.
+
+> CAUTION: on this 128-core host the default `JOBS` value can saturate
+> the box and time out. Use `JOBS=8` as a practical cap.
+
+---
+
+## 10. Switching-mode decision flow
+
+When you have a new workload, pick a mode like this:
+
+```
+Is your binary YOURS to edit?
+  yes -> Add csrwi 0x7C0, 0 and csrwi 0x7C0, 1 around the ROI -> M1
+  no  -> Continue.
+
+Does the binary already export _hybrid_enter_pc / _hybrid_exit_pc?
+  yes -> Use M2.
+  no  -> Continue.
+
+Do you know an instruction count where the ROI is hot?
+  yes -> Use M3.
+  no  -> Continue.
+
+You want SimPoint phase-aware replay -> M4 + M5 + M6 + M7 (T7).
+```
+
+---
+
+## 11. Common failure signatures
+
+| Symptom                                                 | Likely cause                                                        |
+|---------------------------------------------------------|---------------------------------------------------------------------|
+| `SKIP: ... not built`                                   | `source ./setup.sh` not run, or partial build                       |
+| `QEMU 1 expected exit 200, got 0`                       | Trigger never fired (wrong mode, wrong PC/slice/icount target)      |
+| `QEMU 1 expected exit 200, got 124`                     | Plugin hung -> `timeout` killed it; check icount/slice_at value     |
+| `missing _hybrid_enter_pc/_hybrid_exit_pc symbols`      | Wrong fixture for M2; rebuild with the symbols, or use M1 instead   |
+| `vsim drained pc=0x... not in icount_spin loop`         | VSIM_ICOUNT too small / wrong fixture                               |
+| Whole suite times out under scripts/run_e2e.sh                  | `JOBS` too high; set `JOBS=8`                                       |
+
+---
+
+## 12. Review checklist (for the reviewer)
+
+Use this when sanity-checking the tutorial against the code:
+
+- [ ] Plugin arg names match `qemu_plugin/hybrid_handoff.c`
+      (`outfile`, `enter_pc`, `icount`, `bbv_out`, `slice`, `slice_at`).
+- [ ] vsim flag names match `verilator/src/main.cpp`
+      (`--resume-from-qemu`, `--handoff-out`, `--hybrid-exit-pc`,
+      `--hybrid-icount`, `--shared-mem-{path,size,base}`,
+      `--qemu-binary`).
+- [ ] Demo IDs map T1..T7 to M1..M8 (one demo per switching mode).
+- [ ] `demo.sh` order matches `DEMOS` array (T1..T7).
+- [ ] CTest label `switching-mode` registered in
+      `verilator/cmake/HybridConfig.cmake`.
+- [ ] `scripts/run_e2e.sh` carries a `DEMO_TESTS` array with the seven entries.
