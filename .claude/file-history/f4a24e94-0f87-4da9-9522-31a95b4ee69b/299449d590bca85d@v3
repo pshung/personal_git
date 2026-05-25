@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# tests/e2e.sh must print kernel_cycles -- the vsim mcycle delta over the
+# measured region (vsim drain - QEMU1 drain, offset 624) -- for both
+# kernel modes (csr, pc), so the `./hsim run --mode csr|pc` surface
+# carries the cycle figure required by the 4-mode model.
+#
+# Fixture: rt_c_v_matmul.elf (marked RVV GEMM). CSR mode uses the
+# csrwi 0x7C0 markers in the source; PC mode resolves the boundaries
+# from the binary itself (no planted _hybrid_*_pc labels).
+#
+# Manual TDD smoke test (runs real QEMU+vsim round-trips); not wired into
+# scripts/run_e2e.sh.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+FIXTURE=rt_c_v_matmul
+
+. "$SCRIPT_DIR/lib/log.sh"
+. "$ROOT/setup.sh" >/dev/null 2>&1 || true
+
+# Resolve the PC immediately after `jal vmatmul_kernel` in the marked
+# GEMM ELF; that's the PC at which vsim drains for PC mode (ROI_END).
+# Recompiling the fixture relocates this address, so we derive it from
+# objdump every run.
+resolve_post_jal_pc() {
+  local elf="$1"
+  "$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-objdump" -d "$elf" \
+    | awk '
+        /jal[[:space:]]+.*<vmatmul_kernel>/ { matched = 1; next }
+        matched { sub(":", "", $1); printf "0x%s\n", $1; exit }
+      '
+}
+
+check_mode() {
+  local mode="$1"; shift
+  local out rc n
+  out=$(env FIXTURE="$FIXTURE" TRIGGER_MODE="$mode" EXPECT_RC=0 TIMEOUT=120 \
+        "$@" bash "$ROOT/tests/e2e.sh" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 77 ]; then
+    echo "[skip] $mode round-trip skipped (rc=77, e.g. toolchain missing)"
+    return 0
+  fi
+  [ "$rc" -eq 0 ] || { echo "$out"; fail "$mode round-trip did not exit 0 (rc=$rc)"; }
+  n=$(echo "$out" | sed -nE 's/.*kernel_cycles\][[:space:]]*([0-9]+).*/\1/p' | head -1)
+  { [ -n "$n" ] && [ "$n" -gt 0 ]; } \
+    || { echo "$out"; fail "$mode: kernel_cycles not a positive integer (got '${n:-}')"; }
+  echo "[ok] $mode round-trip printed kernel_cycles=$n"
+}
+
+check_mode csr
+
+if [ -z "${HYBRID_TOOLCHAIN:-}" ]; then
+  echo "[skip] pc round-trip: HYBRID_TOOLCHAIN unset (run \`source ./setup.sh\`)"
+else
+  POST_JAL_PC=$(resolve_post_jal_pc "$ROOT/tests/fixtures/$FIXTURE.elf")
+  [ -n "$POST_JAL_PC" ] || fail "could not resolve post-jal PC for vmatmul_kernel"
+  check_mode pc ROI_START=vmatmul_kernel ROI_END="$POST_JAL_PC"
+fi
+
+echo "PASS test_kernel_cycles"

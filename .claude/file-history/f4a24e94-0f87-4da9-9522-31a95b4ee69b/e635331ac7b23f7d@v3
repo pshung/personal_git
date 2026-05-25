@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# RED-then-green test for gemm_modes.md F1: make tests/fixtures/rt_c_v_matmul.c
+# serve BOTH the marked and the markerless build from one source.
+#
+# Pins three source properties the rest of the GEMM-unification depends on:
+#   1. noinline kernel  - `vmatmul_kernel` survives -O1 as a real symbol, so
+#      icount-mode PC-range assertions can anchor on it.
+#   2. marker macro     - compiling with -DHYBRID_MARKERLESS drops the
+#      csrwi 0x7C0 enter/exit markers (needed by the count-driven modes;
+#      otherwise the CSR matcher would drain AT the marker first).
+#   3. behavior-identity - the default (marked) build still emits both markers.
+#
+# Self-contained: resolves the Andes toolchain via tests/lib/paths.sh (config.env)
+# and builds through the fixtures Makefile. Skips (77) if the toolchain is absent.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/../lib/paths.sh"
+
+. "$SCRIPT_DIR/../lib/log.sh"
+
+if [ -z "${HYBRID_TOOLCHAIN:-}" ] || [ ! -x "$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-gcc" ]; then
+  echo "SKIP test_gemm_source: HYBRID_TOOLCHAIN not set/usable"
+  exit 77
+fi
+CC="$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-gcc"
+NM="$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-nm"
+OBJDUMP="$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-objdump"
+
+cd "$SCRIPT_DIR"
+SRC=rt_c_v_matmul.c
+ELF=rt_c_v_matmul.elf
+[ -f "$SRC" ] || fail "missing source $SRC"
+
+# --- 1. marked build: noinline kernel symbol present -----------------------
+# NB: feed grep via here-strings, not `cmd | grep -q`. Under `set -o pipefail`
+# grep -q exits on first match and SIGPIPEs the producer (141), which pipefail
+# then propagates as a spurious failure on large inputs (e.g. the objdump).
+make -s TOOLCHAIN="$HYBRID_TOOLCHAIN" "$ELF" >/dev/null 2>&1 || fail "make $ELF failed"
+syms=$("$NM" "$ELF")
+grep -qw vmatmul_kernel <<<"$syms" \
+  || fail "noinline broken: 'vmatmul_kernel' is not a symbol in $ELF (still inlined)"
+ok "marked build keeps vmatmul_kernel as a linkable symbol (noinline)"
+
+# --- 2. behavior-identity: marked build still emits both csrwi markers ------
+# Match the instruction OPCODE (toolchain-independent): the Andes objdump
+# prints CSR 0x7C0 by its vendor name (milmb), so a textual "0x7c0" match
+# misses. 7c005073 = csrwi 0x7C0,0 (enter); 7c00d073 = csrwi 0x7C0,1 (exit) --
+# the exact encodings insn_match.h drains on.
+dump=$("$OBJDUMP" -d "$ELF")
+grep -qw 7c005073 <<<"$dump" \
+  || fail "marked build lost the enter marker (csrwi 0x7C0,0 / opcode 7c005073)"
+grep -qw 7c00d073 <<<"$dump" \
+  || fail "marked build lost the exit marker (csrwi 0x7C0,1 / opcode 7c00d073)"
+ok "marked build still emits both enter/exit csrwi 0x7C0 markers (opcodes)"
+
+# --- 3. markerless macro drops the markers, keeps the kernel ----------------
+# Compile-only (-S) with the same -march as RT_C_V_CFLAGS; no link/libs needed
+# to observe whether the csrwi markers are emitted.
+ASM=$(mktemp -t gemm-free-XXXXXX.s)
+trap 'rm -f "$ASM"' EXIT
+"$CC" -march=rv64gcv -mabi=lp64d -O1 -Iruntime -Wall \
+  -DHYBRID_MARKERLESS -S "$SRC" -o "$ASM" \
+  || fail "markerless compile (-DHYBRID_MARKERLESS) failed"
+if grep -qE 'csrwi\s+0x7c0|csrwi.*0x7C0' "$ASM"; then
+  fail "markerless build still emits csrwi 0x7c0 markers (HYBRID_MARKERLESS guard missing)"
+fi
+ok "markerless build (-DHYBRID_MARKERLESS) emits no csrwi 0x7c0 markers"
+grep -qE '^vmatmul_kernel:|vmatmul_kernel, ?@function' "$ASM" \
+  || fail "markerless build dropped the vmatmul_kernel function"
+ok "markerless build still contains vmatmul_kernel"
+
+echo "PASS test_gemm_source"
