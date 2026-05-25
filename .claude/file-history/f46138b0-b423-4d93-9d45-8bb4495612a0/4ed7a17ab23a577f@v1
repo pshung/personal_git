@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# Demo (SimPoint stage: slice-consume): drain QEMU at a slice boundary, then
+# measure a window in vsim -- on the RVV GEMM workload.
+#
+# Shows the orchestrator using DIFFERENT trigger modes for the entry and exit
+# of the same vsim window:
+#
+#   QEMU + plugin: slice=N,slice_at=K -> drains at end of slice K.
+#   vsim         : --hybrid-icount M  -> drains after M retired insns.
+#
+# Workload is the MARKERLESS GEMM twin rt_c_v_matmul_free (no csrwi 0x7C0), so
+# neither side can use the marker -- slice/icount ARE the only triggers. There
+# is no natural end-of-program drain (the demo stops vsim mid-kernel by count);
+# it asserts the round-trip DRAINS at both ends with both PCs inside the GEMM
+# kernel.
+#
+# Env (auto-detected with sensible defaults):
+#   VSIM_QEMU     qemu-system-riscv64
+#   VSIM_PLUGIN   libhybrid_handoff.so
+#   VSIM_BIN      sim_<cpu>
+#   VSIM_ELF      markerless fixture (default: rt_c_v_matmul_free.elf)
+#   SLICE         insns per slice    (default: 1000)
+#   SLICE_AT      0-based slice index for drain (default: 1)
+#   ICOUNT_FALLBACK QEMU plugin safety upper bound (default: 10000)
+#   VSIM_ICOUNT   insns vsim runs before exit drain (default: 5000)
+#   SIMPTS        optional simpts file from the bbv stage; if set, slice_at
+#                 picked from its first row (first column) instead of SLICE_AT.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/../lib/paths.sh"
+
+FIXTURE="${FIXTURE:-rt_c_v_matmul_free}"
+SLICE="${SLICE:-1000}"
+SLICE_AT_ENV="${SLICE_AT:-1}"
+ICOUNT_FALLBACK="${ICOUNT_FALLBACK:-10000}"
+VSIM_ICOUNT="${VSIM_ICOUNT:-5000}"
+SIMPTS="${SIMPTS:-}"
+
+# If a SIMPTS file from the bbv stage is provided, pick the first listed slice
+# index. Otherwise fall back to SLICE_AT env (default 1).
+if [ -n "$SIMPTS" ] && [ -s "$SIMPTS" ]; then
+  SLICE_AT=$(awk 'NR==1{print $1}' "$SIMPTS")
+  SLICE_AT_SRC="simpts(first row of $SIMPTS)"
+else
+  SLICE_AT="$SLICE_AT_ENV"
+  SLICE_AT_SRC="env SLICE_AT"
+fi
+
+MODE_LABEL="SimPoint stage: slice-consume entry + icount exit"
+echo "=========================================================="
+echo "Mode: $MODE_LABEL"
+echo "Workload: ${FIXTURE} (markerless RVV GEMM, 200 reps)"
+echo "Entry: QEMU plugin slice=$SLICE slice_at=$SLICE_AT (from $SLICE_AT_SRC)"
+echo "Exit : vsim --hybrid-icount $VSIM_ICOUNT"
+echo "=========================================================="
+
+hybrid_resolve_paths
+
+# Resolve the GEMM kernel range so the drain checks assert the slice/icount
+# targets landed inside vmatmul_kernel (readelf -sW: $2=value $3=size $8=name).
+RE="${HYBRID_TOOLCHAIN:+$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-readelf}"
+RE="${RE:-riscv64-unknown-elf-readelf}"
+read KLO KSZ < <("$RE" -sW "$VSIM_ELF" | awk '$8=="vmatmul_kernel"{print strtonum("0x"$2),$3; exit}')
+if [ -z "${KLO:-}" ] || [ -z "${KSZ:-}" ]; then
+  echo "[demo slice] FAIL: could not resolve vmatmul_kernel range from $VSIM_ELF"; exit 1
+fi
+pc_in_kernel() { awk -v p="$1" -v lo="$KLO" -v sz="$KSZ" 'BEGIN{exit !(p>=lo && p<lo+sz)}'; }
+echo "  vmatmul_kernel: $(printf '0x%x..0x%x' "$KLO" "$((KLO+KSZ))")"
+
+EXPECTED_QEMU_INSN=$(( (SLICE_AT + 1) * SLICE ))
+SHARED_SIZE=$((128 * 1024 * 1024))
+SHARED_MEM=$(mktemp -p /dev/shm vsim-slice-shared.XXXXXX)
+STATE_Q=$(mktemp)
+STATE_V=$(mktemp)
+QEMU_LOG=$(mktemp)
+VSIM_LOG=$(mktemp)
+trap 'rm -f "$SHARED_MEM" "$STATE_Q" "$STATE_V" "$QEMU_LOG" "$VSIM_LOG"' EXIT
+truncate -s "$SHARED_SIZE" "$SHARED_MEM"
+
+read_u64() { python3 -c "
+import struct
+with open('$1', 'rb') as f:
+    f.seek($2); print(struct.unpack('<Q', f.read(8))[0])
+"; }
+
+echo "[demo slice 1/2] QEMU + plugin: drain at end of slice $SLICE_AT (insn $EXPECTED_QEMU_INSN)"
+set +e
+timeout 30 "$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHARED_MEM,size=$SHARED_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -semihosting-config enable=on,target=native \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_Q,slice=$SLICE,slice_at=$SLICE_AT,icount=$ICOUNT_FALLBACK" \
+  >"$QEMU_LOG" 2>&1
+QRC=$?
+set -e
+
+if [ "$QRC" -ne 200 ]; then
+  echo "[demo slice] FAIL: QEMU expected exit 200, got $QRC"
+  tail -20 "$QEMU_LOG"
+  exit 1
+fi
+if [ ! -s "$STATE_Q" ]; then
+  echo "[demo slice] FAIL: QEMU state file empty"
+  exit 1
+fi
+
+# Verify drain happened at the slice boundary (plugin logs idx=K+1 target=K).
+# Fixture-independent: this checks the plugin's slice-consume logic.
+EXPECTED_IDX=$((SLICE_AT + 1))
+if ! grep -qE "slice-consume drain \(idx=$EXPECTED_IDX target=$SLICE_AT\)" "$QEMU_LOG"; then
+  echo "[demo slice] FAIL: QEMU drain not at slice boundary idx=$EXPECTED_IDX target=$SLICE_AT"
+  tail -20 "$QEMU_LOG"
+  exit 1
+fi
+
+PC_Q=$(read_u64 "$STATE_Q" 16)
+if ! pc_in_kernel "$PC_Q"; then
+  echo "[demo slice] FAIL: QEMU drained pc=$(printf '0x%x' "$PC_Q") not in vmatmul_kernel"
+  exit 1
+fi
+echo "  QEMU drain: idx=$EXPECTED_IDX target=$SLICE_AT pc=$(printf '0x%x' "$PC_Q") (in kernel)"
+
+# vsim resumes from the QEMU drain and attaches the SAME shared mmap so the
+# GEMM matrices QEMU wrote to .bss survive (mirrors tests/e2e.sh).
+echo "[demo slice 2/2] vsim: resume + drain after $VSIM_ICOUNT retired insns"
+set +e
+timeout 120 "$VSIM_BIN" "$VSIM_ELF" \
+  --resume-from-qemu "$STATE_Q" \
+  --handoff-out "$STATE_V" \
+  --shared-mem-path "$SHARED_MEM" \
+  --shared-mem-size "$SHARED_SIZE" \
+  --shared-mem-base 0x00000000 \
+  --hybrid-icount "$VSIM_ICOUNT" \
+  >"$VSIM_LOG" 2>&1
+VRC=$?
+set -e
+
+if [ "$VRC" -ne 200 ]; then
+  echo "[demo slice] FAIL: vsim expected exit 200, got $VRC"
+  tail -20 "$VSIM_LOG"
+  exit 1
+fi
+if [ ! -s "$STATE_V" ]; then
+  echo "[demo slice] FAIL: vsim state file empty"
+  exit 1
+fi
+
+PC_V=$(read_u64 "$STATE_V" 16)
+if ! pc_in_kernel "$PC_V"; then
+  echo "[demo slice] FAIL: vsim drained pc=$(printf '0x%x' "$PC_V") not in vmatmul_kernel"
+  exit 1
+fi
+echo "  vsim drain: after $VSIM_ICOUNT insns pc=$(printf '0x%x' "$PC_V") (in kernel)"
+
+echo "[demo slice] PASS ($MODE_LABEL): both drains inside vmatmul_kernel"

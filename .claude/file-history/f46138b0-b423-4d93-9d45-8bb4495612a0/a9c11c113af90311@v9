@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# Demo (icount mode): instruction-count switching on the RVV GEMM workload.
+#
+# Whole-program mode: both legs drain by retired-instruction count alone, with
+# no CSR markers in the workload:
+#
+#   QEMU1 + plugin icount=N1    -> drain at insn N1.
+#   vsim --hybrid-icount N2     -> drain N2 insns later.
+#
+# Workload is the MARKERLESS GEMM twin rt_c_v_matmul_free (200 back-to-back
+# 16x16x16 GEMMs, no csrwi 0x7C0). icount IS the only drain trigger -- the
+# default CSR matcher has nothing to match. There is no natural end-of-program
+# drain here (the demo stops vsim mid-kernel by count), so it asserts the
+# round-trip DRAINS at both ends with both PCs landing inside vmatmul_kernel.
+#
+# Env (auto-detected with sensible defaults):
+#   VSIM_QEMU     qemu-system-riscv64
+#   VSIM_PLUGIN   libhybrid_handoff.so
+#   VSIM_BIN      sim_<cpu>
+#   VSIM_ELF      markerless fixture (default: rt_c_v_matmul_free.elf)
+#   QEMU_ICOUNT   plugin icount drain target (default: 10000)
+#   VSIM_ICOUNT   vsim icount drain target  (default: 5000)
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/../lib/paths.sh"
+
+FIXTURE="${FIXTURE:-rt_c_v_matmul_free}"
+QEMU_ICOUNT="${QEMU_ICOUNT:-2000}"
+VSIM_ICOUNT="${VSIM_ICOUNT:-1000}"
+
+MODE_LABEL="icount mode (samples a whole-program window)"
+echo "=========================================================="
+echo "Mode: $MODE_LABEL"
+echo "Fixture: ${FIXTURE} (markerless RVV GEMM, 200 reps)"
+echo "QEMU1 trigger: plugin icount=$QEMU_ICOUNT"
+echo "vsim  trigger: --hybrid-icount $VSIM_ICOUNT  (CSR matcher disabled)"
+echo "=========================================================="
+
+hybrid_resolve_paths
+
+# Resolve the GEMM kernel's address range so the drain checks assert the count
+# target landed inside vmatmul_kernel (replaces the old icount_spin's hardcoded
+# 0x100002/0x100004 loop PCs). readelf -sW: $2=value(hex) $3=size $8=name.
+RE="${HYBRID_TOOLCHAIN:+$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-readelf}"
+RE="${RE:-riscv64-unknown-elf-readelf}"
+read KLO KSZ < <("$RE" -sW "$VSIM_ELF" | awk '$8=="vmatmul_kernel"{print strtonum("0x"$2),$3; exit}')
+if [ -z "${KLO:-}" ] || [ -z "${KSZ:-}" ]; then
+  echo "[demo icount] FAIL: could not resolve vmatmul_kernel range from $VSIM_ELF"; exit 1
+fi
+pc_in_kernel() { awk -v p="$1" -v lo="$KLO" -v sz="$KSZ" 'BEGIN{exit !(p>=lo && p<lo+sz)}'; }
+echo "  vmatmul_kernel: $(printf '0x%x..0x%x' "$KLO" "$((KLO+KSZ))")"
+
+SHM_SIZE=$((128 * 1024 * 1024))
+SHM=$(mktemp -p /dev/shm vsim-icount-rt.XXXXXX)
+STATE_Q=$(mktemp)
+STATE_V=$(mktemp)
+QEMU_LOG=$(mktemp)
+VSIM_LOG=$(mktemp)
+trap 'rm -f "$SHM" "$STATE_Q" "$STATE_V" "$QEMU_LOG" "$VSIM_LOG"' EXIT
+truncate -s "$SHM_SIZE" "$SHM"
+
+read_u64() { python3 -c "
+import struct
+with open('$1', 'rb') as f:
+    f.seek($2); print(struct.unpack('<Q', f.read(8))[0])
+"; }
+
+echo "[demo icount 1/2] QEMU1 + plugin icount=$QEMU_ICOUNT -> drain"
+set +e
+timeout 120 "$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHM,size=$SHM_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -semihosting-config enable=on,target=native \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_Q,icount=$QEMU_ICOUNT" \
+  </dev/null >"$QEMU_LOG" 2>&1
+QRC=$?
+set -e
+
+if [ "$QRC" -ne 200 ]; then
+  echo "[demo icount] FAIL: QEMU1 expected exit 200, got $QRC"
+  tail -20 "$QEMU_LOG"; exit 1
+fi
+if [ ! -s "$STATE_Q" ]; then
+  echo "[demo icount] FAIL: QEMU1 state empty"; exit 1
+fi
+
+PC_Q=$(read_u64 "$STATE_Q" 16)
+if ! pc_in_kernel "$PC_Q"; then
+  echo "[demo icount] FAIL: QEMU1 drained pc=$(printf '0x%x' "$PC_Q") not in vmatmul_kernel"; exit 1
+fi
+echo "  QEMU1 drain: pc=$(printf '0x%x' "$PC_Q") (in kernel)"
+
+# vsim resumes from the QEMU drain and attaches the SAME shared mmap so the
+# GEMM matrices QEMU1 wrote to .bss survive (mirrors tests/e2e.sh).
+echo "[demo icount 2/2] vsim --hybrid-icount $VSIM_ICOUNT -> drain"
+set +e
+timeout 120 "$VSIM_BIN" "$VSIM_ELF" \
+  --resume-from-qemu "$STATE_Q" \
+  --handoff-out "$STATE_V" \
+  --shared-mem-path "$SHM" \
+  --shared-mem-size "$SHM_SIZE" \
+  --shared-mem-base 0x00000000 \
+  --hybrid-icount "$VSIM_ICOUNT" \
+  >"$VSIM_LOG" 2>&1
+VRC=$?
+set -e
+
+if [ "$VRC" -ne 200 ]; then
+  echo "[demo icount] FAIL: vsim expected exit 200, got $VRC"
+  tail -20 "$VSIM_LOG"; exit 1
+fi
+if [ ! -s "$STATE_V" ]; then
+  echo "[demo icount] FAIL: vsim state empty"; exit 1
+fi
+
+PC_V=$(read_u64 "$STATE_V" 16)
+if ! pc_in_kernel "$PC_V"; then
+  echo "[demo icount] FAIL: vsim drained pc=$(printf '0x%x' "$PC_V") not in vmatmul_kernel"; exit 1
+fi
+echo "  vsim drain: pc=$(printf '0x%x' "$PC_V") (in kernel)"
+
+# Window cycles: the vsim mcycle delta over the measured window (mcycle@624).
+# vsim restores mcycle from the QEMU drain then counts real cycles, so
+# vsim - qemu is the window's cycle count.
+MC_Q=$(read_u64 "$STATE_Q" 624)
+MC_V=$(read_u64 "$STATE_V" 624)
+echo "  window_cycles: $((MC_V - MC_Q))  (vsim mcycle=$MC_V - qemu mcycle=$MC_Q)"
+
+echo "[demo icount] PASS ($MODE_LABEL): both drains inside vmatmul_kernel"
