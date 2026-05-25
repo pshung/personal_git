@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# derive_kernel_roi: derive the PC pair that frames one full call of the
+# vsim-phase kernel (vmatmul_kernel) in an ELF, with no source-level
+# markers required.
+#
+#   start_pc = symbol address of vmatmul_kernel (function entry)
+#   end_pc   = PC of the instruction immediately following the
+#              `jal ...<vmatmul_kernel>` site inside main (call-return PC)
+#
+# Used by PC-trigger demos against the markerless GEMM twin: the QEMU
+# plugin's one-shot enter trigger fires when the hart retires the first
+# insn at vmatmul_kernel; vsim's one-shot exit trigger fires when the hart
+# is about to retire the post-jal insn in main. The measured window is
+# therefore exactly one vmatmul_kernel call (16 outer rows x 16 inner
+# k-iterations + prologue/epilogue + 16 vse32 stores), regardless of how
+# many times main's GEMM_REPEAT loop is configured to invoke the kernel.
+#
+# Usage:
+#   . tests/lib/kernel_roi.sh
+#   read -r START END < <(derive_kernel_roi <elf> <objdump> <nm>)
+#
+# On success prints "0x<start> 0x<end>" (single line, space-separated) and
+# returns 0. On miss prints nothing and returns 1.
+#
+# Implementation note: outputs are captured to variables first, then fed
+# to awk via here-string. This avoids `cmd | awk '... exit'` pipes, which
+# trigger SIGPIPE on the upstream producer and abort the caller when
+# `set -o pipefail` is active.
+
+derive_kernel_roi() {
+  local elf="$1" objdump="$2" nm="$3"
+  local nm_out obj_out start end
+
+  nm_out=$("$nm" --defined-only "$elf" 2>/dev/null) || return 1
+  obj_out=$("$objdump" -d "$elf" 2>/dev/null) || return 1
+
+  start=$(awk '$3=="vmatmul_kernel"{print $1; exit}' <<< "$nm_out")
+  [ -n "$start" ] || return 1
+
+  end=$(awk '
+    /^[0-9a-f]+ <main>:/             { in_main = 1; next }
+    in_main && /^[0-9a-f]+ <[^>]+>:/ { in_main = 0 }
+    in_main && saw_call              { sub(":", "", $1); print $1; exit }
+    in_main && $3 == "jal" && index($0, "<vmatmul_kernel>") { saw_call = 1 }
+  ' <<< "$obj_out")
+  [ -n "$end" ] || return 1
+
+  printf '0x%s 0x%s\n' "$start" "$end"
+}

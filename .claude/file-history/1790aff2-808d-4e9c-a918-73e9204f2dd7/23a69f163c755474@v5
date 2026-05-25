@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Demo (pc mode): PC-trigger switching anchored on the GEMM kernel
+# boundary - no source-level markers, no synthetic _hybrid_*_pc labels.
+#
+# Runs the markerless GEMM twin (rt_c_v_matmul_free, built with
+# -DHYBRID_MARKERLESS -DGEMM_REPEAT=200). At launch the script derives
+# two PCs from the ELF: the symbol address of vmatmul_kernel (function
+# entry) and the address of the instruction immediately following the
+# `jal vmatmul_kernel` site in main (call-return). They thread to the
+# QEMU plugin (enter_pc=) and vsim (--hybrid-exit-pc). Triggers are
+# one-shot on both legs (plugin exits on first match; vsim drains on
+# first match), so the measured window is exactly one full
+# vmatmul_kernel call, regardless of GEMM_REPEAT.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
+# shellcheck disable=SC1091
+. "$ROOT/tests/lib/kernel_roi.sh"
+
+MODE_LABEL="PC mode (markerless, whole kernel)"
+echo "=========================================================="
+echo "Mode: $MODE_LABEL"
+echo "Fixture: rt_c_v_matmul_free (markerless GEMM twin)"
+echo "Trigger: ELF-derived vmatmul_kernel entry -> post-jal return PC"
+echo "Window:  1 vmatmul_kernel call (one-shot trigger; remaining"
+echo "         GEMM_REPEAT iterations run only on QEMU2)"
+echo "=========================================================="
+
+ELF="$ROOT/tests/fixtures/rt_c_v_matmul_free.elf"
+if [ ! -f "$ELF" ]; then
+  echo "[demo pc] SKIP: $ELF missing (run make -C tests/fixtures rt_c_v_matmul_free.elf)"
+  exit 77
+fi
+
+OBJDUMP="${OBJDUMP:-${HYBRID_TOOLCHAIN:+$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-objdump}}"
+OBJDUMP="${OBJDUMP:-riscv64-unknown-elf-objdump}"
+NM="${NM:-${HYBRID_TOOLCHAIN:+$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-nm}}"
+NM="${NM:-riscv64-unknown-elf-nm}"
+for tool in "$OBJDUMP" "$NM"; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "[demo pc] SKIP: $tool not found"
+    exit 77
+  fi
+done
+
+read -r ROI_START ROI_END < <(derive_kernel_roi "$ELF" "$OBJDUMP" "$NM") || true
+if [ -z "${ROI_START:-}" ] || [ -z "${ROI_END:-}" ]; then
+  echo "[demo pc] FAIL: could not derive kernel PCs from $ELF"
+  exit 1
+fi
+echo "ROI start_pc = $ROI_START  (vmatmul_kernel entry)"
+echo "ROI end_pc   = $ROI_END  (insn after jal vmatmul_kernel in main)"
+
+set +e
+FIXTURE=rt_c_v_matmul_free TRIGGER_MODE=pc EXPECT_RC=0 \
+  ROI_START="$ROI_START" ROI_END="$ROI_END" \
+  TIMEOUT="${TIMEOUT:-120}" \
+  bash "$SCRIPT_DIR/../e2e.sh"
+RC=$?
+set -e
+
+if [ "$RC" -eq 77 ]; then
+  echo "[demo pc] SKIP (artifacts missing)"
+  exit 77
+fi
+
+if [ "$RC" -ne 0 ]; then
+  echo "[demo pc] FAIL ($MODE_LABEL): underlying harness exit $RC"
+  exit "$RC"
+fi
+
+echo "[demo pc] PASS ($MODE_LABEL)"
