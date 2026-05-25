@@ -1,0 +1,800 @@
+diff --git a/hsim b/hsim
+index e750788..b3824bf 100755
+--- a/hsim
++++ b/hsim
+@@ -45,9 +45,9 @@ REPO_ROOT = Path(__file__).resolve().parent
+ # Tuple: (key, profiles, how-to-run + note).
+ MODES = [
+     ("csr",      "kernel",        "csrwi 0x7C0,{0,1} markers in source (default); ./hsim run --mode csr"),
+-    ("pc",       "kernel",        "PC / symbol address, no source edit; ./hsim run --mode pc"),
++    ("pc",       "kernel",        "PC / symbol address, no source edit; ./hsim run --mode pc --pc-start S --pc-end E"),
+     ("icount",   "whole program", "single boundary at N retired insns, CSR-less; ./hsim run --mode icount"),
+-    ("simpoint", "whole program", "clustered representative slices -> whole-program cycle estimate; ./hsim estimate"),
++    ("simpoint", "whole program", "clustered representative slices -> whole-program cycle estimate; ./hsim run --mode simpoint"),
+ ]
+ 
+ 
+@@ -105,23 +105,6 @@ def list_fixtures() -> int:
+     return 0
+ 
+ 
+-def list_demos() -> int:
+-    demo_dir = REPO_ROOT / "tests" / "demos"
+-    if not demo_dir.is_dir():
+-        print(f"hsim: missing {demo_dir}", file=sys.stderr)
+-        return 2
+-    width = max(len(f"demo_{short}") for _t, short, _m in _DEMO_ORDER)
+-    print("HEADLINE demos (one per switching mode):")
+-    for _tid, short, mode in _DEMO_ORDER:
+-        if mode != "simpoint-stage":
+-            print(f"  {('demo_' + short).ljust(width)}  mode: {mode}")
+-    print("SimPoint stages (run inside SimPoint mode; not headline modes):")
+-    for _tid, short, mode in _DEMO_ORDER:
+-        if mode == "simpoint-stage":
+-            print(f"  {('demo_' + short).ljust(width)}")
+-    return 0
+-
+-
+ def list_modes() -> int:
+     width_key = max(len(m[0]) for m in MODES)
+     width_tgt = max(len(m[1]) for m in MODES)
+@@ -134,7 +117,6 @@ def list_modes() -> int:
+ def cmd_list(args: argparse.Namespace) -> int:
+     return {
+         "fixtures": list_fixtures,
+-        "demos":    list_demos,
+         "modes":    list_modes,
+     }[args.target]()
+ 
+@@ -200,6 +182,42 @@ def _resolve_artifacts() -> dict[str, Path]:
+     }
+ 
+ 
++_BANNER_RULE = "=" * 58
++
++
++def _print_run_banner(args: argparse.Namespace, elf: Path) -> None:
++    """Print a uniform parameter banner before every `./hsim run`.
++
++    Replaces the per-demo banners the deleted bash demos used to emit, so
++    every invocation -- regardless of mode -- shows what's running and the
++    key parameters at a glance.
++    """
++    trigger = {
++        "csr":      "csrwi 0x7C0,{0,1} markers in source",
++        "pc":       "explicit start/end PCs (symbol or 0x address)",
++        "icount":   "QEMU plugin icount + vsim --hybrid-icount",
++        "simpoint": "BBV profile -> SimPoint cluster -> per-phase drain",
++    }[args.mode]
++
++    if args.mode == "csr":
++        params = ""
++    elif args.mode == "pc":
++        params = f"pc_start={args.pc_start} pc_end={args.pc_end}"
++    elif args.mode == "icount":
++        params = (f"qemu_icount={args.qemu_icount} "
++                  f"vsim_icount={args.vsim_icount}")
++    else:  # simpoint
++        params = (f"interval={args.interval} max_k={args.max_k} "
++                  f"vsim_icount={args.vsim_icount}")
++
++    print(_BANNER_RULE)
++    print(f"Mode:    {args.mode}")
++    print(f"Fixture: {elf.stem}")
++    print(f"Trigger: {trigger}")
++    print(f"Key params: {params}")
++    print(_BANNER_RULE, flush=True)
++
++
+ def cmd_run(args: argparse.Namespace) -> int:
+     elf = Path(args.elf)
+     if not elf.is_absolute():
+@@ -208,6 +226,18 @@ def cmd_run(args: argparse.Namespace) -> int:
+         print(f"hsim: ELF not found: {args.elf}", file=sys.stderr)
+         return 2
+ 
++    if args.mode == "pc":
++        missing = [name for name, val in
++                   (("--pc-start", args.pc_start),
++                    ("--pc-end", args.pc_end))
++                   if not val]
++        if missing:
++            print(f"hsim: --mode pc requires {' and '.join(missing)} "
++                  f"(symbol name or 0x address)", file=sys.stderr)
++            return 2
++
++    _print_run_banner(args, elf)
++
+     artifacts = _resolve_artifacts()
+     for label, path in artifacts.items():
+         if not path.is_file():
+@@ -224,17 +254,15 @@ def cmd_run(args: argparse.Namespace) -> int:
+             label="icount",
+             mmap_size=args.mmap_size,
+         )
+-    if args.mode == "slice":
+-        return _run_drain_pair(
+-            elf, artifacts,
+-            plugin_extras=(
+-                f"slice={args.slice}",
+-                f"slice_at={args.slice_at}",
+-                f"icount={args.qemu_icount}",
+-            ),
+-            vsim_icount=args.vsim_icount,
+-            label="slice",
+-            mmap_size=args.mmap_size,
++    if args.mode == "simpoint":
++        if not _SIMPOINT_BIN.is_file():
++            print("hsim: simpoint not built -- run ./hsim build",
++                  file=sys.stderr)
++            return 2
++        return _run_simpoint_pipeline(
++            elf=elf, artifacts=artifacts,
++            interval=args.interval, max_k=args.max_k,
++            vsim_icount=args.vsim_icount, mmap_size=args.mmap_size,
+         )
+     print(f"hsim: unsupported mode: {args.mode}", file=sys.stderr)
+     return 2
+@@ -250,21 +278,17 @@ def _run_via_e2e(elf: Path, artifacts: dict[str, Path],
+     env["VSIM_BIN"]     = str(artifacts["vsim"])
+     env["VSIM_QEMU"]    = str(artifacts["qemu"])
+     env["VSIM_PLUGIN"]  = str(artifacts["plugin"])
+-    # pc mode: forward the ROI boundaries (symbol name or 0x address). When
+-    # unset, tests/e2e.sh falls back to the planted _hybrid_enter_pc /
+-    # _hybrid_exit_pc markers.
++    # pc mode: forward the explicit boundary PCs (symbol or 0x address).
++    # Required args are validated by cmd_run before this is called.
+     if args.mode == "pc":
+-        if args.roi_start:
+-            env["ROI_START"] = args.roi_start
+-        if args.roi_end:
+-            env["ROI_END"] = args.roi_end
++        env["ROI_START"] = args.pc_start
++        env["ROI_END"] = args.pc_end
+ 
+     cmd = ["bash", str(REPO_ROOT / "tests" / "e2e.sh")]
+     if args.verbose:
+         roi = ""
+         if args.mode == "pc":
+-            roi = (f" ROI_START={env.get('ROI_START', '_hybrid_enter_pc')}"
+-                   f" ROI_END={env.get('ROI_END', '_hybrid_exit_pc')}")
++            roi = f" ROI_START={env['ROI_START']} ROI_END={env['ROI_END']}"
+         print(f"[hsim] FIXTURE={env['FIXTURE']} TRIGGER_MODE={env['TRIGGER_MODE']} "
+               f"VSIM_ELF={env['VSIM_ELF']}{roi}", flush=True)
+         print(f"[hsim] exec: {shlex.join(cmd)}", flush=True)
+@@ -574,109 +598,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
+     return 1 if totals["FAIL"] > 0 else 0
+ 
+ 
+-# --- F8: demo ---------------------------------------------------------------
+-
+-# Demo scripts grouped by the 4 switching modes. csr/pc/icount/simpoint each
+-# have one HEADLINE demo; bbv/slice/archive are SimPoint stages (kept for
+-# coverage, not top-level modes). Filename is `demo_<short>.sh`. T-id aliases
+-# (T1..T7) are retained as back-compat selectors.
+-# Tuple: (t_id, short, mode) -- mode "simpoint-stage" => not a headline demo.
+-_DEMO_ORDER = [
+-    ("T1", "csr_oneshot",             "csr"),
+-    ("T2", "pc_oneshot",              "pc"),
+-    ("T3", "icount_roundtrip",        "icount"),
+-    ("T4", "bbv_profile",             "simpoint-stage"),
+-    ("T5", "slice_consume_roundtrip", "simpoint-stage"),
+-    ("T6", "archive_replay",          "simpoint-stage"),
+-    ("T7", "simpoint_loop",           "simpoint"),
+-]
+-
+-
+-def _demo_script(short: str) -> Path:
+-    return REPO_ROOT / "tests" / "demos" / f"demo_{short}.sh"
+-
+-
+-def _resolve_demo(selector: str) -> tuple[str, Path] | tuple[None, None]:
+-    """Map T-id, short name, or `demo_<short>` to (short, script-path).
+-
+-    Returns (None, None) if no match. The triple form lets users copy-paste
+-    from `./hsim list demos` (which emits `demo_<short>`) too.
+-    """
+-    sel = selector.strip()
+-    for tid, short, _mode in _DEMO_ORDER:
+-        if sel == tid or sel == short or sel == f"demo_{short}":
+-            return short, _demo_script(short)
+-    return None, None
+-
+-
+-def _parse_demo_passthrough(items: list[str]) -> dict[str, str] | None:
+-    """Parse `-- KEY=VAL KEY=VAL ...` trailing args. Returns None on bad form."""
+-    env_extra: dict[str, str] = {}
+-    for it in items or []:
+-        if it == "--":
+-            continue
+-        if "=" not in it or it.startswith("="):
+-            return None
+-        k, v = it.split("=", 1)
+-        env_extra[k] = v
+-    return env_extra
+-
+-
+-def cmd_demo(args: argparse.Namespace) -> int:
+-    if not args.selector:
+-        print(
+-            "hsim: missing demo selector -- run ./hsim list demos",
+-            file=sys.stderr,
+-        )
+-        return 2
+-
+-    short, script = _resolve_demo(args.selector)
+-    if script is None:
+-        print(
+-            f"hsim: unknown demo: {args.selector} -- "
+-            "run ./hsim list demos (or use T1..T7)",
+-            file=sys.stderr,
+-        )
+-        return 2
+-    if not script.is_file():
+-        print(f"hsim: demo script not found: {script}", file=sys.stderr)
+-        return 2
+-
+-    env_extra = _parse_demo_passthrough(args.extras)
+-    if env_extra is None:
+-        print(
+-            "hsim: passthrough args must be KEY=VAL form (after `--`)",
+-            file=sys.stderr,
+-        )
+-        return 2
+-
+-    artifacts = _resolve_artifacts()
+-    for label, path in artifacts.items():
+-        if not path.is_file():
+-            print(f"hsim: {label} not built -- run ./hsim build", file=sys.stderr)
+-            return 2
+-
+-    env = os.environ.copy()
+-    env["VSIM_BIN"]    = str(artifacts["vsim"])
+-    env["VSIM_QEMU"]   = str(artifacts["qemu"])
+-    env["VSIM_PLUGIN"] = str(artifacts["plugin"])
+-    # Demos that shell out to RISC-V toolchain binaries (nm, objdump for the
+-    # PC-mode inner-loop ROI derivation) need HYBRID_TOOLCHAIN even when the
+-    # user hasn't sourced setup.sh first.
+-    tc = _read_hybrid_toolchain()
+-    if tc and "HYBRID_TOOLCHAIN" not in env:
+-        env["HYBRID_TOOLCHAIN"] = tc
+-    env.update(env_extra)
+-
+-    cmd = ["bash", str(script)]
+-    if args.dry_run:
+-        for k, v in env_extra.items():
+-            print(f"{k}={v}")
+-        print(f"exec: {shlex.join(cmd)}")
+-        return 0
+-    return subprocess.run(cmd, cwd=REPO_ROOT, env=env).returncode
+-
+-
+ # --- F9: profile + cluster (M4) ---------------------------------------------
+ 
+ # SimPoint clustering binary. Path is fixed by tools/simpoint/Makefile;
+@@ -1125,56 +1046,35 @@ def _run_drain_at_exit_profile(elf: Path, artifacts: dict[str, Path],
+                 pass
+ 
+ 
+-def cmd_estimate(args: argparse.Namespace) -> int:
+-    elf = Path(args.elf)
+-    if not elf.is_absolute():
+-        elf = (Path.cwd() / elf).resolve()
+-    if not elf.is_file():
+-        print(f"hsim: ELF not found: {args.elf}", file=sys.stderr)
+-        return 2
+-
+-    artifacts = _resolve_artifacts()
+-    for label, path in artifacts.items():
+-        if not path.is_file():
+-            print(f"hsim: {label} not built -- run ./hsim build",
+-                  file=sys.stderr)
+-            return 2
+-    if not _SIMPOINT_BIN.is_file():
+-        print("hsim: simpoint not built -- run ./hsim build",
+-              file=sys.stderr)
+-        return 2
++def _run_simpoint_pipeline(elf: Path, artifacts: dict[str, Path],
++                           interval: int, max_k: int,
++                           vsim_icount: int, mmap_size: int) -> int:
++    """Full SimPoint cycle estimator: profile -> cluster -> per-phase drain.
+ 
+-    # SimPoint-correct default: vsim simulates exactly one slice's
+-    # insns per phase, so CPI_i = delta_mcycle / slice. 0 = "auto".
+-    vsim_icount = args.vsim_icount if args.vsim_icount > 0 else args.slice
++    Shared by `./hsim estimate` and `./hsim run --mode simpoint`. Always
++    profiles to natural program exit (plugin atexit counter -> N_total).
++    Returns 0 on success and prints `estimated_cycles=<int>` as the
++    headline line.
++    """
++    # SimPoint-correct default: vsim simulates exactly one slice's insns
++    # per phase, so CPI_i = delta_mcycle / interval. 0 = "auto".
++    if vsim_icount <= 0:
++        vsim_icount = interval
+ 
+-    with tempfile.TemporaryDirectory(prefix="hsim-estimate-") as tmpdir:
++    with tempfile.TemporaryDirectory(prefix="hsim-simpoint-") as tmpdir:
+         tmp = Path(tmpdir)
+         bbv = tmp / "profile.bb"
+         simpts = tmp / "simpts"
+         weights = tmp / "weights"
+ 
+-        # F14: --icount 0 means run-to-program-exit; the plugin counts every
+-        # retired insn via atexit and writes it as minstret in the drained
+-        # state. --icount N > 0 keeps the legacy icount-cap path.
+-        if args.icount == 0:
+-            rc, n_total = _run_drain_at_exit_profile(
+-                elf, artifacts, bbv, args.slice, args.mmap_size,
+-            )
+-            if rc != 0:
+-                return rc
+-        else:
+-            rc = cmd_profile(argparse.Namespace(
+-                elf=str(elf), slice=args.slice, icount=args.icount,
+-                output=str(bbv), dry_run=False,
+-                mmap_size=args.mmap_size,
+-            ))
+-            if rc != 0:
+-                return rc
+-            n_total = args.icount
++        rc, n_total = _run_drain_at_exit_profile(
++            elf, artifacts, bbv, interval, mmap_size,
++        )
++        if rc != 0:
++            return rc
+ 
+         rc = cmd_cluster(argparse.Namespace(
+-            bbv=str(bbv), max_k=args.max_k,
++            bbv=str(bbv), max_k=max_k,
+             simpts=str(simpts), weights=str(weights), dry_run=False,
+         ))
+         if rc != 0:
+@@ -1194,16 +1094,18 @@ def cmd_estimate(args: argparse.Namespace) -> int:
+ 
+         phases = []
+         for K, w in zip(slice_indices, weight_vals):
+-            print(f"[hsim estimate] phase slice_at={K} weight={w:.3f}",
++            print(f"[hsim simpoint] phase slice_at={K} weight={w:.3f}",
+                   flush=True)
+             try:
++                # qemu_icount_fallback=0: slice_at is the primary trigger;
++                # we no longer expose a profile-pass icount cap.
+                 mc_before, mc_after = _estimate_one_phase(
+-                    elf, artifacts, args.slice, K,
+-                    args.icount, vsim_icount,
+-                    mmap_size=args.mmap_size,
++                    elf, artifacts, interval, K,
++                    0, vsim_icount,
++                    mmap_size=mmap_size,
+                 )
+             except RuntimeError as exc:
+-                print(f"hsim: estimate failed: {exc}", file=sys.stderr)
++                print(f"hsim: simpoint failed: {exc}", file=sys.stderr)
+                 return 1
+             delta = mc_after - mc_before
+             cpi = delta / vsim_icount if vsim_icount > 0 else 0.0
+@@ -1222,6 +1124,32 @@ def cmd_estimate(args: argparse.Namespace) -> int:
+         return 0
+ 
+ 
++def cmd_estimate(args: argparse.Namespace) -> int:
++    elf = Path(args.elf)
++    if not elf.is_absolute():
++        elf = (Path.cwd() / elf).resolve()
++    if not elf.is_file():
++        print(f"hsim: ELF not found: {args.elf}", file=sys.stderr)
++        return 2
++
++    artifacts = _resolve_artifacts()
++    for label, path in artifacts.items():
++        if not path.is_file():
++            print(f"hsim: {label} not built -- run ./hsim build",
++                  file=sys.stderr)
++            return 2
++    if not _SIMPOINT_BIN.is_file():
++        print("hsim: simpoint not built -- run ./hsim build",
++              file=sys.stderr)
++        return 2
++
++    return _run_simpoint_pipeline(
++        elf=elf, artifacts=artifacts,
++        interval=args.slice, max_k=args.max_k,
++        vsim_icount=args.vsim_icount, mmap_size=args.mmap_size,
++    )
++
++
+ # --- main -------------------------------------------------------------------
+ 
+ def build_parser() -> argparse.ArgumentParser:
+@@ -1234,11 +1162,11 @@ def build_parser() -> argparse.ArgumentParser:
+ 
+     p_list = sub.add_parser(
+         "list",
+-        help="list available fixtures, demos, or trigger modes",
++        help="list available fixtures or trigger modes",
+     )
+     p_list.add_argument(
+         "target",
+-        choices=("fixtures", "demos", "modes"),
++        choices=("fixtures", "modes"),
+         help="what to list",
+     )
+     p_list.set_defaults(func=cmd_list)
+@@ -1270,12 +1198,13 @@ def build_parser() -> argparse.ArgumentParser:
+     )
+     p_run.add_argument(
+         "--mode",
+-        choices=("csr", "pc", "icount", "slice"),
++        choices=("csr", "pc", "icount", "simpoint"),
+         required=True,
+         help=(
+-            "trigger mode: csr (csrwi 0x7C0,{0,1}) or pc (ELF symbols) "
+-            "use tests/e2e.sh; icount and slice spawn QEMU+vsim directly "
+-            "for CSR-less workloads"
++            "trigger mode: csr (csrwi 0x7C0,{0,1}) and pc (ELF symbols/PCs) "
++            "profile one kernel via tests/e2e.sh; icount drains both legs at "
++            "an instruction count; simpoint runs the full SimPoint pipeline "
++            "(profile -> cluster -> per-phase drain -> weighted-CPI estimate)"
+         ),
+     )
+     p_run.add_argument(
+@@ -1284,50 +1213,51 @@ def build_parser() -> argparse.ArgumentParser:
+         help="print resolved env and command before launching",
+     )
+     p_run.add_argument(
+-        "--roi-start", dest="roi_start", default=None,
++        "--pc-start", dest="pc_start", default=None,
+         help=(
+             "pc mode: switch-in PC as a symbol name or 0x address "
+-            "(default: _hybrid_enter_pc marker)"
++            "(required for --mode pc)"
+         ),
+     )
+     p_run.add_argument(
+-        "--roi-end", dest="roi_end", default=None,
++        "--pc-end", dest="pc_end", default=None,
+         help=(
+             "pc mode: switch-out PC as a symbol name or 0x address "
+-            "(default: _hybrid_exit_pc marker)"
++            "(required for --mode pc)"
+         ),
+     )
+     p_run.add_argument(
+         "--qemu-icount", dest="qemu_icount", type=int, default=10000,
+         help=(
+-            "QEMU plugin icount target (default: 10000; --mode icount uses "
+-            "this as the drain target, --mode slice uses it as the safety "
+-            "upper bound)"
++            "QEMU plugin icount drain target (default: 10000; --mode icount "
++            "only). For --mode simpoint, see --icount."
+         ),
+     )
+     p_run.add_argument(
+         "--vsim-icount", dest="vsim_icount", type=int, default=5000,
+         help=(
+-            "vsim --hybrid-icount drain target (default: 5000; "
+-            "--mode icount and --mode slice only)"
++            "vsim --hybrid-icount drain target (default: 5000 for --mode "
++            "icount; 0 for --mode simpoint which then uses --interval)"
+         ),
+     )
+     p_run.add_argument(
+-        "--slice", dest="slice", type=int, default=1000,
+-        help="insns per slice (default: 1000; --mode slice only)",
++        "--interval", dest="interval", type=int, default=1000,
++        help=(
++            "--mode simpoint: insns per BBV row / per slice (default: 1000)"
++        ),
+     )
+     p_run.add_argument(
+-        "--slice-at", dest="slice_at", type=int, default=1,
+-        help="0-based slice index to drain at (default: 1; --mode slice only)",
++        "--max-k", dest="max_k", type=int, default=2,
++        help="--mode simpoint: SimPoint -maxK clusters (default: 2)",
+     )
+     p_run.add_argument(
+         "--mmap-size", dest="mmap_size", type=_parse_mmap_size,
+         default=_DEFAULT_MMAP_SIZE,
+         help=(
+             f"shared mmap size (default: 128M; accepts SPEC like 8G, 512M, "
+-            f"1024). Honored for --mode icount/slice; csr/pc use tests/e2e.sh "
+-            f"which has its own 128 MiB default. Set HSIM_MMAP_DIR=/path to "
+-            f"redirect the backing file off /dev/shm."
++            f"1024). Honored for --mode icount/simpoint; csr/pc use "
++            f"tests/e2e.sh which has its own 128 MiB default. Set "
++            f"HSIM_MMAP_DIR=/path to redirect the backing file off /dev/shm."
+         ),
+     )
+     p_run.set_defaults(func=cmd_run)
+@@ -1370,33 +1300,6 @@ def build_parser() -> argparse.ArgumentParser:
+     )
+     p_doctor.set_defaults(func=cmd_doctor)
+ 
+-    demo_list = ", ".join(f"{tid}={short}" for tid, short, _mode in _DEMO_ORDER)
+-    p_demo = sub.add_parser(
+-        "demo",
+-        help="run a milestone demo by T-id or short name (T1..T7)",
+-        description=(
+-            "Run one demo from tests/demos/demo_*.sh. Selector accepts "
+-            f"T-id (T1..T7), short name, or `demo_<short>`. Mapping: {demo_list}. "
+-            "Pass per-run env overrides after `--`, e.g. "
+-            "`./hsim demo T7 -- SLICE=400 MAXK=4`."
+-        ),
+-    )
+-    p_demo.add_argument(
+-        "selector",
+-        nargs="?",
+-        help="demo selector: T1..T7 or short name (e.g. csr_oneshot)",
+-    )
+-    p_demo.add_argument(
+-        "--dry-run",
+-        action="store_true",
+-        help="print the resolved env + command without executing",
+-    )
+-    p_demo.set_defaults(func=cmd_demo)
+-    # `extras` is populated by main() after splitting argv on the first `--`,
+-    # so argparse never sees the passthrough KEY=VAL tail. This avoids the
+-    # argparse.REMAINDER gotcha that swallows `--dry-run` typed after the
+-    # selector.
+-
+     p_profile = sub.add_parser(
+         "profile",
+         help="M4: QEMU + plugin BBV profile pass (writes a SimPoint .bb file)",
+@@ -1534,14 +1437,14 @@ def build_parser() -> argparse.ArgumentParser:
+ 
+     p_estimate = sub.add_parser(
+         "estimate",
+-        help="SimPoint cycle estimator: profile + cluster + per-phase mcycle delta",
++        help="SimPoint cycle estimator (alias of `./hsim run --mode simpoint`)",
+         description=(
+-            "End-to-end SimPoint cycle estimator. Runs an M4 BBV profile "
+-            "pass, clusters the result with SimPoint, drains QEMU + vsim "
+-            "for each cluster representative slice, and aggregates a "
+-            "weighted CPI to produce an estimated cycle count: "
+-            "estimated_cycles = N_total * sum_i(w_i * CPI_i). Composes "
+-            "F9 (profile + cluster) and F11 (slice mode) end to end."
++            "End-to-end SimPoint cycle estimator. Profiles the ELF to its "
++            "natural program exit (plugin atexit counter -> N_total), "
++            "clusters the BBV rows with SimPoint, drains QEMU + vsim per "
++            "cluster representative, and prints the whole-program estimate: "
++            "estimated_cycles = N_total * sum_i(w_i * CPI_i). Equivalent "
++            "to `./hsim run --mode simpoint`."
+         ),
+     )
+     p_estimate.add_argument(
+@@ -1552,15 +1455,6 @@ def build_parser() -> argparse.ArgumentParser:
+         "--slice", dest="slice", type=int, default=1000,
+         help="insns per BBV row / per slice (default: 1000)",
+     )
+-    p_estimate.add_argument(
+-        "--icount", type=int, default=0,
+-        help=(
+-            "total retired insns for the M4 profile pass "
+-            "(default: 0 means run to program exit and read minstret "
+-            "from the plugin atexit drain; pass a positive N to cap "
+-            "the profile pass at N insns and use N as the multiplier)"
+-        ),
+-    )
+     p_estimate.add_argument(
+         "--max-k", dest="max_k", type=int, default=2,
+         help="SimPoint -maxK (default: 2; tiny BBVs need conservative K)",
+@@ -1587,14 +1481,8 @@ def build_parser() -> argparse.ArgumentParser:
+ 
+ 
+ def main(argv: list[str]) -> int:
+-    if "--" in argv:
+-        idx = argv.index("--")
+-        head, tail = argv[:idx], argv[idx + 1:]
+-    else:
+-        head, tail = argv, []
+     parser = build_parser()
+-    args = parser.parse_args(head)
+-    args.extras = tail
++    args = parser.parse_args(argv)
+     return args.func(args)
+ 
+ 
+diff --git a/scripts/run_e2e.sh b/scripts/run_e2e.sh
+index 8f99f0c..6c7fbbc 100755
+--- a/scripts/run_e2e.sh
++++ b/scripts/run_e2e.sh
+@@ -99,21 +99,6 @@ NEG_TESTS=(
+   "rt_pty_handback|bash $HARNESS/drivers/rt_pty_handback.sh"
+ )
+ 
+-# Mode demos: 4 headline demos (one per switching mode: csr/pc/icount/simpoint)
+-# plus the SimPoint stage demos (bbv/slice/archive), kept for coverage. Each
+-# script hard-codes its trigger, so run once (no csr/pc/both loop).
+-DEMO_TESTS=(
+-  # headline: one demo per mode
+-  "demo_csr_oneshot|bash $HARNESS/demos/demo_csr_oneshot.sh"
+-  "demo_pc_oneshot|bash $HARNESS/demos/demo_pc_oneshot.sh"
+-  "demo_icount_roundtrip|bash $HARNESS/demos/demo_icount_roundtrip.sh"
+-  "demo_simpoint_loop|bash $HARNESS/demos/demo_simpoint_loop.sh"
+-  # SimPoint stages (coverage; not headline modes)
+-  "demo_bbv_profile|bash $HARNESS/demos/demo_bbv_profile.sh"
+-  "demo_slice_consume_roundtrip|bash $HARNESS/demos/demo_slice_consume_roundtrip.sh"
+-  "demo_archive_replay|bash $HARNESS/demos/demo_archive_replay.sh"
+-)
+-
+ MODE="${MODE:-both}"
+ case "$MODE" in
+   csr|pc|both) ;;
+@@ -201,12 +186,6 @@ for entry in "${NEG_TESTS[@]}"; do
+   [[ -n "$FILTER" && ! "$neg_name" =~ $FILTER ]] && continue
+   WORKPLAN+=("neg|$neg_name|$neg_cmd")
+ done
+-for entry in "${DEMO_TESTS[@]}"; do
+-  demo_name="${entry%%|*}"
+-  demo_cmd="${entry#*|}"
+-  [[ -n "$FILTER" && ! "$demo_name" =~ $FILTER ]] && continue
+-  WORKPLAN+=("demo|$demo_name|$demo_cmd")
+-done
+ 
+ TOTAL=${#WORKPLAN[@]}
+ step "logs: $LOG_DIR  jobs: $JOBS  mode: $MODE  tests: $TOTAL"
+@@ -241,9 +220,9 @@ done
+ wait
+ exec 8>&-
+ 
+-declare -A MODE_PASS=([csr]=0 [pc]=0 [neg]=0 [demo]=0)
+-declare -A MODE_FAIL=([csr]=0 [pc]=0 [neg]=0 [demo]=0)
+-declare -A MODE_SKIP=([csr]=0 [pc]=0 [neg]=0 [demo]=0)
++declare -A MODE_PASS=([csr]=0 [pc]=0 [neg]=0)
++declare -A MODE_FAIL=([csr]=0 [pc]=0 [neg]=0)
++declare -A MODE_SKIP=([csr]=0 [pc]=0 [neg]=0)
+ declare -a FAILED_NAMES=()
+ while IFS=$'\t' read -r r_mode r_name r_status _r_rc _r_el; do
+   case "$r_status" in
+@@ -273,11 +252,10 @@ echo
+ csr_p=${MODE_PASS[csr]} csr_f=${MODE_FAIL[csr]} csr_s=${MODE_SKIP[csr]}
+ pc_p=${MODE_PASS[pc]}   pc_f=${MODE_FAIL[pc]}   pc_s=${MODE_SKIP[pc]}
+ neg_p=${MODE_PASS[neg]} neg_f=${MODE_FAIL[neg]} neg_s=${MODE_SKIP[neg]}
+-dem_p=${MODE_PASS[demo]} dem_f=${MODE_FAIL[demo]} dem_s=${MODE_SKIP[demo]}
+-total_pass=$((csr_p + pc_p + neg_p + dem_p))
+-total_fail=$((csr_f + pc_f + neg_f + dem_f))
+-total_skip=$((csr_s + pc_s + neg_s + dem_s))
+-step "summary: csr ${csr_p}p/${csr_f}f/${csr_s}s  pc ${pc_p}p/${pc_f}f/${pc_s}s  neg ${neg_p}p/${neg_f}f/${neg_s}s  demo ${dem_p}p/${dem_f}f/${dem_s}s  total ${total_pass} passed, ${total_fail} failed, ${total_skip} skipped"
++total_pass=$((csr_p + pc_p + neg_p))
++total_fail=$((csr_f + pc_f + neg_f))
++total_skip=$((csr_s + pc_s + neg_s))
++step "summary: csr ${csr_p}p/${csr_f}f/${csr_s}s  pc ${pc_p}p/${pc_f}f/${pc_s}s  neg ${neg_p}p/${neg_f}f/${neg_s}s  total ${total_pass} passed, ${total_fail} failed, ${total_skip} skipped"
+ if (( total_fail > 0 )); then
+   fail "failures: ${FAILED_NAMES[*]}"
+   exit 1
+diff --git a/tests/hsim/test_hsim_demo.sh b/tests/hsim/test_hsim_demo.sh
+deleted file mode 100755
+index e0e9ff1..0000000
+--- a/tests/hsim/test_hsim_demo.sh
++++ /dev/null
+@@ -1,74 +0,0 @@
+-#!/usr/bin/env bash
+-# RED test for `./hsim demo <T1..T7|short-name> [-- ENV=VAL ...]`.
+-# Wraps tests/demos/demo_*.sh. Same shape as test_hsim_doctor.sh.
+-
+-set -uo pipefail
+-
+-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+-ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+-HSIM="$ROOT/hsim"
+-
+-fail() { echo "[FAIL] $*" >&2; exit 1; }
+-ok()   { echo "[ok] $*"; }
+-
+-[ -x "$HSIM" ] || fail "missing executable: $HSIM"
+-
+-# 1. --help mentions demo + T-id range so users know the selector form.
+-out=$("$HSIM" demo --help 2>&1) || fail "demo --help non-zero: $out"
+-echo "$out" | grep -qE 'T1' \
+-  || fail "help missing T-id mention:"$'\n'"$out"
+-echo "$out" | grep -qE 'T7' \
+-  || fail "help missing T7 mention:"$'\n'"$out"
+-ok "demo --help mentions T1..T7"
+-
+-# 2. `./hsim demo` with no selector -> rc=2 with usage hint.
+-set +e
+-out=$("$HSIM" demo 2>&1)
+-rc=$?
+-set -e
+-[ "$rc" -eq 2 ] || fail "demo (no arg) rc=$rc (expected 2):"$'\n'"$out"
+-ok "demo without selector -> rc=2"
+-
+-# 3. Bogus selector -> rc=2 with hint.
+-set +e
+-out=$("$HSIM" demo bogus_demo 2>&1)
+-rc=$?
+-set -e
+-[ "$rc" -eq 2 ] || fail "demo bogus rc=$rc (expected 2):"$'\n'"$out"
+-echo "$out" | grep -qiE 'unknown|invalid|not a demo' \
+-  || fail "bogus selector missing hint:"$'\n'"$out"
+-ok "demo bogus -> rc=2 with hint"
+-
+-# 4. T-id selector resolves to the right script (dry-run).
+-out=$("$HSIM" demo T1 --dry-run 2>&1) || fail "T1 --dry-run failed: $out"
+-echo "$out" | grep -qE "bash .*tests/demos/demo_csr_oneshot\.sh" \
+-  || fail "T1 did not resolve to demo_csr_oneshot.sh:"$'\n'"$out"
+-ok "T1 --dry-run resolves to demo_csr_oneshot.sh"
+-
+-# 5. Short-name selector resolves to the same script.
+-out=$("$HSIM" demo csr_oneshot --dry-run 2>&1) \
+-  || fail "csr_oneshot --dry-run failed: $out"
+-echo "$out" | grep -qE "bash .*tests/demos/demo_csr_oneshot\.sh" \
+-  || fail "short-name did not resolve to demo_csr_oneshot.sh:"$'\n'"$out"
+-ok "csr_oneshot --dry-run resolves to demo_csr_oneshot.sh"
+-
+-# 6. Missing artifact -> rc=2 with `not built` hint (mirrors `./hsim run`).
+-set +e
+-out=$(VSIM_BIN=/no/such/vsim "$HSIM" demo T1 2>&1)
+-rc=$?
+-set -e
+-[ "$rc" -eq 2 ] || fail "missing-vsim demo rc=$rc (expected 2):"$'\n'"$out"
+-echo "$out" | grep -qE 'vsim.*not built' \
+-  || fail "no `not built` hint for vsim:"$'\n'"$out"
+-ok "missing artifact -> rc=2 with 'not built' hint"
+-
+-# 7. Passthrough `-- ENV=VAL` shows up in the resolved env (dry-run).
+-out=$("$HSIM" demo T7 --dry-run -- SLICE=400 MAXK=4 2>&1) \
+-  || fail "T7 passthrough --dry-run failed: $out"
+-echo "$out" | grep -qE 'SLICE=400' \
+-  || fail "passthrough SLICE=400 not shown:"$'\n'"$out"
+-echo "$out" | grep -qE 'MAXK=4' \
+-  || fail "passthrough MAXK=4 not shown:"$'\n'"$out"
+-ok "passthrough '-- SLICE=400 MAXK=4' shown in dry-run env"
+-
+-echo "PASS test_hsim_demo"
+diff --git a/tests/hsim/test_hsim_estimate.sh b/tests/hsim/test_hsim_estimate.sh
+index 6bbd574..58f84ca 100755
+--- a/tests/hsim/test_hsim_estimate.sh
++++ b/tests/hsim/test_hsim_estimate.sh
+@@ -1,10 +1,11 @@
+ #!/usr/bin/env bash
+-# RED test for F12: `./hsim estimate <elf> --slice N --icount M --max-k K`.
+-# End-to-end SimPoint cycle estimator: runs M4 profile + cluster +
+-# per-phase QEMU/vsim drain, aggregates weighted CPI -> estimated_cycles.
++# RED test for F12: `./hsim estimate <elf> --slice N [--max-k K]`.
++# End-to-end SimPoint cycle estimator: runs the BBV profile to natural
++# program exit + cluster + per-phase QEMU/vsim drain, aggregates weighted
++# CPI -> estimated_cycles. Equivalent to `./hsim run --mode simpoint`.
+ #
+-# Workload: icount_spin.elf. The full pipeline takes ~30-60s
+-# (profile + cluster + 2 phase drains). Cap at 120s for headroom.
++# Workload: rt_c_v_matmul_free.elf (markerless GEMM that exits naturally).
++# The full pipeline takes ~60-120s. Cap at 180s for headroom.
+ 
+ set -uo pipefail
+ 
+@@ -16,18 +17,21 @@ fail() { echo "[FAIL] $*" >&2; exit 1; }
+ ok()   { echo "[ok] $*"; }
+ 
+ [ -x "$HSIM" ] || fail "missing executable: $HSIM"
+-ELF="$ROOT/tests/fixtures/icount_spin.elf"
++ELF="$ROOT/tests/fixtures/rt_c_v_matmul_free.elf"
+ [ -f "$ELF" ] || fail "missing fixture: $ELF (run ./hsim build first)"
+ 
+ cd "$ROOT"
+ 
+-# 1. estimate --help mentions the key flags.
++# 1. estimate --help mentions the key flags (and NOT --icount: simpoint
++#    always profiles to natural program exit).
+ out=$("$HSIM" estimate --help 2>&1) || fail "estimate --help non-zero: $out"
+-for flag in --slice --icount --max-k --vsim-icount; do
++for flag in --slice --max-k --vsim-icount; do
+   echo "$out" | grep -qE -- "$flag" \
+     || fail "estimate --help missing $flag:"$'\n'"$out"
+ done
+-ok "estimate --help mentions --slice, --icount, --max-k, --vsim-icount"
++echo "$out" | grep -qE -- "--icount" \
++  && fail "estimate --help still mentions removed --icount:"$'\n'"$out"
++ok "estimate --help mentions --slice, --max-k, --vsim-icount (no --icount)"
+ 
+ # 2. estimate with no ELF -> rc=2 (argparse required positional).
+ set +e
+@@ -57,29 +61,36 @@ echo "$out" | grep -qE 'vsim.*not built' \
+   || fail "missing-vsim no 'not built' hint:"$'\n'"$out"
+ ok "missing vsim artifact -> rc=2 with 'not built' hint"
+ 
+-# 5. Real estimate run on icount_spin produces estimated_cycles line.
++# 5. --icount is rejected by argparse (the knob no longer exists).
+ set +e
+-out=$(timeout 120 "$HSIM" estimate "$ELF" \
+-        --slice 1000 --icount 10000 --max-k 2 2>&1)
