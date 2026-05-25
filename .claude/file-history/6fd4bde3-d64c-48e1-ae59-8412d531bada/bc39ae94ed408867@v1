@@ -1,0 +1,81 @@
+// CsrTrigger pre-scans an instruction buffer (typically the loadable
+// executable segments of an ELF) for `csrw 0x7C0, *` instructions and
+// records their PCs. At retire time the simulator queries lookup(pc) to
+// decide whether to drain state and hand back to QEMU.
+//
+// Pure logic: no SystemC, no DMI bus. Decoupled from GPR access -- the
+// caller resolves runtime-kind rs1 values via decode_csrrw_rs1.
+
+#pragma once
+
+#include "hybrid/insn_match.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <optional>
+#include <span>
+#include <unordered_map>
+
+namespace hybrid
+{
+
+struct CsrTriggerHit
+{
+  hybrid_handoff_kind kind;
+  uint32_t insn;
+};
+
+inline auto decode_csrrw_rs1(uint32_t insn) -> uint8_t
+{
+  return static_cast<uint8_t>((insn >> 15) & 0x1Fu);
+}
+
+class CsrTrigger
+{
+public:
+  void scan_buffer(std::span<const uint8_t> code, uint64_t base_pc)
+  {
+    std::size_t i = 0;
+    while (i + sizeof(uint16_t) <= code.size()) {
+      uint16_t lo = 0;
+      std::memcpy(&lo, code.data() + i, sizeof(lo));
+
+      const bool is_32 = (lo & 0x3u) == 0x3u;
+      if (is_32) {
+        if (i + sizeof(uint32_t) > code.size()) break;
+        uint32_t insn = 0;
+        std::memcpy(&insn, code.data() + i, sizeof(insn));
+        hybrid_handoff_kind kind = HYBRID_HANDOFF_NONE;
+        if (hybrid_match_handoff_insn(insn, &kind)) {
+          hits_.insert_or_assign(base_pc + i, CsrTriggerHit{kind, insn});
+        }
+        i += sizeof(uint32_t);
+      } else {
+        i += sizeof(uint16_t);
+      }
+    }
+  }
+
+  // PC-trigger mode: insert a synthetic hit without scanning. Used when the
+  // orchestrator passes --hybrid-exit-pc on the CLI; in that case the binary
+  // need not contain a magic csrwi, and `insn` is unused (HandoffController
+  // decodes the insn only on the RUNTIME arm; PC mode only inserts EXIT).
+  void add_pc_hit(uint64_t pc, hybrid_handoff_kind kind)
+  {
+    hits_.insert_or_assign(pc, CsrTriggerHit{kind, /*insn=*/0u});
+  }
+
+  auto lookup(uint64_t pc) const -> std::optional<CsrTriggerHit>
+  {
+    if (auto it = hits_.find(pc); it != hits_.end()) return it->second;
+    return std::nullopt;
+  }
+
+  auto empty() const -> bool { return hits_.empty(); }
+
+private:
+  std::unordered_map<uint64_t, CsrTriggerHit> hits_;
+};
+
+}  // namespace hybrid
