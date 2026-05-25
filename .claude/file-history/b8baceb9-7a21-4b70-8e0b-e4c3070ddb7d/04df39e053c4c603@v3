@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# RED test: `./hsim run <elf> --mode simpoint --interval N [--max-k K]`.
+# Simpoint mode always profiles to natural program exit (no --icount knob).
+# Reuses the same workflow as `./hsim estimate`.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+HSIM="$ROOT/hsim"
+
+fail() { echo "[FAIL] $*" >&2; exit 1; }
+ok()   { echo "[ok] $*"; }
+
+[ -x "$HSIM" ] || fail "missing executable: $HSIM"
+# Markerless GEMM that exits naturally (200 reps of vmatmul, then _exit).
+ELF="$ROOT/tests/fixtures/rt_c_v_matmul_free.elf"
+[ -f "$ELF" ] || fail "missing fixture: $ELF (run ./hsim build first)"
+
+cd "$ROOT"
+
+# 1. run --help advertises the 4 modes and not 'slice'.
+out=$("$HSIM" run --help 2>&1) || fail "run --help non-zero: $out"
+for choice in csr pc icount simpoint; do
+  echo "$out" | grep -qE "\\b$choice\\b" \
+    || fail "run --help missing --mode choice '$choice':"$'\n'"$out"
+done
+ok "run --help lists csr, pc, icount, simpoint"
+
+# 2. --mode slice is no longer a valid choice.
+set +e
+out=$("$HSIM" run "$ELF" --mode slice 2>&1); rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "--mode slice should be rejected, got rc=0:"$'\n'"$out"
+echo "$out" | grep -qE "invalid choice.*slice" \
+  || fail "--mode slice rejection should say 'invalid choice':"$'\n'"$out"
+ok "--mode slice rejected by argparse (rc=$rc)"
+
+# 3. --slice-at flag and --icount knob are gone from run --help (simpoint
+#    always profiles to natural program exit).
+out2=$("$HSIM" run --help 2>&1)
+echo "$out2" | grep -qE -- "--slice-at" \
+  && fail "run --help still mentions removed --slice-at:"$'\n'"$out2"
+echo "$out2" | grep -qE -- "--icount[[:space:]]" \
+  && fail "run --help still mentions removed --icount (simpoint always runs to exit):"$'\n'"$out2"
+ok "--slice-at and --icount no longer in run --help"
+
+# 4. --interval and --max-k are in run --help.
+echo "$out2" | grep -qE -- "--interval" \
+  || fail "run --help missing --interval (simpoint mode):"$'\n'"$out2"
+echo "$out2" | grep -qE -- "--max-k" \
+  || fail "run --help missing --max-k (simpoint mode):"$'\n'"$out2"
+ok "run --help mentions --interval and --max-k"
+
+# 5. --icount is rejected by argparse for `./hsim run`.
+set +e
+out=$("$HSIM" run "$ELF" --mode simpoint --interval 1000 --icount 5000 2>&1); rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "--icount should be rejected on `./hsim run`, got rc=0:"$'\n'"$out"
+echo "$out" | grep -qE "unrecognized arguments.*--icount" \
+  || fail "--icount rejection should say 'unrecognized arguments':"$'\n'"$out"
+ok "--icount rejected by argparse"
+
+# 6. --mode simpoint accepts --interval + downstream check passes argparse.
+set +e
+out=$(VSIM_BIN=/no/such/vsim "$HSIM" run "$ELF" --mode simpoint \
+        --interval 1000 --max-k 2 2>&1); rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "simpoint with valid args + bogus VSIM_BIN rc=$rc (expected 2):"$'\n'"$out"
+echo "$out" | grep -qi "vsim not built" \
+  || fail "should hit 'vsim not built' downstream:"$'\n'"$out"
+ok "--mode simpoint --interval N --max-k K accepted by argparse"
+
+# 7. Real --mode simpoint run on the markerless GEMM -> rc=0 with
+#    estimated_cycles. No --icount: simpoint runs to natural _exit.
+set +e
+out=$(timeout 180 "$HSIM" run "$ELF" --mode simpoint \
+        --interval 20 --max-k 2 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "--mode simpoint real run rc=$rc:"$'\n'"$out"
+echo "$out" | grep -qE 'estimated_cycles=[0-9]+' \
+  || fail "missing 'estimated_cycles=<int>' line:"$'\n'"$out"
+EST=$(echo "$out" | grep -oE 'estimated_cycles=[0-9]+' | head -1 | cut -d= -f2)
+[ "${EST:-0}" -gt 0 ] \
+  || fail "estimated_cycles must be > 0, got '$EST':"$'\n'"$out"
+ok "real ./hsim run --mode simpoint on rt_c_v_matmul_free -> estimated_cycles=$EST"
+
+echo "PASS test_hsim_run_simpoint"

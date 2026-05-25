@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# RED test for F12: `./hsim estimate <elf> --slice N --icount M --max-k K`.
+# End-to-end SimPoint cycle estimator: runs M4 profile + cluster +
+# per-phase QEMU/vsim drain, aggregates weighted CPI -> estimated_cycles.
+#
+# Workload: icount_spin.elf. The full pipeline takes ~30-60s
+# (profile + cluster + 2 phase drains). Cap at 120s for headroom.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+HSIM="$ROOT/hsim"
+
+fail() { echo "[FAIL] $*" >&2; exit 1; }
+ok()   { echo "[ok] $*"; }
+
+[ -x "$HSIM" ] || fail "missing executable: $HSIM"
+ELF="$ROOT/tests/fixtures/icount_spin.elf"
+[ -f "$ELF" ] || fail "missing fixture: $ELF (run ./hsim build first)"
+
+cd "$ROOT"
+
+# 1. estimate --help mentions the key flags.
+out=$("$HSIM" estimate --help 2>&1) || fail "estimate --help non-zero: $out"
+for flag in --slice --icount --max-k --vsim-icount; do
+  echo "$out" | grep -qE -- "$flag" \
+    || fail "estimate --help missing $flag:"$'\n'"$out"
+done
+ok "estimate --help mentions --slice, --icount, --max-k, --vsim-icount"
+
+# 2. estimate with no ELF -> rc=2 (argparse required positional).
+set +e
+out=$("$HSIM" estimate 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "estimate (no arg) rc=$rc (expected 2):"$'\n'"$out"
+ok "estimate without ELF -> rc=2"
+
+# 3. Bogus ELF -> rc=2 with hint.
+set +e
+out=$("$HSIM" estimate "/no/such/foo.elf" 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "estimate bogus rc=$rc (expected 2):"$'\n'"$out"
+echo "$out" | grep -qiE 'not found|no such' \
+  || fail "estimate bogus missing 'not found' hint:"$'\n'"$out"
+ok "estimate bogus ELF -> rc=2 with hint"
+
+# 4. Missing vsim artifact -> rc=2 with 'not built' hint.
+set +e
+out=$(VSIM_BIN=/no/such/vsim "$HSIM" estimate "$ELF" 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "missing-vsim estimate rc=$rc (expected 2):"$'\n'"$out"
+echo "$out" | grep -qE 'vsim.*not built' \
+  || fail "missing-vsim no 'not built' hint:"$'\n'"$out"
+ok "missing vsim artifact -> rc=2 with 'not built' hint"
+
+# 5. Real estimate run on icount_spin produces estimated_cycles line.
+set +e
+out=$(timeout 120 "$HSIM" estimate "$ELF" \
+        --slice 1000 --icount 10000 --max-k 2 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "estimate real run rc=$rc:"$'\n'"$out"
+echo "$out" | grep -qE 'estimated_cycles=[0-9]+' \
+  || fail "missing 'estimated_cycles=<int>' line:"$'\n'"$out"
+# Parse the estimated cycle count and assert > 0.
+EST=$(echo "$out" | grep -oE 'estimated_cycles=[0-9]+' | head -1 \
+        | cut -d= -f2)
+[ "${EST:-0}" -gt 0 ] \
+  || fail "estimated_cycles must be > 0, got '$EST':"$'\n'"$out"
+ok "estimate emits estimated_cycles=$EST"
+
+# 6. Per-phase rows show delta_mcycle values.
+echo "$out" | grep -qE 'delta_mcycle=[0-9]+' \
+  || fail "missing per-phase 'delta_mcycle=<int>' rows:"$'\n'"$out"
+N_PHASES=$(echo "$out" | grep -cE 'delta_mcycle=[0-9]+')
+[ "$N_PHASES" -ge 1 ] \
+  || fail "need at least 1 per-phase row, got $N_PHASES:"$'\n'"$out"
+# Each delta_mcycle should be > 0 (vsim ran insns, mcycle advanced).
+while IFS= read -r delta; do
+  [ "$delta" -gt 0 ] \
+    || fail "delta_mcycle must be > 0, got '$delta':"$'\n'"$out"
+done < <(echo "$out" | grep -oE 'delta_mcycle=[0-9]+' | cut -d= -f2)
+ok "$N_PHASES per-phase row(s) with delta_mcycle > 0"
+
+echo "PASS test_hsim_estimate"

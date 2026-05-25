@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# RED test: `./hsim run <elf> --mode pc` requires explicit --pc-start /
+# --pc-end. The legacy --roi-start / --roi-end names (and the auto-fallback
+# to the planted _hybrid_enter_pc / _hybrid_exit_pc markers) are removed --
+# pc-mode now demands explicit boundary args every invocation.
+#
+# Argparse-only assertions (no end-to-end run): we test the CLI surface,
+# not vsim/qemu execution.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+HSIM="$ROOT/hsim"
+
+fail() { echo "[FAIL] $*" >&2; exit 1; }
+ok()   { echo "[ok] $*"; }
+
+[ -x "$HSIM" ] || fail "missing executable: $HSIM"
+ELF="$ROOT/tests/fixtures/rt_c_v_matmul_free.elf"
+[ -f "$ELF" ] || fail "missing fixture: $ELF (run ./hsim build)"
+
+cd "$ROOT"
+
+# 1. run --help mentions --pc-start and --pc-end (new names).
+out=$("$HSIM" run --help 2>&1) || fail "run --help non-zero: $out"
+echo "$out" | grep -qE -- "--pc-start" \
+  || fail "run --help missing --pc-start:"$'\n'"$out"
+echo "$out" | grep -qE -- "--pc-end" \
+  || fail "run --help missing --pc-end:"$'\n'"$out"
+ok "run --help advertises --pc-start / --pc-end"
+
+# 2. run --help no longer mentions the legacy --roi-start / --roi-end names.
+echo "$out" | grep -qE -- "--roi-start" \
+  && fail "run --help still mentions removed flag --roi-start:"$'\n'"$out"
+echo "$out" | grep -qE -- "--roi-end" \
+  && fail "run --help still mentions removed flag --roi-end:"$'\n'"$out"
+ok "legacy --roi-start / --roi-end no longer in run --help"
+
+# 3. --mode pc without --pc-start/--pc-end -> rc != 0 with hint.
+set +e
+out=$("$HSIM" run "$ELF" --mode pc 2>&1); rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "pc-mode without pc args should fail, got rc=0:"$'\n'"$out"
+echo "$out" | grep -qE -- "--pc-start" \
+  || fail "pc-mode error should mention --pc-start:"$'\n'"$out"
+ok "pc-mode without --pc-start / --pc-end -> rc=$rc with --pc-start hint"
+
+# 4. --mode pc with only --pc-start (missing --pc-end) -> rc != 0.
+set +e
+out=$("$HSIM" run "$ELF" --mode pc --pc-start vmatmul_kernel 2>&1); rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "pc-mode with only --pc-start should fail, got rc=0:"$'\n'"$out"
+echo "$out" | grep -qE -- "--pc-end" \
+  || fail "missing --pc-end error should mention --pc-end:"$'\n'"$out"
+ok "pc-mode with only --pc-start -> rc=$rc with --pc-end hint"
+
+# 5. --mode pc with both args + missing vsim -> rc=2 with vsim hint
+#    (argparse accepts the args; failure is downstream at artifact check).
+set +e
+out=$(VSIM_BIN=/no/such/vsim "$HSIM" run "$ELF" --mode pc \
+        --pc-start vmatmul_kernel --pc-end 0xdeadbeef 2>&1); rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "pc-mode with both args + bogus VSIM_BIN rc=$rc (expected 2):"$'\n'"$out"
+echo "$out" | grep -qi "vsim not built" \
+  || fail "should hit 'vsim not built' downstream:"$'\n'"$out"
+ok "pc-mode with both --pc-start/--pc-end accepted by argparse"
+
+# 6. Legacy --roi-start / --roi-end are unrecognized.
+set +e
+out=$("$HSIM" run "$ELF" --mode pc --roi-start vmatmul_kernel --roi-end 0x100 2>&1); rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "legacy --roi-start should be rejected by argparse, got rc=0:"$'\n'"$out"
+echo "$out" | grep -qE "unrecognized|invalid" \
+  || fail "legacy --roi-start error should say unrecognized/invalid:"$'\n'"$out"
+ok "legacy --roi-start / --roi-end rejected by argparse"
+
+echo "PASS test_hsim_run_pc_required"

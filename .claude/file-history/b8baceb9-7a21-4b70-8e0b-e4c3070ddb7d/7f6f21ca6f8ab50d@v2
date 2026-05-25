@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# RED test: `./hsim run <elf> --mode icount`.
+# Whole-program instruction-count drain pair: QEMU1 plugin icount=N1 ->
+# drain, then vsim --hybrid-icount N2 -> drain.
+#
+# Workload: icount_spin.elf (CSR-less tight 2-insn loop). Neither leg
+# could use csrwi 0x7C0 -- the icount trigger IS the only drain mechanism.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+HSIM="$ROOT/hsim"
+
+fail() { echo "[FAIL] $*" >&2; exit 1; }
+ok()   { echo "[ok] $*"; }
+
+[ -x "$HSIM" ] || fail "missing executable: $HSIM"
+ELF="$ROOT/tests/fixtures/icount_spin.elf"
+[ -f "$ELF" ] || fail "missing fixture: $ELF (run ./hsim build first)"
+
+cd "$ROOT"
+
+# 1. run --help lists icount mode and the icount knobs.
+out=$("$HSIM" run --help 2>&1) || fail "run --help non-zero: $out"
+echo "$out" | grep -qE "\bicount\b" \
+  || fail "run --help missing --mode choice 'icount':"$'\n'"$out"
+for flag in --qemu-icount --vsim-icount; do
+  echo "$out" | grep -qE -- "$flag" \
+    || fail "run --help missing $flag:"$'\n'"$out"
+done
+ok "run --help lists icount mode + --qemu-icount/--vsim-icount"
+
+# 2. icount with bogus ELF -> rc=2 with path hint.
+set +e
+out=$("$HSIM" run /no/such/foo.elf --mode icount 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "bogus-ELF icount rc=$rc (expected 2):"$'\n'"$out"
+echo "$out" | grep -q "/no/such/foo.elf" \
+  || fail "bogus-ELF missing path hint:"$'\n'"$out"
+ok "bogus ELF --mode icount -> rc=2 with hint"
+
+# 3. icount with missing vsim -> rc=2 with 'not built' hint.
+set +e
+out=$(VSIM_BIN=/no/such/vsim "$HSIM" run "$ELF" --mode icount 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "missing-vsim icount rc=$rc (expected 2):"$'\n'"$out"
+echo "$out" | grep -qi "vsim not built" \
+  || fail "missing-vsim missing hint:"$'\n'"$out"
+ok "missing vsim --mode icount -> rc=2 with hint"
+
+# 4. Real icount run on icount_spin -> rc=0.
+set +e
+out=$(timeout 60 "$HSIM" run "$ELF" --mode icount \
+        --qemu-icount 10000 --vsim-icount 5000 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "icount real run rc=$rc:"$'\n'"$out"
+echo "$out" | grep -qiE 'pass|drain' \
+  || fail "icount run missing PASS/drain marker:"$'\n'"$out"
+ok "real ./hsim run --mode icount on icount_spin -> rc=0"
+
+echo "PASS test_hsim_run_icount"

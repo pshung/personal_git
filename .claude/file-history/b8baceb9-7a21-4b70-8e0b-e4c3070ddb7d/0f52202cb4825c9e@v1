@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# RED test for F14: `./hsim estimate <elf>` with NO --icount flag should
+# run the workload to its natural exit (semihosting EXIT), drain state in
+# the plugin's atexit callback, and use the plugin-counted retired-insn
+# count as N_total in the SimPoint aggregation formula.
+#
+# Workload: tests/fixtures/rt_c_no_trigger_exit.elf. ~50K-100K insns total,
+# no csrwi 0x7C0, exits via libgloss_vh semihosting EXIT.
+#
+# Pipeline (profile + cluster + per-phase drains) caps at 120s for headroom.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+HSIM="$ROOT/hsim"
+
+fail() { echo "[FAIL] $*" >&2; exit 1; }
+ok()   { echo "[ok] $*"; }
+
+[ -x "$HSIM" ] || fail "missing executable: $HSIM"
+ELF="$ROOT/tests/fixtures/rt_c_no_trigger_exit.elf"
+[ -f "$ELF" ] || fail "missing fixture: $ELF (run ./hsim build first)"
+
+cd "$ROOT"
+
+# 1. Fixture sanity: must contain zero csrwi 0x7C0,* insns.
+# Locate the riscv64 objdump (mirrors fixtures/Makefile TOOLCHAIN lookup).
+OBJDUMP=""
+if [ -n "${HYBRID_TOOLCHAIN:-}" ] && [ -x "$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-objdump" ]; then
+  OBJDUMP="$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-objdump"
+elif command -v riscv64-unknown-elf-objdump >/dev/null 2>&1; then
+  OBJDUMP=$(command -v riscv64-unknown-elf-objdump)
+fi
+if [ -n "$OBJDUMP" ]; then
+  count=$("$OBJDUMP" -d "$ELF" 2>/dev/null | grep -cE 'csrwi[[:space:]]+0x7[Cc]0' || true)
+  [ "${count:-0}" -eq 0 ] \
+    || fail "fixture $ELF has $count csrwi 0x7C0 insn(s); F14 needs zero"
+  ok "fixture has zero csrwi 0x7C0 insns"
+else
+  echo "[skip] objdump not found; skipping csrwi check"
+fi
+
+# 2. estimate --help mentions the new --icount 0 semantics.
+out=$("$HSIM" estimate --help 2>&1) || fail "estimate --help non-zero: $out"
+echo "$out" | grep -qiE '(run to (program )?exit|0[[:space:]]*(=|means))' \
+  || fail "estimate --help missing 'run to exit' / '0 means ...' hint:"$'\n'"$out"
+ok "estimate --help documents --icount 0 (run-to-exit) semantics"
+
+# 3. Real estimate run with NO --icount flag uses run-to-exit path.
+set +e
+out=$(timeout 120 "$HSIM" estimate "$ELF" --slice 1000 --max-k 2 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "estimate (no --icount) rc=$rc:"$'\n'"$out"
+ok "estimate without --icount exits 0"
+
+# 4. Output has estimated_cycles=<int>, > 0.
+echo "$out" | grep -qE 'estimated_cycles=[0-9]+' \
+  || fail "missing 'estimated_cycles=<int>' line:"$'\n'"$out"
+EST=$(echo "$out" | grep -oE 'estimated_cycles=[0-9]+' | head -1 | cut -d= -f2)
+[ "${EST:-0}" -gt 0 ] \
+  || fail "estimated_cycles must be > 0, got '$EST':"$'\n'"$out"
+ok "estimated_cycles=$EST"
+
+# 5. N_total surfaced in the report line must be > 0 and >> 2000
+# (loop iters lower bound; libgloss startup adds more).
+echo "$out" | grep -qE 'N=[0-9]+' \
+  || fail "missing 'N=<int>' in summary line:"$'\n'"$out"
+NTOT=$(echo "$out" | grep -oE 'N=[0-9]+' | head -1 | cut -d= -f2)
+[ "${NTOT:-0}" -gt 2000 ] \
+  || fail "N_total must reflect real insn count (>2000), got '$NTOT':"$'\n'"$out"
+ok "N_total=$NTOT (from plugin-counted minstret, not args.icount)"
+
+# 6. Per-phase rows show delta_mcycle > 0.
+echo "$out" | grep -qE 'delta_mcycle=[0-9]+' \
+  || fail "missing per-phase 'delta_mcycle=<int>' rows:"$'\n'"$out"
+N_PHASES=$(echo "$out" | grep -cE 'delta_mcycle=[0-9]+')
+[ "$N_PHASES" -ge 1 ] \
+  || fail "need at least 1 per-phase row, got $N_PHASES:"$'\n'"$out"
+while IFS= read -r delta; do
+  [ "$delta" -gt 0 ] \
+    || fail "delta_mcycle must be > 0, got '$delta':"$'\n'"$out"
+done < <(echo "$out" | grep -oE 'delta_mcycle=[0-9]+' | cut -d= -f2)
+ok "$N_PHASES per-phase row(s) with delta_mcycle > 0"
+
+# 7. weighted_CPI is sensible (positive, < 100).
+echo "$out" | grep -qE 'weighted_CPI=[0-9]+\.[0-9]+' \
+  || fail "missing 'weighted_CPI=<float>' in summary:"$'\n'"$out"
+CPI=$(echo "$out" | grep -oE 'weighted_CPI=[0-9]+\.[0-9]+' | head -1 | cut -d= -f2)
+awk -v c="$CPI" 'BEGIN { exit (c > 0 && c < 100) ? 0 : 1 }' \
+  || fail "weighted_CPI=$CPI out of plausible range:"$'\n'"$out"
+ok "weighted_CPI=$CPI in plausible range"
+
+echo "PASS test_hsim_estimate_drain_at_exit"

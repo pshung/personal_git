@@ -1,0 +1,208 @@
+# Historical roadmap (completed): run every switching mode on one RVV GEMM
+
+> **Status: completed.** The bash demos under `tests/demos/` have been
+> removed; the four switching modes are now reachable via
+> `./hsim run --mode csr|pc|icount|simpoint` directly. This file is kept
+> as a record of the design decisions (one workload, two builds, why).
+
+## Goal
+
+Every switching mode should showcase its mechanism on the SAME
+RVV-intrinsic GEMM, so the suite reads as "one workload, the 4 switching
+modes": CSR, PC, icount, and SimPoint (whose profile / per-phase drain /
+archive stages live inside `./hsim run --mode simpoint`).
+
+We reuse the existing GEMM `tests/fixtures/rt_c_v_matmul.c` (16x16x16 outer-product,
+`__riscv_vle32` / `__riscv_vmacc_vx` / `__riscv_vse32`).
+
+## Why two builds of one source
+
+`qemu_plugin/hybrid_handoff.c:471-485`: in icount/slice/bbv modes the default CSR
+matcher is STILL registered. A workload containing `csrwi 0x7C0,0` drains AT the
+marker and `exit(200)`s before any count target inside the kernel is reached. So:
+
+- Marker-driven demos (csr, pc, archive, simpoint) need the markers -> MARKED build.
+- Coun/profile demos (icount, bbv, slice) need a marker-free workload -> MARKERLESS.
+
+Per user decision: one source, a preprocessor macro toggles the markers, built twice.
+
+### Confirmed findings (probed on the built artifacts)
+- `nm -n rt_c_v_matmul.elf` -> only `main`, `_hybrid_enter_pc`, `_hybrid_exit_pc`.
+  The kernel is inlined at `-O1`, so a PC-range assertion has no symbol to anchor on.
+  Fix: mark `vmatmul_kernel` `noinline` (also keeps it in the ROI per
+  `runtime/rt_c_helpers.h:49-51`).
+- Orchestrator CSR-drain is marker-driven: `tools/orchestrator/spawn.py:33` passes
+  the plugin only `outfile=...`; `tools/orchestrator/checkpoint.py:237` sets replay
+  `trigger_kind="csr"`. So T6 and T7 must use the MARKED build.
+
+## Fixture mapping (current state)
+
+| Mode     | Build      | ELF                    |
+|----------|------------|------------------------|
+| csr      | MARKED     | rt_c_v_matmul.elf      |
+| pc       | MARKERLESS | rt_c_v_matmul_free.elf |
+| icount   | MARKERLESS | rt_c_v_matmul_free.elf |
+| simpoint | MARKED     | rt_c_v_matmul.elf      |
+
+The SimPoint pipeline (`--mode simpoint`) keeps the small interval/icount
+targets profiling the crt0+init prefix BEFORE the enter marker; the
+kernel runs in the per-phase replay legs.
+
+---
+
+## Features (complete ONE per session; update State)
+
+### F1 - GEMM source: marker macro + noinline kernel + repeat loop
+- State: done
+- Depends on: none
+- Description: make the one source serve both builds. Add `#ifndef GEMM_REPEAT
+  #define GEMM_REPEAT 1 #endif`; mark `vmatmul_kernel` `__attribute__((noinline))`;
+  in `main`, guard `enter_vsim()`/`exit_vsim()` with `#ifndef HYBRID_MARKERLESS`
+  and wrap the kernel call in `for (int rep=0; rep<GEMM_REPEAT; rep++)
+  vmatmul_kernel();`. Idempotent (vacc re-seeded per outer iter), phase-2
+  syscall-free and phase-3 verify unchanged. Marked build (REPEAT=1) is
+  behavior-identical to today.
+- Key files: `tests/fixtures/rt_c_v_matmul.c`
+- TDD: GREEN side; F3/F4 demos are the RED tests that pin it.
+
+### F2 - Makefile: markerless twin `rt_c_v_matmul_free.elf`
+- State: done
+- Depends on: F1
+- Description: explicit (non-pattern) rule compiling the SAME `.c` with
+  `-DHYBRID_MARKERLESS -DGEMM_REPEAT=$(GEMM_REPEAT_FREE)`, reusing
+  `RT_C_V_CFLAGS`/`RT_C_LIBS`/`RUNTIME_SRCS`/`test.ld`. Add `GEMM_REPEAT_FREE ?= 200`.
+  Append the ELF to `all` and `clean`. Do NOT add to `RT_C_V_FIXTURES` (pattern rule
+  would seek a nonexistent `_free.c`).
+  ```make
+  rt_c_v_matmul_free.elf: rt_c_v_matmul.c $(RUNTIME_SRCS) test.ld $(RUNTIME_DIR)/rt_c_helpers.h
+  	$(CC) $(RT_C_V_CFLAGS) -DHYBRID_MARKERLESS -DGEMM_REPEAT=$(GEMM_REPEAT_FREE) \
+  	  -T test.ld $(RUNTIME_SRCS) rt_c_v_matmul.c $(RT_C_LIBS) -o $@
+  ```
+- Key files: `tests/fixtures/Makefile`
+- Verify: `make -C tests/fixtures rt_c_v_matmul_free.elf`; `nm -n` shows
+  `vmatmul_kernel`; one-time probe (`drain_at_exit=1` for total; sweep `icount=`
+  reading pc@byte16) confirms 10000/5000 land inside the kernel window.
+
+### F3 - csr / pc marked swap
+- State: done (historical; bash demos removed, now `./hsim run --mode csr|pc`)
+- Depends on: F1
+- Description: `FIXTURE=rt_c_v_regs` -> `rt_c_v_matmul`; update echo line; set
+  `TIMEOUT=120` (heavier vsim leg). e2e.sh handles the rest.
+- Verify (current surface):
+  - `./hsim run tests/fixtures/rt_c_v_matmul.elf --mode csr`
+  - `./hsim run tests/fixtures/rt_c_v_matmul_free.elf --mode pc --pc-start vmatmul_kernel --pc-end 0x<post-jal>`
+
+### F4 - T3 icount demo -> markerless + kernel-range assert + shared mem
+- State: done
+- Depends on: F1, F2
+- Description: default `FIXTURE=rt_c_v_matmul_free`; keep QEMU_ICOUNT=10000 /
+  VSIM_ICOUNT=5000. Replace both `pc in {0x100002,0x100004}` checks with the
+  `pc_in_kernel` helper (resolve `vmatmul_kernel` addr+size via `readelf -sW`). Wire
+  the shared mmap into the vsim leg (`--shared-mem-path/-size/-base 0x0`, mirror
+  `tests/e2e.sh:99-101`) so GEMM .bss survives QEMU1 -> vsim. Update header.
+  ```sh
+  RE="${HYBRID_TOOLCHAIN:+$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-readelf}"; RE="${RE:-riscv64-unknown-elf-readelf}"
+  read KLO KSZ < <("$RE" -sW "$VSIM_ELF" | awk '$8=="vmatmul_kernel"{print strtonum("0x"$2),$3; exit}')
+  pc_in_kernel() { awk -v p="$1" -v lo="$KLO" -v sz="$KSZ" 'BEGIN{exit !(p>=lo && p<lo+sz)}'; }
+  ```
+- Verify (current surface): `./hsim run tests/fixtures/rt_c_v_matmul_free.elf --mode icount --qemu-icount 10000 --vsim-icount 5000`; both drained PCs report inside the GEMM kernel.
+
+### F5..F8 - SimPoint pipeline (profile / per-phase / archive / loop)
+- State: done (historical; bash demos removed)
+- All four stages are now subsumed by `./hsim run --mode simpoint`. The
+  underlying tools (`./hsim profile`, `./hsim cluster`, `./hsim archive`,
+  `./hsim replay`) stay as expert escape hatches.
+- Verify (current surface):
+  - `./hsim run tests/fixtures/rt_c_v_matmul.elf --mode simpoint --interval 20 --icount 2000 --max-k 2`
+    prints `estimated_cycles=<positive int>`.
+
+### F9 - docs
+- State: done
+- Depends on: F3..F8
+- Description: update example fixtures/timeouts; replace "two RVC insns at
+  0x100002/0x100004" prose with the kernel-range check; note the marked vs
+  markerless twin. NOTE: the docs were already restructured to the 4-mode model
+  (CSR/PC/icount/SimPoint) by `mode_consolidation.md` D1-D3, so F9 only swaps
+  fixture names/timeouts and the RVC-insn prose within that structure - do not
+  reintroduce M1-M8 or the seven-mode framing.
+- Key files: `docs/USER_GUIDE.md`, `docs/switching_modes_tutorial.md`
+
+---
+
+## Final verification
+- `make -C tests/fixtures` builds both ELFs clean.
+- `bash tests/fixtures/demo.sh` (T1..T7 tally) all pass.
+
+## Risks
+- noinline changes the marked ELF layout; csr (opcode) + pc (symbol-name) triggers
+  are layout-agnostic - verify T2.
+- Fixed-target overshoot if GEMM_REPEAT_FREE too small; the kernel-range assertion
+  fails loudly (safe RED). REPEAT=200 gives ~26x margin.
+- T7 profile/slice cover the startup prefix, not the kernel proper (pre-existing;
+  documented; deeper rework out of scope here).
+
+## Progress log
+- F1 done: rt_c_v_matmul.c now serves both builds. `vmatmul_kernel` is
+  `noinline` (linkable symbol at -O1, verified via nm); `enter_vsim`/`exit_vsim`
+  guarded by `#ifndef HYBRID_MARKERLESS`; kernel call wrapped in a
+  `GEMM_REPEAT`-count loop (default 1). Marked build behavior-identical: csr
+  round-trip PASS, kernel_cycles=22808 (vs 103 for the old FIR fixture). Pinned
+  by `tests/fixtures/test_gemm_source.sh` (noinline symbol + markers present in
+  marked build + markers absent under -DHYBRID_MARKERLESS).
+- F2 done: added explicit Makefile rule `rt_c_v_matmul_free.elf` (same source,
+  `-DHYBRID_MARKERLESS -DGEMM_REPEAT=$(GEMM_REPEAT_FREE)`, default 200) + the
+  `GEMM_REPEAT_FREE` var; appended to `all` and `clean`. Pinned by
+  `tests/fixtures/test_gemm_markerless_twin.sh` (builds + nm symbol + no
+  markers). One-time reachability probe confirms the F4/F5 targets land in the
+  kernel (0x10021c..0x100274): icount=5000 -> pc=0x100260, icount=10000 ->
+  pc=0x100252, both INSIDE, rc=200.
+- F3 done: csr + pc demos now run the marked GEMM (rt_c_v_matmul), TIMEOUT=120.
+  Banners relabeled off the M1-M8 taxonomy ([demo csr]/[demo pc], "CSR/PC mode
+  (profiles a kernel)"). Both PASS reporting kernel_cycles=22808 (was 103 on the
+  FIR), pc still resolves _hybrid_enter_pc/_hybrid_exit_pc. Acceptance test
+  tests/demos/test_demos_use_gemm.sh (uncommitted until F8) now passes csr+pc,
+  5 demos still RED.
+- F4 done: icount demo now runs the markerless twin (rt_c_v_matmul_free).
+  Resolves vmatmul_kernel range via readelf and replaces the old icount_spin
+  0x100002/0x100004 loop-PC checks with a pc_in_kernel helper; wires the shared
+  mmap into the vsim leg (--shared-mem-path/-size/-base) so GEMM .bss survives
+  QEMU1->vsim. PASS: QEMU1 drain pc=0x100252, vsim drain pc=0x10024c (both in
+  kernel), window_cycles=68766. Acceptance test 3/7 green.
+- F5 done: slice demo now runs the markerless twin (rt_c_v_matmul_free), reusing
+  F4's pc_in_kernel helper + shared-mmap wiring on the vsim leg. KEPT the
+  slice-boundary plugin-log assertion (idx=K+1 target=K). PASS: slice drain at
+  insn 2000 pc=0x100250, vsim drain pc=0x10024c (both in kernel). Acceptance
+  test 4/7 green.
+- F6 done: bbv demo now profiles the markerless twin (rt_c_v_matmul_free), .bb
+  label renamed. SLICE=1000/ICOUNT=10000 kept (EXPECTED_ROWS=10 is
+  fixture-independent). simpoint exit 0; the GEMM BBV did NOT collapse -- found
+  2 clusters (slice 0 = init+early kernel vs steady-state), weights sum 1.0.
+  Banner relabeled to "SimPoint stage: BBV emit + cluster". Acceptance 5/7 green.
+- F7 done: archive demo now uses the marked GEMM (rt_c_v_matmul) in all 3 sites
+  (FIXTURE default, echo, plan YAML elf), trigger.kind: csr kept. PASS: snap/0
+  archived with valid meta.json (schema=1/abi_version=1), replay --resume-with
+  vsim advanced PC 0x1002cc->0x1002d4 (ran the kernel). Banner relabeled to
+  "SimPoint stage: archive emit + checkpoint replay". Acceptance 6/7 green.
+- F8 done: simpoint loop demo now runs the marked GEMM (rt_c_v_matmul); no
+  retune needed -- the longer init prefix gives 63 BBV rows (was ~15) and
+  simpoint still finds 2 clusters (slice 2, 56). Default SLICE=20/
+  PROFILE_ICOUNT=2000 kept; fixed a stale env-doc comment that claimed 200/8000.
+  All M4-M7/T7 labels relabeled to SimPoint stage names. PASS: bbv_rows=63
+  phases=2 replays_ok=2 estimated_cycles=21114. Acceptance test 7/7 GREEN --
+  committed now as the permanent regression guard. All 7 demos run one GEMM.
+- F9 done: docs/switching_modes_tutorial.md + docs/USER_GUIDE.md realigned to
+  the GEMM fixtures within the existing 4-mode structure. Swapped example
+  fixtures (rt_c_v_regs->rt_c_v_matmul, icount_spin->rt_c_v_matmul_free) +
+  TIMEOUT=120 on the heavier e2e examples; replaced the "two RVC insns at
+  0x100002/0x100004" prose with the vmatmul_kernel range (0x10021c..0x100274)
+  + pc_in_kernel; added the marked-vs-markerless-twin explanation in both
+  icount sections; fixed the icount_spin troubleshooting rows. No M1-M8
+  reintroduced (only the intentional migration note at tutorial:42-43 remains).
+
+## Status: COMPLETE
+All features F1-F9 done. `gemm_modes.md` goal met: every demo under
+tests/demos/ runs the one RVV GEMM (rt_c_v_matmul.c) -- marked build for the
+kernel modes (csr/pc) and SimPoint marker-driven stages (archive/loop),
+markerless twin for the count modes (icount/bbv/slice). Guarded by
+tests/demos/test_demos_use_gemm.sh (7/7). Kernel cycles ~22808 (was 103 on the
+old FIR fixture).
