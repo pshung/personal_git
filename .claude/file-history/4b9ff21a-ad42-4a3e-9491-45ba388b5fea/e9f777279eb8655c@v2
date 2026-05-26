@@ -1,0 +1,111 @@
+// MeasureStartSnapshot - F14 observer that captures (mcycle, minstret)
+// K vsim-retires after entry. Used by the gem5-style warmup window: the
+// vsim phase still runs N cold-cache cycles, but the reported ROI delta is
+// taken from the K-th commit instead of from vsim entry, so the cold prefix
+// is excluded from the measurement.
+//
+// Duck-types the observer surface the HandoffController invokes via
+// if-constexpr: `observe_commit() -> void`. Accessors expose the captured
+// values for F16 (StateDrain) to copy into the ABI struct.
+//
+// K = 0 disables the observer: no DMI traffic, snapshot fields stay zero.
+// This is the wire-format K=0 contract from F13: a zero mcycle_at_measure_start
+// downstream means "warmup not enabled / not reached".
+//
+// Capture sequence on the K-th retire: halt the hart via DMCONTROL,
+// abstract-read mcycle and minstret, then issue resumereq so the workload
+// continues. Each halt-read-resume cycle is one-shot per run; the flag
+// `reached_` guards against re-capture.
+
+#pragma once
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/dmi_poll.hpp"
+#include "hybrid/resume_driver.hpp"
+
+#include <cstdint>
+
+namespace hybrid
+{
+
+class MeasureStartSnapshot
+{
+public:
+  using RD = ResumeDriver;
+
+  MeasureStartSnapshot(uint64_t k, DmiBus& bus)
+      : k_{k}, bus_{&bus}
+  {}
+
+  // Move construction transfers state and bus pointer.
+  MeasureStartSnapshot(MeasureStartSnapshot&&) noexcept            = default;
+  MeasureStartSnapshot& operator=(MeasureStartSnapshot&&) noexcept = default;
+
+  void observe_commit()
+  {
+    if (k_ == 0 || reached_) return;
+    ++retired_;
+    if (retired_ != k_) return;
+    capture();
+    reached_ = true;
+  }
+
+  auto snapshot_reached() const -> bool { return reached_; }
+  auto mcycle_at_measure_start() const -> uint64_t { return mcycle_; }
+  auto minstret_at_measure_start() const -> uint64_t { return minstret_; }
+  auto target() const -> uint64_t { return k_; }
+
+private:
+  void capture()
+  {
+    // Halt the hart so abstract-command CSR reads are accepted.
+    bus_->write(RD::kDmcontrol, RD::kDmcontrolDmactive);
+    bus_->write(RD::kDmcontrol, RD::kDmcontrolDmactive | RD::kDmcontrolHaltreq);
+    poll_until_set(*bus_, RD::kDmstatus, RD::kDmstatusAllhalted,
+                   "MeasureStartSnapshot halt");
+
+    mcycle_   = read_csr_64(RD::kCsrMcycle);
+    minstret_ = read_csr_64(RD::kCsrMinstret);
+
+    // Resume so the warmup window continues into the measured region.
+    // The hart re-acks via DmstatusAllresumeack, but we do not block here:
+    // the simulator's run loop drives the next sc_start, which lets the
+    // hart's running state propagate naturally.
+    bus_->write(RD::kDmcontrol, RD::kDmcontrolDmactive | RD::kDmcontrolResumereq);
+    bus_->write(RD::kDmcontrol, RD::kDmcontrolDmactive);  // clear resumereq
+  }
+
+  auto read_csr_64(uint16_t csr) -> uint64_t
+  {
+    bus_->write(RD::kCommand,
+                access_register_command(regno_csr(csr), AarSize::Bits64,
+                                        /*write=*/false));
+    poll_until_clear(*bus_, RD::kAbstractcs, RD::kAbstractcsBusy,
+                     "MeasureStartSnapshot read_csr");
+    const auto status = bus_->read(RD::kAbstractcs);
+    if ((status & RD::kAbstractcsCmderrMask) != 0u) {
+      // Sticky error path mirrors StateDrain: clear and report zero.
+      bus_->write(RD::kAbstractcs, RD::kAbstractcsCmderrMask);
+      return 0u;
+    }
+    const uint64_t lo = bus_->read(RD::kData0);
+    const uint64_t hi = bus_->read(RD::kData1);
+    return lo | (hi << 32);
+  }
+
+  uint64_t k_;
+  DmiBus*  bus_;
+  uint64_t retired_ = 0;
+  bool     reached_ = false;
+  uint64_t mcycle_  = 0;
+  uint64_t minstret_ = 0;
+};
+
+// NullObserver: default Observer for HandoffController instantiations that
+// do not opt into the warmup snapshot. Empty type; HandoffController gates
+// the observer hook through if-constexpr `requires { obs.observe_commit(); }`,
+// which NullObserver omits, so the call is compiled out.
+struct NullObserver
+{};
+
+}  // namespace hybrid
