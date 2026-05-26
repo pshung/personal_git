@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# F15 RED -> GREEN: vsim accepts --vsim-warmup-icount K and the drained
+# state file carries the F13 warmup-snapshot fields populated.
+#
+# This is the structural plumbing test for the warmup wave: every later
+# mode-specific e2e (F17 csr / F18 pc / F19 icount) layers tighter
+# assertions on top of this contract.
+#
+# Test steps:
+#   1. Run QEMU 1 + plugin on rt_c_v_regs to drain the entry state file.
+#   2. Run vsim with --resume-from-qemu + --vsim-warmup-icount 1000.
+#   3. Assert vsim exited 200 (drain on csrwi 0x7C0,1) and produced a state.
+#   4. Read mcycle_at_measure_start / minstret_at_measure_start from the
+#      drained file; both must be > 0 (snapshot fired during the ROI).
+#
+# Manual TDD smoke -- not auto-wired into scripts/run_e2e.sh.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/../lib/paths.sh"
+. "$SCRIPT_DIR/../lib/log.sh"
+
+FIXTURE="${FIXTURE:-rt_c_v_matmul}"
+WARMUP_K="${WARMUP_K:-1000}"
+TIMEOUT="${TIMEOUT:-120}"
+
+hybrid_resolve_paths
+
+# Light gate: vsim --help must announce the new flag, otherwise the binary
+# is older than this test. Fails fast with a useful diagnostic.
+if ! "$VSIM_BIN" --help 2>&1 | grep -q -- '--vsim-warmup-icount'; then
+  fail "F15: $VSIM_BIN --help does not mention --vsim-warmup-icount (rebuild vsim)"
+fi
+ok "vsim --help mentions --vsim-warmup-icount"
+
+SHARED_SIZE=$((128 * 1024 * 1024))
+SHARED_MEM=$(mktemp -p /dev/shm vsim-warmup-shared.XXXXXX)
+STATE_QEMU=$(mktemp)
+STATE_VSIM=$(mktemp)
+SIM_LOG=$(mktemp)
+trap 'rm -f "$SHARED_MEM" "$STATE_QEMU" "$STATE_VSIM" "$SIM_LOG"' EXIT
+truncate -s "$SHARED_SIZE" "$SHARED_MEM"
+
+set +e
+"$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHARED_MEM,size=$SHARED_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -semihosting-config enable=on,target=native \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_QEMU" </dev/null >/dev/null 2>&1
+QEMU1_RC=$?
+set -e
+
+[ "$QEMU1_RC" -eq 200 ] || fail "QEMU 1 expected exit 200 on drain, got $QEMU1_RC"
+[ -s "$STATE_QEMU" ]    || fail "QEMU 1 did not produce state file"
+
+set +e
+timeout "$TIMEOUT" "$VSIM_BIN" "$VSIM_ELF" \
+  --resume-from-qemu "$STATE_QEMU" \
+  --handoff-out "$STATE_VSIM" \
+  --shared-mem-path "$SHARED_MEM" \
+  --shared-mem-size "$SHARED_SIZE" \
+  --shared-mem-base 0x00000000 \
+  --vsim-warmup-icount "$WARMUP_K" >"$SIM_LOG" 2>&1
+VSIM_RC=$?
+set -e
+
+if [ "$VSIM_RC" -ne 200 ]; then
+  echo "--- sim log ---"
+  cat "$SIM_LOG"
+  fail "vsim expected exit 200, got $VSIM_RC"
+fi
+[ -s "$STATE_VSIM" ] || fail "vsim did not produce state file"
+
+python3 "$SCRIPT_DIR/../lib/warmup_assert.py" "$STATE_VSIM" --k "$WARMUP_K" \
+  || fail "warmup snapshot not populated in drained state"
+
+ok "warmup snapshot present in drained state (K=$WARMUP_K)"
+echo "PASS test_vsim_warmup_icount_arg"
