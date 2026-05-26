@@ -1,0 +1,94 @@
+# F4 Cleanup: delete vsim's in-process QEMU2 spawn
+
+Original F4 left the in-process QEMU2 spawn in `verilator/src/main.cpp`
+"so the existing bash harness keeps working". The orchestrator now owns
+the QEMU2 leg (`tools/orchestrator/runner.py::_qemu_resume_to_end`).
+This roadmap deletes the vsim-side spawn and migrates `tests/e2e.sh` to
+the orchestrator.
+
+## Approach: Option A (minimal delta)
+
+`tests/e2e.sh` stays as the bash driver (keeps mcycle-monotonic check
+and pc-mode/kanata env plumbing). Its only change: split off the QEMU2
+spawn into a new orchestrator subcommand.
+
+## Features
+
+### CL1: Add `orchestrator qemu-resume` subcommand  - STRUCTURAL
+
+**Goal**: expose `runner._qemu_resume_to_end` as a CLI command so
+shell drivers can resume QEMU2 without invoking the full plan loop.
+
+**Key files**:
+- `tools/orchestrator/main.py` - new subparser
+- `tools/orchestrator/runner.py` - wrap _qemu_resume_to_end as a callable that takes
+  (state_path, mmap_path, mmap_size, timeout) and resolves Artifacts from env
+- `tools/orchestrator/tests/test_qemu_resume_cli.py` (new) - RED test
+  asserting `python3 -m orchestrator.main qemu-resume --help` lists the
+  expected flags and that argv parsing rejects missing args
+
+**Deps**: none.
+
+### CL2: Migrate `tests/e2e.sh` to use the new subcommand  - BEHAVIORAL
+
+**Goal**: e2e.sh's vsim step no longer passes `--qemu-binary`; QEMU2
+runs as a separate `orchestrator qemu-resume` invocation.
+
+**Key files**:
+- `tests/e2e.sh` - drop `--qemu-binary $VSIM_QEMU` from vsim call;
+  after vsim returns 200, invoke
+  `python3 -m orchestrator.main qemu-resume --state $STATE_VSIM
+   --mmap $SHARED_MEM --size $SHARED_SIZE`; propagate its rc
+
+**Deps**: CL1.
+
+### CL3: Delete vsim's `--qemu-binary` and `qemu_handback.hpp`  - STRUCTURAL DELETE
+
+**Goal**: remove the dead in-process spawn entirely.
+
+**Key files**:
+- `verilator/src/main.cpp` - delete lines 530-542 (spawn block),
+  `args.qemu_binary` field, `--qemu-binary` longopt parser + help text,
+  `#include "hybrid/qemu_handback.hpp"`
+- `verilator/src/hybrid/qemu_handback.hpp` - delete file
+- `verilator/tests/hybrid/qemu_handback.test.cpp` - delete file
+- `verilator/cmake/HybridConfig.cmake` - delete `test_qemu_handback`
+  registration
+
+**Deps**: CL2 (e2e.sh must already work without --qemu-binary).
+
+### CL4: Delete obsolete negative drivers  - STRUCTURAL DELETE
+
+**Goal**: the 3 drivers exercise behaviors that no longer exist in vsim.
+
+**Key files**:
+- `tests/drivers/rt_no_qemu_binary.sh` - delete
+- `tests/drivers/rt_gdbstub_timeout.sh` - delete
+- `tests/drivers/rt_pty_handback.sh` - delete
+- `tests/drivers/qemu_silent_stub.py` - delete (only used by
+  rt_gdbstub_timeout)
+- `scripts/run_e2e.sh` - remove their entries from `NEG_TESTS`
+- KEEP `tests/drivers/rt_corrupt_state.sh` (tests vsim's
+  --resume-from-qemu validation, still relevant)
+
+**Deps**: CL3.
+
+### CL5: Docs  - STRUCTURAL
+
+**Goal**: per project CLAUDE.md "always update docs/USER_GUIDE.md".
+
+**Key files**:
+- `docs/USER_GUIDE.md` - remove any `--qemu-binary` references; add
+  one-line mention that QEMU2 spawn is orchestrator's job
+
+**Deps**: CL3.
+
+## State
+
+| CL  | Status      | Notes |
+|-----|-------------|-------|
+| CL1 | done        | `qemu-resume` subcommand wraps `_qemu_resume_to_end`; 5 new tests pass; 47/47 orchestrator unit tests still pass |
+| CL2 | done        | e2e.sh splits the vsim+QEMU2 leg into vsim drain + orchestrator qemu-resume; csr sweep 17/17 passes; pc smoke (rt_c_hello at boundary PCs) passes; mcycle check preserved |
+| CL3 | done        | Deleted `qemu_handback.hpp`, its doctest, the cmake registration, the `--qemu-binary` flag/help/storage, and the in-process spawn block in main.cpp; vsim rebuilds; container ctest 25/26 (pre-existing kanata_logger_loopgate failure unrelated); csr e2e 7/7 |
+| CL4 | done        | Deleted 3 obsolete drivers + silent stub; removed their NEG_TESTS entries; rt_corrupt_state still passes |
+| CL5 | done        | docs/USER_GUIDE.md: dropped `--qemu-binary` row in vsim flag table; rewrote 2 round-trip examples (csr + pc) to show vsim drain + orchestrator qemu-resume |
