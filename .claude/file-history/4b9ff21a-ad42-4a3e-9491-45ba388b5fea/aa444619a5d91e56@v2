@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# F19: icount mode + --vsim-warmup-icount on the markerless rt_c_v_matmul_free.
+#
+# Both boundaries are insn-count thresholds (CSR-less workload):
+#   plugin arg `icount=Q` drains QEMU 1 after Q committed insns.
+#   `--hybrid-icount M` drains vsim after M committed insns.
+#   `--vsim-warmup-icount K` snapshots (mcycle, minstret) at the K-th
+#   vsim-side commit.
+#
+# Precondition K < M. Then measured-region insn count must equal M - K
+# within +-TOL (the K-th-commit boundary timing tolerance).
+#
+# Manual TDD smoke; not auto-wired into scripts/run_e2e.sh.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/../lib/paths.sh"
+. "$SCRIPT_DIR/../lib/log.sh"
+
+FIXTURE="${FIXTURE:-rt_c_v_matmul_free}"
+QEMU_ICOUNT="${QEMU_ICOUNT:-2000}"
+VSIM_ICOUNT="${VSIM_ICOUNT:-5000}"
+WARMUP_K="${WARMUP_K:-1000}"
+TIMEOUT="${TIMEOUT:-120}"
+# icount-vs-minstret drift: in CSR/PC mode the snapshot lands on minstret = K
+# exactly (the QEMU drain at the csrwi marker pins the pre-vsim minstret
+# value, and vsim's per-commit observer is 1:1 with retired insns). In icount
+# mode there is no marker; ResumeDriver injects PB instructions that bump the
+# hart-side minstret without going through the trigger's observe_commit hook,
+# producing a small constant offset that grows linearly with M. The observed
+# drift on rt_c_v_matmul_free at K=1000, M=5000 is ~0.4% (under 20 insns).
+TOL="${TOL:-25}"
+
+[ "$WARMUP_K" -lt "$VSIM_ICOUNT" ] \
+  || fail "precondition K < M violated: K=$WARMUP_K M=$VSIM_ICOUNT"
+
+hybrid_resolve_paths
+
+SHARED_SIZE=$((128 * 1024 * 1024))
+SHARED_MEM=$(mktemp -p /dev/shm vsim-warmup-icount-shared.XXXXXX)
+STATE_QEMU=$(mktemp)
+STATE_VSIM=$(mktemp)
+trap 'rm -f "$SHARED_MEM" "$STATE_QEMU" "$STATE_VSIM"' EXIT
+truncate -s "$SHARED_SIZE" "$SHARED_MEM"
+
+set +e
+"$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHARED_MEM,size=$SHARED_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -semihosting-config enable=on,target=native \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_QEMU,icount=$QEMU_ICOUNT" </dev/null >/dev/null 2>&1
+QEMU1_RC=$?
+set -e
+[ "$QEMU1_RC" -eq 200 ] || fail "QEMU 1 expected exit 200 on icount drain, got $QEMU1_RC"
+[ -s "$STATE_QEMU" ]    || fail "QEMU 1 produced no state"
+
+set +e
+timeout "$TIMEOUT" "$VSIM_BIN" "$VSIM_ELF" \
+  --resume-from-qemu "$STATE_QEMU" \
+  --handoff-out "$STATE_VSIM" \
+  --shared-mem-path "$SHARED_MEM" \
+  --shared-mem-size "$SHARED_SIZE" \
+  --shared-mem-base 0x00000000 \
+  --hybrid-icount "$VSIM_ICOUNT" \
+  --vsim-warmup-icount "$WARMUP_K" >/dev/null 2>&1
+VSIM_RC=$?
+set -e
+[ "$VSIM_RC" -eq 200 ] || fail "vsim expected exit 200 (icount drain), got $VSIM_RC"
+[ -s "$STATE_VSIM" ]   || fail "vsim produced no state"
+
+python3 - "$STATE_QEMU" "$STATE_VSIM" "$WARMUP_K" "$VSIM_ICOUNT" "$TOL" <<'PYEOF'
+import struct, sys
+qemu_path, vsim_path, k, m, tol = (sys.argv[1], sys.argv[2],
+                                    int(sys.argv[3]), int(sys.argv[4]),
+                                    int(sys.argv[5]))
+with open(qemu_path,"rb") as f: q = f.read()
+with open(vsim_path,"rb") as f: v = f.read()
+q_mc, q_mi = struct.unpack_from('<QQ', q, 624)
+v_mc, v_mi = struct.unpack_from('<QQ', v, 624)
+ms_mc, ms_mi = struct.unpack_from('<QQ', v, 3392)
+print(f"  qemu1: mcycle={q_mc} minstret={q_mi}")
+print(f"  vsim:  mcycle={v_mc} minstret={v_mi}")
+print(f"  snap:  mcycle={ms_mc} minstret={ms_mi}  (K={k}, M={m})")
+fail = []
+if not (q_mc < ms_mc):
+    fail.append(f"snapshot mcycle {ms_mc} not > qemu1 mcycle {q_mc}")
+if not (ms_mc < v_mc):
+    fail.append(f"snapshot mcycle {ms_mc} not < final mcycle {v_mc}")
+snap_delta = ms_mi - q_mi
+if abs(snap_delta - k) > tol:
+    fail.append(f"snapshot minstret delta {snap_delta} not within +-{tol} of K={k}")
+total_delta = v_mi - q_mi
+if abs(total_delta - m) > tol:
+    fail.append(f"vsim minstret delta {total_delta} not within +-{tol} of M={m}")
+measure_delta = v_mi - ms_mi
+if abs(measure_delta - (m - k)) > tol:
+    fail.append(f"measure-window insns {measure_delta} not within +-{tol} of M-K={m-k}")
+if fail:
+    print("FAIL:", "; ".join(fail), file=sys.stderr); sys.exit(1)
+print(f"  measure window: {v_mc - ms_mc} cycles, {measure_delta} insns")
+PYEOF
+
+ok "F19 icount-mode warmup invariants hold (K=$WARMUP_K M=$VSIM_ICOUNT)"
+echo "PASS e2e_warmup_icount"

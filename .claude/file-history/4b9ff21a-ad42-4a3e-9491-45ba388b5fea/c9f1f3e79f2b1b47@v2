@@ -1,0 +1,104 @@
+"""F20: orchestrator reads warmup snapshot fields and reports the 3-way
+cycle breakdown (warmup / measure / total) for downstream consumption.
+
+The synthetic state files in these tests encode the spec's worked example
+(mcycle = 1_000_000, mcycle_at_measure_start = 250_000 -> warmup 250k,
+measure 750k, total 1M). Real e2e validation lives in F17/F18/F19; here
+we lock the orchestrator-side arithmetic.
+"""
+from __future__ import annotations
+
+import ctypes
+from pathlib import Path
+
+import pytest
+
+from orchestrator.abi import (
+    HYBRID_FLAG_RV64,
+    HYBRID_STATE_MAGIC,
+    HYBRID_STATE_VERSION,
+    HybridStateV1,
+)
+from orchestrator.runner import WarmupBreakdown, cycle_breakdown
+
+
+def _write_state(tmp_path: Path, **fields: int) -> Path:
+    s = HybridStateV1()
+    ctypes.memset(ctypes.byref(s), 0, ctypes.sizeof(s))
+    s.magic = HYBRID_STATE_MAGIC
+    s.version = HYBRID_STATE_VERSION
+    s.flags = HYBRID_FLAG_RV64
+    for name, value in fields.items():
+        setattr(s, name, value)
+    path = tmp_path / "state.bin"
+    path.write_bytes(bytes(s))
+    return path
+
+
+def test_cycle_breakdown_full_window(tmp_path: Path) -> None:
+    path = _write_state(
+        tmp_path,
+        mcycle=1_000_000,
+        minstret=800_000,
+        mcycle_at_measure_start=250_000,
+        minstret_at_measure_start=200_000,
+    )
+    bd = cycle_breakdown(path)
+    assert bd == WarmupBreakdown(
+        total_cycles=1_000_000,
+        warmup_cycles=250_000,
+        measure_cycles=750_000,
+        total_insns=800_000,
+        warmup_insns=200_000,
+        measure_insns=600_000,
+        enabled=True,
+    )
+
+
+def test_cycle_breakdown_disabled_when_snapshot_zero(tmp_path: Path) -> None:
+    path = _write_state(
+        tmp_path,
+        mcycle=1_000_000,
+        minstret=800_000,
+    )  # warmup snapshot fields stay 0
+    bd = cycle_breakdown(path)
+    assert bd.enabled is False
+    assert bd.warmup_cycles == 0
+    assert bd.measure_cycles == 1_000_000
+    assert bd.total_cycles == 1_000_000
+    assert bd.warmup_insns == 0
+    assert bd.measure_insns == 800_000
+    assert bd.total_insns == 800_000
+
+
+def test_cycle_breakdown_snapshot_at_drain_boundary(tmp_path: Path) -> None:
+    # Edge case: snapshot fires at the same retire that drains. measure
+    # window is zero cycles. The breakdown stays valid and enabled.
+    path = _write_state(
+        tmp_path,
+        mcycle=500_000,
+        minstret=400_000,
+        mcycle_at_measure_start=500_000,
+        minstret_at_measure_start=400_000,
+    )
+    bd = cycle_breakdown(path)
+    assert bd.enabled is True
+    assert bd.warmup_cycles == 500_000
+    assert bd.measure_cycles == 0
+    assert bd.total_cycles == 500_000
+
+
+def test_cycle_breakdown_rejects_inconsistent_snapshot(tmp_path: Path) -> None:
+    # mcycle_at_measure_start > mcycle would mean the snapshot fired AFTER
+    # drain, which violates the snapshot-then-drain ordering. Surface this
+    # as a ValueError so a corrupted state file fails loudly instead of
+    # producing a negative measure window.
+    path = _write_state(
+        tmp_path,
+        mcycle=100_000,
+        minstret=50_000,
+        mcycle_at_measure_start=200_000,
+        minstret_at_measure_start=150_000,
+    )
+    with pytest.raises(ValueError, match="snapshot"):
+        cycle_breakdown(path)

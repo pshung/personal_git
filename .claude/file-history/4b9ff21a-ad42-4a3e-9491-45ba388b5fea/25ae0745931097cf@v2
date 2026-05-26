@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# F17: CSR mode + --vsim-warmup-icount round-trip on rt_c_v_matmul.
+#
+# Trigger source: pattern-matched `csrwi 0x7C0, 0/1` at retire (default
+# CSR mode). The warmup snapshot mechanism is mode-agnostic - it counts
+# vsim retires after the resume boundary, regardless of trigger source.
+#
+# Invariants asserted on the drained state file:
+#   1. mcycle_at_measure_start > qemu1_mcycle          (warmup fired in vsim)
+#   2. mcycle_at_measure_start < final_mcycle          (snapshot before drain)
+#   3. minstret_at_measure_start - qemu1_minstret
+#      is approximately equal to K (within +-5 insns)  (K-th-commit timing)
+#   4. measured cycles (final - snapshot) > 0          (ROI extends past warmup)
+#
+# Manual TDD smoke; not auto-wired into scripts/run_e2e.sh.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/../lib/paths.sh"
+. "$SCRIPT_DIR/../lib/log.sh"
+
+FIXTURE="${FIXTURE:-rt_c_v_matmul}"
+WARMUP_K="${WARMUP_K:-1000}"
+TIMEOUT="${TIMEOUT:-120}"
+TOL="${TOL:-5}"
+
+hybrid_resolve_paths
+
+SHARED_SIZE=$((128 * 1024 * 1024))
+SHARED_MEM=$(mktemp -p /dev/shm vsim-warmup-csr-shared.XXXXXX)
+STATE_QEMU=$(mktemp)
+STATE_VSIM=$(mktemp)
+trap 'rm -f "$SHARED_MEM" "$STATE_QEMU" "$STATE_VSIM"' EXIT
+truncate -s "$SHARED_SIZE" "$SHARED_MEM"
+
+set +e
+"$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHARED_MEM,size=$SHARED_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -semihosting-config enable=on,target=native \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_QEMU" </dev/null >/dev/null 2>&1
+QEMU1_RC=$?
+set -e
+[ "$QEMU1_RC" -eq 200 ] || fail "QEMU 1 expected exit 200 on drain, got $QEMU1_RC"
+[ -s "$STATE_QEMU" ]    || fail "QEMU 1 produced no state"
+
+set +e
+timeout "$TIMEOUT" "$VSIM_BIN" "$VSIM_ELF" \
+  --resume-from-qemu "$STATE_QEMU" \
+  --handoff-out "$STATE_VSIM" \
+  --shared-mem-path "$SHARED_MEM" \
+  --shared-mem-size "$SHARED_SIZE" \
+  --shared-mem-base 0x00000000 \
+  --vsim-warmup-icount "$WARMUP_K" >/dev/null 2>&1
+VSIM_RC=$?
+set -e
+[ "$VSIM_RC" -eq 200 ] || fail "vsim expected exit 200, got $VSIM_RC"
+[ -s "$STATE_VSIM" ]   || fail "vsim produced no state"
+
+python3 - "$STATE_QEMU" "$STATE_VSIM" "$WARMUP_K" "$TOL" <<'PYEOF'
+import struct, sys
+qemu_path, vsim_path, k, tol = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+with open(qemu_path,"rb") as f: q = f.read()
+with open(vsim_path,"rb") as f: v = f.read()
+q_mc, q_mi = struct.unpack_from('<QQ', q, 624)
+v_mc, v_mi = struct.unpack_from('<QQ', v, 624)
+ms_mc, ms_mi = struct.unpack_from('<QQ', v, 3392)
+print(f"  qemu1: mcycle={q_mc} minstret={q_mi}")
+print(f"  vsim:  mcycle={v_mc} minstret={v_mi}")
+print(f"  snap:  mcycle={ms_mc} minstret={ms_mi}  (K={k})")
+fail = []
+if not (q_mc < ms_mc):       fail.append(f"snapshot mcycle {ms_mc} not > qemu1 mcycle {q_mc}")
+if not (ms_mc < v_mc):       fail.append(f"snapshot mcycle {ms_mc} not < final mcycle {v_mc}")
+delta = ms_mi - q_mi
+if abs(delta - k) > tol:     fail.append(f"snapshot minstret delta {delta} not within +-{tol} of K={k}")
+if not (v_mi > ms_mi):       fail.append(f"final minstret {v_mi} not > snapshot minstret {ms_mi}")
+if fail:
+    print("FAIL:", "; ".join(fail), file=sys.stderr); sys.exit(1)
+print(f"  measure window: {v_mc - ms_mc} cycles, {v_mi - ms_mi} insns")
+PYEOF
+
+ok "F17 CSR-mode warmup invariants hold"
+echo "PASS e2e_warmup_csr"

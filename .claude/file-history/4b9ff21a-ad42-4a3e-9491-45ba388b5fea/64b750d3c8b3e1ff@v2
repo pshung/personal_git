@@ -1,0 +1,177 @@
+"""Orchestrator CLI entry point.
+
+Subcommands:
+  dry-run <plan.yaml>          Parse the plan and print one line per planned
+                               spawn. No process is launched.
+  run <plan.yaml>              F4/F8: execute every step in the plan; the
+                               final spawn's exit code is the CLI return.
+  replay-checkpoint <snap>     F10: hydrate a snap/N archive and resume the
+                               chosen model from it.
+  qemu-resume                  F4-cleanup: spawn QEMU2 from an existing vsim-
+                               drained state file + shared mmap. Used by the
+                               bash e2e harness now that vsim no longer
+                               spawns QEMU itself.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import tempfile
+from pathlib import Path
+
+from orchestrator.checkpoint import replay_checkpoint
+from orchestrator.plan import Session, load_plan
+from orchestrator.runner import (
+    cycle_breakdown,
+    resume_qemu_from_state,
+    run_session,
+)
+
+
+def _format_step_line(idx: int, step) -> str:
+    line = f"  step {idx}: model={step.model} trigger={step.trigger.kind}"
+    if step.trigger.params:
+        params = " ".join(f"{k}={v}" for k, v in step.trigger.params.items())
+        line += f" ({params})"
+    if step.archive_as:
+        line += f" archive_as={step.archive_as}"
+    return line
+
+
+def _print_dry_run(session: Session) -> None:
+    print(f"session: elf={session.elf} mem_size={session.mem_size}")
+    for idx, step in enumerate(session.steps):
+        print(_format_step_line(idx, step))
+
+
+def _print_warmup_breakdowns(state_paths) -> None:
+    """F20: render the warmup/measure/total split for every drained state.
+
+    Each line is prefixed with the step index. Steps whose state file has
+    no snapshot (qemu drains, or vsim drains with K=0) print
+    "warmup: disabled (...)" so the user can still see total cycles
+    without conditional log scraping.
+    """
+    for idx, path in enumerate(state_paths):
+        bd = cycle_breakdown(path)
+        for line in bd.format_lines():
+            print(f"  step {idx}: {line}")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="orchestrator")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    dry = sub.add_parser(
+        "dry-run", help="parse a plan YAML and print planned spawns"
+    )
+    dry.add_argument("plan", type=Path, help="path to a plan YAML")
+
+    run = sub.add_parser(
+        "run", help="execute every step in the plan (F8 N-way loop)"
+    )
+    run.add_argument("plan", type=Path, help="path to a plan YAML")
+    run.add_argument(
+        "--project-root", type=Path, default=Path.cwd(),
+        help="repo root (default: cwd) used to resolve ELF + artifact paths",
+    )
+    run.add_argument(
+        "--workdir", type=Path, default=None,
+        help="persist per-step state files here (default: temp dir, deleted)",
+    )
+    run.add_argument(
+        "--archive-root", type=Path, default=None,
+        help=(
+            "resolve step.archive_as under this directory "
+            "(default: project root)"
+        ),
+    )
+
+    replay = sub.add_parser(
+        "replay-checkpoint",
+        help="hydrate a snap/N archive and resume the chosen model",
+    )
+    replay.add_argument(
+        "snap_dir", type=Path,
+        help="path to a snap/N directory written by an earlier archive_as",
+    )
+    replay.add_argument(
+        "--resume-with", choices=("vsim", "qemu"), default="vsim",
+        help="model to resume the archive with (default: vsim)",
+    )
+    replay.add_argument(
+        "--project-root", type=Path, default=Path.cwd(),
+        help="repo root (default: cwd) used to resolve the archived ELF",
+    )
+    replay.add_argument(
+        "--workdir", type=Path, default=None,
+        help="persist replay state files here (default: temp dir, deleted)",
+    )
+
+    qresume = sub.add_parser(
+        "qemu-resume",
+        help="spawn QEMU2 from an existing drained state + shared mmap",
+    )
+    qresume.add_argument(
+        "--state", type=Path, required=True,
+        help="path to the vsim-drained hybrid_state_v1 binary",
+    )
+    qresume.add_argument(
+        "--mmap", type=Path, required=True,
+        help="path to the shared /dev/shm-backed mmap holding workload memory",
+    )
+    qresume.add_argument(
+        "--size", type=int, required=True,
+        help="size in bytes of the shared mmap (must match QEMU 1's launch)",
+    )
+    qresume.add_argument(
+        "--project-root", type=Path, default=Path.cwd(),
+        help="repo root used to resolve VSIM_QEMU default (default: cwd)",
+    )
+    qresume.add_argument(
+        "--timeout", type=float, default=90.0,
+        help="seconds to wait for QEMU2 to exit (default: 90)",
+    )
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    if args.cmd == "dry-run":
+        _print_dry_run(load_plan(args.plan))
+        return 0
+    if args.cmd == "run":
+        session = load_plan(args.plan)
+        result = run_session(session, args.project_root,
+                             work_dir=args.workdir,
+                             archive_root=args.archive_root)
+        _print_warmup_breakdowns(result.state_paths)
+        return result.exit_code
+    if args.cmd == "qemu-resume":
+        return resume_qemu_from_state(
+            state_path=args.state,
+            mmap_path=args.mmap,
+            mmap_size=args.size,
+            project_root=args.project_root,
+            timeout=args.timeout,
+        )
+    if args.cmd == "replay-checkpoint":
+        if args.workdir is not None:
+            args.workdir.mkdir(parents=True, exist_ok=True)
+            result = replay_checkpoint(
+                snap_dir=args.snap_dir, model=args.resume_with,
+                project_root=args.project_root, work_dir=args.workdir,
+            )
+        else:
+            with tempfile.TemporaryDirectory(prefix="orch-replay-") as tmp:
+                result = replay_checkpoint(
+                    snap_dir=args.snap_dir, model=args.resume_with,
+                    project_root=args.project_root, work_dir=Path(tmp),
+                )
+        return result.exit_code
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,209 @@
+// F14: MeasureStartSnapshot observer. Counts vsim retires; on the K-th
+// commit, halts the hart via DMI Abstract Commands, reads
+// mcycle/minstret, then resumes. K=0 disables (no DMI traffic, fields
+// stay zero).
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/handoff_controller.hpp"
+#include "hybrid/measure_start_snapshot.hpp"
+#include "hybrid/icount_trigger.hpp"
+#include "hybrid/resume_driver.hpp"
+#include "hybrid/state_abi.h"
+#include "recording_bus.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <cstdint>
+
+using hybrid::test::kDmstatusHaltedAndAcked;
+using hybrid::test::RecordingBus;
+using RD = hybrid::ResumeDriver;
+
+namespace {
+
+// Pre-program a bus that lets halt/resume polls and CSR reads complete
+// without iteration. The regfile entries seed the abstract-command
+// reads issued by MeasureStartSnapshot's K-th retire capture.
+void prime_snapshot_bus(RecordingBus& bus, uint64_t mcycle, uint64_t minstret)
+{
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_csr(RD::kCsrMcycle)]   = mcycle;
+  bus.regfile[hybrid::regno_csr(RD::kCsrMinstret)] = minstret;
+}
+
+}  // namespace
+
+TEST_CASE("MeasureStartSnapshot: K=0 disables - no DMI traffic, fields stay zero")
+{
+  RecordingBus bus;
+  prime_snapshot_bus(bus, /*mcycle=*/0xdead, /*minstret=*/0xbeef);
+
+  hybrid::MeasureStartSnapshot snap(/*k=*/0, bus);
+  CHECK_FALSE(snap.snapshot_reached());
+
+  for (int i = 0; i < 100; ++i) snap.observe_commit();
+
+  CHECK_FALSE(snap.snapshot_reached());
+  CHECK(snap.mcycle_at_measure_start() == 0u);
+  CHECK(snap.minstret_at_measure_start() == 0u);
+  CHECK(bus.ops.empty());  // no DMI bytes spent on a disabled observer
+}
+
+TEST_CASE("MeasureStartSnapshot: snapshot fires at exactly the K-th commit")
+{
+  RecordingBus bus;
+  prime_snapshot_bus(bus, /*mcycle=*/100'000, /*minstret=*/50'000);
+
+  hybrid::MeasureStartSnapshot snap(/*k=*/500, bus);
+
+  for (int i = 0; i < 499; ++i) {
+    snap.observe_commit();
+    CHECK_FALSE(snap.snapshot_reached());
+  }
+  CHECK(bus.ops.empty());  // nothing captured before the K-th commit
+
+  snap.observe_commit();
+  CHECK(snap.snapshot_reached());
+  CHECK(snap.mcycle_at_measure_start()   == 100'000u);
+  CHECK(snap.minstret_at_measure_start() == 50'000u);
+}
+
+TEST_CASE("MeasureStartSnapshot: subsequent commits do not re-capture")
+{
+  RecordingBus bus;
+  prime_snapshot_bus(bus, /*mcycle=*/77, /*minstret=*/33);
+
+  hybrid::MeasureStartSnapshot snap(/*k=*/3, bus);
+  snap.observe_commit();
+  snap.observe_commit();
+  snap.observe_commit();  // K-th: captures
+  REQUIRE(snap.snapshot_reached());
+
+  const auto ops_after_capture = bus.ops.size();
+
+  // Even if the underlying counters advance, the snapshot is frozen.
+  bus.regfile[hybrid::regno_csr(RD::kCsrMcycle)]   = 999'999;
+  bus.regfile[hybrid::regno_csr(RD::kCsrMinstret)] = 999'999;
+  for (int i = 0; i < 1000; ++i) snap.observe_commit();
+
+  CHECK(snap.mcycle_at_measure_start()   == 77u);
+  CHECK(snap.minstret_at_measure_start() == 33u);
+  CHECK(bus.ops.size() == ops_after_capture);  // no further DMI traffic
+}
+
+TEST_CASE("MeasureStartSnapshot: K=1 captures on the first commit")
+{
+  RecordingBus bus;
+  prime_snapshot_bus(bus, /*mcycle=*/42, /*minstret=*/7);
+
+  hybrid::MeasureStartSnapshot snap(/*k=*/1, bus);
+  snap.observe_commit();
+
+  CHECK(snap.snapshot_reached());
+  CHECK(snap.mcycle_at_measure_start()   == 42u);
+  CHECK(snap.minstret_at_measure_start() == 7u);
+}
+
+TEST_CASE("MeasureStartSnapshot: capture sequence halts then resumes the hart")
+{
+  RecordingBus bus;
+  prime_snapshot_bus(bus, /*mcycle=*/1, /*minstret=*/1);
+
+  hybrid::MeasureStartSnapshot snap(/*k=*/1, bus);
+  snap.observe_commit();
+  REQUIRE(snap.snapshot_reached());
+
+  // Walk the recorded ops looking for: a halt request (DMCONTROL with
+  // haltreq) followed later by a resume request (DMCONTROL with resumereq).
+  bool saw_haltreq = false;
+  bool saw_resumereq_after_halt = false;
+  for (const auto& op: bus.ops) {
+    if (op.kind != hybrid::test::DmiOp::Kind::Write) continue;
+    if (op.reg != RD::kDmcontrol) continue;
+    if (op.value & RD::kDmcontrolHaltreq)   saw_haltreq = true;
+    if (saw_haltreq && (op.value & RD::kDmcontrolResumereq))
+      saw_resumereq_after_halt = true;
+  }
+  CHECK(saw_haltreq);
+  CHECK(saw_resumereq_after_halt);
+}
+
+TEST_CASE("HandoffController invokes the observer's observe_commit on every retire")
+{
+  RecordingBus bus;
+  prime_snapshot_bus(bus, /*mcycle=*/0xC, /*minstret=*/0xD);
+  bus.regfile[hybrid::regno_csr(RD::kCsrDpc)] = 0x80000040;
+
+  hybrid::IcountTrigger trigger{/*target=*/0};  // never fires drain
+  hybrid::MeasureStartSnapshot observer(/*k=*/5, bus);
+  hybrid::HandoffController h(std::move(trigger), bus, std::move(observer));
+
+  // Five retires must trigger the snapshot capture (driven by the
+  // observer hook), while the icount trigger remains disarmed (target=0).
+  for (int i = 0; i < 5; ++i) {
+    const auto state =
+      h.on_retire(0x80000000, [](uint8_t) -> uint64_t { return 0u; });
+    CHECK_FALSE(state.has_value());
+  }
+  CHECK(h.observer().snapshot_reached());
+  CHECK(h.observer().mcycle_at_measure_start()   == 0xCu);
+  CHECK(h.observer().minstret_at_measure_start() == 0xDu);
+}
+
+TEST_CASE("F16: drained state carries warmup snapshot when observer fires before drain")
+{
+  RecordingBus bus;
+  prime_snapshot_bus(bus, /*mcycle=*/0x1234, /*minstret=*/0xabcd);
+  bus.regfile[hybrid::regno_csr(RD::kCsrDpc)] = 0x80000060;
+
+  hybrid::IcountTrigger trigger{/*target=*/10};
+  hybrid::MeasureStartSnapshot observer(/*k=*/3, bus);
+  hybrid::HandoffController h(std::move(trigger), bus, std::move(observer));
+
+  std::optional<hybrid_state_v1> drained;
+  for (int i = 0; i < 10; ++i) {
+    drained = h.on_retire(0x80000000, [](uint8_t) -> uint64_t { return 0u; });
+    if (drained) break;
+  }
+  REQUIRE(drained);
+  CHECK(drained->mcycle_at_measure_start   == 0x1234u);
+  CHECK(drained->minstret_at_measure_start == 0xabcdu);
+}
+
+TEST_CASE("F16: drained state warmup fields stay zero when observer K=0")
+{
+  RecordingBus bus;
+  prime_snapshot_bus(bus, /*mcycle=*/0x9999, /*minstret=*/0x8888);
+  bus.regfile[hybrid::regno_csr(RD::kCsrDpc)] = 0x80000060;
+
+  hybrid::IcountTrigger trigger{/*target=*/3};
+  hybrid::MeasureStartSnapshot observer(/*k=*/0, bus);  // disabled
+  hybrid::HandoffController h(std::move(trigger), bus, std::move(observer));
+
+  std::optional<hybrid_state_v1> drained;
+  for (int i = 0; i < 3; ++i) {
+    drained = h.on_retire(0x80000000, [](uint8_t) -> uint64_t { return 0u; });
+  }
+  REQUIRE(drained);
+  CHECK(drained->mcycle_at_measure_start   == 0u);
+  CHECK(drained->minstret_at_measure_start == 0u);
+}
+
+TEST_CASE("F16: drained state warmup fields stay zero with NullObserver")
+{
+  RecordingBus bus;
+  prime_snapshot_bus(bus, /*mcycle=*/0x7777, /*minstret=*/0x6666);
+  bus.regfile[hybrid::regno_csr(RD::kCsrDpc)] = 0x80000060;
+
+  hybrid::IcountTrigger trigger{/*target=*/3};
+  hybrid::HandoffController h(std::move(trigger), bus);  // CTAD -> NullObserver
+
+  std::optional<hybrid_state_v1> drained;
+  for (int i = 0; i < 3; ++i) {
+    drained = h.on_retire(0x80000000, [](uint8_t) -> uint64_t { return 0u; });
+  }
+  REQUIRE(drained);
+  CHECK(drained->mcycle_at_measure_start   == 0u);
+  CHECK(drained->minstret_at_measure_start == 0u);
+}
