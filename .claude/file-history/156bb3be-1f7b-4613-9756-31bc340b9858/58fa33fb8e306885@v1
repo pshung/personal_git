@@ -1,0 +1,175 @@
+// Program Buffer execution helpers for the RISC-V Debug Module.
+//
+// Follows the same duck-typed template pattern as dmi_poll.hpp so that
+// resume_driver.hpp can include this header without a circular dependency.
+// Bus type requirement: write(uint8_t reg, uint32_t val) and
+//                       read(uint8_t reg) -> uint32_t.
+//
+// Debug Spec references: section 3.6 (Program Buffer), table 3.1 (DMI),
+// section 3.7.1.3 (Abstract Command - Access Register).
+
+#pragma once
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/dmi_poll.hpp"
+
+#include <array>
+#include <cstdint>
+#include <span>
+#include <stdexcept>
+#include <string>
+
+namespace hybrid {
+
+// DMI address of the first Program Buffer register (progbuf0..progbuf15).
+inline constexpr uint8_t kProgbuf0 = 0x20u;
+
+// Max payload instructions: 16 total slots minus 1 reserved for the
+// mandatory ebreak that terminates execution.
+inline constexpr std::size_t kProgbufMaxInsns = 15u;
+
+// Standard ebreak encoding (funct12=1, opcode=SYSTEM).
+inline constexpr uint32_t kEbreak = 0x00100073u;
+
+// "Execute Program Buffer only" command (Debug Spec table 3.1):
+//   cmdtype  = 0 (Access Register)
+//   aarsize  = Bits64 (3) - ignored by DM when transfer=0, set for consistency
+//   postexec = 1 (bit 18)
+//   transfer = 0 (bit 17 NOT set) - skip register I/O, only run progbuf
+//   write    = 0 (irrelevant when transfer=0)
+//   regno    = 0 (irrelevant when transfer=0)
+inline constexpr uint32_t kExecProgbufCmd =
+    (uint32_t(AarSize::Bits64) & 0x7u) << 20 | (1u << 18);
+
+// Encode `vsetvl rd, rs1, rs2` (RVV 1.0 section 6.2, funct7=1000000).
+// Tier-B restore: stage vl in rs1 and vtype in rs2 via Abstract Commands,
+// then branch-free-restore both in one Program Buffer execution.
+inline constexpr uint32_t encode_vsetvl(uint8_t rd, uint8_t rs1, uint8_t rs2)
+{
+    return (0b1000000u << 25)
+         | ((uint32_t(rs2) & 0x1Fu) << 20)
+         | ((uint32_t(rs1) & 0x1Fu) << 15)
+         | (0b111u << 12)
+         | ((uint32_t(rd)  & 0x1Fu) << 7)
+         | 0x57u;  // OP-V opcode
+}
+
+// Encode `csrrw rd, csr, rs1` (SYSTEM opcode, funct3=001).
+// Tier-A PB fallback: stage the CSR value in rs1 via Abstract Command,
+// then write it to a CSR that the DM cannot reach via abstract access.
+inline constexpr uint32_t encode_csrrw(uint8_t rd, uint16_t csr, uint8_t rs1)
+{
+    return ((uint32_t(csr) & 0xFFFu) << 20)
+         | ((uint32_t(rs1) & 0x1Fu) << 15)
+         | (0b001u << 12)
+         | ((uint32_t(rd)  & 0x1Fu) << 7)
+         | 0x73u;  // SYSTEM opcode
+}
+
+// Encode `vle8.v vd, (rs1)` - unit-stride vector load, EEW=8 (RVV 1.0 sec 7.4).
+// Fields: vm=1 (unmasked, bit 25), width=000, mop=00, mew=0, nf=000,
+// lumop=00000, opcode LOAD-FP=0x07. PB V-regfile reload sweeps v0..v31 from
+// the shared scratch region after a vsetvl to e8/m1.
+inline constexpr uint32_t encode_vle8_v(uint8_t vd, uint8_t rs1)
+{
+    return (1u << 25)
+         | ((uint32_t(rs1) & 0x1Fu) << 15)
+         | ((uint32_t(vd)  & 0x1Fu) << 7)
+         | 0x07u;  // LOAD-FP opcode
+}
+
+// Encode `vse8.v vs3, (rs1)` - unit-stride vector store, EEW=8. Mirror of
+// encode_vle8_v with opcode STORE-FP=0x27. PB V-regfile dump sweeps v0..v31
+// back to the shared scratch region at drain.
+inline constexpr uint32_t encode_vse8_v(uint8_t vs3, uint8_t rs1)
+{
+    return (1u << 25)
+         | ((uint32_t(rs1) & 0x1Fu) << 15)
+         | ((uint32_t(vs3) & 0x1Fu) << 7)
+         | 0x27u;  // STORE-FP opcode
+}
+
+// Write insns[0..n-1] to progbuf0..n-1 and kEbreak to progbuf[n].
+// Clears any sticky abstractcs.cmderr (W1C), issues kExecProgbufCmd, polls
+// until abstractcs.busy clears, then returns whether cmderr stayed clear.
+//
+// Returns true on success; false if the DM set cmderr during execution.
+// Throws std::runtime_error if insns.size() > kProgbufMaxInsns or poll
+// times out.
+template<typename Bus>
+inline bool exec_progbuf(Bus& bus, std::span<const uint32_t> insns)
+{
+    constexpr uint8_t  kAbstractcs   = 0x16u;
+    constexpr uint8_t  kCommand      = 0x17u;
+    constexpr uint32_t kBusy         = 1u << 12;
+    constexpr uint32_t kCmderrMask   = 0x7u << 8;
+
+    if (insns.size() > kProgbufMaxInsns)
+        throw std::runtime_error(
+            "exec_progbuf: too many instructions ("
+            + std::to_string(insns.size()) + " > "
+            + std::to_string(kProgbufMaxInsns) + ")");
+
+    for (std::size_t i = 0; i < insns.size(); ++i)
+        bus.write(static_cast<uint8_t>(kProgbuf0 + i), insns[i]);
+    bus.write(static_cast<uint8_t>(kProgbuf0 + insns.size()), kEbreak);
+
+    if ((bus.read(kAbstractcs) & kCmderrMask) != 0u)
+        bus.write(kAbstractcs, kCmderrMask);
+
+    bus.write(kCommand, kExecProgbufCmd);
+    poll_until_clear(bus, kAbstractcs, kBusy, "exec_progbuf busy");
+
+    return (bus.read(kAbstractcs) & kCmderrMask) == 0u;
+}
+
+// vtype encoding for e8, m1, ta, ma (vsew=000, vlmul=000, vta=1, vma=1).
+// The V-data sweep loads/stores one byte-element per lane (vl=vlenb).
+inline constexpr uint32_t kVtypeE8M1 = 0xC0u;
+
+// Abstract-command write of a 64-bit value to Debug Module register `regno`
+// (GPR/CSR/FPR): DATA0/DATA1 + Access-Register(write) + busy-poll. Free
+// function so ResumeDriver, StateDrain, and the V-data sweep share one copy.
+template<typename Bus>
+inline void write_register_abstract(Bus& bus, uint16_t regno, uint64_t value)
+{
+    constexpr uint8_t  kData0      = 0x04u;
+    constexpr uint8_t  kData1      = 0x05u;
+    constexpr uint8_t  kAbstractcs = 0x16u;
+    constexpr uint8_t  kCommand    = 0x17u;
+    constexpr uint32_t kBusy       = 1u << 12;
+    bus.write(kData0, static_cast<uint32_t>(value & 0xffffffffu));
+    bus.write(kData1, static_cast<uint32_t>((value >> 32) & 0xffffffffu));
+    bus.write(kCommand,
+              access_register_command(regno, AarSize::Bits64, /*write=*/true));
+    poll_until_clear(bus, kAbstractcs, kBusy, "write_register_abstract");
+}
+
+// Sweep all 32 V data registers between the hart regfile and a contiguous
+// scratch region via the Program Buffer. load=true issues vle8.v
+// (scratch -> regfile, on resume); load=false issues vse8.v (regfile ->
+// scratch, at drain). The leading vsetvl to e8/m1 sets vl=vlenb (one
+// byte-element per lane) and forces vstart=0, so each unit-stride access
+// covers the whole register even when the hart had vstart!=0. Uses x5/x6
+// (vsetvl operands) and x7 (base pointer) as scratch. `stride` is the
+// per-register byte spacing in the scratch region (the wire format reserves
+// HYBRID_VLEN_BYTES_MAX per reg, independent of the runtime vlenb).
+template<typename Bus>
+inline void pb_v_data_sweep(Bus& bus, uint64_t scratch_gpa, uint64_t stride,
+                            uint64_t vlenb, bool load)
+{
+    write_register_abstract(bus, regno_gpr(5), vlenb);       // AVL
+    write_register_abstract(bus, regno_gpr(6), kVtypeE8M1);  // e8, m1, ta, ma
+    const std::array<uint32_t, 1> pb_vsetvl = { encode_vsetvl(0, 5, 6) };
+    exec_progbuf(bus, std::span<const uint32_t>{pb_vsetvl});
+    for (uint16_t i = 0; i < 32; ++i) {
+        write_register_abstract(
+            bus, regno_gpr(7), scratch_gpa + static_cast<uint64_t>(i) * stride);
+        const std::array<uint32_t, 1> pb = {
+            load ? encode_vle8_v(static_cast<uint8_t>(i), 7)
+                 : encode_vse8_v(static_cast<uint8_t>(i), 7) };
+        exec_progbuf(bus, std::span<const uint32_t>{pb});
+    }
+}
+
+}  // namespace hybrid
