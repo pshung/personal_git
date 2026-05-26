@@ -1,0 +1,69 @@
+"""B6: PC regnum must follow the discovered reg_map, not be hardcoded.
+
+`apply_state` at `gdbstub.py:285` previously sent the PC via
+`encode_p_body(32, state.pc)`. That assumes the conventional
+`org.gnu.gdb.riscv.cpu` feature layout (32 GPRs + PC) so PC lands at
+gdb regnum 32. Alternate stubs (or a feature XML that uses an explicit
+`regnum=` attribute) place PC at a different index; the hardcoded 32
+then writes PC into the wrong register and QEMU2 resumes off the rails.
+
+This test pins the new contract: PC regnum is taken from reg_map["pc"].
+"""
+from __future__ import annotations
+
+from orchestrator.abi import HybridStateV1
+from orchestrator.gdbstub import apply_state, encode_p_body
+
+
+class _RecordingSession:
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+
+    def send_command(self, body: bytes) -> bytes:
+        self.sent.append(body)
+        return b"OK"
+
+    def cont(self) -> None:
+        pass
+
+
+def _make_state(pc: int) -> HybridStateV1:
+    s = HybridStateV1()
+    s.magic = 0x42594841
+    s.version = 1
+    s.flags = 0
+    s.pc = pc
+    return s
+
+
+def test_apply_state_uses_reg_map_pc_not_hardcoded_32() -> None:
+    # Synthetic stub where PC has regnum=33 (one slot beyond the
+    # conventional 32). The apply must use 33; the body for hardcoded
+    # regnum 32 must not appear.
+    reg_map: dict[str, int] = {"pc": 33}
+    pc_value = 0xCAFEBABEDEADBEEF
+    state = _make_state(pc_value)
+
+    sess = _RecordingSession()
+    apply_state(sess, reg_map, state)
+
+    expected_body = encode_p_body(33, pc_value)
+    wrong_body = encode_p_body(32, pc_value)
+
+    assert expected_body in sess.sent, (
+        f"PC P-packet with regnum 33 not found; sent={sess.sent!r}")
+    assert wrong_body not in sess.sent, (
+        f"PC still sent with hardcoded regnum 32: {wrong_body!r}")
+
+
+def test_apply_state_raises_when_reg_map_missing_pc() -> None:
+    # If discovery did not advertise PC, silently writing to regnum 32
+    # is unsafe; the apply must refuse rather than write to a guessed
+    # slot.
+    state = _make_state(0x80000000)
+    sess = _RecordingSession()
+    try:
+        apply_state(sess, {}, state)
+    except (KeyError, RuntimeError):
+        return
+    raise AssertionError("apply_state should raise when reg_map lacks 'pc'")

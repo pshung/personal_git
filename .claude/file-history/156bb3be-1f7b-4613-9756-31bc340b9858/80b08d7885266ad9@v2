@@ -1,0 +1,63 @@
+"""B5 verification: apply_state must NOT emit V-CSR P-packets when vlenb=0.
+
+The B5 audit claimed `apply_state` writes vtype/vl/vstart/vxsat/vxrm/vcsr
+unconditionally whenever HYBRID_FLAG_V is set. This test pins the gate:
+when vlenb=0 (a stub that could not read vlenb), no V-CSR P-packets
+should be emitted. If this test fails, the gate is missing.
+"""
+from __future__ import annotations
+
+from orchestrator.abi import HYBRID_FLAG_V, HybridStateV1
+from orchestrator.gdbstub import apply_state
+
+
+class _RecordingSession:
+    """Captures send_command bodies; replies OK to every P packet."""
+
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+
+    def send_command(self, body: bytes) -> bytes:
+        self.sent.append(body)
+        return b"OK"
+
+    def cont(self) -> None:
+        pass
+
+
+def _v_names() -> tuple[bytes, ...]:
+    return tuple(b"P" + n + b"=" for n in (
+        b"100", b"101", b"102", b"103", b"104", b"105",  # vstart..vl by hex
+    )) + tuple(f"v{i}".encode() for i in range(32))
+
+
+def test_no_v_csr_packets_when_vlenb_zero_even_if_flag_v_set() -> None:
+    state = HybridStateV1()
+    state.magic = 0x42594841
+    state.version = 1
+    state.flags = HYBRID_FLAG_V
+    state.vlenb = 0  # the audit's failure scenario
+
+    reg_map = {
+        "pc": 32,  # B6: apply_state requires reg_map["pc"]
+        "vstart": 0x100, "vxsat": 0x101, "vxrm": 0x102, "vcsr": 0x103,
+        "vtype": 0x104, "vl": 0x105,
+    }
+    reg_map.update({f"v{i}": 0x200 + i for i in range(32)})
+
+    sess = _RecordingSession()
+    apply_state(sess, reg_map, state)
+
+    v_csr_names = {"vstart", "vxsat", "vxrm", "vcsr", "vtype", "vl"}
+    v_csr_regs = {reg_map[n] for n in v_csr_names}
+    v_data_regs = {reg_map[f"v{i}"] for i in range(32)}
+
+    for body in sess.sent:
+        if not body.startswith(b"P"):
+            continue
+        eq = body.index(b"=")
+        reg = int(body[1:eq], 16)
+        assert reg not in v_csr_regs, (
+            f"B5 violation: V-CSR P-packet emitted with vlenb=0: {body!r}")
+        assert reg not in v_data_regs, (
+            f"B5 violation: V-data P-packet emitted with vlenb=0: {body!r}")
