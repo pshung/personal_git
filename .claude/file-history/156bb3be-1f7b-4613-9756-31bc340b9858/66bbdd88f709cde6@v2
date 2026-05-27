@@ -1,0 +1,66 @@
+/* B14: regression test pinning the bbv_emit_tick bounds check.
+ *
+ * The audit suspected bbv_emit_tick at bbv_emit.c:51 might silently
+ * mis-attribute on a stale bb_id=0 or out-of-range value. In fact the
+ * current gate `if (bb_id == 0 || bb_id > e->counts->len) return;`
+ * already drops both cases. This test pins that contract: feed a
+ * synthetic stream including 0 and a wildly-out-of-range value, then
+ * verify no slice row is emitted (since no real ticks accumulate).
+ *
+ * Host-buildable via:
+ *   cc -O0 -g $(pkg-config --cflags glib-2.0) bbv_emit.c test_bbv_emit_bounds.c \
+ *     $(pkg-config --libs glib-2.0) -o /tmp/t_b14 && /tmp/t_b14
+ */
+#include "bbv_emit.h"
+
+#include <glib.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+static void fail(const char *msg)
+{
+    fprintf(stderr, "FAIL[bbv_emit_bounds]: %s\n", msg);
+    exit(1);
+}
+
+int main(void)
+{
+    char path[] = "/tmp/bbv_emit_bounds_XXXXXX.bb";
+    int fd = g_mkstemp(path);
+    if (fd < 0) fail("mkstemp");
+    close(fd);  /* bbv_emit_new fopens it itself */
+
+    /* slice_target=1: a single legitimate tick would emit a row. */
+    BbvEmit *e = bbv_emit_new(path, /*slice_target=*/1);
+    if (!e) fail("bbv_emit_new");
+
+    /* bb_id=0 (the sentinel) and a wildly-out-of-range bb_id must both
+     * be dropped silently, without advancing slice_acc. */
+    bbv_emit_tick(e, 0);
+    bbv_emit_tick(e, 999999);
+    bbv_emit_tick(e, 1);  /* invalid: no id 1 has been assigned yet */
+
+    bbv_emit_close(e);
+
+    /* File should be empty: no slice row written. */
+    struct stat st;
+    if (stat(path, &st) != 0) fail("stat");
+    if (st.st_size != 0) {
+        char buf[256];
+        FILE *fp = fopen(path, "r");
+        fread(buf, 1, sizeof(buf) - 1, fp);
+        buf[sizeof(buf) - 1] = '\0';
+        fprintf(stderr, "B14 violation: slice row emitted from invalid bb_ids: %s\n", buf);
+        fclose(fp);
+        unlink(path);
+        exit(1);
+    }
+
+    unlink(path);
+    printf("[bbv_emit_bounds] PASS\n");
+    return 0;
+}

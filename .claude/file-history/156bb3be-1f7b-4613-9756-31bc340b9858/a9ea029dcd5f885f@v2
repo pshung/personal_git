@@ -1,0 +1,87 @@
+"""B10: hsim must reject plugin-arg values that contain a comma.
+
+The plugin arg string is `lib.so,outfile=PATH,key=val,...`. Commas are
+QEMU's own field separator; a comma in a path silently splits the arg
+into pieces, smearing key=value pairs and corrupting plugin parse.
+mktemp rarely emits commas but a user-supplied path can. The fix is to
+raise at argv construction time so the failure is loud and local
+instead of becoming a downstream QEMU parse error.
+"""
+from __future__ import annotations
+
+import importlib.util
+import importlib.machinery
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+HSIM = REPO_ROOT / "hsim"
+
+
+def _load_hsim():
+    # `hsim` has no .py suffix; force SourceFileLoader so spec resolution
+    # picks the right loader regardless of filename heuristics.
+    loader = importlib.machinery.SourceFileLoader("hsim_module", str(HSIM))
+    spec = importlib.util.spec_from_loader("hsim_module", loader)
+    assert spec is not None
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def test_qemu_drain_argv_rejects_comma_in_shm_path() -> None:
+    hsim = _load_hsim()
+    with pytest.raises(ValueError, match="comma"):
+        hsim._qemu_drain_argv(
+            qemu=Path("/usr/bin/qemu-system-riscv64"),
+            elf=Path("/tmp/safe.elf"),
+            plugin=Path("/tmp/lib.so"),
+            shm_path=Path("/tmp/has,comma.shm"),
+            shm_size=128 * 1024 * 1024,
+            state_out=Path("/tmp/state.bin"),
+        )
+
+
+def test_qemu_drain_argv_rejects_comma_in_state_out() -> None:
+    hsim = _load_hsim()
+    with pytest.raises(ValueError, match="comma"):
+        hsim._qemu_drain_argv(
+            qemu=Path("/usr/bin/qemu-system-riscv64"),
+            elf=Path("/tmp/safe.elf"),
+            plugin=Path("/tmp/lib.so"),
+            shm_path=Path("/tmp/safe.shm"),
+            shm_size=128 * 1024 * 1024,
+            state_out=Path("/tmp/has,comma.bin"),
+        )
+
+
+def test_qemu_drain_argv_rejects_comma_in_plugin_extras() -> None:
+    hsim = _load_hsim()
+    with pytest.raises(ValueError, match="comma"):
+        hsim._qemu_drain_argv(
+            qemu=Path("/usr/bin/qemu-system-riscv64"),
+            elf=Path("/tmp/safe.elf"),
+            plugin=Path("/tmp/lib.so"),
+            shm_path=Path("/tmp/safe.shm"),
+            shm_size=128 * 1024 * 1024,
+            state_out=Path("/tmp/state.bin"),
+            plugin_extras=("bbv_out=/tmp/oh,no.bbv",),
+        )
+
+
+def test_qemu_drain_argv_accepts_clean_paths() -> None:
+    # Regression: the comma guard must not reject ordinary paths.
+    hsim = _load_hsim()
+    argv = hsim._qemu_drain_argv(
+        qemu=Path("/usr/bin/qemu-system-riscv64"),
+        elf=Path("/tmp/safe.elf"),
+        plugin=Path("/tmp/lib.so"),
+        shm_path=Path("/tmp/safe.shm"),
+        shm_size=128 * 1024 * 1024,
+        state_out=Path("/tmp/state.bin"),
+    )
+    # Plugin section is the last "-plugin" arg.
+    plugin_idx = argv.index("-plugin")
+    assert "/tmp/state.bin" in argv[plugin_idx + 1]
+    assert "," in argv[plugin_idx + 1]  # field separator commas are fine
