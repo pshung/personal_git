@@ -1,0 +1,351 @@
+# Hybrid Simulator - Market Requirements Document
+
+Status: draft v0.1. Written 2026-05-28. Owner: Nick.
+
+Companion to `commercial_v1_roadmap.md` (engineering plan) and
+`limitation.md` (current ROI envelope). This file is the *product*
+view: who needs this, why the existing tool stack does not serve
+them, and what we must deliver to claim the market.
+
+---
+
+## 1. Problem statement
+
+Pre-silicon performance evaluation today forces customers to pick
+exactly one trade-off:
+
+- **QEMU**: runs at MHz, but tells you nothing about cycles.
+- **Alioth (SystemC cycle-correlated)**: ~0.1-1 MIPS. Customer-facing,
+  RTL-correlated. Booting Linux to a SPEC kernel takes hours-days.
+- **Verilator (RTL cycle-exact)**: ~5-9 KHz on Andes RISC-V. Cannot
+  reach a real workload's steady state in human time.
+- **FPGA / emulator**: near-real speed, cycle-exact, but late in the
+  schedule, expensive, and has almost no signal visibility.
+
+The single biggest gap: **"I want cycle-accurate measurement of a
+small kernel, but the workload spends 99% of cycles in boring boot,
+libc init, OS warmup, and dataset load."** No tool above answers
+this without weeks of runtime or a tape-out.
+
+Hybrid simulator closes this gap by running the boring 99% in QEMU
+and switching into a cycle-accurate simulator only for the
+region of interest (ROI).
+
+---
+
+## 2. Target users
+
+| User | Today's pain | Hybrid_sim payoff |
+|---|---|---|
+| **Andes architect** evaluating a microarch change on a real workload | Re-runs full Verilator/Alioth for every tweak (days per iteration) | Boot once, re-measure ROI in minutes (100x-1000x faster iteration) |
+| **Andes customer** sizing a SoC for their own workload | Cannot wait days; cannot get FPGA before tape-out | Ships hybrid_sim, runs their ELF, gets cycle figures in minutes |
+| **SPEC / benchmark engineer** producing whole-program CPI | Fully cycle-accurate run is intractable | SimPoint clustering + per-phase cycle-exact measurement + weighted combine |
+| **Pipeline / kanata trace consumer** | Trace file dominated by uninteresting boot | Record only the loop iterations that matter, byte-identical to a fully-RTL baseline |
+| **DV engineer** chasing a perf anomaly that only appears after long warmup | Cannot reproduce in Verilator alone | Fast-forward in QEMU to the anomaly, then cycle-exact from there |
+
+---
+
+## 3. Market Requirements
+
+Numbered for traceability into the engineering roadmap.
+
+### MR-A - Linux-userspace ROI measurement
+
+A user shall be able to boot Linux (or any S/U-mode workload), reach
+an application's hot loop, hand off to the cycle-accurate simulator,
+measure the loop, and hand back.
+
+- **Status**: blocked. ROI is M-mode only today (`limitation.md` core
+  rule). Requires Wave 2 of `commercial_v1_roadmap.md`: paging (L3),
+  trap state (L4), priv restore (L6), PMP (L2), syscalls in ROI (L1).
+- **Acceptance**: a fixture that boots Linux, runs a userspace
+  benchmark kernel, returns a cycle count that agrees with a
+  fully-RTL baseline within an explicit error budget.
+
+### MR-B - Whole-program estimate via SimPoint
+
+A user shall be able to point hybrid_sim at a long workload and
+receive a weighted whole-program cycle estimate without running the
+whole workload cycle-accurate.
+
+- **Status**: shipped at v0.x for M-mode workloads (`./hsim run
+  --mode simpoint`); `commercial_v1_roadmap.md` Wave 5 (L14) adds
+  CI bands and tuned warmup.
+- **Acceptance**: estimate within 5-10% of fully-RTL for at least 3
+  SPEC-class workloads.
+
+### MR-C - Customer-deliverable workload measurement
+
+An Andes customer with their own ELF shall be able to run that ELF
+against hybrid_sim and get RTL-correlated cycle figures, without
+needing FPGA hardware or RTL access.
+
+- **Status**: blocked on MR-A plus Andes vendor CSR parity
+  (`commercial_v1_roadmap.md` Wave 3, L21) and trigger redesign
+  (L12 - move off CSR `0x7C0`).
+- **Acceptance**: a customer-style benchmark (closed-source ELF,
+  Linux userspace, vendor-CSR usage) round-trips and produces a
+  cycle count.
+
+### MR-D - Iterative microarch tweak loop
+
+An architect shall be able to change a microarch parameter, rebuild
+the cycle-accurate simulator, and re-measure the same ROI without
+re-running the boot phase.
+
+- **Status**: partially supported (QEMU phase is stable; vsim
+  rebuild is independent). Wider envelope (MR-A) makes this usable
+  on real workloads.
+- **Acceptance**: edit-rebuild-measure cycle under 5 minutes for a
+  kernel inside a Linux app.
+
+### MR-E - ROI-only pipeline trace recording
+
+A user shall be able to record kanata or Clarity-style pipeline
+traces for exactly the iterations of interest, with byte-identical
+output to a fully-RTL baseline over that window.
+
+- **Status**: shipped at v0.x for M-mode (kanata integration in
+  Phase 4 of `hybrid_plan.md`).
+- **Acceptance**: kanata diff is empty against a fully-RTL baseline
+  for the recorded window after warmup.
+
+---
+
+## 4. Competitive positioning
+
+Single-tool view:
+
+| Tool | Speed (rough) | Cycle fidelity | Visibility | Available |
+|---|---|---|---|---|
+| QEMU (TCG) | 200-1000 MIPS | none | low | always |
+| Alioth | 0.1-1 MIPS | RTL-correlated, small CPI gap | high (Clarity DB, HPM) | post pipeline model |
+| Verilator | 1-50 KHz | cycle-exact (is the RTL) | very high (every wire) | when RTL exists |
+| FPGA | 10-100 MHz | cycle-exact | very low (ILA only) | very late |
+| **Hybrid_sim (QEMU + vsim)** | QEMU speed for boring code, vsim speed in ROI | cycle-exact in ROI | very high in ROI | needs RTL for vsim leg |
+
+The pitch is *not* "faster than FPGA". It is **"the only tool that
+gives Verilator-grade fidelity on a kernel inside a workload that is
+too long for Verilator to reach"**. That is a different axis.
+
+---
+
+## 5. Where hybrid_sim does NOT help
+
+Honest scope-out, to keep the MRD credible:
+
+- **Pre-RTL architecture exploration** (cache sizing, vector width,
+  ROB depth before any RTL exists). Use Alioth alone.
+- **RTL bug hunting outside the ROI**. If the bug is in boot or
+  setup code, hybrid_sim runs that part on QEMU and never exercises
+  the RTL there.
+- **Full-system regression at near-real speed**. Use FPGA.
+- **Functional bring-up of a new core**. Use QEMU alone.
+- **Workloads with no clear ROI** (e.g. a long random benchmark
+  with no hot kernel). SimPoint mode mitigates but cannot eliminate
+  the problem.
+
+---
+
+## 6. v1 envelope vs market reach
+
+Today's narrow envelope (from `limitation.md`):
+
+- M-mode only, no S/U-mode (L6)
+- No virtual memory (L3)
+- Trap-free ROI (L4)
+- No syscalls / semihosting in ROI (L1, blocker)
+- No PMP enforcement (L2)
+- Single hart (L8)
+- No Andes vendor CSRs (L21)
+- Hard-wired to `andes_ae350` + `ax45mpv` (L10)
+
+Implication: **MR-A, MR-C, MR-D cannot ship today.** Only MR-B (in
+M-mode workloads) and MR-E (in M-mode workloads) are claimable.
+
+Ship targets (from `commercial_v1_roadmap.md`):
+
+| Milestone | Cumulative weeks | MRs claimable |
+|---|---|---|
+| Wave 0 + Wave 1 | 6 | MR-B (M-mode), MR-E (M-mode) - same as today, but loud about wrongness |
+| MV beta (Wave 0+1 + L3+L4+L6) | ~18 | MR-A partial (S-mode, traps, paging), MR-B widened |
+| Commercial v1.0 (Waves 0-5) | ~30 | MR-A, MR-B, MR-C, MR-D, MR-E |
+
+---
+
+## 7. Success metrics
+
+How we know hybrid_sim is winning its market:
+
+1. **Wall-clock speedup**: on a representative workload with ROI <
+   1% of dynamic instructions, hybrid_sim produces a cycle figure at
+   least **100x faster** than vsim-alone. Target stretch: 1000x.
+2. **Accuracy**: per-ROI cycle figure within **<= 1%** of a fully-RTL
+   baseline (excluding the documented microarch warm-up discontinuity).
+3. **Whole-program estimate**: SimPoint output within **5-10%** of
+   fully-RTL on at least 3 SPEC-class workloads.
+4. **Customer adoption**: at least one external customer running
+   their own ELF end-to-end under hybrid_sim.
+5. **Time-to-first-result**: a new user goes from `git clone` to a
+   working round-trip cycle figure in **under 30 minutes**.
+
+---
+
+## 8. Future direction - QEMU + Alioth
+
+The hybrid_sim architecture is *consumer-agnostic* at the boundary:
+QEMU plugin drains state into `hybrid_state_v1`, the consumer
+restores it. Today the consumer is vsim (Verilator). A natural
+extension is **QEMU + Alioth**.
+
+Comparative pitch:
+
+| Stack | Boot Linux + measure kernel | Visibility | Customer-shippable |
+|---|---|---|---|
+| Alioth alone | hours-days | high | yes |
+| QEMU + vsim (today) | minutes | very high | no (vsim needs RTL) |
+| **QEMU + Alioth (future)** | **minutes** | **high (Clarity DB, HPM, customer config)** | **yes** |
+
+Strategic case: this would give Andes a customer-shippable
+fast-forward story matching gem5's KVM->O3 switching, while
+keeping Alioth's RTL-correlation and customer-config advantages.
+The Alioth-vs-gem5 doc explicitly calls out
+*"Mid-sim CPU swap: Not supported"* as an Alioth gap.
+
+Engineering scope (rough): port the consumer side from DMI Abstract
+Commands to `afw::Module` state writes. Everything else - QEMU
+plugin, wire format, mmap RAM, SimPoint clustering, orchestrator -
+stays the same.
+
+This is NOT scoped into commercial v1.0. It is documented here to
+keep the MRD honest about where the platform can go after v1.0.
+
+---
+
+## 9. Competitive landscape
+
+The "fast-forward boring code + cycle-accurate ROI" pattern has
+commercial proof: Synopsys, Cadence, and Siemens all sell
+million-dollar tools that do exactly this. The pattern has a market.
+
+Hybrid_sim's wedge is **not** "do this pattern better than ZeBu" -
+it is **"do this pattern at zero cost, with Andes IP support out of
+the box, for the customer tier that cannot afford Tier-1 emulator
+capex"**.
+
+### 9.1 The competitor matrix
+
+| Tier | Tool | Fast side | Cycle side | Price |
+|---|---|---|---|---|
+| 1 | Synopsys ZeBu + Virtualizer | Virtualizer (TLM, MHz) | ZeBu FPGA emulator (10-100 MHz) | $M+ capex |
+| 1 | Cadence Palladium + Helium | Helium (virtual platform) | Palladium Z2 emulator | $M+ capex |
+| 1 | Siemens Veloce + Vista | Vista (VP) | Veloce Strato emulator | $M+ capex |
+| 2 | Synopsys Imperas (acq. 2024) | OVPsim functional | Timing models / DPI to RTL | $K-M license |
+| 2 | ARM Fast Models + Cycle Models | Fast Models | Cycle Models | $K-M license |
+| 2 | Wind River Simics + Hindsight | Functional full-system | Cycle analysis | $K-M license |
+| 3 | gem5 KVM -> O3CPU | KVM / AtomicSimpleCPU | O3CPU | Open source |
+| 3 | Spike + RTL DPI bridges | Spike functional ISS | RTL via DPI | Open source / hobby |
+| - | **hybrid_sim** | **QEMU 9.x** | **vsim (Verilator); Alioth in future** | **$0 internal** |
+
+Tier 1 is the canonical pattern: boot Linux in TLM, switch to a
+multi-million-dollar FPGA emulator at the ROI. Used by Apple,
+Qualcomm, Intel, AMD-tier vendors. Same pattern, premium hardware
+on the cycle side.
+
+Tier 2 is the RISC-V / specialty mid-market. Imperas was the
+dominant commercial RISC-V hybrid story before Synopsys bought it
+in 2024.
+
+Tier 3 is the academic / open baseline. gem5's KVM -> O3CPU swap
+is the *reference* pattern hybrid_sim follows.
+
+### 9.2 Where hybrid_sim wins
+
+- **Cost**: $0 vs $M+ for ZeBu/Palladium. Andes engineers and
+  (future) customers pay zero per-seat.
+- **Andes-specific output**: first-class kanata, Clarity DB, HPM
+  counters, Andes vendor CSRs, ACE. Generic tools do not know about
+  these.
+- **No FPGA bring-up**: runs on any Linux laptop. ZeBu/Palladium
+  need a board and weeks of partitioning per design point.
+- **Customer-shippable** (with QEMU + Alioth path, Section 8):
+  customers measure their workloads without ever touching RTL or
+  FPGA bitstreams.
+
+### 9.3 Where hybrid_sim loses
+
+- **Cycle-side speed**: ZeBu/Palladium emulators run at 10-100 MHz;
+  hybrid_sim's vsim leg runs at 5-9 KHz, ~10,000x slower. For ROIs
+  that are themselves billions of cycles, commercial emulators
+  still win.
+- **OS-bearing workloads today**: ZeBu hybrid boots Linux; hybrid_sim
+  is M-mode-only until Wave 2 of the roadmap closes L1-L6.
+- **Maturity**: ZeBu/Palladium are 10+ years productized with full
+  support contracts; hybrid_sim is alpha.
+- **Generic ISA / SoC coverage**: ZeBu/Palladium are ISA-agnostic
+  and customer-configurable; hybrid_sim is hard-wired to
+  `andes_ae350` + `ax45mpv` until L10 closes.
+
+### 9.4 Target customer profile
+
+The commercial alternatives delineate the addressable market.
+Hybrid_sim's most likely customer:
+
+- Mid-tier RISC-V SoC integrator with an Andes IP license.
+- Cannot justify $M+ ZeBu/Palladium capex.
+- Has perf-measurement needs beyond what QEMU alone provides.
+- Today: bare-metal kernels. Wave 2 onward: Linux userspace.
+- Wants Andes-correlated CPI figures, not generic numbers.
+
+The customer who **can** afford ZeBu **and** needs full-system Linux
+at emulator speed is **not** our target. We compete in the tier
+below.
+
+### 9.5 Risks from the commercial landscape
+
+- **Tier-1 price compression**: Synopsys / Cadence may discount
+  hybrid solutions for RISC-V mid-tier customers; our cost wedge
+  narrows.
+- **Imperas under Synopsys**: now part of a Tier-1 vendor; may
+  expand into Andes IP support. Monitor.
+- **Customer-built in-house tools**: SiFive, MIPS, others may build
+  similar internally. IP defensibility is weak; speed of delivery
+  matters.
+- **gem5 productization** (low probability): if a vendor
+  productizes gem5 hybrid with RISC-V support, our open-source /
+  cost story weakens.
+
+---
+
+## 10. Open product questions
+
+For PM / lead review:
+
+- **Customer license model**: does hybrid_sim ship inside the same
+  customer-facing Alioth bundle, or as a separate add-on?
+- **QEMU dependency**: customers run on whatever QEMU we tell them
+  to. Do we fork (long-term maintenance) or pin to upstream
+  (compatibility risk)?
+- **Closed-source customer ELFs**: does the magic-CSR trigger
+  approach require customer-source modification, or does PC-trigger
+  mode (no source change) cover the common case?
+- **Andes vendor CSR exposure**: which Andes-custom CSRs are
+  customer-visible and must round-trip? L21 lists 9; do we need
+  more?
+- **Multi-hart priority**: which customers are blocked on multi-hart
+  (L8 / Wave 4)? If none yet, defer beyond v1.0.
+
+---
+
+## 11. References
+
+- `commercial_v1_roadmap.md` - engineering plan, 6 waves, 21
+  numbered limitations closed.
+- `docs/limitation.md` - current ROI envelope, ground truth.
+- `docs/USER_GUIDE.md` - user-facing workflows and modes.
+- `hybrid_plan.md` - original design rationale and phased delivery.
+- `specs/hybrid-sim-gem5-switch-parity.md` - parity analysis with
+  gem5's switchable-CPU mechanism.
+- Alioth: `~/work/Alioth/doc/alioth-vs-gem5.md` for the
+  "Mid-sim CPU swap: Not supported" gap that QEMU+Alioth would
+  close.
