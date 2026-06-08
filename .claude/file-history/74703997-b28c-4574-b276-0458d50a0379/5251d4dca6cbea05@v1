@@ -1,0 +1,102 @@
+// Pin the GPA-to-file-offset contract for hybrid shared mode: a narrow RAM
+// region [base, base+size) over an mmap span translates GPA `base + N` to
+// file offset `N`, so QEMU and vsim see identical bytes through the same
+// backing file. Also guards against SimpleMemory's size-check rejecting an
+// external buffer sized to match a sub-2.25 GB region.
+
+#include "platform/mmap_backing.hpp"
+#include "platform/simple_memory.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <string>
+
+namespace {
+auto unique_tmp_path(const char* tag) -> std::string
+{
+  auto p = std::filesystem::temp_directory_path()
+           / (std::string{"vsim_shared_mem_offset_"} + tag + "_"
+              + std::to_string(::getpid()));
+  std::filesystem::remove(p);
+  return p.string();
+}
+}  // namespace
+
+TEST_CASE("narrow QEMU-virt region maps GPA 0x80010000 to file offset 0x10000")
+{
+  const auto path = unique_tmp_path("write");
+  constexpr std::size_t kSize = 8 * 1024 * 1024;
+  constexpr uint64_t kBaseGpa = 0x80000000;
+
+  MmapBacking backing(path, kSize);
+
+  SimpleMemory<32> mem{
+    "mem", MemoryRegion{kBaseGpa, kBaseGpa + kSize - 1},
+    MemoryRegion{SimpleMemory<32>::INVALID_ADDRESS,
+                 SimpleMemory<32>::INVALID_ADDRESS},
+    backing.span()};
+
+  std::array<uint8_t, 8> pattern{0xde, 0xad, 0xbe, 0xef,
+                                  0xca, 0xfe, 0xba, 0xbe};
+  tlm::tlm_generic_payload gp;
+  gp.set_command(tlm::TLM_WRITE_COMMAND);
+  gp.set_address(kBaseGpa + 0x10000);
+  gp.set_data_ptr(pattern.data());
+  gp.set_data_length(pattern.size());
+  gp.set_response_status(tlm::TLM_INCOMPLETE_RESPONSE);
+  sc_core::sc_time delay = sc_core::SC_ZERO_TIME;
+  mem.b_transport(gp, delay);
+  REQUIRE(gp.get_response_status() == tlm::TLM_OK_RESPONSE);
+
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  REQUIRE(fd >= 0);
+  void* p = ::mmap(nullptr, kSize, PROT_READ, MAP_SHARED, fd, 0);
+  REQUIRE(p != MAP_FAILED);
+  auto* file_bytes = static_cast<const uint8_t*>(p);
+  for (std::size_t i = 0; i < pattern.size(); ++i)
+    CHECK(file_bytes[0x10000 + i] == pattern[i]);
+  ::munmap(p, kSize);
+  ::close(fd);
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("bytes pre-placed at file offset 0x10000 read back as GPA 0x80010000")
+{
+  const auto path = unique_tmp_path("read");
+  constexpr std::size_t kSize = 8 * 1024 * 1024;
+  constexpr uint64_t kBaseGpa = 0x80000000;
+
+  MmapBacking backing(path, kSize);
+  backing.span()[0x10000 + 0] = 0xa5;
+  backing.span()[0x10000 + 1] = 0x5a;
+
+  SimpleMemory<32> mem{
+    "mem", MemoryRegion{kBaseGpa, kBaseGpa + kSize - 1},
+    MemoryRegion{SimpleMemory<32>::INVALID_ADDRESS,
+                 SimpleMemory<32>::INVALID_ADDRESS},
+    backing.span()};
+
+  std::array<uint8_t, 2> out{};
+  tlm::tlm_generic_payload gp;
+  gp.set_command(tlm::TLM_READ_COMMAND);
+  gp.set_address(kBaseGpa + 0x10000);
+  gp.set_data_ptr(out.data());
+  gp.set_data_length(out.size());
+  gp.set_response_status(tlm::TLM_INCOMPLETE_RESPONSE);
+  sc_core::sc_time delay = sc_core::SC_ZERO_TIME;
+  mem.b_transport(gp, delay);
+  REQUIRE(gp.get_response_status() == tlm::TLM_OK_RESPONSE);
+
+  CHECK(out[0] == 0xa5);
+  CHECK(out[1] == 0x5a);
+  std::filesystem::remove(path);
+}
