@@ -1,0 +1,113 @@
+// End-to-end of the file-only path: read a state file from disk and drive a
+// DMI bus through ResumeDriver. The bus is a recording mock; the SystemC and
+// AHB layers are exercised in the actual simulator integration.
+
+#include "hybrid/resume_driver.hpp"
+#include "hybrid/resume_from_qemu.hpp"
+#include "hybrid/state_abi.h"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <vector>
+
+namespace {
+
+constexpr uint8_t kDmcontrol = 0x10;
+constexpr uint8_t kCommand   = 0x17;
+
+constexpr uint16_t kCsrDpc = 0x7B1;
+
+struct RecordingBus final : hybrid::DmiBus
+{
+  struct Op
+  {
+    bool is_write;
+    uint8_t reg;
+    uint32_t value;
+  };
+  std::vector<Op> ops;
+  uint32_t dmstatus_value = (1u << 9) | (1u << 17);
+  uint32_t abstractcs_value = 0;
+
+  void write(uint8_t r, uint32_t v) override
+  {
+    ops.push_back({true, r, v});
+  }
+  auto read(uint8_t r) -> uint32_t override
+  {
+    ops.push_back({false, r, 0});
+    if (r == 0x11) return dmstatus_value;
+    if (r == 0x16) return abstractcs_value;
+    return 0;
+  }
+};
+
+auto unique_tmp_path(const char* tag) -> std::string
+{
+  auto p = std::filesystem::temp_directory_path()
+           / (std::string{"vsim_resume_"} + tag + "_"
+              + std::to_string(::getpid()));
+  std::filesystem::remove(p);
+  return p.string();
+}
+
+auto write_state_file(const std::string& path, const hybrid_state_v1& s)
+  -> void
+{
+  std::ofstream f(path, std::ios::binary | std::ios::trunc);
+  f.write(reinterpret_cast<const char*>(&s),
+          static_cast<std::streamsize>(sizeof(s)));
+}
+
+}  // namespace
+
+TEST_CASE("resume_from_qemu loads file then drives bus to set DPC")
+{
+  hybrid_state_v1 s{};
+  s.magic = HYBRID_STATE_MAGIC;
+  s.version = HYBRID_STATE_VERSION;
+  s.flags = HYBRID_FLAG_RV64;
+  s.pc = 0xDEADC0DE'BEEFFEEDULL;
+
+  const auto path = unique_tmp_path("ok");
+  write_state_file(path, s);
+
+  RecordingBus bus;
+  hybrid::resume_from_qemu(path, bus);
+
+  // The first DMCONTROL write primes dmactive (without haltreq); the
+  // second DMCONTROL write requests halt.
+  REQUIRE(bus.ops.size() >= 2);
+  CHECK(bus.ops[0].is_write);
+  CHECK(bus.ops[0].reg == kDmcontrol);
+  CHECK((bus.ops[0].value & 1u) == 1u);
+  CHECK(((bus.ops[0].value >> 31) & 1u) == 0u);
+
+  CHECK(bus.ops[1].is_write);
+  CHECK(bus.ops[1].reg == kDmcontrol);
+  CHECK(((bus.ops[1].value >> 31) & 1u) == 1u);
+
+  // A COMMAND write targeting CSR DPC (regno=0x7B1) must occur.
+  bool saw_dpc_command = false;
+  for (const auto& op : bus.ops) {
+    if (op.is_write && op.reg == kCommand && (op.value & 0xffffu) == kCsrDpc) {
+      saw_dpc_command = true;
+      break;
+    }
+  }
+  CHECK(saw_dpc_command);
+
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("resume_from_qemu propagates load errors")
+{
+  RecordingBus bus;
+  CHECK_THROWS(hybrid::resume_from_qemu("/no/such/file/here", bus));
+  CHECK(bus.ops.empty());
+}
