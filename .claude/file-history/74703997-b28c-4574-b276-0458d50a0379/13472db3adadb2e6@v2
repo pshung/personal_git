@@ -1,0 +1,73 @@
+// MmapBacking + SimpleMemory glued together: writes via TLM land on disk,
+// bytes pre-placed by an external owner are visible via TLM reads.
+
+#include "platform/mmap_backing.hpp"
+#include "platform/simple_memory.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include "test_helpers.hpp"
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <array>
+#include <filesystem>
+
+using namespace hybrid::test;
+
+TEST_CASE("write through SimpleMemory shows up on disk through MmapBacking")
+{
+  const auto path = unique_tmp_path("write");
+  constexpr std::size_t kSize = 0x1000;
+  constexpr uint64_t kBase = 0x1000;
+
+  MmapBacking backing(path, kSize);
+  SimpleMemory<32> mem{
+    "mem", MemoryRegion{kBase, kBase + kSize - 1},
+    MemoryRegion{SimpleMemory<32>::INVALID_ADDRESS,
+                 SimpleMemory<32>::INVALID_ADDRESS},
+    backing.span()};
+
+  std::array<uint8_t, 4> bytes{0xde, 0xad, 0xbe, 0xef};
+  tlm_write(mem, kBase + 0x100, bytes);
+
+  // Independent reader: open the file fresh and mmap it.
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  REQUIRE(fd >= 0);
+  void* p = ::mmap(nullptr, kSize, PROT_READ, MAP_SHARED, fd, 0);
+  REQUIRE(p != MAP_FAILED);
+  auto* file_bytes = static_cast<const uint8_t*>(p);
+  for (std::size_t i = 0; i < bytes.size(); ++i)
+    CHECK(file_bytes[0x100 + i] == bytes[i]);
+  ::munmap(p, kSize);
+  ::close(fd);
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("bytes pre-placed in the file are read back through SimpleMemory")
+{
+  const auto path = unique_tmp_path("read");
+  constexpr std::size_t kSize = 0x1000;
+  constexpr uint64_t kBase = 0x1000;
+
+  MmapBacking backing(path, kSize);
+  // Outside writer (e.g. QEMU side) places known bytes via the same mapping.
+  backing.span()[0x200] = 0xca;
+  backing.span()[0x201] = 0xfe;
+
+  SimpleMemory<32> mem{
+    "mem", MemoryRegion{kBase, kBase + kSize - 1},
+    MemoryRegion{SimpleMemory<32>::INVALID_ADDRESS,
+                 SimpleMemory<32>::INVALID_ADDRESS},
+    backing.span()};
+
+  std::array<uint8_t, 2> bytes{};
+  tlm_read(mem, kBase + 0x200, bytes);
+
+  CHECK(bytes[0] == 0xca);
+  CHECK(bytes[1] == 0xfe);
+  std::filesystem::remove(path);
+}
