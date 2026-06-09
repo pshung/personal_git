@@ -1,0 +1,103 @@
+// `andes-sim run --model fast|accurate|hybrid [engine selection] ELF [-- engine args]`.
+//
+// The top selection axis. F7/F8 land the two standalone models, `fast` (QEMU)
+// and `accurate` (a cycle-accurate engine, from reset): each resolves its
+// engine, then hands off to transparent passthrough -- the ELF plus everything
+// after `--` becomes the engine's own command line, run with inherited stdio,
+// no timeout, and the exit code propagated, so a gdbstub / monitor /
+// semihosting console all behave as if the engine were invoked directly.
+// `hybrid` (F9) lands later; its dispatch arm stubs for now.
+#include <cstdio>
+#include <string>
+
+#include "cli.hpp"
+#include "engine_descriptor.hpp"
+#include "engine_registry.hpp"
+#include "models.hpp"
+#include "run_passthrough.hpp"
+
+namespace andes_sim {
+namespace {
+
+// The standalone-passthrough spine shared by `fast` and `accurate`: both take a
+// single ELF, then exec the resolved engine standalone with the post-`--` args
+// appended verbatim (inherit stdio, no timeout, propagate exit code). The only
+// per-model differences -- which engine, and how it is selected -- are resolved
+// by the caller; `model` here only labels the positional diagnostics.
+int run_standalone(const Cli& cli, const EngineDescriptor& eng,
+                   const char* model) {
+  if (cli.positional.empty()) {
+    std::fprintf(stderr, "andes-sim run --model %s: missing ELF\n", model);
+    return 2;
+  }
+  if (cli.positional.size() > 1) {
+    std::fprintf(stderr,
+                 "andes-sim run --model %s: unexpected argument '%s' "
+                 "(engine args go after --)\n",
+                 model, cli.positional[1].c_str());
+    return 2;
+  }
+  std::string err;
+  int rc = run_passthrough(eng, "standalone", cli.positional[0],
+                           cli.passthrough, err);
+  if (!err.empty()) std::fprintf(stderr, "andes-sim run: %s\n", err.c_str());
+  return rc;
+}
+
+// `run --model fast`: QEMU alone, functional, transparent passthrough. Needs
+// only the built-in qemu descriptor, so it resolves that directly rather than
+// discover_engines(), which would spawn a --describe subprocess per Verilator
+// build only to discard them all here.
+int run_fast(const Cli& cli) {
+  // fast is QEMU-only; an explicit engine must name it.
+  if (!cli.engine.empty() && cli.engine != "qemu") {
+    std::fprintf(stderr,
+                 "andes-sim run --model fast: engine must be 'qemu', got '%s'\n",
+                 cli.engine.c_str());
+    return 2;
+  }
+  return run_standalone(cli, builtin_qemu(), "fast");
+}
+
+// `run --model accurate`: one cycle-accurate engine alone, from reset (no QEMU,
+// no --resume-from-qemu), transparent passthrough -- cycles surface in the
+// engine's own output. Unlike fast, this must discover the Verilator build(s)
+// to resolve the engine (explicit --engine, else the sole one).
+int run_accurate(const Cli& cli) {
+  Discovery disc = discover_engines();
+  std::string err;
+  const EngineDescriptor* eng =
+      resolve_accurate_engine(disc.engines, cli.engine, err);
+  if (!eng) {
+    std::fprintf(stderr, "andes-sim run --model accurate: %s\n", err.c_str());
+    // Surface why an expected engine may be absent (failed --describe, etc.).
+    for (const std::string& w : disc.warnings)
+      std::fprintf(stderr, "andes-sim: skipped engine: %s\n", w.c_str());
+    return 2;
+  }
+  return run_standalone(cli, *eng, "accurate");
+}
+
+}  // namespace
+
+int cmd_run(const Cli& cli) {
+  if (cli.model.empty()) {
+    std::fprintf(stderr,
+                 "andes-sim run: --model fast|accurate|hybrid is required\n");
+    return 2;
+  }
+  if (!find_model(cli.model)) {
+    std::fprintf(stderr,
+                 "andes-sim run: unknown model '%s' (want fast|accurate|hybrid)\n",
+                 cli.model.c_str());
+    return 2;
+  }
+  if (cli.model == "fast") return run_fast(cli);
+  if (cli.model == "accurate") return run_accurate(cli);
+
+  std::fprintf(stderr, "andes-sim run --model %s: not yet implemented\n",
+               cli.model.c_str());
+  return 3;
+}
+
+}  // namespace andes_sim
