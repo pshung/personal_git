@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# End-to-end harness: QEMU 1 + plugin -> vsim (2-phase, no QEMU2 handback).
+#
+# Memory between QEMU and vsim is shared via an /dev/shm-backed mmap
+# (128 MB). Works for both asm fixtures (handoff_roundtrip, rt_*) and
+# C-level fixtures (rt_c_*). C fixtures require shared mmap so the
+# stack/heap survives handoffs; asm fixtures don't need it but run
+# fine with it.
+#
+# Env:
+#   FIXTURE         REQUIRED. .elf name under tests/fixtures/ (no .elf suffix).
+#   TRIGGER_MODE    csr | pc (default csr).
+#   ROI_START       pc mode switch-in PC: a 0x address or a symbol in
+#                   $VSIM_ELF. If BOTH ROI_START and ROI_END are unset, they
+#                   are auto-derived from the fixture's milmb ROI markers via
+#                   objdump (see roi_markers_from_disasm) -- the bulk runner
+#                   relies on this; ./hsim run always passes them explicitly.
+#   ROI_END         pc mode switch-out PC, same forms / same auto-derivation.
+#   TIMEOUT         vsim leg timeout in seconds (default 60).
+#   CHECK_MCYCLE_MONOTONIC=1   assert mcycle/minstret strictly increased
+#                              between QEMU 1's drain and vsim's drain.
+#   WARMUP_ICOUNT              gem5-style warmup window. When set and > 0,
+#                              passes --vsim-warmup-icount K to vsim and
+#                              prints a [warmup] line carrying the captured
+#                              (mcycle_at_measure_start, minstret_at_measure_start)
+#                              pair from the drained state file.
+#   VSIM_BIN, VSIM_QEMU, VSIM_PLUGIN, VSIM_ELF, NM  override built paths.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/lib/paths.sh"
+. "$SCRIPT_DIR/lib/roi.sh"
+
+FIXTURE="${FIXTURE:?FIXTURE env var is required (e.g. FIXTURE=rt_c_hello)}"
+TIMEOUT="${TIMEOUT:-60}"
+TRIGGER_MODE="${TRIGGER_MODE:-csr}"
+
+hybrid_resolve_paths
+
+NM="${NM:-${HYBRID_TOOLCHAIN:+$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-nm}}"
+NM="${NM:-riscv64-unknown-elf-nm}"
+
+case "$TRIGGER_MODE" in
+  csr) ;;
+  pc)
+    if ! command -v "$NM" >/dev/null 2>&1; then
+      echo "skip[$FIXTURE pc]: nm not found at $NM"
+      exit 77
+    fi
+    # ROI_START / ROI_END name the two switch PCs (0x address or symbol in
+    # $VSIM_ELF). ./hsim run always passes them explicitly. When a caller
+    # leaves BOTH unset (e.g. the bulk runner scripts/run_e2e.sh), derive them
+    # from the fixture's milmb ROI markers via objdump, so pc mode needs no
+    # per-fixture config and no planted boundary symbols. A partial set or a
+    # derivation miss falls through to roi_resolve_pair's required-vars error.
+    if [ -z "${ROI_START:-}" ] && [ -z "${ROI_END:-}" ]; then
+      OBJDUMP="${OBJDUMP:-${HYBRID_TOOLCHAIN:+$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-objdump}}"
+      OBJDUMP="${OBJDUMP:-riscv64-unknown-elf-objdump}"
+      if command -v "$OBJDUMP" >/dev/null 2>&1 \
+         && MARKERS=$(roi_markers_from_disasm "$("$OBJDUMP" -d "$VSIM_ELF")"); then
+        ROI_START="0x${MARKERS%% *}"
+        ROI_END="0x${MARKERS##* }"
+        export ROI_START ROI_END
+      fi
+    fi
+    NM_OUT=$("$NM" --defined-only "$VSIM_ELF")
+    roi_resolve_pair "$NM_OUT" "$FIXTURE pc" || exit 1
+    ;;
+  *)
+    echo "FAIL[$FIXTURE]: unknown TRIGGER_MODE=$TRIGGER_MODE (use csr|pc)"
+    exit 1
+    ;;
+esac
+
+# 128 MB matches the QEMU virt machine default; vsim uses the same size.
+SHARED_SIZE=$((128 * 1024 * 1024))
+SHARED_MEM=$(mktemp -p /dev/shm vsim-e2e-shared.XXXXXX)
+STATE_QEMU=$(mktemp)
+STATE_VSIM=$(mktemp)
+SIM_LOG=$(mktemp)
+trap 'rm -f "$SHARED_MEM" "$STATE_QEMU" "$STATE_VSIM" "$SIM_LOG"' EXIT
+truncate -s "$SHARED_SIZE" "$SHARED_MEM"
+
+PLUGIN_ARGS="outfile=$STATE_QEMU"
+VSIM_TRIG_ARGS=()
+if [ "$TRIGGER_MODE" = "pc" ]; then
+  PLUGIN_ARGS="$PLUGIN_ARGS,enter_pc=0x$ENTER_PC"
+  VSIM_TRIG_ARGS=(--hybrid-exit-pc "0x$EXIT_PC")
+fi
+
+# F21: forward --vsim-warmup-icount when caller asked for a warmup window.
+VSIM_WARMUP_ARGS=()
+if [ "${WARMUP_ICOUNT:-0}" -gt 0 ] 2>/dev/null; then
+  VSIM_WARMUP_ARGS=(--vsim-warmup-icount "$WARMUP_ICOUNT")
+fi
+
+# Optional ROI kanata logging: hsim sets KANATA_FILE (and optionally
+# OBJDUMP_FILE) when the user passes --kanata. vsim's --kanata-roi auto-
+# derives the window from the resume PC and the unique exit PC.
+VSIM_KANATA_ARGS=()
+if [ -n "${KANATA_FILE:-}" ]; then
+  VSIM_KANATA_ARGS+=(--kanata "$KANATA_FILE" --kanata-roi)
+  if [ -n "${OBJDUMP_FILE:-}" ]; then
+    VSIM_KANATA_ARGS+=(--objdump "$OBJDUMP_FILE")
+  fi
+fi
+
+echo "[$FIXTURE 1/2 mode=$TRIGGER_MODE] QEMU 1: drain entry state"
+set +e
+"$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHARED_MEM,size=$SHARED_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -semihosting-config enable=on,target=native \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,$PLUGIN_ARGS" </dev/null >/dev/null 2>&1
+QEMU1_RC=$?
+set -e
+
+if [ "$QEMU1_RC" -ne 200 ]; then
+  echo "FAIL[$FIXTURE]: QEMU 1 expected exit 200 on drain, got $QEMU1_RC"
+  exit 1
+fi
+
+if [ ! -s "$STATE_QEMU" ]; then
+  echo "FAIL[$FIXTURE]: QEMU 1 did not produce state"
+  exit 1
+fi
+
+echo "[$FIXTURE 2/2 mode=$TRIGGER_MODE] vsim: resume + drain"
+set +e
+timeout "$TIMEOUT" "$VSIM_BIN" "$VSIM_ELF" \
+  --resume-from-qemu "$STATE_QEMU" \
+  --handoff-out "$STATE_VSIM" \
+  --shared-mem-path "$SHARED_MEM" \
+  --shared-mem-size "$SHARED_SIZE" \
+  --shared-mem-base 0x00000000 \
+  "${VSIM_TRIG_ARGS[@]}" \
+  "${VSIM_KANATA_ARGS[@]}" \
+  "${VSIM_WARMUP_ARGS[@]}" </dev/null >"$SIM_LOG" 2>&1
+VSIM_RC=$?
+set -e
+
+# vsim drained on the exit trigger and exited 200 (kExitHandoffToQemu).
+# Anything else is a hard failure: the cycle figure is only valid when vsim
+# drained cleanly.
+if [ "$VSIM_RC" -ne 200 ]; then
+  echo "FAIL[$FIXTURE]: vsim expected exit 200 (drain), got $VSIM_RC"
+  echo "--- sim log ---"
+  cat "$SIM_LOG"
+  exit 1
+fi
+
+# Kernel cycles (always) + opt-in monotonic check. Offsets locked by
+# state_abi_check.h (mcycle@624, minstret@632). vsim restores mcycle from
+# QEMU 1's drain then counts real clock cycles, so vsim_mcycle - qemu1_mcycle
+# is the measured region's cycle count. Runs before the RC gate so the
+# verdict is independent of any downstream-phase failure.
+if [ -s "$STATE_VSIM" ] && [ -s "$STATE_QEMU" ]; then
+  read_u64_le() { od -A n -j "$1" -N 8 -t u8 "$2" | tr -d ' \n'; }
+  Q1_MCYCLE=$(read_u64_le 624 "$STATE_QEMU")
+  Q1_MINST=$(read_u64_le  632 "$STATE_QEMU")
+  V_MCYCLE=$(read_u64_le  624 "$STATE_VSIM")
+  V_MINST=$(read_u64_le   632 "$STATE_VSIM")
+  echo "[$FIXTURE kernel_cycles] $((V_MCYCLE - Q1_MCYCLE))  (vsim mcycle=$V_MCYCLE - qemu1 mcycle=$Q1_MCYCLE)"
+  # F21: when WARMUP_ICOUNT is set, surface the snapshot pair so callers
+  # can verify the warmup window without re-parsing the state file.
+  # Offsets locked by include/hybrid/state_abi_check.h (F13):
+  #   mcycle_at_measure_start@3392, minstret_at_measure_start@3400.
+  if [ "${WARMUP_ICOUNT:-0}" -gt 0 ] 2>/dev/null; then
+    MS_MC=$(read_u64_le 3392 "$STATE_VSIM")
+    MS_MI=$(read_u64_le 3400 "$STATE_VSIM")
+    echo "[$FIXTURE warmup] K=$WARMUP_ICOUNT mcycle_at_measure_start=$MS_MC minstret_at_measure_start=$MS_MI"
+  fi
+  if [ "${CHECK_MCYCLE_MONOTONIC:-0}" = "1" ]; then
+    echo "[$FIXTURE mcycle/minstret] qemu1: mcycle=$Q1_MCYCLE minstret=$Q1_MINST"
+    echo "[$FIXTURE mcycle/minstret] vsim:  mcycle=$V_MCYCLE minstret=$V_MINST"
+    if [ "$V_MCYCLE" -le "$Q1_MCYCLE" ]; then
+      echo "FAIL[$FIXTURE]: mcycle not strictly increasing across vsim"
+      exit 1
+    fi
+    if [ "$V_MINST" -le "$Q1_MINST" ]; then
+      echo "FAIL[$FIXTURE]: minstret not strictly increasing across vsim"
+      exit 1
+    fi
+    echo "[$FIXTURE mcycle/minstret] PASS: strictly increasing"
+  fi
+fi
+
+echo "[$FIXTURE PASS] 2-phase handoff complete (QEMU 1 drain -> vsim drain)"
