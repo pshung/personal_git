@@ -1,0 +1,64 @@
+"""RAII owner for the session-wide /dev/shm shared mmap.
+
+A hybrid session shares one file-backed mmap across all spawns (QEMU 1 -> vsim
+-> QEMU 2 -> ...). The orchestrator owns the fd for the lifetime of the
+session so that:
+
+  - the kernel keeps the inode around even if every child closes/munmaps;
+  - the path stays stable across spawns (children mmap by path, not by fd);
+  - a crash leaves no leaked inode (TemporaryFile unlinks on close).
+
+Two construction modes:
+
+  MmapOwner.allocate(mem_size)
+      Create a fresh anonymous file under /dev/shm sized to `mem_size`.
+      Unlinked on context exit.
+
+  MmapOwner.attach(existing_path, mem_size)
+      Attach to an existing file (caller-owned lifecycle). Used when the
+      plan pins `mmap_path:` to a specific location.
+
+Both modes expose `path`, `size`, and the context-manager protocol.
+"""
+from __future__ import annotations
+
+import os
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import IO
+
+
+@dataclass
+class MmapOwner:
+    path: Path
+    size: int
+    _fp: IO[bytes] | None = None
+    _attached: bool = False
+
+    @classmethod
+    def allocate(cls, size: int,
+                 dir: str | Path = "/dev/shm",
+                 prefix: str = "orch-shared-") -> "MmapOwner":
+        if size <= 0:
+            raise ValueError(f"mmap size must be > 0, got {size}")
+        fp = tempfile.NamedTemporaryFile(  # noqa: SIM115 - close in __exit__
+            prefix=prefix, dir=str(dir), delete=True,
+        )
+        os.ftruncate(fp.fileno(), size)
+        return cls(path=Path(fp.name), size=size, _fp=fp, _attached=False)
+
+    @classmethod
+    def attach(cls, path: str | Path, size: int) -> "MmapOwner":
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"mmap path does not exist: {p}")
+        return cls(path=p, size=size, _fp=None, _attached=True)
+
+    def __enter__(self) -> "MmapOwner":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._fp is not None and not self._attached:
+            self._fp.close()  # TemporaryFile unlinks on close.
+            self._fp = None
