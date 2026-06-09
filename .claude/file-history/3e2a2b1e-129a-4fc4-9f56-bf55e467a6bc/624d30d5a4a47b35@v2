@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# F9 contract: `run --model hybrid` -- orchestrate a QEMU1 -> vsim handoff (no
+# QEMU2) and print the one-line window-cycle figure for the csr | pc | icount
+# triggers. Three layers:
+#
+#   1. unit (fast, no spawn): the elf-syms boundary resolver, hybrid_trigger
+#      (CLI -> Trigger, incl. pc symbol resolution + icount defaults), the
+#      trigger->argv mapping (plan-test), and the new CLI flags (cli-test).
+#   2. validation error paths via the real binary, all exiting BEFORE any spawn:
+#      missing ELF, pc without boundaries, an undefined pc symbol, simpoint
+#      (F11, not yet), and an unknown trigger.
+#   3. real handoff + golden parity (guarded): run csr/pc/icount through both
+#      ./hsim (the Python golden) and andes-sim and assert identical window
+#      cycle numbers, plus the new output format. Skipped when the qemu/vsim/
+#      plugin artifacts or the golden driver are not built.
+#
+# pc uses handoff_roundtrip.elf's own csr markers as the boundaries (_start =
+# the enter marker 0x100000, 0x10000c = the exit marker), so pc reproduces csr's
+# switch points exactly -- and exercises BOTH symbol and 0x resolution.
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+
+BIN="$ROOT/build/andes-sim"
+ELF="$ROOT/tests/fixtures/handoff_roundtrip.elf"  # asm fixture
+CELF="$ROOT/tests/fixtures/rt_c_matmul.elf"       # C fixture (needs shared mmap)
+SPIN="$ROOT/tests/fixtures/icount_spin.elf"
+ENG=verilator:ax45mpv_premium  # the engine ./hsim resolves by default
+
+bash "$ROOT/scripts/build_driver.sh" >/dev/null 2>&1 || fail "build_driver.sh failed"
+
+# 1. unit tests (the F9 pure cores)
+for t in elf-syms hybrid plan cli; do
+  "$ROOT/build/driver/andes-sim-$t-test" >/dev/null 2>&1 \
+    || fail "unit test andes-sim-$t-test failed"
+done
+echo "[ok] unit: elf-syms, hybrid_trigger, trigger->argv (plan), CLI flags"
+
+# 2. validation error paths -- real binary, but every case errors before a spawn
+# expect WANT_RC REGEX -- cmd...: run cmd, assert exit code + combined-output match
+expect() {
+  local want="$1" re="$2"; shift 2
+  local out rc
+  out=$("$@" 2>&1 </dev/null); rc=$?
+  [ "$rc" -eq "$want" ] || fail "rc=$rc want $want for [$*]: $out"
+  printf '%s\n' "$out" | grep -Eq "$re" || fail "missing /$re/ for [$*]: $out"
+}
+expect 2 'ELF not found'        "$BIN" run --model hybrid /no/such.elf
+expect 2 'engine args go after' "$BIN" run --model hybrid a.elf b.elf
+expect 2 'requires --pc-start'  "$BIN" run --model hybrid --trigger pc "$ELF"
+expect 2 'not defined' "$BIN" run --model hybrid --trigger pc \
+  --pc-start nope_xyz --pc-end _start "$ELF"
+expect 2 'F11'              "$BIN" run --model hybrid --trigger simpoint "$ELF"
+expect 2 'unknown trigger'  "$BIN" run --model hybrid --trigger bogus "$ELF"
+expect 2 'csr or pc'        "$BIN" run --model hybrid --trigger icount \
+  --kanata /tmp/k "$SPIN"
+expect 2 'requires --kanata' "$BIN" run --model hybrid --trigger csr \
+  --objdump /tmp/o "$ELF"
+echo "[ok] validation: missing ELF, pc boundaries, bad symbol, simpoint/unknown trigger, kanata/objdump"
+
+# 3. real handoff + golden parity (guarded on built artifacts)
+QEMU="$ROOT/build/qemu/qemu-system-riscv64"
+SIM="$ROOT/verilator/build/sim_ax45mpv_premium"
+PLUGIN="$ROOT/qemu_plugin/libhybrid_handoff.so"
+if [ -x "$QEMU" ] && [ -x "$SIM" ] && [ -f "$PLUGIN" ] && [ -x "$ROOT/hsim" ]; then
+  # Pull the window/kernel cycle integer from either driver's "] N  (vsim..."
+  # line (golden csr/pc say "kernel_cycles", icount/andes say "window_cycles";
+  # the number's position is identical).
+  cyc() { grep -oE '\] [0-9]+  \(' | grep -oE '[0-9]+' | head -1; }
+  check_parity() {  # LABEL GOLDEN_NUM ANDES_NUM
+    [ -n "$2" ] || fail "$1: golden produced no cycle number"
+    [ -n "$3" ] || fail "$1: andes-sim produced no cycle number"
+    [ "$2" = "$3" ] || fail "$1: cycle mismatch golden=$2 andes=$3"
+    echo "[ok] $1 parity: $3 cycles (golden == andes-sim)"
+  }
+
+  # csr -- also assert the new output format (window_cycles + PASS line)
+  GO=$(cd "$ROOT" && timeout 180 ./hsim run --mode csr "$ELF" 2>&1 | cyc)
+  AO=$(timeout 180 "$BIN" run --model hybrid --trigger csr --engine "$ENG" "$ELF" 2>&1)
+  printf '%s\n' "$AO" | grep -Eq '^\[csr window_cycles\] [0-9]+  \(vsim mcycle=' \
+    || fail "csr: missing window_cycles line: $AO"
+  printf '%s\n' "$AO" | grep -Eq '^PASS: --model hybrid --trigger csr ' \
+    || fail "csr: missing PASS line: $AO"
+  check_parity csr "$GO" "$(printf '%s\n' "$AO" | cyc)"
+
+  # csr on a C fixture -- the stack/heap + main()'s frame must survive the
+  # handoff through the shared mmap (asm fixtures are self-contained; this is
+  # the "+ C fixtures" half of the done-when).
+  GO=$(cd "$ROOT" && timeout 180 ./hsim run --mode csr "$CELF" 2>&1 | cyc)
+  AO=$(timeout 180 "$BIN" run --model hybrid --trigger csr --engine "$ENG" "$CELF" 2>&1 | cyc)
+  check_parity csr-c "$GO" "$AO"
+
+  # pc -- symbol start (_start) + 0x end (the exit marker)
+  GO=$(cd "$ROOT" && timeout 180 ./hsim run --mode pc \
+        --pc-start _start --pc-end 0x10000c "$ELF" 2>&1 | cyc)
+  AO=$(timeout 180 "$BIN" run --model hybrid --trigger pc --engine "$ENG" \
+        --pc-start _start --pc-end 0x10000c "$ELF" 2>&1 | cyc)
+  check_parity pc "$GO" "$AO"
+
+  # icount -- defaults (qemu 10000 / vsim 5000); andes keeps --shared-mem-* but
+  # the cycle number is unchanged (this is the deliberate-divergence guard).
+  GO=$(cd "$ROOT" && timeout 180 ./hsim run --mode icount "$SPIN" 2>&1 | cyc)
+  AO=$(timeout 180 "$BIN" run --model hybrid --trigger icount --engine "$ENG" "$SPIN" 2>&1 | cyc)
+  check_parity icount "$GO" "$AO"
+
+  # kanata ROI trace forwards onto the vsim leg and writes a non-empty file.
+  KAN=$(mktemp); rm -f "$KAN"
+  timeout 180 "$BIN" run --model hybrid --trigger csr --engine "$ENG" \
+    --kanata "$KAN" "$ELF" >/dev/null 2>&1
+  [ -s "$KAN" ] || fail "kanata: trace file empty/missing after csr run"
+  echo "[ok] kanata: csr run wrote a non-empty ROI trace ($(wc -l <"$KAN") lines)"
+  rm -f "$KAN"
+else
+  echo "[skip] real handoff parity: need built qemu+vsim+plugin and ./hsim"
+fi
+
+ok "F9 run --model hybrid (csr|pc|icount)"
