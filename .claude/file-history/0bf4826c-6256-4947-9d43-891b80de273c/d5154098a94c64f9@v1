@@ -1,0 +1,85 @@
+"""Subprocess factories for QEMU and vsim.
+
+argv builders are pure (no I/O), so they unit-test cleanly. The actual
+process spawn goes through `subprocess.Popen` directly in `runner.py`.
+
+QEMU 2's launch (`qemu_resume_argv`) mirrors `qemu_handback.hpp::spawn_qemu`
+in the vsim sources. The key invariant is: in shared-mmap (tier-2) mode,
+`-kernel` is OMITTED so QEMU 2 does not re-zero `.bss` / re-load `.data`
+on top of phase-2 memory.
+"""
+from __future__ import annotations
+
+import socket
+from pathlib import Path
+
+
+def qemu_drain_argv(qemu_bin: Path, elf: Path, plugin: Path,
+                    mmap_path: Path, mmap_size: int,
+                    state_out: Path) -> list[str]:
+    """QEMU 1: load ELF, drain on plugin's CSR/PC trigger, exit 200."""
+    mem_obj = (
+        f"memory-backend-file,id=mem,share=on,"
+        f"mem-path={mmap_path},size={mmap_size}"
+    )
+    return [
+        str(qemu_bin),
+        "-object", mem_obj,
+        "-machine", "andes_ae350,memory-backend=mem",
+        "-cpu", "andes-ax45mpv,vlen=512",
+        "-nographic",
+        "-semihosting-config", "enable=on,target=native",
+        "-bios", str(elf),
+        "-plugin", f"{plugin},outfile={state_out}",
+    ]
+
+
+def vsim_argv(vsim_bin: Path, elf: Path,
+              state_in: Path, state_out: Path,
+              mmap_path: Path, mmap_size: int,
+              shared_mem_base: int = 0x00000000) -> list[str]:
+    """vsim: resume from QEMU 1 state, run ROI, drain, exit 200.
+
+    `--qemu-binary` is intentionally omitted - the orchestrator spawns
+    QEMU 2 externally, so vsim's in-process handback path stays dormant
+    (see hybrid_vsim/src/main.cpp:478-490, kept for the bash harness).
+    """
+    return [
+        str(vsim_bin),
+        str(elf),
+        "--resume-from-qemu", str(state_in),
+        "--handoff-out", str(state_out),
+        "--shared-mem-path", str(mmap_path),
+        "--shared-mem-size", str(mmap_size),
+        "--shared-mem-base", hex(shared_mem_base),
+    ]
+
+
+def qemu_resume_argv(qemu_bin: Path, mmap_path: Path, mmap_size: int,
+                    gdb_port: int) -> list[str]:
+    """QEMU 2: start halted under gdbstub. No `-kernel`: shared mmap
+    already holds the ELF text/data from QEMU 1's launch."""
+    mem_obj = (
+        f"memory-backend-file,id=mem,share=on,"
+        f"mem-path={mmap_path},size={mmap_size}"
+    )
+    return [
+        str(qemu_bin),
+        "-object", mem_obj,
+        "-machine", "andes_ae350,memory-backend=mem",
+        "-cpu", "andes-ax45mpv,vlen=512",
+        "-bios", "none",
+        "-nographic",
+        "-semihosting-config", "enable=on,target=native",
+        "-gdb", f"tcp::{gdb_port}",
+        "-S",
+    ]
+
+
+def pick_free_port() -> int:
+    """Ask the kernel for a free loopback port. Subject to a small TOCTOU
+    race vs. the QEMU bind that follows; in practice safe enough for
+    test-driver use, mirrors `qemu_handback.hpp::pick_free_port`."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
