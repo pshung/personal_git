@@ -1,0 +1,173 @@
+// `andes-sim list fixtures|models|engines`.
+//
+// `list fixtures` is a faithful C++ port of the Python hsim `parse_fixtures`
+// + `list_fixtures`, so its output stays byte-identical to the golden driver
+// (the parity flywheel depends on this). `list models` is new surface (the
+// composition axis that replaced the old `--mode`). `list engines` is a
+// scaffold until runtime discovery lands in F2.
+#include <algorithm>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <set>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "cli.hpp"
+#include "models.hpp"
+#include "repo_root.hpp"
+
+namespace fs = std::filesystem;
+
+namespace andes_sim {
+namespace {
+
+std::string ljust(std::string s, size_t w) {
+  if (s.size() < w) s.append(w - s.size(), ' ');
+  return s;
+}
+
+std::vector<std::string> read_lines(const fs::path& p, bool& ok) {
+  std::ifstream f(p);
+  std::vector<std::string> lines;
+  ok = static_cast<bool>(f);
+  if (!ok) return lines;
+  std::string line;
+  while (std::getline(f, line)) lines.push_back(line);
+  return lines;
+}
+
+// Match a Makefile variable assignment at column 0: `VAR :?= <body>` where
+// VAR is [A-Z_][A-Z0-9_]*. Mirrors the Python regex anchor. On success sets
+// `var` and `body` (the text after `=`, continuation backslash included).
+bool parse_assignment(const std::string& line, std::string& var,
+                      std::string& body) {
+  const size_t n = line.size();
+  if (n == 0) return false;
+  char c0 = line[0];
+  if (!((c0 >= 'A' && c0 <= 'Z') || c0 == '_')) return false;
+  size_t p = 0;
+  while (p < n) {
+    char c = line[p];
+    if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') ++p;
+    else break;
+  }
+  var = line.substr(0, p);
+  while (p < n && (line[p] == ' ' || line[p] == '\t')) ++p;  // \s*
+  if (p < n && line[p] == ':') ++p;                          // :?
+  if (p >= n || line[p] != '=') return false;                // =
+  ++p;
+  body = line.substr(p);
+  return true;
+}
+
+struct Fixture {
+  std::string name;
+  std::string family;
+};
+
+// Extract fixture (name, family) rows from tests/fixtures/Makefile in stable,
+// family-grouped, file order; dedupe globally; append handoff_roundtrip last.
+std::vector<Fixture> parse_fixtures(const std::vector<std::string>& lines) {
+  static const std::pair<std::string, std::string> interesting[] = {
+      {"RT_FIXTURES", "asm"},
+      {"RT_C_FIXTURES", "c"},
+      {"RT_C_V_FIXTURES", "c+rvv"},
+      {"PROBE_V_FIXTURES", "probe"},
+  };
+  std::vector<Fixture> rows;
+  std::set<std::string> seen;
+
+  for (size_t k = 0; k < lines.size(); ++k) {
+    std::string var, body;
+    if (!parse_assignment(lines[k], var, body)) continue;
+    std::string family;
+    for (const auto& it : interesting)
+      if (it.first == var) { family = it.second; break; }
+    if (family.empty()) continue;
+
+    // Splice continuation lines: a trailing backslash + newline becomes a space.
+    size_t li = k;
+    while (!body.empty() && body.back() == '\\') {
+      body.pop_back();
+      body.push_back(' ');
+      if (++li < lines.size()) body += lines[li];
+      else break;
+    }
+
+    std::istringstream iss(body);
+    std::string name;
+    while (iss >> name)
+      if (seen.insert(name).second) rows.push_back({name, family});
+  }
+
+  // handoff_roundtrip is not in a *_FIXTURES var; list it explicitly.
+  if (seen.insert("handoff_roundtrip").second)
+    rows.push_back({"handoff_roundtrip", "asm"});
+
+  return rows;
+}
+
+int list_fixtures() {
+  fs::path mk = repo_root() / "tests" / "fixtures" / "Makefile";
+  bool ok;
+  std::vector<std::string> lines = read_lines(mk, ok);
+  if (!ok) {
+    std::fprintf(stderr, "andes-sim: missing %s\n", mk.c_str());
+    return 2;
+  }
+  std::vector<Fixture> rows = parse_fixtures(lines);
+
+  size_t width = 0;
+  for (const Fixture& r : rows) width = std::max(width, r.name.size());
+
+  std::printf("%s  FAMILY\n", ljust("FIXTURE", width).c_str());
+  for (const Fixture& r : rows)
+    std::printf("%s  %s\n", ljust(r.name, width).c_str(), r.family.c_str());
+  return 0;
+}
+
+int list_models() {
+  size_t wn = 5, we = 7;  // header widths: MODEL, ENGINES
+  for (const Model& m : kModels) {
+    wn = std::max(wn, m.name.size());
+    we = std::max(we, m.engines.size());
+  }
+  std::printf("%s  %s  NOTES\n", ljust("MODEL", wn).c_str(),
+              ljust("ENGINES", we).c_str());
+  for (const Model& m : kModels)
+    std::printf("%s  %s  %s\n", ljust(std::string(m.name), wn).c_str(),
+                ljust(std::string(m.engines), we).c_str(),
+                std::string(m.notes).c_str());
+  return 0;
+}
+
+int list_engines() {
+  // Runtime discovery (scan + --describe) lands in F2; emit the header so the
+  // command shape is stable from F1 on.
+  std::printf("ENGINE  TYPE  KIND  TRIGGERS\n");
+  std::printf("(engine discovery lands in F2; see driver/ROADMAP.md)\n");
+  return 0;
+}
+
+}  // namespace
+
+int cmd_list(const Cli& cli) {
+  if (cli.positional.empty()) {
+    std::fprintf(stderr,
+                 "andes-sim list: expected one of fixtures|models|engines\n");
+    return 2;
+  }
+  const std::string& t = cli.positional[0];
+  if (t == "fixtures") return list_fixtures();
+  if (t == "models") return list_models();
+  if (t == "engines") return list_engines();
+  std::fprintf(
+      stderr,
+      "andes-sim list: unknown target '%s' (want fixtures|models|engines)\n",
+      t.c_str());
+  return 2;
+}
+
+}  // namespace andes_sim

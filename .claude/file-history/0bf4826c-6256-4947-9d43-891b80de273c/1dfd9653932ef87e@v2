@@ -1,0 +1,144 @@
+#include "engine_registry.hpp"
+
+#include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <set>
+#include <sstream>
+
+#include <unistd.h>
+
+#include "json.hpp"
+#include "process.hpp"
+#include "repo_root.hpp"
+
+namespace fs = std::filesystem;
+
+namespace andes_sim {
+namespace {
+
+constexpr int kDescribeTimeoutMs = 5000;
+
+// The bundled functional engine. QEMU does not implement --describe, so its
+// descriptor is built in. Binary path honors $VSIM_QEMU (matching hsim) then
+// the default build location.
+EngineDescriptor builtin_qemu() {
+  EngineDescriptor d;
+  d.id = "qemu";
+  d.type = "qemu";
+  d.kind = "functional";
+  d.xlen = 64;
+  d.triggers = {"csr", "pc", "icount", "simpoint"};
+  d.roles = {"standalone", "fast-leg"};
+  d.state = {"drain"};
+  d.source = "built-in";
+  if (const char* q = std::getenv("VSIM_QEMU"); q && *q)
+    d.bin_path = q;
+  else
+    d.bin_path = (repo_root() / "build" / "qemu" / "qemu-system-riscv64").string();
+  return d;
+}
+
+bool is_executable_file(const fs::path& p) {
+  std::error_code ec;
+  if (!fs::is_regular_file(p, ec)) return false;
+  return ::access(p.c_str(), X_OK) == 0;
+}
+
+std::string read_file(const fs::path& p) {
+  std::ifstream f(p, std::ios::binary);
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
+}
+
+// Ask one binary to describe itself: try `<bin> --describe`, else read the
+// <bin>.json sidecar. On success fills `d` and returns true; on failure leaves
+// a human-readable note in `warn`.
+bool describe_one(const fs::path& bin, EngineDescriptor& d, std::string& warn) {
+  RunResult r = run_process({bin.string(), "--describe"}, kDescribeTimeoutMs);
+  if (!r.spawn_failed && !r.timed_out && r.rc == 0) {
+    json::Parsed p = json::parse(r.out);
+    if (p.ok) {
+      std::string err = descriptor_from_json(p.value, d);
+      if (err.empty()) {
+        d.bin_path = bin.string();
+        d.source = "--describe";
+        return true;
+      }
+      warn = bin.string() + ": --describe JSON invalid: " + err;
+    } else {
+      warn = bin.string() + ": --describe output is not JSON: " + p.error;
+    }
+  }
+
+  fs::path sidecar = bin;
+  sidecar += ".json";
+  std::error_code ec;
+  if (fs::exists(sidecar, ec)) {
+    json::Parsed p = json::parse(read_file(sidecar));
+    if (p.ok) {
+      EngineDescriptor sd;
+      std::string err = descriptor_from_json(p.value, sd);
+      if (err.empty()) {
+        sd.bin_path = bin.string();
+        sd.source = "sidecar";
+        d = std::move(sd);
+        return true;
+      }
+      warn = sidecar.string() + ": invalid descriptor: " + err;
+    } else {
+      warn = sidecar.string() + ": not JSON: " + p.error;
+    }
+  }
+
+  if (warn.empty()) warn = bin.string() + ": no --describe and no sidecar";
+  return false;
+}
+
+void scan_dir(const fs::path& dir, bool require_sim_prefix, Discovery& out,
+              std::set<std::string>& seen) {
+  std::error_code ec;
+  if (!fs::is_directory(dir, ec)) return;
+
+  std::vector<fs::path> entries;
+  for (const auto& e : fs::directory_iterator(dir, ec)) entries.push_back(e.path());
+  std::sort(entries.begin(), entries.end());  // stable, deterministic order
+
+  for (const fs::path& p : entries) {
+    if (require_sim_prefix && p.filename().string().rfind("sim_", 0) != 0) continue;
+    if (!is_executable_file(p)) continue;
+    EngineDescriptor d;
+    std::string warn;
+    if (describe_one(p, d, warn)) {
+      if (seen.insert(d.id).second) out.engines.push_back(std::move(d));
+    } else if (!warn.empty()) {
+      out.warnings.push_back(warn);
+    }
+  }
+}
+
+}  // namespace
+
+Discovery discover_engines() {
+  Discovery out;
+  std::set<std::string> seen;
+
+  EngineDescriptor qemu = builtin_qemu();
+  seen.insert(qemu.id);
+  out.engines.push_back(std::move(qemu));
+
+  if (const char* env = std::getenv("ANDES_SIM_ENGINES_DIR"); env && *env) {
+    std::stringstream ss(env);
+    std::string dir;
+    while (std::getline(ss, dir, ':'))
+      if (!dir.empty()) scan_dir(dir, /*require_sim_prefix=*/false, out, seen);
+  } else {
+    scan_dir(repo_root() / "verilator" / "build", /*require_sim_prefix=*/true,
+             out, seen);
+  }
+  return out;
+}
+
+}  // namespace andes_sim
