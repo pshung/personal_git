@@ -1,0 +1,104 @@
+/* Tier-2 C-level fixture: 16x16x16 GEMM via RVV intrinsics
+ * (2-phase: QEMU1 -> vsim).
+ *
+ *   QEMU 1: init_matrices -- RVV vid.v + vadd.vx + vrem.vx fills A and B.
+ *           V instructions retire just before the entry drain, exercising
+ *           the plugin's HandoffSite translation-time PC capture (the
+ *           old qemu_plugin_read_register("pc") path lagged for V).
+ *   vsim:   vmatmul_kernel -- RVV outer-product GEMM (vle32 + vmacc.vx +
+ *           vse32). C is written to .bss inside the ROI; the exit_vsim
+ *           "memory" clobber anchors the stores so the kernel survives.
+ *           vsim drains at the exit marker and exits 200.
+ *
+ * (The old phase-3 QEMU2 scalar re-verify was removed with the QEMU2 leg;
+ * the fixture now validates that the RVV GEMM kernel runs and drains.)
+ *
+ * RVV shape
+ *   VLEN=512, e32, LMUL=1 -> vlmax = 16 elements per V reg, exactly one
+ *   row of a 16-wide matrix. The kernel runs N outer iterations (one per
+ *   row of A), each accumulating into a single V register seeded to zero
+ *   and storing it back as one row of C.
+ *
+ * Cross-phase memory survival (same convention as rt_c_matmul.c)
+ *   Matrices sit in .bss. The "no redundant ELF reload" rule keeps phase-1
+ *   .bss writes intact through the shared memory-backend-file.
+ */
+#include "runtime/rt_c_helpers.h"
+
+#include <riscv_vector.h>
+#include <stdint.h>
+
+#define N 16
+
+static int32_t A[N * N];
+static int32_t B[N * N];
+static int32_t C[N * N];
+
+#define AT(M, i, j) ((M)[(i) *N + (j)])
+
+/* Vectorized init: one V register holds [0, 1, ..., N-1], reused across
+ * rows. Per row i: A[i][:] = (vidx + i)   % 7, B[i][:] = (vidx + 3i) % 5.
+ * vid.v writes unsigned lane indices; reinterpret to signed so the rest of
+ * the math (and the int32_t* matrix pointers) stay in i32 land. */
+static void init_matrices(void)
+{
+  size_t           vl     = __riscv_vsetvl_e32m1((size_t) N);
+  const vuint32m1_t vidx_u = __riscv_vid_v_u32m1(vl);
+  const vint32m1_t  vidx   = __riscv_vreinterpret_v_u32m1_i32m1(vidx_u);
+
+  for (int i = 0; i < N; i++) {
+    vint32m1_t va = __riscv_vadd_vx_i32m1(vidx, i, vl);
+    va            = __riscv_vrem_vx_i32m1(va, 7, vl);
+    __riscv_vse32_v_i32m1(&AT(A, i, 0), va, vl);
+
+    vint32m1_t vb = __riscv_vadd_vx_i32m1(vidx, i * 3, vl);
+    vb            = __riscv_vrem_vx_i32m1(vb, 5, vl);
+    __riscv_vse32_v_i32m1(&AT(B, i, 0), vb, vl);
+  }
+}
+
+/* Outer-product RVV GEMM: for each row i of C, accumulate
+ *   C[i][:] += A[i][k] * B[k][:]
+ * using a single V register per row.
+ *
+ * noinline keeps the kernel a distinct symbol at -O1 so PC-range modes can
+ * anchor on it, and keeps every kernel op inside the marker span (a call
+ * cannot be reordered across the memory-clobbering enter/exit markers; see
+ * runtime/rt_c_helpers.h cycle-attribution contract). */
+static void __attribute__((noinline)) vmatmul_kernel(void)
+{
+  for (int i = 0; i < N; i++) {
+    size_t     vl   = __riscv_vsetvl_e32m1((size_t) N);
+    vint32m1_t vacc = __riscv_vmv_v_x_i32m1(0, vl);
+    for (int k = 0; k < N; k++) {
+      const int32_t  a_ik = AT(A, i, k);
+      const vint32m1_t vb_k =
+        __riscv_vle32_v_i32m1(&AT(B, k, 0), vl);
+      vacc = __riscv_vmacc_vx_i32m1(vacc, a_ik, vb_k, vl);
+    }
+    __riscv_vse32_v_i32m1(&AT(C, i, 0), vacc, vl);
+  }
+}
+
+int main(void)
+{
+  /* Phase 1 (QEMU 1): seed inputs only. */
+  init_matrices();
+
+#ifndef HYBRID_MARKERLESS
+  enter_vsim();
+#endif
+
+  /* Phase 2 (vsim): RVV kernel only. No I/O permitted. */
+  vmatmul_kernel();
+
+#ifndef HYBRID_MARKERLESS
+  exit_vsim();
+#else
+  /* No exit marker to anchor the C stores; force them live so the kernel
+   * is not eliminated (the QEMU2 verify that read C was removed). */
+  __asm__ __volatile__("" ::: "memory");
+#endif
+
+  return 0;
+}

@@ -1,0 +1,333 @@
+"""Session runner: iterate `session.steps`, dispatch each spawn, validate state.
+
+F8 turned the F4 hard-coded 3-spawn shape into a generic loop over
+`session.steps`. Each step nominates a (model, trigger) pair; the runner
+dispatches per-(model, trigger.kind) to the right argv builder and exit-code
+contract:
+
+  (qemu, csr|icount|phase)    drain spawn: writes state_out, expects rc=200.
+  (vsim, csr|icount|phase)    vsim drain: reads state_in, writes state_out,
+                              expects rc=200.
+
+There is no QEMU 2 leg (the vsim -> QEMU2 handback was removed); a plan with
+a `qemu` step under any non-drain trigger is rejected.
+
+The shared `/dev/shm` mmap is owned by `MmapOwner` for the whole session so
+the fd survives every spawn boundary (children mmap by path).
+
+Archive (`step.archive_as`) is accepted as a no-op in F8; F9 wires the
+copy-out to `snap/N/`.
+"""
+from __future__ import annotations
+
+import contextlib
+import os
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+from orchestrator.abi import HybridStateV1, validate_state_file
+from orchestrator.checkpoint import write_archive
+from orchestrator.mmap_owner import MmapOwner
+from orchestrator.plan import Session, Step
+from orchestrator.spawn import qemu_drain_argv, vsim_argv
+
+# Drain triggers: the spawn exits 200 with a state file on disk.
+_DRAIN_TRIGGERS = frozenset({"csr", "icount", "phase"})
+
+
+@dataclass(frozen=True)
+class SessionResult:
+    """Per-session run outcome.
+
+    `exit_code` is 0 on success (every step matched its expected return), or
+    the last spawn's non-conformant rc on failure (e.g. drain expected but
+    workload returned 0).
+
+    `state_paths` lists the state-file Path produced by each drain step in
+    spawn order. Every step drains now (the QEMU2 resume-and-finish leg was
+    removed).
+    """
+    exit_code: int
+    state_paths: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class WarmupBreakdown:
+    """F20: 3-way cycle/insn split derived from a vsim drain state file.
+
+    The vsim ROI is partitioned at the K-th-commit snapshot boundary:
+
+      [vsim entry] -- warmup (cold caches) -- [snapshot] -- measure -- [drain]
+                       ^ warmup_cycles                       ^ measure_cycles
+                       ^------------ total_cycles ---------------------^
+
+    Field semantics (cycles units; matching `_insns` fields are minstret):
+      total_cycles   = state.mcycle                       (whole vsim window)
+      warmup_cycles  = state.mcycle_at_measure_start      (snapshot value)
+      measure_cycles = total_cycles - warmup_cycles       (ROI-final figure)
+
+    `enabled` is False when the snapshot never fired
+    (`mcycle_at_measure_start == 0`): K=0 was passed, or the workload exited
+    inside the warmup window. In that case the measure window equals the
+    total window and warmup is reported as 0 cycles.
+    """
+    total_cycles:   int
+    warmup_cycles:  int
+    measure_cycles: int
+    total_insns:    int
+    warmup_insns:   int
+    measure_insns:  int
+    enabled:        bool
+
+    def format_lines(self) -> tuple[str, ...]:
+        """Render the 3-way breakdown as fixed-width lines for CLI printing."""
+        if not self.enabled:
+            return (
+                f"warmup: disabled "
+                f"(total {self.total_cycles} cycles, "
+                f"{self.total_insns} insns)",
+            )
+        return (
+            f"warmup:  {self.warmup_cycles:>14} cycles  "
+            f"{self.warmup_insns:>14} insns",
+            f"measure: {self.measure_cycles:>14} cycles  "
+            f"{self.measure_insns:>14} insns",
+            f"total:   {self.total_cycles:>14} cycles  "
+            f"{self.total_insns:>14} insns",
+        )
+
+
+def cycle_breakdown(state_path: Path) -> WarmupBreakdown:
+    """Compute the F20 3-way breakdown from a vsim-drained state file.
+
+    Returns a WarmupBreakdown ready to be `format_lines()`-printed.
+    Raises ValueError if the snapshot's mcycle_at_measure_start exceeds
+    state.mcycle (or the minstret pair is similarly inconsistent), which
+    would mean the snapshot fired AFTER drain and the wire-format
+    invariant has been violated.
+    """
+    state = HybridStateV1.from_buffer_copy(Path(state_path).read_bytes())
+    snap_mc, snap_mi = (state.mcycle_at_measure_start,
+                        state.minstret_at_measure_start)
+    enabled = snap_mc > 0
+    if enabled and snap_mc > state.mcycle:
+        raise ValueError(
+            f"snapshot mcycle ({snap_mc}) exceeds drained mcycle "
+            f"({state.mcycle}); state file is corrupt or out of order"
+        )
+    if enabled and snap_mi > state.minstret:
+        raise ValueError(
+            f"snapshot minstret ({snap_mi}) exceeds drained minstret "
+            f"({state.minstret}); state file is corrupt or out of order"
+        )
+    if not enabled:
+        return WarmupBreakdown(
+            total_cycles=state.mcycle,
+            warmup_cycles=0,
+            measure_cycles=state.mcycle,
+            total_insns=state.minstret,
+            warmup_insns=0,
+            measure_insns=state.minstret,
+            enabled=False,
+        )
+    return WarmupBreakdown(
+        total_cycles=state.mcycle,
+        warmup_cycles=snap_mc,
+        measure_cycles=state.mcycle - snap_mc,
+        total_insns=state.minstret,
+        warmup_insns=snap_mi,
+        measure_insns=state.minstret - snap_mi,
+        enabled=True,
+    )
+
+
+@dataclass(frozen=True)
+class Artifacts:
+    qemu: Path
+    vsim: Path
+    plugin: Path
+
+    @classmethod
+    def from_env(cls, project_root: Path) -> "Artifacts":
+        return cls(
+            qemu=Path(os.environ.get(
+                "VSIM_QEMU", project_root / "build" / "qemu"
+                / "qemu-system-riscv64",
+            )),
+            vsim=Path(os.environ.get(
+                "VSIM_BIN", project_root / "hybrid_vsim" / "build"
+                / "sim_ax45mpv_premium",
+            )),
+            plugin=Path(os.environ.get(
+                "VSIM_PLUGIN", project_root / "qemu_plugin"
+                / "libhybrid_handoff.so",
+            )),
+        )
+
+
+def _wait(proc: subprocess.Popen, timeout: float) -> int:
+    try:
+        return proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise
+
+
+def run_session(session: Session, project_root: Path,
+                artifacts: Artifacts | None = None,
+                spawn_timeout: float = 90.0,
+                work_dir: Path | None = None,
+                archive_root: Path | None = None,
+                initial_state_in: Path | None = None) -> SessionResult:
+    """Execute every step in `session.steps` and return the aggregate result.
+
+    If `work_dir` is provided, state files persist under it as
+    `orch-state-{idx}.bin`. Otherwise a `TemporaryDirectory` is created and
+    cleaned up on exit - state paths are only meaningful while the runner
+    holds them.
+
+    `archive_root` is the parent directory under which `step.archive_as`
+    resolves: a step with `archive_as: "snap/0"` writes its artefacts into
+    `archive_root / "snap" / "0"`. Defaults to `project_root`. Steps
+    without `archive_as` skip the archive write.
+
+    `initial_state_in` seeds the first step's `state_in` (the input to a
+    drain spawn). F10 (`replay_checkpoint`) sets this to
+    the archive's `state.bin` so the first step can resume mid-workload.
+    Default `None` matches today's behavior: a session starts cold and the
+    first step must be a model+trigger combination that does not require a
+    prior state file.
+    """
+    if not session.steps:
+        raise ValueError("session must have at least one step")
+    if any(s.trigger.params.get("hart_id", 0) != 0 for s in session.steps):
+        raise ValueError("multi-hart (hart_id != 0) is out of scope for v1")
+
+    artifacts = artifacts or Artifacts.from_env(project_root)
+    elf = project_root / session.elf
+    archive_root = archive_root or project_root
+    cpu_variant = _cpu_variant_from_vsim(artifacts.vsim)
+
+    with contextlib.ExitStack() as stack:
+        if work_dir is None:
+            wd = Path(stack.enter_context(
+                tempfile.TemporaryDirectory(prefix="orch-work-")
+            ))
+        else:
+            wd = work_dir
+
+        if session.mmap_path:
+            shm = stack.enter_context(
+                MmapOwner.attach(session.mmap_path, session.mem_size)
+            )
+        else:
+            shm = stack.enter_context(MmapOwner.allocate(session.mem_size))
+
+        state_paths: list[Path] = []
+        prev_state: Path | None = initial_state_in
+        last_rc = 0
+        for idx, step in enumerate(session.steps):
+            state_out = (
+                wd / f"orch-state-{idx}.bin"
+                if step.trigger.kind in _DRAIN_TRIGGERS else None
+            )
+            last_rc = _execute_step(
+                step, artifacts, elf, shm, prev_state, state_out,
+                spawn_timeout,
+            )
+            if state_out is not None:
+                validate_state_file(state_out)
+                state_paths.append(state_out)
+                prev_state = state_out
+                if step.archive_as is not None:
+                    write_archive(
+                        archive_root / step.archive_as,
+                        state_path=state_out,
+                        mmap_path=shm.path, mmap_size=shm.size,
+                        elf_path=session.elf,
+                        source_step_index=idx,
+                        cpu_variant=cpu_variant,
+                        region_id=step.archive_as,
+                        slice_index=_slice_index_from_archive_as(
+                            step.archive_as
+                        ),
+                    )
+        return SessionResult(exit_code=last_rc, state_paths=tuple(state_paths))
+
+
+def _cpu_variant_from_vsim(vsim_bin: Path) -> str | None:
+    """Best-effort: vsim binary name encodes CPU variant (sim_<variant>).
+
+    Returns None when the binary name does not match the convention, so
+    F10's replay validation can tell "archive lacks the field" from
+    "archive claims a mismatched variant".
+    """
+    name = vsim_bin.name
+    if name.startswith("sim_"):
+        return name[len("sim_"):]
+    return None
+
+
+def _slice_index_from_archive_as(archive_as: str) -> int | None:
+    """Parse the trailing path component as int; None on non-numeric."""
+    tail = Path(archive_as).name
+    try:
+        return int(tail)
+    except ValueError:
+        return None
+
+
+def _execute_step(step: Step, arts: Artifacts, elf: Path, shm: MmapOwner,
+                  state_in: Path | None, state_out: Path | None,
+                  timeout: float) -> int:
+    if step.model == "qemu":
+        if step.trigger.kind in _DRAIN_TRIGGERS:
+            assert state_out is not None
+            _qemu_drain(arts, elf, shm, state_out, timeout)
+            return 0
+        raise ValueError(
+            f"unsupported (model=qemu, trigger={step.trigger.kind})"
+        )
+    if step.model == "vsim":
+        if step.trigger.kind in _DRAIN_TRIGGERS:
+            if state_in is None:
+                raise ValueError(
+                    f"vsim step requires state_in from a prior drain"
+                )
+            assert state_out is not None
+            _vsim_drain(arts, elf, state_in, state_out, shm, timeout)
+            return 0
+        raise ValueError(
+            f"unsupported (model=vsim, trigger={step.trigger.kind})"
+        )
+    raise ValueError(f"unknown model: {step.model!r}")
+
+
+def _qemu_drain(arts: Artifacts, elf: Path, shm: MmapOwner,
+                state_out: Path, timeout: float) -> None:
+    argv = qemu_drain_argv(arts.qemu, elf, arts.plugin, shm.path, shm.size,
+                           state_out)
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    rc = _wait(proc, timeout)
+    if rc != 200:
+        raise RuntimeError(
+            f"qemu drain expected exit 200, got {rc}. argv={argv}"
+        )
+
+
+def _vsim_drain(arts: Artifacts, elf: Path, state_in: Path, state_out: Path,
+                shm: MmapOwner, timeout: float) -> None:
+    argv = vsim_argv(arts.vsim, elf, state_in, state_out, shm.path, shm.size)
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                            stdout=sys.stderr, stderr=sys.stderr)
+    rc = _wait(proc, timeout)
+    if rc != 200:
+        raise RuntimeError(
+            f"vsim expected exit 200 (drained), got {rc}. argv={argv}"
+        )

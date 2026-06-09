@@ -1,0 +1,102 @@
+"""Session-plan grammar for the orchestrator.
+
+A plan is a YAML document with two top-level keys:
+
+    session:
+      mem_size:  int      # bytes; size of the shared /dev/shm mmap
+      mmap_path: str|null # null => orchestrator picks under /dev/shm
+      elf:       str      # ELF launched by every spawn in the session
+
+    steps:
+      - model:   "qemu" | "vsim"
+        trigger: { kind: ..., <kind-specific params...> }
+        on_exit: { archive_as: "snap/N" }   # optional
+
+Trigger kinds recognised today (the parser accepts any kind; whether a
+given trigger is actually supported by the targeted model is the spawn
+layer's concern, landing in F4/F5/F6/F8):
+
+    csr             -- CSR/PC matcher (today's default)
+    icount          -- retire-count threshold (F5/F6)
+    phase           -- BBV slice consume (F11)
+    end_of_program  -- spawn runs to workload completion (rc=0)
+"""
+from __future__ import annotations
+
+import dataclasses
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+@dataclasses.dataclass(frozen=True)
+class TriggerSpec:
+    kind: str
+    params: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass(frozen=True)
+class Step:
+    model: str
+    trigger: TriggerSpec
+    archive_as: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Session:
+    elf: str
+    mem_size: int
+    mmap_path: str | None
+    steps: tuple[Step, ...]
+
+
+_VALID_MODELS = frozenset({"qemu", "vsim"})
+
+
+def load_plan(path: str | Path) -> Session:
+    raw = yaml.safe_load(Path(path).read_text())
+    if not isinstance(raw, dict):
+        raise ValueError(f"plan {path}: top-level must be a mapping")
+    if "session" not in raw or "steps" not in raw:
+        raise ValueError(
+            f"plan {path}: missing 'session' or 'steps' top-level key"
+        )
+
+    session_raw = raw["session"]
+    steps_raw = raw["steps"]
+    if not isinstance(steps_raw, list) or not steps_raw:
+        raise ValueError(f"plan {path}: 'steps' must be a non-empty list")
+
+    steps = tuple(_parse_step(s, path, i) for i, s in enumerate(steps_raw))
+    return Session(
+        elf=str(session_raw["elf"]),
+        mem_size=int(session_raw["mem_size"]),
+        mmap_path=session_raw.get("mmap_path"),
+        steps=steps,
+    )
+
+
+def _parse_step(d: dict[str, Any], path: str | Path, idx: int) -> Step:
+    model = d.get("model")
+    if model not in _VALID_MODELS:
+        raise ValueError(
+            f"plan {path} step {idx}: model={model!r} not in {sorted(_VALID_MODELS)}"
+        )
+
+    trig_raw = d.get("trigger")
+    if not isinstance(trig_raw, dict) or "kind" not in trig_raw:
+        raise ValueError(
+            f"plan {path} step {idx}: 'trigger' must be a mapping with 'kind'"
+        )
+    kind = str(trig_raw["kind"])
+    params = {k: v for k, v in trig_raw.items() if k != "kind"}
+
+    on_exit = d.get("on_exit") or {}
+    archive_as = on_exit.get("archive_as") if isinstance(on_exit, dict) else None
+
+    return Step(
+        model=str(model),
+        trigger=TriggerSpec(kind=kind, params=params),
+        archive_as=archive_as,
+    )
