@@ -1,0 +1,94 @@
+/* Tier-2 C-level fixture: 1D 3-tap FIR convolution split across all three
+ * handoff phases, with the V regfile as the carrier of state between
+ * QEMU 1 <-> vsim and vsim <-> QEMU 2.
+ *
+ * Workload
+ *   y[i] = x[i-1] + 2 * x[i] + x[i+1]     (zero-padded at the edges)
+ *   x[i] = i + 1                          (i in 0..15)
+ *
+ * Phase split (mirrors a realistic hybrid-sim use case: fast functional
+ * setup / cycle-accurate vector kernel / fast functional verify):
+ *
+ *   QEMU 1   generate x via vid + 1
+ *   vsim     apply the FIR kernel: vslide1up / vslide1down + vadd
+ *   QEMU 2   vse32 y, scalar verify against the lane-wise closed form
+ *
+ * V regfile transport
+ *   x rides QEMU 1 -> vsim in its compiler-picked V register.
+ *   y rides vsim   -> QEMU 2 in its compiler-picked V register.
+ *
+ *   The fixture never names a physical V register. vsim transparently
+ *   saves/restores the full 32-V-reg regfile bit-identically at each
+ *   boundary via the Debug Module Program Buffer (see ResumeDriver and
+ *   StateDrain) -- the benchmark issues no transport code. Because every V
+ *   reg's contents survive the round trip, the compiler's per-variable
+ *   tracking ("x lives in v_compiler_choice") stays valid across enter_vsim
+ *   and exit_vsim and the body of main() can be written in pure RVV
+ *   intrinsics.
+ *
+ * Transport-coverage note
+ *   This fixture exercises V-regfile transport only if the compiler computes
+ *   x in phase 1 and carries it in a V register across enter_vsim (rather
+ *   than rematerializing vid+1 in phase 2). The Andes GCC does this on its
+ *   own at -O1..-O3 -- verified byte-identical with and without an explicit
+ *   asm volatile("" : : "vr"(x)) force-live guard -- so no guard is used. If
+ *   a future toolchain rematerializes x past the drain, the test would pass
+ *   via recompute instead of transport (silent coverage loss); re-add the
+ *   "vr" guards before enter_vsim / exit_vsim then.
+ *
+ * VLEN contract: VLEN=512, e32 m1 -> 16 lanes per V reg. N=16.
+ *
+ * Phase-2 rule: no syscalls between enter_vsim and exit_vsim (vsim does
+ * not implement semihosting).
+ */
+#include "runtime/rt_c_helpers.h"
+
+#include <riscv_vector.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#define N 16
+
+int main(void)
+{
+  const size_t vl = __riscv_vsetvl_e32m1((size_t) N);
+
+  /* Phase 1 (QEMU 1): x = [1, 2, 3, ..., N] via vid + 1. */
+  const vuint32m1_t vid_u = __riscv_vid_v_u32m1(vl);
+  const vint32m1_t  x     = __riscv_vadd_vx_i32m1(
+        __riscv_vreinterpret_v_u32m1_i32m1(vid_u), 1, vl);
+
+  enter_vsim();
+
+  /* Phase 2 (vsim): 3-tap FIR convolution
+   *   x_left[i]  = (i == 0)     ? 0 : x[i - 1]   (vslide1up)
+   *   x_right[i] = (i == N - 1) ? 0 : x[i + 1]   (vslide1down)
+   *   y[i]       = x_left[i] + 2 * x[i] + x_right[i] */
+  const vint32m1_t x_left  = __riscv_vslide1up_vx_i32m1(x, 0, vl);
+  const vint32m1_t x_right = __riscv_vslide1down_vx_i32m1(x, 0, vl);
+  const vint32m1_t two_x   = __riscv_vsll_vx_i32m1(x, 1, vl);          /* 2*x */
+  const vint32m1_t partial = __riscv_vadd_vv_i32m1(x_left, two_x, vl); /* x_left + 2x */
+  const vint32m1_t y       = __riscv_vadd_vv_i32m1(partial, x_right, vl);
+
+  exit_vsim();
+
+  /* Phase 3 (QEMU 2): store y and verify. */
+  int32_t out[N];
+  __riscv_vse32_v_i32m1(out, y, vl);
+
+  for (int i = 0; i < N; i++) {
+    const int32_t x_im1 = (i == 0)     ? 0 : i;        /* x[i-1] zero-padded */
+    const int32_t x_i   = i + 1;                        /* x[i] */
+    const int32_t x_ip1 = (i == N - 1) ? 0 : (i + 2);   /* x[i+1] zero-padded */
+    const int32_t expected = x_im1 + 2 * x_i + x_ip1;
+    if (out[i] != expected) {
+      printf("rt_c_v_regs: FAIL i=%d got=%d expected=%d\n", i, (int) out[i],
+             (int) expected);
+      fflush(stdout);
+      return 1;
+    }
+  }
+  printf("rt_c_v_regs: PASS\n");
+  fflush(stdout);
+  return 0;
+}
