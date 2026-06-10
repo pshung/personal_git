@@ -1,0 +1,171 @@
+// Unit tests for the pure cores of `run` (no spawn):
+//   - passthrough_argv (F7): fill an engine's role invoke template ({bin}/{elf})
+//     then append the verbatim post-`--` engine args -- the data path behind
+//     `run --model fast prog.elf -- -gdb tcp::1234 -S` behaving like raw QEMU.
+//   - resolve_accurate_engine (F8): pick the cycle-accurate engine for
+//     `run --model accurate` (explicit --engine or the sole default; the
+//     ambiguous / missing / wrong-kind error branches).
+//
+// The live spawn path (run_passthrough -> exec_passthrough) is exercised
+// end-to-end by tests/andes_sim/test_andes_sim_f{7,8}.sh; exec_passthrough's
+// stdio-inherit + exit-code propagation is already covered by the F5 infra
+// test, so this file stays pure. Plain assert-and-count harness.
+#include <string>
+#include <vector>
+
+#include "engine_descriptor.hpp"
+#include "engine_registry.hpp"
+#include "run_passthrough.hpp"
+#include "test_check.hpp"
+
+using namespace andes_sim;
+using andes_sim::test::check_eq;
+
+namespace {
+
+// The standalone template the built-in qemu descriptor ships (engine_registry):
+// the andes functional config, {bin}/{elf} to be filled.
+EngineDescriptor fake_qemu() {
+  EngineDescriptor d;
+  d.id = "qemu";
+  d.bin_path = "/q";
+  d.invoke.push_back(
+      {"standalone",
+       {"{bin}", "-machine", "andes_ae350", "-cpu", "andes-ax45mpv,vlen=512",
+        "-nographic", "-semihosting-config", "enable=on,target=native", "-bios",
+        "{elf}"}});
+  return d;
+}
+
+// A minimal engine descriptor for the resolution tests: only id + kind matter
+// to resolve_accurate_engine.
+EngineDescriptor eng(const std::string& id, const std::string& kind) {
+  EngineDescriptor d;
+  d.id = id;
+  d.kind = kind;
+  return d;
+}
+
+}  // namespace
+
+int main() {
+  const EngineDescriptor q = fake_qemu();
+
+  // The F7 done-when shape: post-`--` engine args (here a gdbstub) append
+  // verbatim AFTER the filled standalone template.
+  {
+    std::string err;
+    std::vector<std::string> got = passthrough_argv(
+        q, "standalone", "/prog.elf", {"-gdb", "tcp::1234", "-S"}, err);
+    CHECK(err.empty());
+    check_eq(got,
+             {"/q", "-machine", "andes_ae350", "-cpu", "andes-ax45mpv,vlen=512",
+              "-nographic", "-semihosting-config", "enable=on,target=native",
+              "-bios", "/prog.elf", "-gdb", "tcp::1234", "-S"},
+             "gdbstub");
+  }
+
+  // No passthrough args: just the filled template, {elf} in place.
+  {
+    std::string err;
+    std::vector<std::string> got =
+        passthrough_argv(q, "standalone", "/prog.elf", {}, err);
+    CHECK(err.empty());
+    check_eq(got,
+             {"/q", "-machine", "andes_ae350", "-cpu", "andes-ax45mpv,vlen=512",
+              "-nographic", "-semihosting-config", "enable=on,target=native",
+              "-bios", "/prog.elf"},
+             "no-pass");
+  }
+
+  // A role the engine has no template for is an error, not a silent partial
+  // argv (the caller must not spawn a half-built command line).
+  {
+    std::string err;
+    std::vector<std::string> got =
+        passthrough_argv(q, "accurate-leg", "/prog.elf", {}, err);
+    CHECK(got.empty());
+    CHECK(!err.empty());
+  }
+
+  // --- resolve_accurate_engine (F8): which cycle-accurate engine `accurate` runs ---
+  const EngineDescriptor qemu = eng("qemu", "functional");
+  const EngineDescriptor v1 = eng("vsim:ax45mpv_premium", "cycle-accurate");
+  const EngineDescriptor v2 = eng("vsim:ax66_makatau", "cycle-accurate");
+
+  // No --engine, exactly one cycle-accurate engine: that one is the default.
+  {
+    std::vector<EngineDescriptor> engines = {qemu, v1};
+    std::string err;
+    const EngineDescriptor* got = resolve_accurate_engine(engines, "", err);
+    CHECK(got == &engines[1]);
+    CHECK(err.empty());
+  }
+  // No --engine, two cycle-accurate engines: ambiguous -> error naming both.
+  {
+    std::vector<EngineDescriptor> engines = {qemu, v1, v2};
+    std::string err;
+    CHECK(resolve_accurate_engine(engines, "", err) == nullptr);
+    CHECK(err.find("multiple") != std::string::npos);
+    CHECK(err.find("vsim:ax45mpv_premium") != std::string::npos);
+    CHECK(err.find("vsim:ax66_makatau") != std::string::npos);
+  }
+  // No --engine, zero cycle-accurate engines (qemu is functional): error.
+  {
+    std::vector<EngineDescriptor> engines = {qemu};
+    std::string err;
+    CHECK(resolve_accurate_engine(engines, "", err) == nullptr);
+    CHECK(!err.empty());
+  }
+  // Explicit --engine selects that engine among several cycle-accurate ones.
+  {
+    std::vector<EngineDescriptor> engines = {qemu, v1, v2};
+    std::string err;
+    const EngineDescriptor* got =
+        resolve_accurate_engine(engines, "vsim:ax66_makatau", err);
+    CHECK(got == &engines[2]);
+    CHECK(err.empty());
+  }
+  // Explicit --engine that matches no discovered engine: error.
+  {
+    std::vector<EngineDescriptor> engines = {qemu, v1};
+    std::string err;
+    CHECK(resolve_accurate_engine(engines, "vsim:nope", err) == nullptr);
+    CHECK(err.find("vsim:nope") != std::string::npos);
+  }
+  // Explicit --engine naming a functional engine (qemu): wrong kind -> error.
+  {
+    std::vector<EngineDescriptor> engines = {qemu, v1};
+    std::string err;
+    CHECK(resolve_accurate_engine(engines, "qemu", err) == nullptr);
+    CHECK(err.find("cycle-accurate") != std::string::npos);
+  }
+
+  // --- normalize_engine_label: the vsim binary self-reports the third-party
+  // simulator name; the product surface speaks "vsim". One translation point so
+  // every downstream consumer (list / --engine / errors / banner) sees the
+  // product id.
+  {  // the legacy label is rewritten in both type and the id prefix
+    EngineDescriptor d = eng("verilator:ax45mpv_premium", "cycle-accurate");
+    d.type = "verilator";
+    normalize_engine_label(d);
+    CHECK(d.type == "vsim");
+    CHECK(d.id == "vsim:ax45mpv_premium");
+  }
+  {  // the built-in functional engine is untouched
+    EngineDescriptor d = eng("qemu", "functional");
+    d.type = "qemu";
+    normalize_engine_label(d);
+    CHECK(d.type == "qemu");
+    CHECK(d.id == "qemu");
+  }
+  {  // a different backend passes through verbatim (only verilator is renamed)
+    EngineDescriptor d = eng("alioth:x", "cycle-accurate");
+    d.type = "alioth";
+    normalize_engine_label(d);
+    CHECK(d.type == "alioth");
+    CHECK(d.id == "alioth:x");
+  }
+
+  return andes_sim::test::report("run");
+}

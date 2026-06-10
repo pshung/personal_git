@@ -1,0 +1,99 @@
+// Runtime engine discovery -- the hot-plug seam.
+//
+// discover_engines() returns the built-in qemu descriptor plus every engine
+// found by scanning a directory and asking each binary to self-report via
+// `--describe` (falling back to a <bin>.json sidecar). No engine is compiled
+// into the framework; dropping a freshly built sim_<cfg> into the scan dir
+// makes it appear here with no andes-sim rebuild.
+//
+// Scan dir: $ANDES_SIM_ENGINES_DIR (colon-separated; REPLACES the default and
+// accepts any executable) if set, else <repo>/verilator/build (filtered to
+// sim_* binaries).
+#ifndef ANDES_SIM_ENGINE_REGISTRY_HPP
+#define ANDES_SIM_ENGINE_REGISTRY_HPP
+
+#include <string>
+#include <vector>
+
+#include "engine_descriptor.hpp"
+#include "strutil.hpp"
+
+namespace andes_sim {
+
+struct Discovery {
+  std::vector<EngineDescriptor> engines;   // deduped by id; qemu first
+  std::vector<std::string> warnings;       // binaries that failed to describe
+};
+
+Discovery discover_engines();
+
+// The bundled qemu descriptor (no directory scan, no --describe subprocess).
+// discover_engines() seeds the registry with it; `run --model fast` resolves
+// qemu through it directly, paying none of the Verilator-engine discovery cost.
+EngineDescriptor builtin_qemu();
+
+// Rewrite a discovered engine's identity from the third-party simulator name to
+// the product name: type "verilator" -> "vsim", id "verilator:<cfg>" ->
+// "vsim:<cfg>". discover_engines() applies this once, before the id is used for
+// dedup or shown anywhere, so every downstream consumer (list / --engine /
+// errors / run banner) speaks "vsim" and a user never sees "verilator". Any
+// other backend (qemu, a drop-in alioth/sid) passes through untouched.
+inline void normalize_engine_label(EngineDescriptor& d) {
+  if (d.type == "verilator") d.type = "vsim";
+  if (d.id.rfind("verilator:", 0) == 0) d.id = "vsim:" + d.id.substr(10);
+}
+
+// Select the cycle-accurate engine for `run --model accurate` from an
+// already-discovered set (pure; spawns nothing). With `want_id` empty, default
+// to the sole cycle-accurate engine -- erroring if there are none or more than
+// one (ambiguous). With `want_id` set, that engine must exist and be
+// cycle-accurate. Returns nullptr and sets `err` (naming the available
+// cycle-accurate ids) on any failure; the returned pointer aliases into
+// `engines`, so it must outlive the result.
+inline const EngineDescriptor* resolve_accurate_engine(
+    const std::vector<EngineDescriptor>& engines, const std::string& want_id,
+    std::string& err) {
+  auto is_accurate = [](const EngineDescriptor& e) {
+    return e.kind == "cycle-accurate";
+  };
+  auto accurate_ids = [&] {
+    std::vector<std::string> ids;
+    for (const EngineDescriptor& e : engines)
+      if (is_accurate(e)) ids.push_back(e.id);
+    return join(ids, ", ");
+  };
+
+  if (!want_id.empty()) {  // explicit --engine
+    for (const EngineDescriptor& e : engines) {
+      if (e.id != want_id) continue;
+      if (is_accurate(e)) return &e;
+      err = "engine '" + want_id + "' is " +
+            (e.kind.empty() ? "not cycle-accurate" : e.kind) +
+            "; model accurate needs a cycle-accurate engine";
+      return nullptr;
+    }
+    std::string have = accurate_ids();
+    err = "no engine '" + want_id + "'" +
+          (have.empty() ? " (no cycle-accurate engines found)"
+                        : " (cycle-accurate engines: " + have + ")");
+    return nullptr;
+  }
+
+  // No --engine: default to the sole cycle-accurate engine.
+  const EngineDescriptor* sole = nullptr;
+  int n = 0;
+  for (const EngineDescriptor& e : engines)
+    if (is_accurate(e)) { sole = &e; ++n; }
+  if (n == 1) return sole;
+  if (n == 0)
+    err = "model accurate: no cycle-accurate engine found "
+          "(build one with: andes-sim build --what vsim)";
+  else
+    err = "model accurate: multiple cycle-accurate engines; select one with "
+          "--engine (have: " + accurate_ids() + ")";
+  return nullptr;
+}
+
+}  // namespace andes_sim
+
+#endif  // ANDES_SIM_ENGINE_REGISTRY_HPP
