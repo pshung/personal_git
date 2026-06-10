@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+# Generates docs/andes_sim_tutorial.ipynb (nbformat 4.4). Outputs are real
+# captures from running the built ./build/andes-sim in this repo.
+import json, sys
+
+cells = []
+_ec = 0
+
+def md(text):
+    cells.append({"cell_type": "markdown", "metadata": {}, "source": text})
+
+def code(src, out=None):
+    global _ec
+    _ec += 1
+    outputs = []
+    if out is not None:
+        outputs.append({"output_type": "stream", "name": "stdout", "text": out})
+    cells.append({"cell_type": "code", "metadata": {},
+                  "execution_count": _ec, "outputs": outputs, "source": src})
+
+# ---------------------------------------------------------------- intro
+md("""# andes-sim: a hands-on tutorial
+
+`andes-sim` is one command that drives the Andes RISC-V simulators. This
+notebook teaches it by running **real examples** against the binary built in
+this repo (`build/andes-sim`). Every output below came from an actual run.
+
+## The mental model: one run = MODEL x ENGINE ( x TRIGGER )
+
+To run something you pick up to three things:
+
+| Axis | Question it answers | Choices |
+|------|---------------------|---------|
+| **model**   | which simulators run, and how they combine | `fast`, `cycle`, `hybrid` |
+| **engine**  | which concrete simulator binary            | `qemu` (built in) or `vsim:<cpu>` (discovered) |
+| **trigger** | (hybrid only) where the measured region starts and ends | `csr`, `pc`, `icount` |
+
+The three models in one picture:
+
+```
+fast    QEMU only        fast (MHz speed), functional only, NO cycle count
+cycle   one vsim only    cycle-accurate, but runs the WHOLE program in RTL (slow)
+hybrid  QEMU  ->  vsim    QEMU fast-forwards; vsim measures only the region you pick
+```
+
+`hybrid` is the reason the tool exists: QEMU runs the boring parts quickly,
+and the cycle-accurate vsim measures only the small region of interest (ROI).
+
+> Note: `andes-sim` is the multi-engine driver and uses `--model` / `--engine`
+> / `--trigger`. The older `./hsim` driver uses `--mode`; this tutorial is
+> about `andes-sim`.""")
+
+# ---------------------------------------------------------------- setup
+md("""## Setup
+
+Prerequisites: the driver, the simulators, and the test fixtures are already
+built (`build/andes-sim`, `verilator/build/sim_*`, `build/qemu/...`, the QEMU
+plugin, and `tests/fixtures/*.elf`). If any are missing:
+
+```sh
+bash scripts/build_driver.sh      # the driver only
+# or, everything:
+source ./setup.sh                 # qemu + vsim + plugin + simpoint
+make -C tests/fixtures -j         # the .elf fixtures
+```
+
+Launch Jupyter from the repo root. The next cell locates the binary and
+defines one helper, `sim(...)`, that runs `andes-sim` and prints what it
+prints. Every later cell calls it.""")
+
+code('''import os, subprocess
+from pathlib import Path
+
+def _find_root():
+    here = Path.cwd().resolve()
+    for d in (here, *here.parents):
+        if (d / "build" / "andes-sim").exists():
+            return d
+    raise SystemExit(
+        "Could not find build/andes-sim. Build it with\\n"
+        "    bash scripts/build_driver.sh\\n"
+        "and launch Jupyter from the repo root.")
+
+ROOT = _find_root()
+SIM  = ROOT / "build" / "andes-sim"
+print("repo root :", ROOT)
+print("andes-sim :", SIM)
+
+def sim(*args, timeout=300, env=None, full_stderr=False):
+    """Run `andes-sim <args>` from the repo root and print its output.
+
+    stdout is shown verbatim (the result lives there). From stderr we keep
+    only andes-sim's own lines (the [andes-sim] banner + diagnostics) and
+    drop the engine's verbose boot log; pass full_stderr=True to see all.
+    """
+    argv = [str(SIM), *map(str, args)]
+    print("$ andes-sim " + " ".join(map(str, args)))
+    environ = {**os.environ, **(env or {})}
+    try:
+        p = subprocess.run(argv, cwd=ROOT, env=environ,
+                           stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=timeout)
+        out, err, rc = p.stdout, p.stderr, p.returncode
+    except subprocess.TimeoutExpired as ex:           # long RTL runs
+        out = ex.stdout or ""                          # may be bytes on timeout
+        err = ex.stderr or ""
+        if isinstance(out, (bytes, bytearray)): out = out.decode(errors="replace")
+        if isinstance(err, (bytes, bytearray)): err = err.decode(errors="replace")
+        rc  = None
+    if out:
+        print(out, end="" if out.endswith("\\n") else "\\n")
+    keep = err if full_stderr else "\\n".join(
+        ln for ln in err.splitlines()
+        if ln.startswith(("andes-sim", "[andes-sim]")))
+    if keep.strip():
+        print("--- stderr ---")
+        print(keep if keep.endswith("\\n") else keep + "\\n", end="")
+    print("[timed out]" if rc is None else f"[exit {rc}]")
+    return rc''',
+"repo root : /home/nick/work/hybrid_sim\nandes-sim : /home/nick/work/hybrid_sim/build/andes-sim\n")
+
+# ---------------------------------------------------------------- 1 discover
+md("""## 1. Discover what is available
+
+Start with `--help`. The release surface is deliberately small: just `run`
+and `list`.""")
+
+code('sim("--help")',
+"""$ andes-sim --help
+usage: andes-sim <cmd> [args...]
+
+Multi-engine driver for the Andes simulators (QEMU + vsim).
+
+commands:
+  run        run one simulation (--model fast|cycle|hybrid)
+  list       list models|engines
+
+(set ANDES_SIM_DEV=1 to show developer commands)
+[exit 0]
+""")
+
+md("""Developer commands (`build`, `test`, `doctor`) are hidden by default and
+shown only when `ANDES_SIM_DEV=1` is set. They are for working on the repo,
+not for running simulations.""")
+
+code('sim("--help", env={"ANDES_SIM_DEV": "1"})',
+"""$ andes-sim --help
+usage: andes-sim <cmd> [args...]
+
+Multi-engine driver for the Andes simulators (QEMU + vsim).
+
+commands:
+  run        run one simulation (--model fast|cycle|hybrid)
+  list       list models|engines
+
+developer commands:
+  build      build artifacts (qemu, vsim, plugin, simpoint, fixtures, driver)
+  test       run the end-to-end suite
+  doctor     check environment health
+[exit 0]
+""")
+
+md("`list models` shows the three compositions and what each one is for.")
+
+code('sim("list", "models")',
+"""$ andes-sim list models
+MODEL   ENGINES       NOTES
+fast    qemu          functional
+cycle   vsim:<cfg>    cycle-accurate
+hybrid  qemu -> vsim  QEMU fast-forwards, vsim measures the ROI; pick --trigger csr|pc|icount
+[exit 0]
+""")
+
+md("""`list engines` shows the concrete simulators. `qemu` is built in. The
+`vsim:<cpu>` rows are discovered at runtime by scanning `verilator/build/` for
+binaries that can describe themselves, so building a new CPU config makes it
+appear here with no code change.
+
+- **KIND** is what the selector keys on: `functional` (QEMU) vs
+  `cycle-accurate` (vsim). `cycle` and `hybrid` need a `cycle-accurate` engine.
+- **VLEN** is the vector register width in bits (`-` means not reported).""")
+
+code('sim("list", "engines")',
+"""$ andes-sim list engines
+ENGINE                 TYPE  KIND            VLEN
+qemu                   qemu  functional      -
+vsim:ax45mpv_mp2       vsim  cycle-accurate  512
+vsim:ax45mpv_premium   vsim  cycle-accurate  512
+vsim:ax46mpv_advanced  vsim  cycle-accurate  512
+vsim:ax66_makatau      vsim  cycle-accurate  128
+vsim:d23               vsim  cycle-accurate  -
+[exit 0]
+""")
+
+md("""> This repo has **five** cycle-accurate engines built. When more than one
+> exists, `cycle` and `hybrid` cannot guess which to use, so you must name one
+> with `--engine` (shown later). If only one were built, it would be picked
+> automatically.""")
+
+# ---------------------------------------------------------------- 2 fast
+md("""## 2. Model `fast` - QEMU only (functional)
+
+`fast` runs the ELF on QEMU alone. It is a **transparent passthrough**: the
+program's own input/output flows straight through, and QEMU's exit code is
+propagated. You get speed and a functional result, but **no cycle count**.
+
+The `run` flags:
+
+```
+--model fast|cycle|hybrid          which composition
+--engine <id>                      pick a specific engine (e.g. vsim:ax45mpv_premium)
+--trigger csr|pc|icount            ROI delimiter (hybrid only)
+-- <args...>                       forward everything after -- to the engine, verbatim
+```
+
+First, a program that finishes on its own. `rt_c_v_matmul_free.elf` is a
+silent compute kernel, so there is no printout - QEMU just runs it to the end
+and exits 0.""")
+
+code('sim("run", "--model", "fast", "tests/fixtures/rt_c_v_matmul_free.elf")',
+"""$ andes-sim run --model fast tests/fixtures/rt_c_v_matmul_free.elf
+[exit 0]
+""")
+
+md("""To *see* passthrough, run a fixture that prints. `rt_c_hello.elf` prints a
+banner, then runs the two handoff markers that mark a region for `hybrid`.
+
+Under `fast` there is no vsim to hand off to, so after the banner the program
+just waits. We cap it with a short `timeout` - this is expected, and it shows
+why these fixtures are really meant for `hybrid`.""")
+
+code('sim("run", "--model", "fast", "tests/fixtures/rt_c_hello.elf", timeout=8)',
+"""$ andes-sim run --model fast tests/fixtures/rt_c_hello.elf
+hello from QEMU1
+[timed out]
+""")
+
+# ---------------------------------------------------------------- 3 cycle
+md("""## 3. Model `cycle` - one vsim, from reset (cycle-accurate, slow)
+
+`cycle` runs the ELF on a single vsim engine **from reset**, in RTL. It is also
+a transparent passthrough - you see the engine's own log. It is cycle-accurate
+but slow, because it simulates the *entire* program (boot, libc init, the
+kernel, teardown) at the gate level.
+
+Because this repo has several cycle-accurate engines, `cycle` first refuses to
+guess and tells you to pick one:""")
+
+code('sim("run", "--model", "cycle", "tests/fixtures/rt_c_v_matmul_free.elf")',
+"""$ andes-sim run --model cycle tests/fixtures/rt_c_v_matmul_free.elf
+--- stderr ---
+andes-sim run --model cycle: model cycle: multiple cycle-accurate engines; select one with --engine (have: vsim:ax45mpv_mp2, vsim:ax45mpv_premium, vsim:ax46mpv_advanced, vsim:ax66_makatau, vsim:d23)
+[exit 2]
+""")
+
+md("""Now name an engine with `--engine`. We use `full_stderr=True` to see
+vsim's boot log, and a short `timeout` to keep the demo brief.""")
+
+code('''sim("run", "--model", "cycle", "--engine", "vsim:ax45mpv_premium",
+    "tests/fixtures/rt_c_v_matmul_free.elf", timeout=20, full_stderr=True)''',
+"""$ andes-sim run --model cycle --engine vsim:ax45mpv_premium tests/fixtures/rt_c_v_matmul_free.elf
+--- stderr ---
+[info] loading segment: addr=0x100000, memsz=40352, filesz=36304
+[info] hart 0 reset vector: 0x100000
+[timed out]
+""")
+
+md("""**Important limitation.** vsim does **not** implement semihosting - every
+guest system call trap is fatal (see `docs/vsim_semihosting_investigation.md`).
+The fixtures do their I/O through the Andes `libgloss_vh` semihosting path,
+which only QEMU handles. So a standalone `cycle` run of one of these programs
+never reaches a clean exit on its own; it is bounded only by the `timeout`
+above.
+
+This is precisely why **hybrid** exists: let QEMU handle the semihosting-heavy
+boot and teardown, and let vsim measure just the region of interest. Use
+`cycle` standalone for bare workloads that do no semihosting I/O, or for short
+bounded runs.""")
+
+# ---------------------------------------------------------------- 4 hybrid
+md("""## 4. Model `hybrid` - the headline
+
+`hybrid` runs two legs in one command:
+
+```
+QEMU1  -- drained state + shared memory -->  vsim
+(fast-forward to the ROI)                    (measure the ROI, then drain)
+```
+
+The result is **window_cycles**: the vsim cycle count for the region, measured
+as `vsim mcycle - qemu mcycle`. Output layout:
+
+- **stdout** carries the result: an `[hsim mmap]` line, the
+  `[... window_cycles] N` line, and a `PASS:` line.
+- **stderr** carries the `[andes-sim] model=... engine=... trigger=...` banner.
+
+The **trigger** decides where the measured region begins and ends:
+
+| Trigger | Profiles          | How the region is delimited |
+|---------|-------------------|------------------------------|
+| `csr`   | a kernel you mark | two `csrwi 0x7C0, 0/1` markers compiled into the source |
+| `pc`    | a kernel          | two explicit PCs you pass (`--pc-start`, `--pc-end`); a symbol or `0x` address |
+| `icount`| a sampled window  | instruction counts: fast-forward N, then measure M (no markers) |
+
+> The absolute `mcycle=...` numbers in the output are a free-running counter
+> and differ on every run. The bracketed `window_cycles` value is the figure
+> you care about, and it is deterministic for a given ELF + engine + trigger.""")
+
+md("""### 4a. trigger `csr` - measure a marked kernel
+
+`rt_c_v_matmul.elf` wraps its kernel in the two `csrwi 0x7C0, 0/1` markers, so
+the trigger needs no parameters. This is the canonical example.""")
+
+code('''sim("run", "--model", "hybrid", "--trigger", "csr",
+    "--engine", "vsim:ax45mpv_premium",
+    "tests/fixtures/rt_c_v_matmul.elf")''',
+"""$ andes-sim run --model hybrid --trigger csr --engine vsim:ax45mpv_premium tests/fixtures/rt_c_v_matmul.elf
+[hsim mmap] 128.0 MiB at /dev/shm (free: 251.9 GiB)
+[csr window_cycles] 22808  (vsim mcycle=528351608616204 - qemu mcycle=528351608593396)
+PASS: --model hybrid --trigger csr (rt_c_v_matmul)
+--- stderr ---
+[andes-sim] model=hybrid engine=vsim:ax45mpv_premium trigger=csr fixture=rt_c_v_matmul
+[exit 0]
+""")
+
+md("""### 4b. trigger `pc` - measure between two PCs
+
+When the binary has no markers, pass the boundary PCs yourself. `--pc-start`
+accepts a **symbol name** (andes-sim resolves it from the ELF) or a `0x`
+address; `--pc-end` is the same. Both are required.
+
+`rt_c_v_matmul_free.elf` is the markerless twin of the kernel above. We start
+at the `vmatmul_kernel` symbol and end at the return point after its call in
+`main`. The cell resolves that end PC with `objdump` (needs `$HYBRID_TOOLCHAIN`)
+and falls back to the known address.""")
+
+code('''ELF = "tests/fixtures/rt_c_v_matmul_free.elf"
+tc  = os.environ.get("HYBRID_TOOLCHAIN", "")
+END = "0x1002c4"   # insn after `jal vmatmul_kernel` in main (fallback)
+objdump = os.path.join(tc, "bin", "riscv64-unknown-elf-objdump") if tc else ""
+if objdump and os.path.exists(objdump):
+    lines = subprocess.run([objdump, "-d", str(ROOT / ELF)],
+                           capture_output=True, text=True).stdout.splitlines()
+    after = False
+    for i, ln in enumerate(lines):
+        if "<main>:" in ln:
+            after = True
+        elif after and "jal" in ln and "<vmatmul_kernel>" in ln:
+            END = "0x" + lines[i + 1].split(":")[0].strip()
+            break
+print("pc-start = vmatmul_kernel   pc-end =", END)
+
+sim("run", "--model", "hybrid", "--trigger", "pc",
+    "--engine", "vsim:ax45mpv_premium",
+    "--pc-start", "vmatmul_kernel", "--pc-end", END, ELF)''',
+"""pc-start = vmatmul_kernel   pc-end = 0x1002c4
+$ andes-sim run --model hybrid --trigger pc --engine vsim:ax45mpv_premium --pc-start vmatmul_kernel --pc-end 0x1002c4 tests/fixtures/rt_c_v_matmul_free.elf
+[hsim mmap] 128.0 MiB at /dev/shm (free: 251.9 GiB)
+[pc window_cycles] 22769  (vsim mcycle=528595698639853 - qemu mcycle=528595698617084)
+PASS: --model hybrid --trigger pc (rt_c_v_matmul_free)
+--- stderr ---
+[andes-sim] model=hybrid engine=vsim:ax45mpv_premium trigger=pc fixture=rt_c_v_matmul_free
+[exit 0]
+""")
+
+md("""`pc` here measured `22769` cycles versus `csr`'s `22808` - both wrap the
+same single `vmatmul_kernel` call, so the figures match closely. The small
+difference is where each boundary lands relative to the marker instructions.""")
+
+md("""### 4c. trigger `icount` - sample a window by instruction count
+
+For workloads you cannot edit and do not want to mark. QEMU fast-forwards
+`--qemu-icount` instructions, then vsim measures `--vsim-icount` instructions
+and drains. No markers needed. Defaults are `10000` / `5000`.""")
+
+code('''sim("run", "--model", "hybrid", "--trigger", "icount",
+    "--engine", "vsim:ax45mpv_premium",
+    "--qemu-icount", "2000", "--vsim-icount", "1000",
+    "tests/fixtures/rt_c_v_matmul_free.elf")''',
+"""$ andes-sim run --model hybrid --trigger icount --engine vsim:ax45mpv_premium --qemu-icount 2000 --vsim-icount 1000 tests/fixtures/rt_c_v_matmul_free.elf
+[hsim mmap] 128.0 MiB at /dev/shm (free: 251.9 GiB)
+[icount window_cycles] 13182  (vsim mcycle=528475913589534 - qemu mcycle=528475913576352)
+PASS: --model hybrid --trigger icount (rt_c_v_matmul_free)
+--- stderr ---
+[andes-sim] model=hybrid engine=vsim:ax45mpv_premium trigger=icount fixture=rt_c_v_matmul_free
+[exit 0]
+""")
+
+# ---------------------------------------------------------------- 5 engine
+md("""## 5. Picking an engine with `--engine`
+
+`--engine <id>` selects which simulator to use. For `fast` it must be `qemu`
+(the only functional engine). For `cycle` and `hybrid` it names one of the
+`vsim:<cpu>` rows from `list engines`. Different CPU configs have different
+microarchitectures and VLEN, so the same workload reports different cycles.
+
+Try it yourself - rerun the csr example on a 128-bit-VLEN core and compare:
+
+```python
+sim("run", "--model", "hybrid", "--trigger", "csr",
+    "--engine", "vsim:ax66_makatau",
+    "tests/fixtures/rt_c_v_matmul.elf")
+```
+
+If you omit `--engine` while several cycle-accurate engines are built, you get
+the `select one with --engine` error from section 3.""")
+
+# ---------------------------------------------------------------- 6 passthrough
+md("""## 6. Forwarding native engine flags with `--`
+
+Everything after a lone `--` is passed to the engine **verbatim**; andes-sim
+does not interpret it. This lets you use an engine's own command line - for
+example a gdbstub on the functional engine:
+
+```python
+# QEMU opens a gdb server on :1234 and waits (Ctrl-C to stop).
+sim("run", "--model", "fast", "tests/fixtures/rt_c_hello.elf",
+    "--", "-gdb", "tcp::1234", "-S")
+```
+
+The `--` boundary is what lets `fast` and `cycle` expose the full native CLI of
+their engine, so you can attach a debugger, a monitor, or a console exactly as
+if you had launched the simulator directly.""")
+
+# ---------------------------------------------------------------- 7 dev
+md("""## 7. Developer commands (optional)
+
+Set `ANDES_SIM_DEV=1` to reveal `build`, `test`, and `doctor` (section 1). They
+build the artifacts, run the end-to-end suite, and check environment health -
+useful when working on the repo, not when just running simulations. For most
+build/test work the documented entry points are `bash scripts/build_driver.sh`,
+`source ./setup.sh`, and `bash scripts/run_e2e.sh` (use `JOBS=8`).""")
+
+# ---------------------------------------------------------------- 8 cheatsheet
+md("""## 8. Cheat sheet and where to go next
+
+```sh
+andes-sim list models                       # the 3 compositions
+andes-sim list engines                       # the concrete simulators
+andes-sim run --model fast  ELF              # QEMU only, functional
+andes-sim run --model cycle --engine vsim:<cpu> ELF      # one vsim, from reset
+andes-sim run --model hybrid --trigger csr    --engine vsim:<cpu> ELF
+andes-sim run --model hybrid --trigger pc     --engine vsim:<cpu> --pc-start S --pc-end E ELF
+andes-sim run --model hybrid --trigger icount --engine vsim:<cpu> --qemu-icount N --vsim-icount M ELF
+```
+
+Next:
+
+- `docs/USER_GUIDE.md` - the full guide (build, configure, every mode).
+- `docs/switching_modes_tutorial.md` - one deep-dive exercise per trigger.
+- `CLAUDE.md` - key files and the architecture summary.""")
+
+# ---------------------------------------------------------------- emit
+nb = {
+    "cells": cells,
+    "metadata": {
+        "kernelspec": {"display_name": "Python 3", "language": "python",
+                       "name": "python3"},
+        "language_info": {"name": "python"},
+    },
+    "nbformat": 4,
+    "nbformat_minor": 4,
+}
+
+dest = sys.argv[1]
+with open(dest, "w") as f:
+    json.dump(nb, f, indent=1, ensure_ascii=True)
+    f.write("\n")
+print("wrote", dest, "with", len(cells), "cells")
