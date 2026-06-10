@@ -1,0 +1,152 @@
+#include "process.hpp"
+
+#include <cerrno>
+#include <ctime>
+
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+namespace andes_sim {
+namespace {
+
+long now_ms() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+// fork + (optional chdir) + (optional stdin from /dev/null) + exec + wait. The
+// child always inherits this process's stdout and stderr. Returns the child's
+// exit code, 128+signal if it was signalled, or -1 on empty argv / fork
+// failure. Backs both run_inherit (build: stdin closed, chdir) and
+// exec_passthrough (run fast/accurate: stdin inherited, no chdir).
+int spawn_inherit(const std::vector<std::string>& argv, const std::string& cwd,
+                  bool stdin_from_devnull) {
+  if (argv.empty()) return -1;
+
+  pid_t pid = fork();
+  if (pid < 0) return -1;
+
+  if (pid == 0) {  // child
+    if (!cwd.empty() && chdir(cwd.c_str()) != 0) _exit(127);
+    if (stdin_from_devnull) {
+      int devnull = open("/dev/null", O_RDONLY);
+      if (devnull >= 0) {
+        dup2(devnull, STDIN_FILENO);
+        if (devnull > 2) close(devnull);
+      }
+    }
+    std::vector<char*> cargv;
+    cargv.reserve(argv.size() + 1);
+    for (const std::string& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
+    cargv.push_back(nullptr);
+    execvp(cargv[0], cargv.data());
+    _exit(127);  // exec failed
+  }
+
+  int status = 0;
+  waitpid(pid, &status, 0);
+  if (WIFEXITED(status)) return WEXITSTATUS(status);
+  if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+  return -1;
+}
+
+}  // namespace
+
+RunResult run_process(const std::vector<std::string>& argv, int timeout_ms) {
+  RunResult r;
+  if (argv.empty()) {
+    r.spawn_failed = true;
+    return r;
+  }
+
+  int fds[2];
+  if (pipe(fds) != 0) {
+    r.spawn_failed = true;
+    return r;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(fds[0]);
+    close(fds[1]);
+    r.spawn_failed = true;
+    return r;
+  }
+
+  if (pid == 0) {  // child
+    close(fds[0]);
+    dup2(fds[1], STDOUT_FILENO);
+    int devnull = open("/dev/null", O_RDWR);
+    if (devnull >= 0) {
+      dup2(devnull, STDIN_FILENO);
+      dup2(devnull, STDERR_FILENO);
+      if (devnull > 2) close(devnull);
+    }
+    close(fds[1]);
+    std::vector<char*> cargv;
+    cargv.reserve(argv.size() + 1);
+    for (const std::string& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
+    cargv.push_back(nullptr);
+    execvp(cargv[0], cargv.data());
+    _exit(127);  // exec failed
+  }
+
+  // parent
+  close(fds[1]);
+  int rfd = fds[0];
+  const long deadline = now_ms() + timeout_ms;
+  char buf[4096];
+
+  while (true) {
+    long remaining = deadline - now_ms();
+    if (remaining < 0) remaining = 0;
+    struct pollfd pfd{rfd, POLLIN, 0};
+    int pr = poll(&pfd, 1, static_cast<int>(remaining));
+    if (pr < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    if (pr == 0) {  // timed out with no data ready
+      kill(pid, SIGKILL);
+      r.timed_out = true;
+      break;
+    }
+    if (pfd.revents & (POLLIN | POLLHUP | POLLERR)) {
+      ssize_t n = read(rfd, buf, sizeof(buf));
+      if (n > 0) {
+        r.out.append(buf, static_cast<size_t>(n));
+      } else if (n == 0) {
+        break;  // EOF: child closed stdout
+      } else {
+        if (errno == EINTR) continue;
+        break;
+      }
+    }
+    if (now_ms() >= deadline) {  // chatty child kept us past the deadline
+      kill(pid, SIGKILL);
+      r.timed_out = true;
+      break;
+    }
+  }
+
+  close(rfd);
+  int status = 0;
+  waitpid(pid, &status, 0);
+  // rc stays -1 (the default) when timed out or abnormally terminated.
+  if (!r.timed_out && WIFEXITED(status)) r.rc = WEXITSTATUS(status);
+  return r;
+}
+
+int run_inherit(const std::vector<std::string>& argv, const std::string& cwd) {
+  return spawn_inherit(argv, cwd, /*stdin_from_devnull=*/true);
+}
+
+int exec_passthrough(const std::vector<std::string>& argv) {
+  return spawn_inherit(argv, /*cwd=*/"", /*stdin_from_devnull=*/false);
+}
+
+}  // namespace andes_sim
