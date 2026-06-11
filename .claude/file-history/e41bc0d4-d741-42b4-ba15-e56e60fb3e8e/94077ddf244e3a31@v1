@@ -1,0 +1,127 @@
+// HandoffController glues CsrTrigger and StateDrain. Given a retired PC and
+// a GPR probe, decides whether to drain state and returns the populated
+// hybrid_state_v1 if so. Pure-logic; no SystemC.
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/csr_trigger.hpp"
+#include "hybrid/handoff_controller.hpp"
+#include "hybrid/insn_match.h"
+#include "hybrid/resume_driver.hpp"
+#include "hybrid/state_abi.h"
+#include "insn_encoders.hpp"
+#include "recording_bus.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <array>
+#include <cstdint>
+
+using hybrid::test::as_bytes;
+using hybrid::test::encode_csrrw;
+using hybrid::test::encode_csrrwi;
+using hybrid::test::kDmstatusHaltedAndAcked;
+using hybrid::test::RecordingBus;
+using RD = hybrid::ResumeDriver;
+
+TEST_CASE("HandoffController: EXIT csrwi triggers drain and returns state")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_gpr(12)] = 3;
+  bus.regfile[hybrid::regno_csr(RD::kCsrDpc)] = 0x80000004;
+
+  hybrid::CsrTrigger trigger;
+  const std::array<uint32_t, 1> code{encode_csrrwi(0, 0x7C0, 1)};
+  trigger.scan_buffer(as_bytes(code), /*base_pc=*/0x80000000);
+
+  hybrid::HandoffController h(std::move(trigger), bus);
+  const auto state = h.on_retire(0x80000000, [](uint8_t) { return 0u; });
+
+  REQUIRE(state);
+  CHECK(state->magic == HYBRID_STATE_MAGIC);
+  CHECK(state->gpr[12] == 3);
+  CHECK(state->pc == 0x80000004);
+}
+
+TEST_CASE("HandoffController: non-trigger PC returns nullopt without drain")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid::CsrTrigger trigger;
+  hybrid::HandoffController h(std::move(trigger), bus);
+
+  const auto state = h.on_retire(0xDEADBEEF, [](uint8_t) { return 0u; });
+  CHECK_FALSE(state.has_value());
+  CHECK(bus.ops.empty());
+}
+
+TEST_CASE("HandoffController: ENTER csrwi never fires (vsim ignores entry)")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid::CsrTrigger trigger;
+  const std::array<uint32_t, 1> code{encode_csrrwi(0, 0x7C0, 0)};
+  trigger.scan_buffer(as_bytes(code), /*base_pc=*/0x80000000);
+
+  hybrid::HandoffController h(std::move(trigger), bus);
+  const auto state = h.on_retire(0x80000000, [](uint8_t) { return 0u; });
+  CHECK_FALSE(state.has_value());
+  CHECK(bus.ops.empty());
+}
+
+TEST_CASE("HandoffController: PC-mode synthetic EXIT hit drains like CSR EXIT")
+{
+  // PC-trigger mode populates the trigger map via add_pc_hit() instead of
+  // scan_buffer(). HandoffController must dispatch on `kind` only and not
+  // depend on a recorded `insn`. This is the single-test contract the PC
+  // mode relies on.
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_gpr(12)] = 7;
+  bus.regfile[hybrid::regno_csr(RD::kCsrDpc)] = 0x80000048;
+
+  hybrid::CsrTrigger trigger;
+  trigger.add_pc_hit(0x80000044, HYBRID_HANDOFF_EXIT);
+
+  hybrid::HandoffController h(std::move(trigger), bus);
+  const auto state = h.on_retire(0x80000044, [](uint8_t) { return 0u; });
+
+  REQUIRE(state);
+  CHECK(state->magic == HYBRID_STATE_MAGIC);
+  CHECK(state->gpr[12] == 7);
+  CHECK(state->pc == 0x80000048);
+}
+
+TEST_CASE("HandoffController: PC-mode hit at unrelated PC stays silent")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid::CsrTrigger trigger;
+  trigger.add_pc_hit(0x80000044, HYBRID_HANDOFF_EXIT);
+
+  hybrid::HandoffController h(std::move(trigger), bus);
+  const auto state = h.on_retire(0x80000048, [](uint8_t) { return 0u; });
+  CHECK_FALSE(state.has_value());
+  CHECK(bus.ops.empty());
+}
+
+TEST_CASE("HandoffController: RUNTIME fires only when probed GPR == 1")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid::CsrTrigger trigger;
+  const std::array<uint32_t, 1> code{encode_csrrw(0, 0x7C0, /*rs1=*/10)};
+  trigger.scan_buffer(as_bytes(code), /*base_pc=*/0x80000000);
+
+  hybrid::HandoffController h(std::move(trigger), bus);
+
+  CHECK_FALSE(h.on_retire(0x80000000,
+                          [](uint8_t r) { return r == 10 ? 0u : 0u; }));
+  REQUIRE(h.on_retire(0x80000000,
+                      [](uint8_t r) { return r == 10 ? 1u : 0u; }));
+}

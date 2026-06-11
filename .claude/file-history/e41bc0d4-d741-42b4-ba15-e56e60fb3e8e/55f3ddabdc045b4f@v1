@@ -1,0 +1,111 @@
+// Glues CsrTrigger and StateDrain. The simulator's run-loop calls on_retire
+// once per committed PC; the controller decides via the trigger map whether
+// to drain state and returns the populated hybrid_state_v1 if so. The
+// caller (simulator.hpp) is responsible for writing the file and exiting
+// with EXIT_HANDOFF_TO_QEMU.
+
+#pragma once
+
+#include "hybrid/csr_trigger.hpp"
+#include "hybrid/insn_match.h"
+#include "hybrid/measure_start_snapshot.hpp"
+#include "hybrid/resume_driver.hpp"
+#include "hybrid/state_abi.h"
+#include "hybrid/state_drain.hpp"
+
+#include <cstdint>
+#include <optional>
+#include <utility>
+
+namespace hybrid
+{
+
+template<typename Trigger, typename Observer = NullObserver>
+class HandoffController
+{
+public:
+  HandoffController(Trigger trigger, DmiBus& bus)
+      : trigger_{std::move(trigger)}, drain_{bus}
+  {}
+
+  HandoffController(Trigger trigger, DmiBus& bus, Observer observer)
+      : trigger_{std::move(trigger)},
+        drain_{bus},
+        observer_{std::move(observer)}
+  {}
+
+  // Snapshot of the QEMU 1 input state. When set, drain merges FP/CSR/V
+  // fields from the snapshot into the freshly drained GPRs+PC, avoiding
+  // a per-field DM Abstract Command on every handoff.
+  void set_passthrough_input(hybrid_state_v1 input)
+  {
+    passthrough_ = input;
+  }
+
+  // Read-only view of the underlying trigger. Used by the ROI kanata-gate
+  // derivation, which needs to read scanned EXIT PCs without consuming them.
+  auto trigger() const -> const Trigger& { return trigger_; }
+
+  // Read-only view of the observer slot. F16 (StateDrain) reads the warmup
+  // snapshot from here when copying into the ABI struct.
+  auto observer() const -> const Observer& { return observer_; }
+  auto observer() -> Observer& { return observer_; }
+
+  template<typename GprProbe>
+  auto on_retire(uint64_t pc, GprProbe&& read_gpr)
+    -> std::optional<hybrid_state_v1>
+  {
+    if constexpr (requires { trigger_.observe_commit(); }) {
+      trigger_.observe_commit();
+    }
+    if constexpr (requires { observer_.observe_commit(); }) {
+      observer_.observe_commit();
+    }
+    const auto hit = trigger_.lookup(pc);
+    if (!hit) return std::nullopt;
+
+    bool fire = false;
+    switch (hit->kind) {
+    case HYBRID_HANDOFF_EXIT:
+      fire = true;
+      break;
+    case HYBRID_HANDOFF_RUNTIME: {
+      const auto rs1 = decode_csrrw_rs1(hit->insn);
+      fire = (read_gpr(rs1) == 1u);
+      break;
+    }
+    case HYBRID_HANDOFF_ENTER:  // entry is QEMU's job; vsim ignores it
+    case HYBRID_HANDOFF_NONE:
+      break;
+    }
+    if (!fire) return std::nullopt;
+    // F16: push warmup snapshot into the drain right before it runs so the
+    // returned state file carries mcycle_at_measure_start / minstret_at_measure_start.
+    // The if-constexpr branch compiles away for NullObserver (no accessors).
+    if constexpr (requires { observer_.mcycle_at_measure_start(); }) {
+      drain_.set_warmup_snapshot(observer_.mcycle_at_measure_start(),
+                                 observer_.minstret_at_measure_start());
+    }
+    if (passthrough_) return drain_.drain_with_passthrough(*passthrough_);
+    return drain_.drain();
+  }
+
+private:
+  Trigger trigger_;
+  StateDrain drain_;
+  Observer observer_{};
+  std::optional<hybrid_state_v1> passthrough_;
+};
+
+// CTAD: the old `HandoffController(trigger, bus)` call sites must still
+// deduce `Observer = NullObserver`. The default-arg form of CTAD cannot
+// see template defaults, so spell them out as deduction guides.
+template<typename Trigger>
+HandoffController(Trigger, DmiBus&)
+  -> HandoffController<Trigger, NullObserver>;
+
+template<typename Trigger, typename Observer>
+HandoffController(Trigger, DmiBus&, Observer)
+  -> HandoffController<Trigger, Observer>;
+
+}  // namespace hybrid
