@@ -1,0 +1,166 @@
+// andes-sim -- multi-engine driver for the Andes simulators (QEMU, Verilator,
+// and future backends). One C++20 binary that selects a model (fast / cycle
+// / hybrid), resolves engines at runtime, and either passes through to a single
+// engine or orchestrates a hybrid round-trip.
+//
+// This file owns argument dispatch only: parse the CLI, route to a command.
+// Each subcommand below resolves to its handler as its feature lands (F1-F13);
+// until then it stubs out, keeping the command surface stable.
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <string>
+#include <string_view>
+
+#include "cli.hpp"
+#include "dev_mode.hpp"
+#include "repo_root.hpp"
+
+namespace andes_sim {
+int cmd_list(const Cli& cli);
+int cmd_doctor(const Cli& cli);
+int cmd_build(const Cli& cli);
+int cmd_run(const Cli& cli);
+}  // namespace andes_sim
+
+namespace {
+
+using andes_sim::Cli;
+using andes_sim::is_dev_mode;
+
+// Each command's release tier decides where it shows in `--help`:
+//   Release -- the finished, user-facing product surface (always listed).
+//   Dev     -- developer tooling, listed only when ANDES_SIM_DEV is set.
+//   Hidden  -- a stable dispatch slot for an unfinished ROADMAP feature; never
+//              listed (explicit invocation still hits the "not yet implemented"
+//              stub), so the product never advertises half-built work.
+enum class Tier { Release, Dev, Hidden };
+
+struct Subcommand {
+  std::string_view name;
+  std::string_view brief;
+  Tier tier;
+};
+
+// The full command surface. Names are fixed from F0 so usage, dispatch, and
+// tests are stable; handlers arrive feature by feature. The tier (above) keeps
+// dev and unfinished commands out of the release `--help` (see print_usage).
+// Listed release-first, then dev, then hidden -- dispatch is by name, so the
+// order is purely the display order.
+constexpr Subcommand kSubcommands[] = {
+    {"run", "run one simulation (--model fast|cycle|hybrid)", Tier::Release},
+    {"list", "list models|engines", Tier::Release},
+    {"build", "build artifacts (qemu, vsim, plugin, simpoint, fixtures, driver)",
+     Tier::Dev},
+    {"test", "run the end-to-end suite", Tier::Dev},
+    {"doctor", "check environment health", Tier::Dev},
+    {"profile", "profile a workload into a basic-block vector", Tier::Hidden},
+    {"cluster", "cluster a BBV into SimPoint phases", Tier::Hidden},
+    {"archive", "snapshot a drained state into a replayable dir", Tier::Hidden},
+    {"replay", "replay a snapshot", Tier::Hidden},
+    {"estimate",
+     "whole-program cycle estimate (run --model hybrid --trigger simpoint)",
+     Tier::Hidden},
+};
+
+const Subcommand* find(std::string_view name) {
+  for (const Subcommand& s : kSubcommands)
+    if (s.name == name) return &s;
+  return nullptr;
+}
+
+void print_command(std::FILE* out, const Subcommand& s) {
+  std::fprintf(out, "  %-9.*s  %.*s\n", static_cast<int>(s.name.size()),
+               s.name.data(), static_cast<int>(s.brief.size()), s.brief.data());
+}
+
+void print_usage(std::FILE* out) {
+  std::fputs("usage: andes-sim <cmd> [args...]\n\n", out);
+  std::fputs("Multi-engine driver for the Andes simulators (QEMU + vsim).\n\n",
+             out);
+  std::fputs("commands:\n", out);
+  for (const Subcommand& s : kSubcommands)
+    if (s.tier == Tier::Release) print_command(out, s);
+
+  if (is_dev_mode()) {
+    std::fputs("\ndeveloper commands:\n", out);
+    for (const Subcommand& s : kSubcommands)
+      if (s.tier == Tier::Dev) print_command(out, s);
+  } else {
+    std::fputs("\n(set ANDES_SIM_DEV=1 to show developer commands)\n", out);
+  }
+}
+
+void print_subcommand_help(const Subcommand& sc, std::FILE* out) {
+  std::fprintf(out, "usage: andes-sim %.*s [args...]\n\n",
+               static_cast<int>(sc.name.size()), sc.name.data());
+  std::fprintf(out, "%.*s\n", static_cast<int>(sc.brief.size()), sc.brief.data());
+  if (sc.name == "run") {
+    std::fputs(
+        "\nselection:\n"
+        "  --model fast|cycle|hybrid          which composition to run\n"
+        "  --engine <id>                      pick a specific engine "
+        "(e.g. vsim:ax45mpv_premium)\n"
+        "  --trigger marker|pc|icount            ROI delimiter (hybrid only)\n"
+        "  -- <args...>                       forward everything after -- "
+        "verbatim to the engine\n",
+        out);
+  } else if (sc.name == "list") {
+    // fixtures lists internal test ELFs -- a developer target, shown only in
+    // dev mode (the release product lists user-facing models + engines).
+    std::fputs(is_dev_mode() ? "\ntargets: fixtures | models | engines\n"
+                             : "\ntargets: models | engines\n",
+               out);
+  }
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  using namespace andes_sim;
+
+  Cli cli = parse_cli(argc, argv);
+  if (!cli.error.empty()) {
+    std::fprintf(stderr, "andes-sim: %s\n", cli.error.c_str());
+    return 2;
+  }
+
+  if (cli.subcommand.empty()) {  // no command, or top-level -h
+    if (cli.help) {
+      print_usage(stdout);
+      return 0;
+    }
+    print_usage(stderr);
+    return 2;
+  }
+
+  const Subcommand* sc = find(cli.subcommand);
+  if (!sc) {
+    std::fprintf(stderr, "andes-sim: unknown command '%s'\n\n",
+                 cli.subcommand.c_str());
+    print_usage(stderr);
+    return 2;
+  }
+
+  if (cli.help) {
+    print_subcommand_help(*sc, stdout);
+    return 0;
+  }
+
+  if (cli.subcommand == "list") return cmd_list(cli);
+  if (cli.subcommand == "doctor") return cmd_doctor(cli);
+  if (cli.subcommand == "build") return cmd_build(cli);
+  if (cli.subcommand == "run") return cmd_run(cli);
+
+  // Remaining subcommands stub out until their feature lands. Resolve the repo
+  // root so the discovery path stays live and observable.
+  std::string root;
+  try {
+    root = repo_root().string();
+  } catch (const std::exception& e) {
+    root = std::string("<unknown: ") + e.what() + ">";
+  }
+  std::fprintf(stderr, "andes-sim %s: not yet implemented (repo root: %s)\n",
+               cli.subcommand.c_str(), root.c_str());
+  return 3;
+}
