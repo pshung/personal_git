@@ -1,0 +1,109 @@
+// `andes-sim build [--what TARGET] [--dry-run]`.
+//
+// A thin delegator: each target maps to an ordered list of subprocess steps
+// that call the repo's existing build scripts / Makefiles (setup.sh,
+// scripts/build_*.sh, make). No build logic is duplicated here -- this is a port
+// of hsim's cmd_build. `--dry-run` prints the shlex-joined commands (byte-exact
+// with the golden); a real run banners each step and inherits its stdio so the
+// user watches the build live. Targets match the golden's six; `--what driver`
+// (building this C++ driver) is an F14 addition.
+#include <cstdio>
+#include <string>
+#include <vector>
+
+#include "cli.hpp"
+#include "process.hpp"
+#include "repo_root.hpp"
+
+namespace andes_sim {
+namespace {
+
+// POSIX shell-quote one token (mirrors Python shlex.quote): empty -> ''; a token
+// of only the safe set passes through unquoted; otherwise wrap in single quotes,
+// rendering each embedded ' as the '"'"' splice.
+std::string shlex_quote(const std::string& s) {
+  if (s.empty()) return "''";
+  auto safe = [](char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '_' || c == '@' || c == '%' ||
+           c == '+' || c == '=' || c == ':' || c == ',' || c == '.' ||
+           c == '/' || c == '-';
+  };
+  bool all_safe = true;
+  for (char c : s)
+    if (!safe(c)) { all_safe = false; break; }
+  if (all_safe) return s;
+  std::string q = "'";
+  for (char c : s) q += (c == '\'') ? "'\"'\"'" : std::string(1, c);
+  q += "'";
+  return q;
+}
+
+std::string shlex_join(const std::vector<std::string>& argv) {
+  std::string line;
+  for (size_t i = 0; i < argv.size(); ++i) {
+    if (i) line += ' ';
+    line += shlex_quote(argv[i]);
+  }
+  return line;
+}
+
+using Step = std::vector<std::string>;
+
+// Map a --what target to its ordered steps (mirrors hsim's _build_steps).
+// Returns false if the target is unknown. `root` is the absolute repo root, used
+// for the plugin's QEMU_ROOT: it must be absolute because `make -C qemu_plugin`
+// chdirs first, so a relative path (the old ./QEMU) would resolve under
+// qemu_plugin/ and miss the headers -- setup.sh:115 passes an absolute path too.
+bool build_steps(const std::string& what, const std::string& root,
+                 std::vector<Step>& out) {
+  const Step qemu = {"bash", "scripts/build_qemu.sh"};
+  const Step vsim = {"bash", "scripts/build_vsim.sh"};
+  const Step plugin = {"make", "-C", "qemu_plugin", "QEMU_ROOT=" + root + "/QEMU"};
+  const Step simpoint = {"bash", "scripts/build_simpoint.sh"};
+  const Step fixtures = {"make", "-C", "tests/fixtures"};
+  // "all" needs no runtime step: the fixtures Makefile self-builds the
+  // runtime library through its grouped target. The explicit target is for
+  // users who want build/runtime/ without the fixture ELFs.
+  const Step runtime = {"make", "-C", "runtime"};
+  const Step setup = {"bash", "setup.sh"};
+  if (what == "all") { out = {setup, fixtures}; return true; }
+  if (what == "qemu") { out = {qemu}; return true; }
+  if (what == "vsim") { out = {vsim}; return true; }
+  if (what == "plugin") { out = {plugin}; return true; }
+  if (what == "simpoint") { out = {simpoint}; return true; }
+  if (what == "fixtures") { out = {fixtures}; return true; }
+  if (what == "runtime") { out = {runtime}; return true; }
+  return false;
+}
+
+}  // namespace
+
+int cmd_build(const Cli& cli) {
+  const std::string what = cli.what.empty() ? "all" : cli.what;
+  const std::string root = repo_root().string();
+  std::vector<Step> steps;
+  if (!build_steps(what, root, steps)) {
+    std::fprintf(stderr, "andes-sim: unknown build target: %s\n", what.c_str());
+    return 2;
+  }
+
+  for (const Step& argv : steps) {
+    const std::string line = shlex_join(argv);
+    if (cli.dry_run) {
+      std::printf("%s\n", line.c_str());
+      continue;
+    }
+    std::printf("[andes-sim] %s\n", line.c_str());
+    std::fflush(stdout);  // banner before the child writes to the shared stdout
+    int rc = run_inherit(argv, root);
+    if (rc != 0) {
+      std::fprintf(stderr, "andes-sim: build step failed (rc=%d): %s\n", rc,
+                   line.c_str());
+      return rc;
+    }
+  }
+  return 0;
+}
+
+}  // namespace andes_sim
