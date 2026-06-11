@@ -1,0 +1,118 @@
+// Unit tests for the F5 infra helpers:
+//   - parse_size          (driver/shm.hpp)   size-spec parsing
+//   - exec_passthrough    (driver/process.hpp) exit-code propagation
+//   - run_process         (driver/process.hpp) timeout kill + capture
+//   - read_state_file     (driver/state.hpp)  hybrid_state_v1 read + validate
+//
+// Plain assert-and-count harness (no doctest); each CHECK bumps a failure
+// counter and the process exits non-zero if any failed. Run by
+// tests/andes_sim/test_andes_sim_f5.sh.
+#include <cstdint>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
+
+#include "hybrid/state_abi.h"
+#include "process.hpp"
+#include "shm.hpp"
+#include "state.hpp"
+#include "test_check.hpp"
+
+using namespace andes_sim;
+
+int main() {
+  // --- parse_size: <number>[K|M|G|T] -> byte count ---
+  {
+    std::string err;
+    CHECK(parse_size("1024", err) == 1024 && err.empty());
+    CHECK(parse_size("128M", err) == 128LL * 1024 * 1024);
+    CHECK(parse_size("512M", err) == 512LL * 1024 * 1024);
+    CHECK(parse_size("8G", err) == 8LL * 1024 * 1024 * 1024);
+    CHECK(parse_size("1T", err) == 1LL * 1024 * 1024 * 1024 * 1024);
+    // fractional value truncates like Python int(float(num) * mult)
+    CHECK(parse_size("1.5G", err) ==
+          static_cast<long long>(1.5 * 1024 * 1024 * 1024));
+    // suffix is case-insensitive and surrounding whitespace is tolerated
+    CHECK(parse_size("  64m  ", err) == 64LL * 1024 * 1024);
+    // malformed specs return 0 and set err
+    for (const char* bad : {"", "8X", "0", "abc", "-4", "1.2.3"}) {
+      err.clear();
+      CHECK(parse_size(bad, err) == 0 && !err.empty());
+    }
+  }
+
+  // --- exec_passthrough: forwards the child's exit code ---
+  {
+    CHECK(exec_passthrough({"sh", "-c", "exit 0"}) == 0);
+    CHECK(exec_passthrough({"sh", "-c", "exit 7"}) == 7);
+    CHECK(exec_passthrough({"sh", "-c", "exit 42"}) == 42);
+    // a binary that cannot be exec'd reports 127 (exec failure)
+    CHECK(exec_passthrough({"/nonexistent/andes-sim-xyz"}) == 127);
+    // empty argv: nothing to run
+    CHECK(exec_passthrough({}) == -1);
+  }
+
+  // --- run_process: a slow child is killed at the timeout ---
+  {
+    RunResult r = run_process({"sh", "-c", "sleep 5"}, 150);
+    CHECK(r.timed_out);
+    CHECK(r.rc == -1);
+  }
+  // --- run_process: a fast child's stdout is captured and rc propagated ---
+  {
+    RunResult r = run_process({"sh", "-c", "printf hello; exit 3"}, 2000);
+    CHECK(!r.timed_out);
+    CHECK(r.rc == 3);
+    CHECK(r.out == "hello");
+  }
+
+  // --- read_state_file: round-trip a known-good hybrid_state_v1 ---
+  {
+    hybrid_state_v1 st{};
+    st.magic = HYBRID_STATE_MAGIC;
+    st.version = HYBRID_STATE_VERSION;
+    st.flags = HYBRID_FLAG_RV64 | HYBRID_FLAG_V;
+    st.mcycle = 123456;
+    st.minstret = 7890;
+    st.vlenb = 64;
+
+    char path[] = "/tmp/andes-sim-state.XXXXXX";
+    int fd = mkstemp(path);
+    CHECK(fd >= 0);
+    CHECK(write(fd, &st, sizeof(st)) == static_cast<ssize_t>(sizeof(st)));
+    close(fd);
+
+    StateFile good = read_state_file(path);
+    CHECK(good.ok());
+    CHECK(good.error.empty());
+    CHECK(good.st.mcycle == 123456);
+    CHECK(good.st.minstret == 7890);
+    CHECK(good.st.flags == (HYBRID_FLAG_RV64 | HYBRID_FLAG_V));
+    CHECK(good.st.vlenb == 64);
+
+    // a bad magic is rejected
+    st.magic = 0xdeadbeefu;
+    int fd2 = open(path, O_WRONLY | O_TRUNC);
+    CHECK(fd2 >= 0);
+    CHECK(write(fd2, &st, sizeof(st)) == static_cast<ssize_t>(sizeof(st)));
+    close(fd2);
+    CHECK(!read_state_file(path).ok());
+
+    // a truncated file (wrong size) is rejected
+    st.magic = HYBRID_STATE_MAGIC;
+    int fd3 = open(path, O_WRONLY | O_TRUNC);
+    CHECK(fd3 >= 0);
+    CHECK(write(fd3, &st, 16) == 16);
+    close(fd3);
+    CHECK(!read_state_file(path).ok());
+
+    unlink(path);
+  }
+  // a missing file is rejected (not a crash)
+  CHECK(!read_state_file("/nonexistent/andes-sim-no-such-state").ok());
+
+  return andes_sim::test::report("infra");
+}
