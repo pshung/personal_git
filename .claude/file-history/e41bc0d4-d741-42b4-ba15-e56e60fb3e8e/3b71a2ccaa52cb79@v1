@@ -1,0 +1,197 @@
+// `andes-sim run --model fast|cycle|hybrid [engine selection] ELF [-- engine args]`.
+//
+// The top selection axis. F7/F8 land the two standalone models, `fast` (QEMU)
+// and `cycle` (a cycle-accurate engine, from reset): each resolves its
+// engine, then hands off to transparent passthrough -- the ELF plus everything
+// after `--` becomes the engine's own command line, run with inherited stdio,
+// no timeout, and the exit code propagated, so a gdbstub / monitor /
+// semihosting console all behave as if the engine were invoked directly.
+// `hybrid` (F9) orchestrates a QEMU1 -> vsim handoff via run_plan and prints the
+// window-cycle figure (the vsim mcycle delta).
+#include <cstdio>
+#include <filesystem>
+#include <string>
+
+#include "cli.hpp"
+#include "engine_descriptor.hpp"
+#include "engine_registry.hpp"
+#include "hybrid.hpp"
+#include "models.hpp"
+#include "plan.hpp"
+#include "run_passthrough.hpp"
+#include "run_plan.hpp"
+#include "shm.hpp"
+
+namespace fs = std::filesystem;
+
+namespace andes_sim {
+namespace {
+
+// Validate the lone-ELF positional shape the standalone models require: print
+// the diagnostic and return 2 on a violation, else 0. Split out so `cycle`
+// can reject a missing/extra ELF BEFORE paying for engine discovery (which
+// spawns a --describe subprocess per Verilator build). `model` labels the error.
+int check_one_elf(const Cli& cli, const char* model) {
+  if (cli.positional.empty()) {
+    std::fprintf(stderr, "andes-sim run --model %s: missing ELF\n", model);
+    return 2;
+  }
+  if (cli.positional.size() > 1) {
+    std::fprintf(stderr,
+                 "andes-sim run --model %s: unexpected argument '%s' "
+                 "(engine args go after --)\n",
+                 model, cli.positional[1].c_str());
+    return 2;
+  }
+  return 0;
+}
+
+// The standalone-passthrough spine shared by `fast` and `cycle`: both take a
+// single ELF, then exec the resolved engine standalone with the post-`--` args
+// appended verbatim (inherit stdio, no timeout, propagate exit code). The only
+// per-model differences -- which engine, and how it is selected -- are resolved
+// by the caller; `model` here only labels the positional diagnostics.
+int run_standalone(const Cli& cli, const EngineDescriptor& eng,
+                   const char* model) {
+  if (int rc = check_one_elf(cli, model)) return rc;
+  std::string err;
+  int rc = run_passthrough(eng, "standalone", cli.positional[0],
+                           cli.passthrough, err);
+  if (!err.empty()) std::fprintf(stderr, "andes-sim run: %s\n", err.c_str());
+  return rc;
+}
+
+// `run --model fast`: QEMU alone, functional, transparent passthrough. Needs
+// only the built-in qemu descriptor, so it resolves that directly rather than
+// discover_engines(), which would spawn a --describe subprocess per Verilator
+// build only to discard them all here.
+int run_fast(const Cli& cli) {
+  // fast is QEMU-only; an explicit engine must name it.
+  if (!cli.engine.empty() && cli.engine != "qemu") {
+    std::fprintf(stderr,
+                 "andes-sim run --model fast: engine must be 'qemu', got '%s'\n",
+                 cli.engine.c_str());
+    return 2;
+  }
+  return run_standalone(cli, builtin_qemu(), "fast");
+}
+
+// `run --model cycle`: one cycle-accurate engine alone, from reset (no QEMU,
+// no --resume-from-qemu), transparent passthrough -- cycles surface in the
+// engine's own output. Unlike fast, this must discover the Verilator build(s)
+// to resolve the engine (explicit --engine, else the sole one).
+int run_accurate(const Cli& cli) {
+  // Reject a missing/extra ELF before discovery so a CLI typo does not spawn a
+  // --describe subprocess per Verilator build only to fail on the argument.
+  if (int rc = check_one_elf(cli, "cycle")) return rc;
+  Discovery disc = discover_engines();
+  std::string err;
+  const EngineDescriptor* eng =
+      resolve_accurate_engine(disc.engines, cli.engine, err);
+  if (!eng) {
+    std::fprintf(stderr, "andes-sim run --model cycle: %s\n", err.c_str());
+    // Surface why an expected engine may be absent (failed --describe, etc.).
+    for (const std::string& w : disc.warnings)
+      std::fprintf(stderr, "andes-sim: skipped engine: %s\n", w.c_str());
+    return 2;
+  }
+  return run_standalone(cli, *eng, "cycle");
+}
+
+// `run --model hybrid`: orchestrate a QEMU1 fast-forward -> vsim measure+drain
+// handoff (no QEMU2). The trigger (csr|pc|icount) delimits the ROI; the cycle
+// figure is the vsim mcycle minus QEMU1's drained mcycle. Replaces the Python
+// driver's tests/e2e.sh delegation with a single window-cycle line.
+int run_hybrid(const Cli& cli) {
+  // Single diagnostic sink for the early-validation returns: prefix + exit 2.
+  auto fail = [](const std::string& msg) {
+    std::fprintf(stderr, "andes-sim run --model hybrid: %s\n", msg.c_str());
+    return 2;
+  };
+
+  if (int rc = check_one_elf(cli, "hybrid")) return rc;
+
+  // Resolve to an absolute, existing path: a clean error beats a downstream
+  // spawn failure, and pc-trigger resolution reads the ELF's .symtab.
+  std::error_code ec;
+  const fs::path elf = fs::absolute(cli.positional[0], ec);
+  if (ec || !fs::is_regular_file(elf, ec))
+    return fail("ELF not found: " + cli.positional[0]);
+  const std::string elf_path = elf.string();
+
+  // Validate everything cheap BEFORE the expensive engine discovery, so a CLI
+  // mistake fails fast without spawning a --describe per Verilator build.
+  std::string err;
+  const Trigger trig = hybrid_trigger(cli, elf_path, err);
+  if (!err.empty()) return fail(err);
+
+  std::vector<std::string> vsim_extras = vsim_extra_args(cli, trig.kind, err);
+  if (!err.empty()) return fail(err);
+
+  long long mem = 128LL * 1024 * 1024;  // shared mmap; --mmap-size overrides
+  if (!cli.mmap_size.empty()) {
+    std::string se;
+    mem = parse_size(cli.mmap_size, se);
+    if (!se.empty()) return fail("--mmap-size: " + se);
+  }
+
+  // qemu is the built-in fast leg; resolve the accurate (vsim) leg by --engine
+  // or the sole cycle-accurate engine (reusing the F8 selector).
+  Discovery disc = discover_engines();
+  const EngineDescriptor* acc =
+      resolve_accurate_engine(disc.engines, cli.engine, err);
+  if (!acc) {
+    std::fprintf(stderr, "andes-sim run --model hybrid: %s\n", err.c_str());
+    for (const std::string& w : disc.warnings)
+      std::fprintf(stderr, "andes-sim: skipped engine: %s\n", w.c_str());
+    return 2;
+  }
+
+  Plan plan;
+  plan.elf = elf_path;
+  plan.mem_size = mem;
+  Step qemu_step{"qemu", "fast-leg", trig};
+  Step vsim_step{acc->id, "accurate-leg", trig};
+  vsim_step.extra_args = std::move(vsim_extras);  // kanata + warmup, validated
+  plan.steps = {qemu_step, vsim_step};
+
+  // Banner to stderr so the window-cycle result stands alone on stdout.
+  std::fprintf(stderr, "[andes-sim] model=hybrid engine=%s trigger=%s fixture=%s\n",
+               acc->id.c_str(), trig.kind.c_str(), elf.stem().string().c_str());
+
+  const PlanResult r = run_plan(plan, disc.engines);
+  if (!r.ok()) {
+    std::fprintf(stderr, "andes-sim run --model hybrid: %s\n", r.error.c_str());
+    return 1;
+  }
+  // phases[0] = QEMU1 drain, [1] = vsim drain; the kernel/window figure is the
+  // vsim mcycle delta.
+  const unsigned long long q_mc = r.phases[0].mcycle;
+  const unsigned long long v_mc = r.phases[1].mcycle;
+  std::printf("[%s window_cycles] %llu  (vsim mcycle=%llu - qemu mcycle=%llu)\n",
+              trig.kind.c_str(), v_mc - q_mc, v_mc, q_mc);
+  std::printf("PASS: --model hybrid --trigger %s (%s)\n", trig.kind.c_str(),
+              elf.stem().string().c_str());
+  return 0;
+}
+
+}  // namespace
+
+int cmd_run(const Cli& cli) {
+  if (cli.model.empty()) {
+    std::fprintf(stderr,
+                 "andes-sim run: --model fast|cycle|hybrid is required\n");
+    return 2;
+  }
+  if (!find_model(cli.model)) {
+    std::fprintf(stderr,
+                 "andes-sim run: unknown model '%s' (want fast|cycle|hybrid)\n",
+                 cli.model.c_str());
+    return 2;
+  }
+  if (cli.model == "fast") return run_fast(cli);
+  if (cli.model == "cycle") return run_accurate(cli);
+  return run_hybrid(cli);  // model validated above; only hybrid remains
+}
+
+}  // namespace andes_sim
