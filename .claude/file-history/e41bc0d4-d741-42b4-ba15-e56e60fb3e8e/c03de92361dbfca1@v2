@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# PC-trigger contract: the drained resume PC equals the --pc-start boundary.
+#
+# The drain callback fires BEFORE the trigger insn executes, so the captured
+# state is pre-execution. A marker is an architectural NOP and may be skipped
+# (resume at vaddr+size), but a pc boundary is real user code: if the plugin
+# reports vaddr+size, the boundary insn executes on NEITHER leg (e.g. a
+# skipped vsetivli leaves vtype.vill set and the vsim window faults on the
+# first vector op). The plugin must report the boundary's own vaddr so the
+# insn runs inside the measured window.
+#
+# Required environment (auto-detected with sensible defaults):
+#   VSIM_QEMU    qemu-system-riscv64
+#   VSIM_PLUGIN  libhybrid_handoff.so
+#   VSIM_ELF     any fixture with a `main` symbol (default: vplat_hello.elf)
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/../lib/paths.sh"
+
+FIXTURE="${FIXTURE:-vplat_hello}"
+hybrid_resolve_paths
+
+NM="${NM:-${HYBRID_TOOLCHAIN:+$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-nm}}"
+command -v "${NM:-nm}" >/dev/null 2>&1 || NM=nm
+ENTER_HEX=$("$NM" "$VSIM_ELF" | awk '$3 == "main" { print $1; exit }')
+[ -n "$ENTER_HEX" ] || { echo "FAIL[pc_trigger_resume_pc]: no main in $VSIM_ELF"; exit 1; }
+ENTER=$(printf '0x%x' "0x$ENTER_HEX")
+
+SHARED_SIZE=$((128 * 1024 * 1024))
+SHARED_MEM=$(mktemp -p /dev/shm vsim-pcresume-shared.XXXXXX)
+STATE_QEMU=$(mktemp)
+QEMU_LOG=$(mktemp)
+trap 'rm -f "$SHARED_MEM" "$STATE_QEMU" "$QEMU_LOG"' EXIT
+truncate -s "$SHARED_SIZE" "$SHARED_MEM"
+
+set +e
+"$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHARED_MEM,size=$SHARED_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -semihosting-config enable=on,target=native \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_QEMU,enter_pc=$ENTER" \
+  </dev/null >"$QEMU_LOG" 2>&1
+RC=$?
+set -e
+
+if [ "$RC" -ne 200 ]; then
+  echo "FAIL[pc_trigger_resume_pc]: expected QEMU exit=200 on drain, got $RC"
+  tail -5 "$QEMU_LOG"
+  exit 1
+fi
+if ! grep -q "drained state to .* (pc=$ENTER)" "$QEMU_LOG"; then
+  echo "FAIL[pc_trigger_resume_pc]: resume PC != pc-start boundary $ENTER:"
+  grep "drained state" "$QEMU_LOG" || tail -5 "$QEMU_LOG"
+  exit 1
+fi
+echo "[pc_trigger_resume_pc] PASS: drain resumes at the boundary insn ($ENTER)"
