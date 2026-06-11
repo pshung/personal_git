@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# RED->GREEN: resolve_pc maps an ROI boundary (a symbol name OR a 0x-hex
+# address) to a bare hex address, resolving symbols against `nm` output.
+# This is the primitive that lets pc mode point at ANY symbol/address
+# instead of the planted _hybrid_enter_pc / _hybrid_exit_pc markers.
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/roi.sh"
+
+fail() { echo "FAIL[roi_resolve]: $1"; exit 1; }
+
+# Fake `nm --defined-only` output (columns: addr type name).
+NM_FIXTURE='0000000000100002 T _hybrid_enter_pc
+0000000000100020 T _hybrid_exit_pc
+0000000000100040 T vmatmul_kernel
+0000000000100000 T main'
+
+# 1. hex passthrough strips the 0x prefix, keeps the digits.
+got=$(resolve_pc "0x100abc" "$NM_FIXTURE")
+[ "$got" = "100abc" ] || fail "hex passthrough: want 100abc got '$got'"
+
+# 2. uppercase 0X prefix also stripped.
+got=$(resolve_pc "0X1f" "$NM_FIXTURE")
+[ "$got" = "1f" ] || fail "0X prefix: want 1f got '$got'"
+
+# 3. arbitrary symbol name resolves via nm output.
+got=$(resolve_pc "vmatmul_kernel" "$NM_FIXTURE")
+[ "$got" = "0000000000100040" ] || fail "symbol resolve: want ...100040 got '$got'"
+
+# 4. unknown symbol -> empty (caller turns this into a FAIL).
+got=$(resolve_pc "nope" "$NM_FIXTURE")
+[ -z "$got" ] || fail "unknown symbol: want empty got '$got'"
+
+# --- roi_resolve_pair: env-required + dual resolve, as e2e.sh uses it ---
+
+# 5. unset ROI_START/ROI_END -> error (no implicit fallback).
+unset ROI_START ROI_END
+out=$(roi_resolve_pair "$NM_FIXTURE" t 2>&1)
+[ $? -ne 0 ] || fail "unset pair: expected nonzero return"
+case "$out" in *"ROI_START and ROI_END"*) ;; *) fail "unset pair: missing required-vars message: '$out'";; esac
+
+# 6. ROI_START symbol + ROI_END hex resolve to ENTER_PC / EXIT_PC.
+ROI_START=vmatmul_kernel ROI_END=0x100100 roi_resolve_pair "$NM_FIXTURE" t \
+  || fail "override pair: returned nonzero"
+[ "$ENTER_PC" = "0000000000100040" ] || fail "ENTER_PC: got '$ENTER_PC'"
+[ "$EXIT_PC"  = "100100" ]            || fail "EXIT_PC: got '$EXIT_PC'"
+
+# 7. an unresolvable boundary fails loudly and names the offender.
+out=$(ROI_START=ghost ROI_END=main roi_resolve_pair "$NM_FIXTURE" myfix 2>&1)
+[ $? -ne 0 ] || fail "bad start: expected nonzero return"
+case "$out" in *"myfix"*"ghost"*) ;; *) fail "bad start: message missing label/symbol: '$out'";; esac
+
+# --- roi_markers_from_disasm: derive pc-mode boundaries from ROI markers ----
+# Lets the bulk runner drive pc mode with no per-fixture config: ENTER is the
+# entry marker `slti x0, x0, 0x5A0` (enc 5a002013), EXIT is the LAST exit
+# marker `slti x0, x0, 0x5A1` (enc 5a102013). Both are the marker PCs -- the
+# plugin/vsim resume one insn past the trigger (compute_handoff_pc=vaddr+size),
+# reproducing marker mode's switch points. Inputs are `objdump -d` fragments.
+
+# 8. in-order fixture: entry marker -> single exit marker.
+DISASM_INORDER='  10023c: 5a002013  slti zero,zero,1440
+  100240: 5a102013  slti zero,zero,1441
+  100244: 8082  ret'
+got=$(roi_markers_from_disasm "$DISASM_INORDER") \
+  || fail "in-order: function returned nonzero"
+[ "$got" = "10023c 100240" ] || fail "in-order: want '10023c 100240' got '$got'"
+
+# 9. jump-over-poison fixture (rt_pc_jump): the c.j skips dead exit markers;
+#    the LAST 5a102013 is the real, reachable exit -- not the first.
+DISASM_JUMP='  100000: 5a002013  slti zero,zero,1440
+  100004: a83d  c.j 0x100042
+  100006: 5a102013  slti zero,zero,1441
+  10000a: 5a102013  slti zero,zero,1441
+  100042: 5a102013  slti zero,zero,1441
+  100046: 4601  c.li a2,0'
+got=$(roi_markers_from_disasm "$DISASM_JUMP") \
+  || fail "jump: function returned nonzero"
+[ "$got" = "100000 100042" ] || fail "jump: want '100000 100042' (last exit) got '$got'"
+
+# 10. no markers -> nonzero return, empty output.
+DISASM_NONE='  100000: 1141  c.addi sp,sp,-16
+  100002: 8082  ret'
+got=$(roi_markers_from_disasm "$DISASM_NONE"); rc=$?
+[ "$rc" -ne 0 ] || fail "no-markers: expected nonzero return, got rc=0"
+[ -z "$got" ]   || fail "no-markers: expected empty output, got '$got'"
+
+echo "[roi_resolve] PASS"
