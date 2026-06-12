@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# L20: fcsr (frm + sticky fflags) round-trips QEMU1 -> vsim -> drain.
+#
+# rt_c_fcsr sets fcsr=0x21 (frm=RTZ | NX) before the enter marker; the
+# plugin must drain it (state file offset 3408, locked by
+# state_abi_check.h). The vsim leg's in-ROI self-check exits 1 if
+# ResumeDriver did not restore the value, then writes the sentinel 0x45
+# (frm=RDN | NX|UF) that StateDrain must capture at the exit marker.
+#
+# Manual TDD smoke; not auto-wired into scripts/run_e2e.sh (the fixture
+# itself runs there via the normal marker/pc suite).
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/../lib/paths.sh"
+. "$SCRIPT_DIR/../lib/log.sh"
+
+FIXTURE="${FIXTURE:-rt_c_fcsr}"
+TIMEOUT="${TIMEOUT:-120}"
+
+hybrid_resolve_paths
+
+SHARED_SIZE=$((128 * 1024 * 1024))
+SHARED_MEM=$(mktemp -p /dev/shm vsim-fcsr-shared.XXXXXX)
+STATE_QEMU=$(mktemp)
+STATE_VSIM=$(mktemp)
+trap 'rm -f "$SHARED_MEM" "$STATE_QEMU" "$STATE_VSIM"' EXIT
+truncate -s "$SHARED_SIZE" "$SHARED_MEM"
+
+read_u64_le() { od -A n -j "$1" -N 8 -t u8 "$2" | tr -d ' \n'; }
+FCSR_OFF=3408  # locked by include/hybrid/state_abi_check.h
+
+set +e
+"$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHARED_MEM,size=$SHARED_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_QEMU" </dev/null >/dev/null 2>&1
+QEMU1_RC=$?
+set -e
+[ "$QEMU1_RC" -eq 200 ] || fail "QEMU 1 expected exit 200 on marker drain, got $QEMU1_RC"
+[ -s "$STATE_QEMU" ]    || fail "QEMU 1 produced no state"
+
+Q_FCSR=$(read_u64_le "$FCSR_OFF" "$STATE_QEMU")
+[ "$Q_FCSR" -eq 33 ] \
+  || fail "QEMU 1 drained fcsr=$Q_FCSR, want 33 (0x21: frm=RTZ | NX) -- plugin not draining fcsr?"
+ok "QEMU 1 drained fcsr=0x21"
+
+set +e
+timeout "$TIMEOUT" "$VSIM_BIN" "$VSIM_ELF" \
+  --resume-from-qemu "$STATE_QEMU" \
+  --handoff-out "$STATE_VSIM" \
+  --shared-mem-path "$SHARED_MEM" \
+  --shared-mem-size "$SHARED_SIZE" \
+  --shared-mem-base 0x00000000 </dev/null >/dev/null 2>&1
+VSIM_RC=$?
+set -e
+[ "$VSIM_RC" -ne 1 ] \
+  || fail "vsim leg exited 1: the fixture's in-ROI self-check saw fcsr != 0x21 (ResumeDriver not restoring fcsr?)"
+[ "$VSIM_RC" -eq 200 ] || fail "vsim expected exit 200 (marker drain), got $VSIM_RC"
+[ -s "$STATE_VSIM" ]   || fail "vsim produced no state"
+ok "vsim in-ROI self-check passed (fcsr restored)"
+
+V_FCSR=$(read_u64_le "$FCSR_OFF" "$STATE_VSIM")
+[ "$V_FCSR" -eq 69 ] \
+  || fail "vsim drained fcsr=$V_FCSR, want 69 (0x45: frm=RDN | NX|UF) -- StateDrain not reading fcsr back?"
+ok "vsim drain captured the in-ROI fcsr sentinel 0x45"
+
+echo "PASS e2e_fcsr_roundtrip"
