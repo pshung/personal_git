@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# F19: icount mode + --vsim-warmup-icount on the markerless rt_c_v_matmul_free.
+#
+# Both boundaries are insn-count thresholds (CSR-less workload):
+#   plugin arg `icount=Q` drains QEMU 1 after Q committed insns.
+#   `--hybrid-icount M` drains vsim after M committed insns.
+#   `--vsim-warmup-icount K` snapshots (mcycle, minstret) at the K-th
+#   vsim-side commit.
+#
+# Precondition K < M. Then measured-region insn count must equal M - K
+# within +-TOL (the K-th-commit boundary timing tolerance).
+#
+# Manual TDD smoke; not auto-wired into scripts/run_e2e.sh.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/../lib/paths.sh"
+. "$SCRIPT_DIR/../lib/log.sh"
+
+FIXTURE="${FIXTURE:-rt_c_v_matmul_free}"
+# Count geometry: Q + M must fit INSIDE the fixture's real execution
+# length, or vsim reaches the program's SimControl exit before the icount
+# drain and returns the guest exit code instead of 200. rt_c_v_matmul_free
+# reaches _exit at ~insn 2900 (everything after is the _exit spin loop,
+# which QEMU-side counters still tick while the shutdown request is
+# serviced -- do NOT size Q/M from a drain_at_exit total). Q=500 resumes
+# inside crt0/kernel setup; Q+M=2500 leaves ~400 insns of margin.
+QEMU_ICOUNT="${QEMU_ICOUNT:-500}"
+VSIM_ICOUNT="${VSIM_ICOUNT:-2000}"
+WARMUP_K="${WARMUP_K:-500}"
+TIMEOUT="${TIMEOUT:-120}"
+# icount-vs-minstret drift: in marker/PC mode the snapshot lands on
+# minstret = K exactly (the QEMU drain at the marker pins the pre-vsim
+# minstret value, and vsim's per-commit observer is 1:1 with retired
+# insns). In icount mode there is no marker; ResumeDriver injects PB
+# instructions that bump the hart-side minstret without going through the
+# trigger's observe_commit hook, producing a small constant offset that
+# grows with M (observed: 19 insns at K=500, M=2000).
+TOL="${TOL:-25}"
+
+[ "$WARMUP_K" -lt "$VSIM_ICOUNT" ] \
+  || fail "precondition K < M violated: K=$WARMUP_K M=$VSIM_ICOUNT"
+
+hybrid_resolve_paths
+
+SHARED_SIZE=$((128 * 1024 * 1024))
+SHARED_MEM=$(mktemp -p /dev/shm vsim-warmup-icount-shared.XXXXXX)
+STATE_QEMU=$(mktemp)
+STATE_VSIM=$(mktemp)
+trap 'rm -f "$SHARED_MEM" "$STATE_QEMU" "$STATE_VSIM"' EXIT
+truncate -s "$SHARED_SIZE" "$SHARED_MEM"
+
+set +e
+"$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHARED_MEM,size=$SHARED_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_QEMU,icount=$QEMU_ICOUNT" </dev/null >/dev/null 2>&1
+QEMU1_RC=$?
+set -e
+[ "$QEMU1_RC" -eq 200 ] || fail "QEMU 1 expected exit 200 on icount drain, got $QEMU1_RC"
+[ -s "$STATE_QEMU" ]    || fail "QEMU 1 produced no state"
+
+set +e
+timeout "$TIMEOUT" "$VSIM_BIN" "$VSIM_ELF" \
+  --resume-from-qemu "$STATE_QEMU" \
+  --handoff-out "$STATE_VSIM" \
+  --shared-mem-path "$SHARED_MEM" \
+  --shared-mem-size "$SHARED_SIZE" \
+  --shared-mem-base 0x00000000 \
+  --hybrid-icount "$VSIM_ICOUNT" \
+  --vsim-warmup-icount "$WARMUP_K" >/dev/null 2>&1
+VSIM_RC=$?
+set -e
+[ "$VSIM_RC" -eq 200 ] \
+  || fail "vsim expected exit 200 (icount drain), got $VSIM_RC -- if this is the guest exit code, Q+M=$((QEMU_ICOUNT + VSIM_ICOUNT)) no longer fits inside the fixture (see count geometry note above)"
+[ -s "$STATE_VSIM" ]   || fail "vsim produced no state"
+
+python3 "$SCRIPT_DIR/../lib/warmup_assert.py" \
+  "$STATE_QEMU" "$STATE_VSIM" --k "$WARMUP_K" --m "$VSIM_ICOUNT" --tol "$TOL" \
+  || fail "F19 icount-mode warmup invariants violated"
+
+ok "F19 icount-mode warmup invariants hold (K=$WARMUP_K M=$VSIM_ICOUNT)"
+echo "PASS e2e_warmup_icount"
