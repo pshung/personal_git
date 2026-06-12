@@ -1,0 +1,508 @@
+# Hybrid Simulator - Current Limitations
+
+What this simulator cannot do today, and where it will give wrong answers,
+hang, or crash on a real workload. Written 2026-05-28 from a direct read of
+the current code (not just the older audit notes).
+
+How this file relates to the others:
+
+- `ROADMAP.md` (top level) - the master feature roadmap. Every open
+  limitation below is absorbed there as an `F-ENG-*` feature; that file is
+  the *plan to fix*. This file stays the *plain-English "do not do this"
+  list* and the source of the L-ids.
+- `docs/archive/TODO.md` - the older failure-mode backlog (`F-T*`) and the
+  gem5-parity bug-audit wave (`B1-B20`, fully closed), both superseded by
+  `ROADMAP.md`. Kept for history.
+
+Each entry below was checked against the code on 2026-05-28. The `Where`
+line points at the exact file and line that proves the limit.
+
+---
+
+## The core rule: the vsim measurement window (ROI) is very narrow
+
+This is the single most important limitation. Everything in Tier 1 is a
+consequence of it.
+
+When execution hands off to vsim, the resume step writes back only a small
+part of the CPU state. Read `resume_driver.hpp:60-145`: it restores GPRs,
+FPRs, the V registers, PC, and only four CSRs - `mstatus`, `mtvec`,
+`mcycle`, `minstret`. It does NOT write `satp`, `mepc`, `mcause`, `mtval`,
+`mscratch`, `medeleg`, `mideleg`, `mip`, `mie`, or any PMP register.
+
+So the region you measure on vsim (between `enter_vsim` and `exit_vsim`) MUST
+be:
+
+- M-mode only (no S-mode, no U-mode)
+- No virtual memory / paging (satp is at reset = bare mode)
+- Trap-free (no exceptions, no interrupts, no ebreak)
+- PMP-static (no memory-protection setup is carried in)
+- No system calls / semihosting
+- No atomics that cross the handoff boundary
+- No MMIO (UART, PLIC, timer, ROM)
+
+If the measured region steps outside this envelope, the result is silently
+wrong or the run hangs. Each case is listed below.
+
+---
+
+## State coverage: what the wire format carries
+
+Inventory view of the ROI rule above. Everything below is checked against
+`include/hybrid/state_abi.h` (struct), the QEMU plugin drain
+(`qemu_plugin/hybrid_handoff.c`), the vsim resume (`resume_driver.hpp`),
+and the vsim drain (`state_drain.hpp`).
+
+### Carried in `hybrid_state_v1`
+
+- 32 GPRs, 32 FPRs
+- 13 M-mode CSRs: `mstatus, mepc, mtvec, mcause, mtval, mscratch,
+  medeleg, mideleg, mip, mie, mcycle, minstret, satp`
+- PMP: 16 `pmpcfg` + 64 `pmpaddr`
+- V extension: `vstart, vtype, vl, vlenb, vreg[32], vxsat, vxrm, vcsr`
+- F13 warmup metadata: `mcycle_at_measure_start`, `minstret_at_measure_start`
+- `reserved[216]` = room for ~27 more `uint64` before a v2 layout is needed
+
+### NOT in the wire format at all
+
+- All S-mode CSRs: `stvec, sepc, scause, stval, sscratch, sie, sip,
+  scounteren, senvcfg, stimecmp`
+- `fcsr / frm / fflags` (FP rounding mode + sticky flags). See L20.
+- HPM block: `mhpmcounter3..31`, `mhpmevent3..31`, `mcounteren,
+  menvcfg, mcountinhibit, mconfigptr, misa, time`
+- Every Andes-custom CSR (`mmsc_cfg, mcache_ctl, mmisc_ctl, micm_cfg,
+  mdcm_cfg, mxstatus, mdcause, mnvec`, ...). See L21.
+
+### Carried but NOT restored into vsim
+
+The QEMU1 plugin drains them into the struct, but `ResumeDriver`
+writes none of them into the vsim hart. They are dead during the ROI:
+
+- `satp` (L3), `mepc / mcause / mtval` (L4), `mscratch, medeleg,
+  mideleg, mip, mie`, and all PMP (L2).
+
+Only four CSRs are actually restored into vsim: `mstatus, mtvec,
+mcycle, minstret` (`resume_driver.hpp:60-145`).
+
+### Transport ceiling - why "all CSRs" is not free
+
+Three surfaces, three ceilings:
+
+| Surface         | Mechanism                                     | Ceiling |
+|-----------------|-----------------------------------------------|---------|
+| QEMU1 drain     | plugin reads by NAME from gdbstub XML         | only CSRs the QEMU fork advertises |
+| vsim resume     | DMI Abstract Cmd + Program Buffer (by number) | RO / WARL / locked bits will not take arbitrary values |
+| vsim drain      | DMI Abstract read (by number)                 | general for any readable CSR |
+
+Two structural blockers to "all CSRs":
+
+1. Wire format is a fixed C struct; `reserved[216]` fits about 27 more
+   `uint64`. Reaching the full M + S + HPM + Andes set needs a v2 layout.
+2. Semantics, not just bits. Restore order and side effects already bite
+   (`mstatus.FS/VS` gating, `vsetvl` atomicity for `vtype/vl`). Writing
+   `satp` flushes the TLB; Andes `mcache_ctl / mmisc_ctl` toggle caches,
+   prefetchers, branch prediction and may be RO or locked when written
+   via the debug module mid-run. Those are exactly the CSRs that shape
+   the cycle figure.
+
+Verdict: extending the wire format to a bounded set (`fcsr`, S-mode trap
+CSRs, a chosen Andes microarch subset) in a v2 layout is feasible.
+"All RISC-V CSRs including Andes-specific" is not feasible without
+redesigning the wire format and lifting the entire ROI envelope (L2-L6).
+
+---
+
+## Tier 1 - Will break on the next real workload
+
+### L1. No system calls / semihosting inside the ROI  (F-T1.1)
+
+- When it bites: any C code calling `printf`, `malloc`, `_exit`, `fopen`, or
+  anything that ends up in `libgloss` between `enter_vsim()` and `exit_vsim()`.
+- What happens: libgloss emits the semihosting magic triple
+  (`slli x0,x0,0x1f; ebreak; srai x0,x0,0x7`). vsim has no semihosting
+  handler, so the ebreak traps, the trap handler calls `_exit`, which is
+  another ebreak -> infinite trap loop -> the run times out.
+- Where: `docs/vsim_semihosting_investigation.md` (unsolved);
+  `tests/fixtures/runtime/{trap.S,handler.c}`.
+- Status: OPEN. Workaround: keep all I/O in phase 1 (the QEMU leg, before the
+  ROI). Do not put any syscall in the measured region.
+
+### L2. PMP protection is not carried into vsim  (F-T1.3)
+
+- When it bites: a workload that relies on PMP-enforced memory regions
+  (write-protect, execute-lock) inside the ROI.
+- What happens: the QEMU plugin drains all 16 `pmpcfg` + 64 `pmpaddr`
+  entries (`hybrid_handoff.c:292-295`), but the resume step writes none of
+  them. vsim runs the ROI with zeroed PMP, so any protection from phase 1
+  silently disappears.
+- Where: `resume_driver.hpp` - no `pmpcfg`/`pmpaddr` write path exists.
+- Status: OPEN.
+
+### L3. Virtual memory (paging) is off inside the ROI
+
+- When it bites: any workload running with paging enabled (satp != 0), i.e.
+  almost anything under an OS.
+- What happens: `satp` is drained into the state file, but the resume step
+  never writes `satp` into vsim. The ROI executes in bare mode, so every
+  virtual address is treated as physical. Loads/stores hit the wrong memory.
+- Where: `resume_driver.hpp:32-42` (CSR constant list has no satp);
+  `resume()` never writes it.
+- Status: OPEN, and only partly documented (CLAUDE.md mentions trap-free +
+  PMP-static but not paging).
+
+### L4. Trap / exception state is lost across the ROI  (F-T1.4)
+
+- When it bites: any trap (illegal instruction, page fault, misaligned
+  access, ebreak) fires inside the ROI.
+- What happens: at drain, `mcause`, `mtval`, `mepc` are NOT re-read from
+  vsim; the stale QEMU1 values pass straight through into the drained state
+  file. Any trap-diagnostic logic reading that state sees wrong values. Also `mepc`/
+  trap-delegation CSRs are not restored into vsim, so trap handling inside
+  the ROI starts from reset values.
+- Where: `state_drain.hpp:71-109` (`drain_with_passthrough` re-reads GPRs,
+  FPRs, V-CSRs, mcycle, minstret - but not mcause/mtval/mepc).
+- Status: OPEN.
+
+### L5. Atomics (LR/SC) cannot cross the handoff  (F-T1.5)
+
+- When it bites: an `lr.{w,d}` retires before the trigger and the matching
+  `sc.{w,d}` retires after it - or any reservation held across the boundary.
+- What happens: the LR/SC reservation is not part of the wire format, so it
+  never round-trips. The `sc` always fails on re-entry; a
+  `__atomic_compare_exchange` loop spins forever.
+- Where: `include/hybrid/state_abi.h` - no reservation field.
+- Status: OPEN. The plan is to reject (not transport) a pending reservation
+  at the trigger.
+
+### L20. FP rounding mode (fcsr) does not round-trip  (new 2026-05-28)
+
+- When it bites: any workload that sets a non-default rounding mode
+  (`frm != 0 / RNE`) before the ROI, or relies on sticky `fflags` after
+  it, while running FP code inside.
+- What happens: `fcsr` (which packs `frm[7:5]` and `fflags[4:0]`) is not
+  in `hybrid_state_v1`. The plugin does not drain it; the resume step
+  does not restore it; the drain does not read it back. vsim sees the
+  reset value (RNE, no flags). FP results inside the ROI use the
+  wrong rounding;
+  sticky flags after the ROI are wrong.
+- Where: `include/hybrid/state_abi.h` (no `fcsr` field);
+  `qemu_plugin/hybrid_handoff.c` (no `fcsr` handle in `VcpuRegs`);
+  `resume_driver.hpp` (no `fcsr` restore).
+- Status: OPEN. Concrete next move: add `uint64_t fcsr` from
+  `reserved[]`, drain alongside FPRs, restore after `mstatus.FS` is
+  enabled, and drain it back at vsim exit.
+
+---
+
+## Tier 2 - Will break when you scale up
+
+### L6. Whole-program (S/U-mode) privilege is forced to M-mode  (F-T2.1)
+
+- When it bites: a kernel/Linux-style workload that is in S- or U-mode at the
+  trigger boundary.
+- What happens: both sides hardcode `priv = 3` (M-mode):
+  `state_drain.hpp:51` and `hybrid_handoff.c:264`. On the vsim side DCSR.prv
+  is never written, so `dret` always resumes in M-mode. S/U code then raises
+  illegal-instruction -> trap loop.
+- Where: `state_drain.hpp:51`, `hybrid_handoff.c:264`.
+- Status: OPEN.
+
+### L7. Workload must fit in the 128 MB shared mmap, with no bounds check  (F-T2.2)
+
+- When it bites: heap, stack, or static data extends past the default 128 MB
+  shared memory.
+- What happens: there is no startup check that the ELF segments fit. vsim's
+  memory rejects or truncates the access; QEMU may see it as MMIO. Silent
+  corruption.
+- Where: orchestrator mmap sizing; `--mmap-size` exists but nothing validates
+  ELF size against it.
+- Status: OPEN. Workaround: pass `--mmap-size` large enough by hand.
+
+### L8. Single hart only  (F-T2.3)
+
+- When it bites: any multi-hart config (`_NDS_NHART=2`), IPIs, hart-to-hart
+  sync.
+- What happens: the resume/drain code only handles hart 0. The icount
+  counter is a single `uint64_t` (`icount_trigger.hpp:14-15`); BBV emit is
+  single-hart (`bbv_emit.h:9`). Resuming hart 1 from hart 0 state corrupts
+  both.
+- Where: `resume_driver.hpp`, `state_drain.hpp`, `icount_trigger.hpp:14`,
+  `qemu_plugin/bbv_emit.h:9`.
+- Status: OPEN.
+
+### L9. MMIO inside the ROI is not handled  (F-T2.5)
+
+- When it bites: the ROI touches UART (`putchar`), PLIC, the timer, ROM, or
+  any aliased/device memory.
+- What happens: the Phase-5 interconnect watch was never built. Writes to
+  MMIO ranges either vanish or hit RAM as if they were normal memory.
+- Where: no allowlist/watch in the platform interconnect.
+- Status: OPEN.
+
+---
+
+## Tier 3 - Configuration and accuracy limits
+
+### L10. The whole pipeline is hard-wired to one CPU
+
+- When it bites: any machine other than `andes_ae350`, any CPU other than
+  `andes-ax45mpv`, or any VLEN other than 512.
+- What happens: the QEMU spawn passes `-machine andes_ae350` and
+  `-cpu andes-ax45mpv,vlen=512` literally (`tools/orchestrator/spawn.py`).
+  The V-register scratch address is the constant `kVScratchGpa = 0x00FF0000`
+  (`v_regfile_xfer.hpp:42`), which is only correct when RAM base is 0 (true
+  for `andes_ae350`, wrong for `-M virt` where it would need 0x80FF0000).
+  The shared-memory base defaults to 0 in `spawn.py`. Nothing parameterizes
+  these per machine.
+- Where: `tools/orchestrator/spawn.py`, `v_regfile_xfer.hpp:38-42`.
+- Status: by design for now; blocks porting to another core.
+
+### L11. VLEN is fixed at 512 bits, and a mismatch is silent  (F-T3.4)
+
+- When it bites: a fixture built for a different VLEN than the vsim config,
+  or any future config change to VLEN.
+- What happens: the wire format reserves 64 bytes per vector register
+  (`HYBRID_VLEN_BYTES_MAX = 64`, `state_abi.h:34`). There is no runtime check
+  that `vlenb` from QEMU equals `vlenb` in vsim. If they differ, the upper
+  bytes of each V register are uninitialized scratch -> garbage in the V
+  regfile. The constant is also duplicated in `checkpoint.py:44`
+  (`LIVE_VLEN_BYTES = 64`) and can drift from `spawn.py`.
+- Where: `state_abi.h:34`, `v_regfile_xfer.hpp`, `checkpoint.py:44`.
+- Status: OPEN.
+
+### L12. CSR-mode trigger collides with real use of CSR 0x7C0
+
+- When it bites: a workload that legitimately writes CSR `0x7C0` with
+  immediate 0 or 1.
+- What happens: the default (CSR) mode treats `csrwi 0x7C0, 0` as ROI entry
+  and `csrwi 0x7C0, 1` as exit. A real write to that CSR would false-trigger
+  a handoff. (0x7C0 is a benign vendor CSR on ax45mp, so this is unlikely in
+  practice, but it is a hard assumption.)
+- Where: `qemu_plugin/hybrid_handoff.c` CSR matcher; `csr_trigger.hpp`.
+- Status: inherent to CSR mode. Workaround: use `--mode pc` or `--mode icount`.
+
+### L13. CSR marker must be a 32-bit instruction  (B18, documented)
+
+- When it bites: never today, but worth knowing.
+- What happens: the matcher skips any instruction whose size is not 4 bytes
+  (`hybrid_handoff.c:505-506`). RV32C has no compressed `csrwi`, so this is
+  correct now; if a future extension adds a 16-bit CSR write the marker and
+  this gate must change together.
+- Where: `hybrid_handoff.c:499-506`.
+- Status: documented limit, no action needed now.
+
+### L14. The SimPoint cycle estimate is an approximation, not a measurement
+
+- When it bites: any `--mode simpoint` / `./hsim.py estimate` run where you read
+  the headline `estimated_cycles` as if it were exact.
+- What happens: each phase CPI is sampled from a single window of
+  `vsim_icount` instructions at the slice boundary
+  (`hsim.py:1188-1193`), and the whole-program figure is
+  `N_total * weighted_CPI`. Two accuracy gaps:
+  1. The microarchitectural state (caches, branch predictor) is cold at each
+     window start unless you pass `--vsim-warmup-icount`. Without warmup the
+     CPI is biased high.
+  2. No error bound or confidence interval is reported. The estimate inherits
+     SimPoint's usual phase-approximation error.
+- Where: `hsim.py:1122-1202` (`_run_simpoint_pipeline`).
+- Status: by design; mitigate with `--vsim-warmup-icount`.
+
+### L21. Andes vendor CSRs are not transported  (new 2026-05-28)
+
+- When it bites: any workload whose behavior or cycle figure depends on
+  Andes-specific CSRs (`mmsc_cfg, mcache_ctl, mmisc_ctl, micm_cfg,
+  mdcm_cfg, mxstatus, mdcause, mnvec, mslideleg`, ...).
+- What happens: zero Andes vendor CSRs appear in `hybrid_state_v1`;
+  none are drained, restored, or read back. vsim runs the ROI with
+  whatever its reset / boot-time values were. Cache-enable, prefetcher,
+  branch-predictor, and ECC controls in particular shape the cycle
+  count, so this is an accuracy hazard, not only a correctness one.
+  CSR `0x7C0` is also actively repurposed by the trigger matcher (L12)
+  instead of being preserved.
+- Where: `include/hybrid/state_abi.h` (no Andes block);
+  `qemu_plugin/hybrid_handoff.c` (no Andes handles);
+  `resume_driver.hpp` (no Andes restore path).
+- Status: OPEN. Any v2 extension should label each Andes CSR as either
+  microarch-only (read-only / boot-set, no runtime restore needed) or
+  software-visible (must round-trip).
+
+---
+
+## Tier 4 - Robustness and tooling gaps
+
+### L15. No value-level check that the handoff copied state correctly  (F-T3.1)
+
+- When it bites: any bug that copies the wrong register, byte-swaps, or
+  truncates a 64-bit value in the icount or simpoint paths.
+- What happens: those paths only assert exit code and PC range. A wrong
+  register value passes silently. There is no `g`-packet readback compared
+  against the drained state.
+- Where: `hsim.py` (`_run_drain_pair`, `_run_simpoint_pipeline`).
+- Status: OPEN. This is the cheapest high-value fix (see
+  `docs/archive/TODO.md` "next moves", or `ROADMAP.md` F-ENG-01).
+
+### L16. [REMOVED: the QEMU2 handback leg was deleted 2026-06-09] CSR restore to QEMU2 is silently skipped if the stub omits the name
+
+- When it bites: a QEMU build whose feature XML does not advertise some CSR
+  (e.g. `medeleg`, `satp`, `mie`).
+- What happens: GPRs and PC hard-fail if missing, but every CSR/PMP/V write
+  goes through `_try_write_u64`, which returns quietly when the name is not
+  found (`gdbstub.py:251-258`). That CSR keeps QEMU2's reset value with no
+  warning. The asymmetry (hard-fail GPR vs silent-skip CSR) is the hazard.
+- Where: `gdbstub.py:251-258`, used at `gdbstub.py:299-305`.
+- Status: REMOVED - the QEMU2 handback leg was deleted 2026-06-09.
+
+### L17. [REMOVED: the QEMU2 handback leg was deleted 2026-06-09] gdbstub handback uses a fixed 10 s timeout and a racy port pick
+
+- When it bites: QEMU2 slow to answer under host load; or many parallel runs
+  (the `JOBS=8` e2e runner) picking ports at the same time.
+- What happens: `RECV_TIMEOUT = 10.0` is hardcoded (`gdbstub.py:135`); a slow
+  reply raises mid-restore and the run dies. `pick_free_port` binds port 0,
+  reads the number, closes, then QEMU binds it later - a TOCTOU window where
+  another process can grab the port (`spawn.py`, acknowledged in its
+  comment). Wrong-port connect = hang until timeout.
+- Where: `gdbstub.py:135`, `tools/orchestrator/spawn.py`.
+- Status: REMOVED - the QEMU2 handback leg was deleted 2026-06-09.
+
+### L18. Wire format is little-endian / same-arch only
+
+- When it bites: running any component on a big-endian host, or mixing hosts
+  with different struct alignment.
+- What happens: the state struct is exchanged byte-for-byte with no byte-swap
+  path (`state_abi.h:7-9`). The Python mirror uses a native-endian
+  `ctypes.Structure` (`abi.py:30`), so a BE host would mis-parse the body
+  while the `<II` magic check still passes - a silent mis-read.
+- Where: `state_abi.h:7-9`, `abi.py:30`.
+- Status: by design (x86-64 host + RV64 guest only).
+
+### L19. Other un-guarded failure paths  (F-T3.3, F-T3.5, F-T3.6, F-T3.8)
+
+- Determinism is not guaranteed across re-runs (reserved bytes, CSR drain
+  order); no test pins byte-identical output.
+- Submodule version drift (QEMU plugin ABI, vsim DM, pinned SimPoint
+  `17783e5`) has no CI gate.
+- Failure injection is thin: partial drain, disk full, mmap truncated
+  mid-run are not covered.
+- [REMOVED: the QEMU2 handback leg was deleted 2026-06-09] A QEMU2 that
+  launches but never answers the gdbstub can be left as a zombie (no
+  SIGALRM watchdog around the handshake).
+- Status: all OPEN, lower priority.
+
+---
+
+## Documentation drift (not a runtime limit, but a trap)
+
+The QEMU2 handback leg has been removed entirely (2026-06-09). The
+simulator is now 2-phase: QEMU1 drains architectural state to the
+`hybrid_state_v1` file and exits; vsim resumes from that file, runs the
+ROI cycle-accurately, and drains again. There is no third phase. Any
+docs (`CLAUDE.md`, older architecture notes) that still describe
+`verilator/src/hybrid/qemu_handback.hpp`, a QEMU2 spawn, or a gdbstub
+P-packet restore are stale - that code path no longer exists.
+
+---
+
+## Quick reference
+
+| ID  | Limitation                              | Severity | Status |
+|-----|-----------------------------------------|----------|--------|
+| L1  | No syscalls/semihosting in ROI          | blocker  | open   |
+| L2  | PMP not restored to vsim                | high     | open   |
+| L3  | Paging (satp) off in ROI                | high     | open   |
+| L4  | Trap state lost across ROI              | high     | open   |
+| L5  | LR/SC cannot cross handoff              | high     | open   |
+| L6  | Privilege forced to M-mode              | high     | open   |
+| L7  | 128 MB mmap, no bounds check            | medium   | open   |
+| L8  | Single hart only                        | medium   | open   |
+| L9  | MMIO in ROI not handled                 | medium   | open   |
+| L10 | Hard-wired to andes_ae350 / ax45mpv     | medium   | by design |
+| L11 | VLEN fixed at 512, mismatch silent      | medium   | open   |
+| L12 | CSR 0x7C0 trigger collision             | low      | inherent |
+| L13 | CSR marker must be 32-bit               | low      | documented |
+| L14 | SimPoint estimate is approximate        | medium   | by design |
+| L15 | No value-level handoff check            | medium   | open   |
+| L16 | CSR restore silently skipped if missing | medium   | removed |
+| L17 | Fixed gdbstub timeout + racy port       | low      | removed |
+| L18 | Little-endian / same-arch only          | low      | by design |
+| L19 | Determinism / drift / fault-injection   | low      | open   |
+| L20 | fcsr/frm/fflags not transported         | high     | open   |
+| L21 | Andes vendor CSRs not transported       | high     | open   |
+
+---
+
+## Commercial product quality rating  (assessed 2026-05-28)
+
+Honest scorecard for "is this a shippable commercial product today?".
+Rated against industry baselines (Synopsys VCS, Cadence Xcelium,
+gem5 + functional warmup) for a CPU vendor's hybrid sim offering.
+
+**Overall: 4/10 as a shippable commercial product. ~7/10 as an internal
+/ research tool inside its narrow design envelope.**
+
+### Axis breakdown
+
+| Axis                                  | Score | Note |
+|---------------------------------------|-------|------|
+| Architecture clarity                  | 8/10  | Two-phase handoff is clean; shared ABI is a single header. |
+| Engineering discipline                | 7/10  | TDD gate, doctest, parallel CI, candid `limitation.md`. |
+| State coverage (correctness surface)  | 3/10  | 21 documented limitations; only 4 CSRs round-trip into vsim. |
+| Generality of workload                | 2/10  | ROI must be M-mode, trap-free, PMP-static, no syscalls (L1-L6). |
+| ISA completeness                      | 3/10  | No S/U mode, no fcsr, no HPM, zero Andes vendor CSRs (vendor IS Andes). |
+| Wire-format extensibility             | 4/10  | v1 only; growth happens by carving `reserved[216]` ad-hoc. No v2 path. |
+| Robustness / errors                   | 5/10  | `cmderr` is cleared and swallowed; only a private diagnostic side channel. |
+| Docs / onboarding                     | 7/10  | `CLAUDE.md`, `USER_GUIDE.md`, `limitation.md` are unusually honest. |
+| Test fixtures                         | 6/10  | Solid asm + C-runtime e2e, but no OS-mode, no FP-rounding, no trap fixtures. |
+| Portability                           | 4/10  | x86-64 host + little-endian assumed (L18); pinned Andes toolchain; podman-only vsim build. |
+
+### What blocks commercial shipping
+
+1. **Silent correctness gaps.** `fcsr/frm/fflags` never round-trip (L20)
+   - an FP workload that touches rounding mode will look numerically
+   fine but be wrong. `cmderr` is W1C-cleared so a partial CSR restore
+   is observable only through a private counter
+   (`resume_driver.hpp:196-205`).
+2. **ROI envelope is too narrow.** "M-mode only, no traps, no paging,
+   no syscalls inside the window" (L1-L6) rules out every real
+   OS-bearing benchmark - SPEC under Linux, any driver code, anything
+   with page faults.
+3. **No Andes vendor CSRs.** For an Andes product, shipping zero
+   `mmsc_cfg / mcache_ctl / mmisc_ctl` transport (L21) is a
+   credibility hit and an accuracy hazard - cache and prefetcher
+   controls shape the cycle count.
+4. **Only 4 CSRs restored into vsim.** `satp`, `mepc/mcause/mtval`,
+   `mscratch`, `mip/mie`, PMP are drained but never written back into
+   vsim (`resume_driver.hpp:60-145`). They exist in the wire format
+   but not in the simulator. Any future need for traps or dynamic
+   PMP needs `resume_driver` extended.
+5. **Wire format is v1-locked with ad-hoc growth.** Each new field
+   steals from `reserved[]` (warmup metadata already ate 16 bytes;
+   `state_abi.h:85-88`). No deprecation path, no feature bits beyond
+   the three `HYBRID_FLAG_*` bits.
+6. **Build/test infrastructure is single-host.** Podman-required vsim
+   build, hardcoded `JOBS=8` ceiling on 128-core hosts,
+   `/dev/shm`-backed fixtures - all fine for a lab, painful for a
+   commercial CI matrix.
+
+### What it does well (the 7/10 internal-tool score)
+
+- Two-phase handoff is a clear, documented contract.
+- `state_abi.h` plus `static_assert`s pin layout - good ABI hygiene.
+- The team writes down what does NOT work (this file, 21 entries plus
+  the state-coverage section) instead of hiding it. Commercially that
+  is the release-blocker checklist; internally it is exemplary.
+- SimPoint integration for whole-program cycle estimation (L14) is a
+  real differentiator over a pure functional sim.
+
+### Bottom line
+
+Ship-grade architecture, research-grade coverage. For commercial
+release you need:
+
+- v2 wire format with feature bits and a deprecation path
+- S-mode + traps + paging supported inside ROI (close L3, L4, L6)
+- Andes vendor CSR transport (close L21)
+- `fcsr` fix (close L20)
+- A proper error policy instead of `cmderr` swallowing
+- A value-level handoff checker (close L15) wired into CI
+
+Rough effort: 6-9 months of focused hardening, not weeks.
