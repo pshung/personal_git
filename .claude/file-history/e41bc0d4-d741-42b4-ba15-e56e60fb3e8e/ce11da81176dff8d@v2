@@ -1,0 +1,79 @@
+/* Tier-2 C-level fixture: 8x8x8 GEMM (2-phase: QEMU1 -> vsim).
+ * (Was 16x16x16 while the ROI was accidentally empty -- see below. With the
+ * kernel really inside the ROI, 16^3 costs ~322k vsim cycles and brushes the
+ * harness timeouts; 8^3 keeps a real ROI at ~1/8 the cycles.)
+ *
+ *   QEMU 1: init_matrices -- fills A and B with deterministic patterns.
+ *   vsim:   matmul_kernel -- pure C = A * B, no syscalls (phase-2 rule).
+ *           The matrices are non-static on purpose: the markers' "memory"
+ *           clobber covers only ESCAPED memory, and with `static` arrays
+ *           (addresses never leave the TU, C never read back) GCC hoisted
+ *           the inlined kernel above enter_vsim() and later, with
+ *           noinline, deleted the call as a dead store -- the fixture
+ *           shipped with an EMPTY ROI (markers back-to-back,
+ *           window_cycles ~74 of drain overhead; found 2026-06-12 by
+ *           --cosim's ROI retire count). External linkage makes A/B/C
+ *           visible to the opaque drain, so the kernel is live and its
+ *           call (noinline, rt_c_helpers.h anchor rule) is pinned between
+ *           the markers. vsim drains at the exit marker and exits 200.
+ *
+ * (The old phase-3 QEMU2 print + independent re-verify was removed with the
+ * QEMU2 leg; the fixture now validates that the GEMM kernel runs and drains.)
+ *
+ * Cross-phase memory survival
+ *   Matrices sit in .bss. The "no redundant ELF reload" rule keeps phase-1
+ *   .bss writes intact through the shared memory-backend-file.
+ */
+#include "runtime/rt_c_helpers.h"
+
+#include <stdint.h>
+
+#define N 8
+
+/* Non-static: see the header comment (escape => the marker clobbers apply). */
+int32_t A[N * N];
+int32_t B[N * N];
+int32_t C[N * N];
+
+#define AT(M, i, j) ((M)[(i) *N + (j)])
+
+static void init_matrices(void)
+{
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < N; j++) {
+      AT(A, i, j) = (int32_t) ((i + j) % 7);
+      AT(B, i, j) = (int32_t) ((i * 3 + j) % 5);
+    }
+  }
+}
+
+/* noinline: the call anchors every kernel op inside the marker span (same
+ * pattern as rt_c_v_matmul). Inlined at -O2, the whole GEMM hoists above
+ * enter_vsim() -- see the header comment. */
+static void __attribute__((noinline)) matmul_kernel(void)
+{
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < N; j++) {
+      int32_t s = 0;
+      for (int k = 0; k < N; k++) {
+        s += AT(A, i, k) * AT(B, k, j);
+      }
+      AT(C, i, j) = s;
+    }
+  }
+}
+
+int main(void)
+{
+  /* Phase 1 (QEMU 1): seed inputs. */
+  init_matrices();
+
+  enter_vsim();
+
+  /* Phase 2 (vsim): GEMM kernel only. No syscalls. */
+  matmul_kernel();
+
+  exit_vsim();
+
+  return 0;
+}

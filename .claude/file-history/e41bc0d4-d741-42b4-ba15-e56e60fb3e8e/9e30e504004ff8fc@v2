@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Fixture ROI-content contract: a fixture whose phase-2 comment promises a
+# kernel must actually carry that kernel BETWEEN the markers. The compiler
+# may legally hoist an inlined kernel above enter_vsim() -- the markers'
+# "memory" clobber does not cover statics whose address never escapes --
+# which silently empties the ROI (rt_c_matmul shipped that way: markers
+# back-to-back, window_cycles ~74 of pure drain overhead). Anchor rule
+# (runtime/rt_c_helpers.h): kernels live in a noinline function called
+# between the markers.
+#
+# Checks (static, objdump):
+#   rt_c_matmul    span contains the GEMM: a kernel call (jal) or a mul
+#   rt_c_v_matmul  span contains the kernel call (control: known-good)
+#   rt_c_v_regs    span contains vector instructions (inline V kernel)
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+. "$SCRIPT_DIR/../lib/paths.sh"
+
+OBJDUMP="${OBJDUMP:-${HYBRID_TOOLCHAIN:+$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-objdump}}"
+OBJDUMP="${OBJDUMP:-riscv64-unknown-elf-objdump}"
+command -v "$OBJDUMP" >/dev/null 2>&1 || { echo "skip[fixture_roi_content]: no objdump"; exit 77; }
+
+FIXDIR="$SCRIPT_DIR"
+
+# Instructions strictly between the ENTER and EXIT markers.
+roi_body() {
+  "$OBJDUMP" -d "$FIXDIR/$1.elf" \
+    | awk '/5a002013/ { on = 1; next } /5a102013/ { exit } on'
+}
+
+check_roi() {  # $1 = fixture, $2 = required-content regex, $3 = description
+  BODY=$(roi_body "$1")
+  if [ -z "$BODY" ]; then
+    fail "$1: ROI is EMPTY (markers back-to-back) -- kernel hoisted out?"
+  fi
+  if ! printf '%s\n' "$BODY" | grep -Eq "$2"; then
+    echo "--- ROI body of $1 ---"
+    printf '%s\n' "$BODY"
+    fail "$1: ROI does not contain $3 (want /$2/)"
+  fi
+  ok "$1: ROI carries $3"
+}
+
+check_roi rt_c_matmul   '\sjal\s|\smulw?\s' "the GEMM (kernel call or mul)"
+check_roi rt_c_v_matmul '\sjal\s'           "the kernel call"
+check_roi rt_c_v_regs   '\sv[a-z0-9.]+\.v'  "vector instructions"
+
+ok "fixture ROI content"
