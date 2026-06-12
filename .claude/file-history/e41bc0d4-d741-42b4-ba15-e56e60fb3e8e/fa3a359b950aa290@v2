@@ -1,0 +1,75 @@
+/* rt_c_v_fill.c - Round-trip fixture: a fully filled V register across the
+ * handoff (L11).
+ *
+ * Unlike rt_c_v_regs (e32 kernel, vl set from the data count), this fixture
+ * fills v8 across ALL vlenb bytes (vsetvli AVL=VLMAX, e8/m1), so the drained
+ * vreg slot is deterministic end to end at any VLEN. The old wire format
+ * clamped the drain at 64 bytes per register; tests/hybrid/
+ * e2e_vlen1024_drain.sh runs the QEMU leg at vlen=1024 and asserts the LAST
+ * byte of v8 (vreg offset 1023 .. 1151 in the file) survives un-truncated.
+ *
+ * Phase 1 (QEMU1): v8 = 0xA5 repeated vlenb times, then the enter marker.
+ * Phase 2 (vsim): the in-ROI self-check stores v8 and compares every byte;
+ *   on mismatch it exits 1, so the vsim leg returns 1 instead of 200 and
+ *   the harness fails loudly. On success v8 is refilled with the sentinel
+ *   0x5A for StateDrain to capture at the exit marker.
+ *
+ * crt0.S sets mstatus.VS=Initial, so V is usable in M-mode on both engines.
+ * The insns after the exit marker touch no V state, so the drain's 0-3 insn
+ * halt slack cannot disturb the sentinel.
+ */
+#include <stdlib.h>
+
+#include "runtime/rt_c_helpers.h"
+
+#define FILL_BYTE 0xA5u
+#define SENTINEL_BYTE 0x5Au
+
+/* HYBRID_VLEN_BYTES_MAX mirror: big enough for VLEN 1024. */
+static unsigned char buf[128];
+
+/* vl=VLMAX at e8/m1 covers the whole register; returns vlenb. The "=&r"
+ * early-clobber is required: vsetvli writes %0 before vmv.v.x reads %1,
+ * so they must not share a register. */
+static unsigned long fill_v8(unsigned long pattern)
+{
+  unsigned long vl;
+  asm volatile("vsetvli %0, x0, e8, m1, ta, ma\n\t"
+               "vmv.v.x v8, %1"
+               : "=&r"(vl)
+               : "r"(pattern));
+  return vl;
+}
+
+static void store_v8(unsigned char *dst)
+{
+  unsigned long vl;
+  asm volatile("vsetvli %0, x0, e8, m1, ta, ma\n\t"
+               "vse8.v v8, (%1)"
+               : "=&r"(vl)
+               : "r"(dst)
+               : "memory");
+}
+
+int main(void)
+{
+  /* Phase 1 (QEMU1): fill the full register width. */
+  unsigned long vlenb = fill_v8(FILL_BYTE);
+  if (vlenb > sizeof(buf))
+    exit(2); /* engine wider than the wire format; should have aborted */
+
+  enter_vsim();
+
+  /* Phase 2 (vsim): every restored byte must carry the pattern. */
+  store_v8(buf);
+  for (unsigned long i = 0; i < vlenb; ++i)
+    if (buf[i] != FILL_BYTE)
+      exit(1);
+
+  /* Leave a distinct value for the exit drain to capture. */
+  fill_v8(SENTINEL_BYTE);
+
+  exit_vsim();
+
+  return 0;
+}
