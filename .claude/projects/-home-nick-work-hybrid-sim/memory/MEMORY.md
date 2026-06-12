@@ -14,3 +14,4 @@
 - [vsim halt slack](project_vsim_halt_slack.md) - exit drain retires 0-3 extra insns past the trigger; align comparisons to the drained pc (plugin drain_pc=)
 - [rt_c_matmul empty ROI](project_rt_c_matmul_empty_roi.md) - FIXED 7022599; lesson: marker "memory" clobbers only cover escaped memory (statics can hoist/DCE across markers); guard test: tests/fixtures/test_fixture_roi_content.sh
 - [cosim checkpoint co-sim](project_cosim_roi.md) - see cosim_roi.md in repo: --cosim (dev) drains vsim checkpoints every N retires + QEMU oracle at same minstret deltas; mmap stays shared (oracle replays from boot on own RAM); register-only (memory co-sim rejected); suppresses window_cycles
+- [Background Bash cwd](feedback_background_bash_cwd.md) - background tasks inherit last foreground cwd; absolute paths + check log content, trailing echo masks rc
