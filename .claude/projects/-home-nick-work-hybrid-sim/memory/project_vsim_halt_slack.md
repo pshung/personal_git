@@ -1,0 +1,24 @@
+---
+name: vsim-halt-slack
+description: "vsim's exit drain is insn-imprecise (0-3 extra retires past the trigger); verification must sample at vsim's drained pc (plugin drain_pc=)"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: e41bc0d4-d741-42b4-ba15-e56e60fb3e8e
+---
+
+vsim's exit-trigger drain is NOT insn-precise: between the exit marker/pc
+retiring and the DMI haltreq taking effect, the AX45MPV core retires a
+variable 0-3 more instructions. The drained pc (DPC) and any GPRs those
+slack insns touch reflect the later sample point. This is inherent to the
+DMI halt path, not a bug; the mcycle figure already includes the slack.
+
+Discovered 2026-06-12 by the verify_oracle feature (first VERIFY=1 suite
+run failed 20/35 on pc/GPR mismatches; e.g. rt_c_matmul's vsim drain showed
+pc after `main` returned and a0 clobbered by `c.li a0,0`).
+
+**How to apply:** any tool comparing or replaying a vsim drain must align to
+the drained pc, not to trigger+1. The QEMU plugin's oracle mode does this
+via `exit_marker=1|exit_pc=0x... , drain_pc=<vsim drained pc>` (arm at the
+boundary, drain at the first post-arm hit of drain_pc). See verify_oracle.md
+"Boundary semantics" and [[hsim-cpp-rewrite]].

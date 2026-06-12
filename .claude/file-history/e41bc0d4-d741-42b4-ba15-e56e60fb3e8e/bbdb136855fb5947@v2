@@ -1,0 +1,100 @@
+# verify_oracle -- QEMU-oracle differential verification (opt-in, default OFF)
+
+Problem: with the QEMU2 handback removed, the post-ROI verification code in a
+workload never runs, and the e2e suite only checks that a cycle figure exists.
+Nothing proves the vsim leg executed the ROI *correctly*.
+
+Solution (PM decision, 2026-06-12): differential check against QEMU as the
+oracle. The same ELF runs twice:
+  run A (oracle):  pure QEMU, plugin drains hybrid_state_v1 at the ROI exit
+                   boundary (new plugin mode).
+  run B (hybrid):  the normal QEMU1 -> vsim run; vsim already drains
+                   hybrid_state_v1 at the same boundary.
+The pre-ROI path is QEMU in both runs, so the ROI inputs are identical; any
+architectural divergence inside the ROI (RTL bug, resume bug, drain bug) shows
+up as a field mismatch. Verification is OPT-IN and default OFF everywhere:
+`--verify` on `andes-sim run`, `VERIFY=1` on the e2e harness.
+
+Compare policy (fixed, derived from what vsim's drain freshly reads --
+state_drain.hpp drain_with_passthrough):
+  strict:  pc, gpr[0..31]; fpr[0..31] (when FLAG_FP); vstart/vtype/vl/
+           vxsat/vxrm/vcsr + vreg[] (when FLAG_V); magic/version/flags/
+           hart_id/priv/vlenb (identity).
+  skipped: mstatus, mepc, mtvec, mcause, mtval, mscratch, medeleg, mideleg,
+           mip, mie, satp, pmpcfg[], pmpaddr[] -- passthrough on the vsim
+           side (copied from QEMU1's ENTRY snapshot, never re-read), so a
+           compare would test entry-vs-exit, not vsim-vs-oracle.
+  masked:  mcycle, minstret, mcycle/minstret_at_measure_start -- counters
+           differ between engines by design.
+
+Boundary semantics: the oracle arms on the exit boundary's exec callback and
+drains on a later one (exec callbacks fire pre-execution, so the capture is
+post-retire state). EMPIRICAL FINDING (first full-suite run, 20/35 failed):
+vsim's DMI halt is NOT insn-precise -- the core retires a variable 0-3 more
+insns while haltreq propagates, so vsim's drained pc lands past the trigger
+and those slack insns' effects are in its record. Fix: the harness reads
+vsim's drained pc and passes it as the plugin's `drain_pc=`; the oracle
+drains at the first post-arm hit of that pc, so both sides sample the SAME
+architectural point (pc then matches by construction; if vsim's pc is never
+reached -- a real control-flow divergence -- the oracle never drains and the
+run fails on its exit code). Limitation: the oracle arms on the first
+exit-boundary hit; like the hybrid run itself it assumes a single-shot ROI.
+icount-trigger verify is out of scope (off-by-one window semantics differ;
+revisit if needed).
+
+## F1: plugin oracle exit drain
+State: done
+Description: three new plugin args, mutually exclusive with the other
+trigger modes:
+  exit_marker=1   marker mode -- arm on the EXIT marker `slti x0,x0,0x5A1`
+  exit_pc=0x...   pc mode -- arm on the boundary vaddr (e2e derives it from
+                  the exit marker; users may pass any post-ROI pc)
+  drain_pc=0x...  modifier (landed second, after the slack finding above):
+                  drain at the first post-arm hit of this pc instead of the
+                  very next tick; callers pass vsim's drained pc
+All register a per-insn exec callback (same cost class as icount mode);
+the armed drain reuses handoff_drain (exit 200, atomic state write).
+Key files: qemu_plugin/hybrid_handoff.c,
+tests/plugin/test_plugin_oracle_exit_drain.sh (new)
+Dependencies: none
+
+## F2: state-diff compare core + dev subcommand
+State: done
+Description: `diff_states(ref, got)` implements the compare policy above and
+returns the mismatch list; `andes-sim state-diff <ref.bin> <got.bin>` (Dev
+tier, hidden from release --help) prints PASS or one line per mismatch and
+exits 0/1. Unit tests build synthetic hybrid_state_v1 pairs.
+Key files: driver/state_diff.hpp/.cpp (new), driver/state_diff_test.cpp (new),
+driver/main.cpp, driver/CMakeLists.txt,
+tests/andes_sim/test_andes_sim_release_surface.sh
+Dependencies: none
+
+## F3: e2e harness VERIFY=1 (default off)
+State: done
+Description: tests/e2e.sh gains VERIFY=1: after the vsim leg, run the oracle
+QEMU (plain memory -- no shared mmap; the oracle must boot on clean memory),
+expect exit 200, then `build/andes-sim state-diff` the oracle file against
+the vsim drain. Prints `[FIXTURE verify] PASS|FAIL`. Default (VERIFY unset)
+changes nothing. scripts/run_e2e.sh passes the env through untouched.
+Key files: tests/e2e.sh, tests/andes_sim/test_andes_sim_verify_e2e.sh (new)
+Dependencies: F1, F2
+Gate: full suite VERIFY=1 JOBS=8 must pass on all 35 tests (the empirical
+check of the compare policy -- any false mismatch is fixed here).
+
+## F4: andes-sim run --verify (default off)
+State: done
+Description: `--verify` on `run --model hybrid --trigger marker|pc`. After
+the main plan, the driver runs a one-step oracle plan (fast-leg template,
+fresh mmap so memory starts clean, trigger suffix exit_marker=1/exit_pc=...)
+and diffs in-process via diff_states (PlanResult carries the drained structs).
+Prints `[verify] PASS: ...` or the mismatch lines and exits non-zero.
+`--verify` with --model fast|cycle or --trigger icount is a usage error.
+Key files: driver/cli.hpp/.cpp, driver/plan.hpp, driver/run_plan.cpp,
+driver/cmd_run.cpp, driver/main.cpp (run help),
+tests/andes_sim/test_andes_sim_verify.sh (new)
+Dependencies: F2 (F1 for the oracle leg to work at runtime)
+
+## Docs
+Each feature updates docs/USER_GUIDE.md in its own change set; the user-facing
+section teaches `--verify` (what it proves, what it skips, why counters are
+excluded) and notes the e2e VERIFY=1 knob for developers.

@@ -1,0 +1,313 @@
+// Unit tests for the F6 phase-plan executor's pure core:
+//   - build_argv  (driver/argv.hpp)     invoke-template placeholder fill
+//   - plan_argvs  (driver/run_plan.hpp) state-file threading across steps
+//
+// These cover everything in run_plan EXCEPT the live spawn loop, which the
+// integration acceptance (tests/andes_sim/test_andes_sim_f6.sh -> a real
+// 2-step qemu+vsim run) exercises. Plain assert-and-count harness; run by that
+// same f6 script. No QEMU2 leg exists -- handback was removed.
+#include <map>
+#include <string>
+#include <vector>
+
+#include "argv.hpp"
+#include "engine_descriptor.hpp"
+#include "plan.hpp"
+#include "run_plan.hpp"
+#include "test_check.hpp"
+
+using namespace andes_sim;
+using andes_sim::test::check_eq;
+
+namespace {
+
+// The canonical drain templates (what builtin_qemu() and vsim --describe ship).
+const std::vector<std::string> kQemuFastLeg = {
+    "{bin}",
+    "-object", "memory-backend-file,id=mem,share=on,mem-path={mmap},size={mmap_size}",
+    "-machine", "andes_ae350,memory-backend=mem",
+    "-cpu", "andes-ax45mpv,vlen={vlen}",
+    "-nographic",
+    "-semihosting-config", "enable=on,target=native",
+    "-bios", "{elf}",
+    "-plugin", "{plugin},outfile={state_out}{trigger}",
+};
+
+const std::vector<std::string> kVsimAccurateLeg = {
+    "{bin}", "{elf}",
+    "--resume-from-qemu", "{state_in}",
+    "--handoff-out", "{state_out}",
+    "--shared-mem-path", "{mmap}",
+    "--shared-mem-size", "{mmap_size}",
+    "--shared-mem-base", "{mmap_base}",
+};
+
+EngineDescriptor fake(const std::string& id, const std::string& bin,
+                      const std::string& role,
+                      const std::vector<std::string>& tmpl) {
+  EngineDescriptor d;
+  d.id = id;
+  d.bin_path = bin;
+  d.invoke.push_back({role, tmpl});
+  return d;
+}
+
+}  // namespace
+
+int main() {
+  // --- build_argv: every placeholder filled, including substring + repeat ---
+  {
+    std::string err;
+    std::map<std::string, std::string> ctx = {
+        {"bin", "/q"},      {"elf", "/e"},     {"plugin", "/p"},
+        {"mmap", "/m"},     {"mmap_size", "134217728"}, {"state_out", "/s0"},
+        {"trigger", ""},  // marker: no plugin suffix
+        {"vlen", "512"},
+    };
+    std::vector<std::string> got = build_argv(kQemuFastLeg, ctx, err);
+    CHECK(err.empty());
+    check_eq(got,
+             {"/q", "-object",
+              "memory-backend-file,id=mem,share=on,mem-path=/m,size=134217728",
+              "-machine", "andes_ae350,memory-backend=mem", "-cpu",
+              "andes-ax45mpv,vlen=512", "-nographic", "-semihosting-config",
+              "enable=on,target=native", "-bios", "/e", "-plugin",
+              "/p,outfile=/s0"},
+             "qemu");
+  }
+  {
+    std::string err;
+    std::map<std::string, std::string> ctx = {
+        {"bin", "/v"},  {"elf", "/e"},  {"state_in", "/s0"},
+        {"state_out", "/s1"}, {"mmap", "/m"}, {"mmap_size", "134217728"},
+        {"mmap_base", "0x0"},
+    };
+    std::vector<std::string> got = build_argv(kVsimAccurateLeg, ctx, err);
+    CHECK(err.empty());
+    check_eq(got,
+             {"/v", "/e", "--resume-from-qemu", "/s0", "--handoff-out", "/s1",
+              "--shared-mem-path", "/m", "--shared-mem-size", "134217728",
+              "--shared-mem-base", "0x0"},
+             "vsim");
+  }
+  // a repeated placeholder expands every occurrence
+  {
+    std::string err;
+    std::vector<std::string> got =
+        build_argv({"a={x},b={y},a2={x}"}, {{"x", "1"}, {"y", "2"}}, err);
+    CHECK(err.empty());
+    check_eq(got, {"a=1,b=2,a2=1"}, "repeat");
+  }
+  // an unknown placeholder is an error, not a silent empty fill
+  {
+    std::string err;
+    std::vector<std::string> got = build_argv({"{bogus}"}, {{"x", "1"}}, err);
+    CHECK(got.empty());
+    CHECK(!err.empty());
+  }
+
+  // --- plan_argvs: thread state files across a 2-step hybrid plan ---
+  std::vector<EngineDescriptor> engines = {
+      fake("qemu", "/qbin", "fast-leg", kQemuFastLeg),
+      fake("vsim:test", "/vbin", "accurate-leg", kVsimAccurateLeg),
+  };
+  Plan plan;
+  plan.elf = "/e";
+  plan.mem_size = 134217728;
+  plan.steps = {
+      {"qemu", "fast-leg", {"marker", {}}},
+      {"vsim:test", "accurate-leg", {"marker", {}}},
+  };
+  RuntimeCtx rc;
+  rc.mmap_path = "/mm";
+  rc.mem_size = 134217728;
+  rc.mmap_base = "0x0";
+  rc.plugin_path = "/pl";
+
+  {
+    std::string err;
+    std::vector<std::vector<std::string>> argvs =
+        plan_argvs(plan, engines, "/wd", rc, err);
+    CHECK(err.empty());
+    CHECK(argvs.size() == 2);
+    if (argvs.size() == 2) {
+      // step 0 (qemu): drains to state-0.bin; no state_in referenced
+      check_eq(argvs[0],
+               {"/qbin", "-object",
+                "memory-backend-file,id=mem,share=on,mem-path=/mm,size=134217728",
+                "-machine", "andes_ae350,memory-backend=mem", "-cpu",
+                "andes-ax45mpv,vlen=512", "-nographic", "-semihosting-config",
+                "enable=on,target=native", "-bios", "/e", "-plugin",
+                "/pl,outfile=/wd/state-0.bin"},
+               "step0");
+      // step 1 (vsim): resumes from step 0's drain, drains to state-1.bin
+      check_eq(argvs[1],
+               {"/vbin", "/e", "--resume-from-qemu", "/wd/state-0.bin",
+                "--handoff-out", "/wd/state-1.bin", "--shared-mem-path", "/mm",
+                "--shared-mem-size", "134217728", "--shared-mem-base", "0x0"},
+               "step1");
+    }
+  }
+  // --- plan_argvs: the fast leg inherits the accurate-leg engine's vlen ---
+  // (hw-config sync: the engine descriptor's vlen fills {vlen} in the QEMU
+  // -cpu template; an engine that reports none falls back to 512 -- covered
+  // by the default plan above, whose vsim:test has no vlen.)
+  {
+    std::vector<EngineDescriptor> engines128 = engines;
+    engines128[1].vlen = 128;  // e.g. vsim:ax66_makatau
+    std::string err;
+    std::vector<std::vector<std::string>> argvs =
+        plan_argvs(plan, engines128, "/wd", rc, err);
+    CHECK(err.empty());
+    CHECK(argvs.size() == 2);
+    if (argvs.size() == 2) {
+      bool found = false;
+      for (const std::string& a : argvs[0])
+        if (a == "andes-ax45mpv,vlen=128") found = true;
+      CHECK(found);
+    }
+  }
+
+  // --- leg_trigger_args: a trigger's per-role argv contribution ---
+  {
+    std::string err;
+    // marker drives nothing into the argv; the plugin/vsim detect markers.
+    LegTriggerArgs marker = leg_trigger_args({"marker", {}}, "fast-leg", err);
+    CHECK(err.empty());
+    CHECK(marker.plugin_suffix.empty());
+    CHECK(marker.extra.empty());
+
+    // pc: qemu gets the enter_pc plugin suffix; vsim gets the exit-pc tokens.
+    const Trigger pc = {"pc", {{"enter_pc", "0x10"}, {"exit_pc", "0x20"}}};
+    LegTriggerArgs pf = leg_trigger_args(pc, "fast-leg", err);
+    CHECK(err.empty());
+    CHECK(pf.plugin_suffix == ",enter_pc=0x10");
+    CHECK(pf.extra.empty());
+    LegTriggerArgs pa = leg_trigger_args(pc, "accurate-leg", err);
+    CHECK(err.empty());
+    CHECK(pa.plugin_suffix.empty());
+    check_eq(pa.extra, {"--hybrid-exit-pc", "0x20"}, "pc-acc");
+
+    // icount: qemu icount= suffix; vsim --hybrid-icount tokens (N != M).
+    const Trigger ic = {"icount", {{"qemu_icount", "99"}, {"vsim_icount", "7"}}};
+    LegTriggerArgs i_f = leg_trigger_args(ic, "fast-leg", err);
+    CHECK(err.empty());
+    CHECK(i_f.plugin_suffix == ",icount=99");
+    LegTriggerArgs ia = leg_trigger_args(ic, "accurate-leg", err);
+    CHECK(err.empty());
+    check_eq(ia.extra, {"--hybrid-icount", "7"}, "ic-acc");
+
+    // a role outside fast-leg/accurate-leg carries no trigger args
+    LegTriggerArgs none = leg_trigger_args(pc, "standalone", err);
+    CHECK(err.empty());
+    CHECK(none.plugin_suffix.empty());
+    CHECK(none.extra.empty());
+
+    // unknown trigger kind / missing required param are errors
+    leg_trigger_args({"bogus", {}}, "fast-leg", err);
+    CHECK(!err.empty());
+    leg_trigger_args({"pc", {}}, "fast-leg", err);
+    CHECK(!err.empty());
+
+    // verify oracle leg (verify_oracle F4): qemu drains at the ROI exit,
+    // sampling at vsim's drained pc (drain_pc).
+    const Trigger vm = {"verify-marker", {{"drain_pc", "0x100072"}}};
+    LegTriggerArgs vmf = leg_trigger_args(vm, "fast-leg", err);
+    CHECK(err.empty());
+    CHECK(vmf.plugin_suffix == ",exit_marker=1,drain_pc=0x100072");
+    CHECK(vmf.extra.empty());
+    const Trigger vp = {"verify-pc",
+                        {{"exit_pc", "0x20"}, {"drain_pc", "0x28"}}};
+    LegTriggerArgs vpf = leg_trigger_args(vp, "fast-leg", err);
+    CHECK(err.empty());
+    CHECK(vpf.plugin_suffix == ",exit_pc=0x20,drain_pc=0x28");
+    leg_trigger_args({"verify-marker", {}}, "fast-leg", err);
+    CHECK(!err.empty());  // missing drain_pc
+    leg_trigger_args({"verify-pc", {{"drain_pc", "0x28"}}}, "fast-leg", err);
+    CHECK(!err.empty());  // missing exit_pc
+  }
+
+  // --- plan_argvs: pc trigger threads enter_pc (qemu) + exit_pc (vsim) ---
+  {
+    Plan p = plan;
+    const Trigger pc = {"pc", {{"enter_pc", "0x100000"}, {"exit_pc", "0x100042"}}};
+    p.steps[0].trigger = pc;
+    p.steps[1].trigger = pc;
+    std::string err;
+    std::vector<std::vector<std::string>> argvs =
+        plan_argvs(p, engines, "/wd", rc, err);
+    CHECK(err.empty());
+    CHECK(argvs.size() == 2);
+    if (argvs.size() == 2) {
+      // qemu: enter_pc folded into the single -plugin token (its last arg)
+      CHECK(argvs[0].back() == "/pl,outfile=/wd/state-0.bin,enter_pc=0x100000");
+      // vsim: --hybrid-exit-pc appended verbatim after the filled template
+      check_eq(argvs[1],
+               {"/vbin", "/e", "--resume-from-qemu", "/wd/state-0.bin",
+                "--handoff-out", "/wd/state-1.bin", "--shared-mem-path", "/mm",
+                "--shared-mem-size", "134217728", "--shared-mem-base", "0x0",
+                "--hybrid-exit-pc", "0x100042"},
+               "pc-step1");
+    }
+  }
+
+  // --- plan_argvs: icount trigger threads icount=N (qemu) + --hybrid-icount M ---
+  {
+    Plan p = plan;
+    const Trigger ic = {"icount", {{"qemu_icount", "10000"}, {"vsim_icount", "5000"}}};
+    p.steps[0].trigger = ic;
+    p.steps[1].trigger = ic;
+    std::string err;
+    std::vector<std::vector<std::string>> argvs =
+        plan_argvs(p, engines, "/wd", rc, err);
+    CHECK(err.empty());
+    if (argvs.size() == 2) {
+      CHECK(argvs[0].back() == "/pl,outfile=/wd/state-0.bin,icount=10000");
+      const std::vector<std::string>& v = argvs[1];
+      CHECK(v.size() >= 2);
+      CHECK(v[v.size() - 2] == "--hybrid-icount");
+      CHECK(v.back() == "5000");
+    }
+  }
+
+  // --- plan_argvs: Step.extra_args append AFTER trigger args (e2e.sh order) ---
+  {
+    Plan p = plan;
+    const Trigger pc = {"pc", {{"enter_pc", "0x100000"}, {"exit_pc", "0x100042"}}};
+    p.steps[0].trigger = pc;
+    p.steps[1].trigger = pc;
+    p.steps[1].extra_args = {"--vsim-warmup-icount", "100"};
+    std::string err;
+    std::vector<std::vector<std::string>> argvs =
+        plan_argvs(p, engines, "/wd", rc, err);
+    CHECK(err.empty());
+    if (argvs.size() == 2) {
+      const std::vector<std::string>& v = argvs[1];
+      CHECK(v.size() >= 4);
+      // tail order: ... --hybrid-exit-pc 0x100042 --vsim-warmup-icount 100
+      CHECK(v[v.size() - 4] == "--hybrid-exit-pc");
+      CHECK(v[v.size() - 3] == "0x100042");
+      CHECK(v[v.size() - 2] == "--vsim-warmup-icount");
+      CHECK(v.back() == "100");
+    }
+  }
+
+  // unknown engine id is an error
+  {
+    Plan bad = plan;
+    bad.steps[0].engine_id = "nope";
+    std::string err;
+    CHECK(plan_argvs(bad, engines, "/wd", rc, err).empty());
+    CHECK(!err.empty());
+  }
+  // a role the engine has no template for is an error
+  {
+    Plan bad = plan;
+    bad.steps[1].role = "no-such-role";
+    std::string err;
+    CHECK(plan_argvs(bad, engines, "/wd", rc, err).empty());
+    CHECK(!err.empty());
+  }
+
+  return andes_sim::test::report("plan");
+}

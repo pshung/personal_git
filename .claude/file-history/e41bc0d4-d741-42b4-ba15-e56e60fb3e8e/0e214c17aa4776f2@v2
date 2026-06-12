@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# state-diff dev command (verify_oracle F2): compares two drained
+# hybrid_state_v1 files under the oracle policy. Uses the plugin's oracle
+# exit-drain (F1) to produce a real state file, then checks:
+#   1. a file vs itself        -> PASS, rc 0
+#   2. vs a tampered GPR byte  -> FAIL, rc 1, mismatch line names the reg
+#   3. vs a tampered mcycle    -> PASS (counters are masked)
+#   4. usage / unreadable file -> rc 2
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+. "$SCRIPT_DIR/../lib/paths.sh"
+
+BIN="$ROOT/build/andes-sim"
+bash "$ROOT/scripts/build_driver.sh" >/dev/null 2>&1 || fail "build_driver.sh failed"
+
+FIXTURE="${FIXTURE:-rt_c_hello}"
+hybrid_resolve_paths
+
+REF=$(mktemp)
+GOT=$(mktemp)
+trap 'rm -f "$REF" "$GOT"' EXIT
+
+# A real drained state from a pure-QEMU oracle run.
+"$VSIM_QEMU" -machine andes_ae350 -cpu andes-ax45mpv,vlen=512 -nographic \
+  -semihosting-config enable=on,target=native -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$REF,exit_marker=1" </dev/null >/dev/null 2>&1
+RC=$?
+[ "$RC" -eq 200 ] || fail "oracle drain run failed (rc=$RC)"
+[ -s "$REF" ] || fail "oracle drain produced no state file"
+
+# 1. identical files PASS.
+cp "$REF" "$GOT"
+expect 0 '\[state-diff\] PASS' "$BIN" state-diff "$REF" "$GOT"
+ok "identical states PASS"
+
+# 2. flip one byte of x5 (gpr[5] @ offset 32 + 5*8 = 72) -> named mismatch.
+B=$(od -A n -j 72 -N 1 -t u1 "$REF" | tr -d ' ')
+printf "\\$(printf '%03o' $(( (B + 1) % 256 )))" \
+  | dd of="$GOT" bs=1 seek=72 conv=notrunc status=none
+expect 1 '\[state-diff\] x5: ref=' "$BIN" state-diff "$REF" "$GOT"
+expect 1 '\[state-diff\] FAIL: 1 mismatch' "$BIN" state-diff "$REF" "$GOT"
+ok "tampered x5 caught and named"
+
+# 3. flip a byte of mcycle (@624) -> still PASS (counters masked).
+cp "$REF" "$GOT"
+B=$(od -A n -j 624 -N 1 -t u1 "$REF" | tr -d ' ')
+printf "\\$(printf '%03o' $(( (B + 1) % 256 )))" \
+  | dd of="$GOT" bs=1 seek=624 conv=notrunc status=none
+expect 0 '\[state-diff\] PASS' "$BIN" state-diff "$REF" "$GOT"
+ok "mcycle difference masked"
+
+# 4. usage errors.
+expect 2 'usage: andes-sim state-diff' "$BIN" state-diff "$REF"
+expect 2 'cannot open' "$BIN" state-diff "$REF" /nonexistent/state.bin
+ok "usage and unreadable-file errors exit 2"
+
+ok "state-diff dev command"
