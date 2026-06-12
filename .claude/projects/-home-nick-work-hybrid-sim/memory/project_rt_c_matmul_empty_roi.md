@@ -1,28 +1,29 @@
 ---
 name: rt-c-matmul-empty-roi
-description: "rt_c_matmul fixture bug: compiler hoisted the inlined GEMM above enter_vsim(), so the ROI is empty (markers back-to-back); window_cycles=74 is drain overhead only"
+description: "FIXED 2026-06-12 (7022599): rt_c_matmul's ROI was empty (kernel hoisted/DCE'd past the markers); root cause = non-escaping statics; lesson: marker memory clobbers only cover ESCAPED memory"
 metadata: 
   node_type: memory
   type: project
   originSessionId: e41bc0d4-d741-42b4-ba15-e56e60fb3e8e
 ---
 
-Discovered 2026-06-12 while smoke-testing cosim checkpoints: in
-tests/fixtures/rt_c_matmul.elf the compiler hoisted the inlined
-matmul_kernel() ABOVE the enter_vsim() marker. The ENTER (0x1002aa) and
-EXIT (0x1002ae) markers are back-to-back; the ROI retires only ~3 insns
-(halt slack). The GEMM actually runs in QEMU phase 1, and the hybrid
-window_cycles (~74) measures drain overhead, not the kernel.
+FIXED in 7022599 (2026-06-12). rt_c_matmul shipped with an EMPTY ROI:
+the compiler hoisted the inlined GEMM above enter_vsim(), and with
+noinline alone it deleted the call as a dead store. window_cycles (~74)
+measured drain overhead. Found by --cosim's "N ROI retires" line.
 
-Why nothing caught it: e2e only checks a cycle figure exists, and
---verify compares two deterministic runs that agree whether or not the
-ROI re-ran on vsim. `--cosim` surfaces it directly: "3 ROI retires".
-rt_c_v_matmul is fine (its ROI is a real `jal vmatmul_kernel`, 1692
-retires); rt_c_v_regs is fine (7 inline V insns).
+ROOT CAUSE (the durable lesson): GCC's asm "memory" clobber only orders
+accesses to ESCAPED memory. A `static` array whose address never leaves
+the TU is invisible to the marker asm, so kernel code touching only such
+arrays can hoist, sink, or be DCE'd across the markers -- noinline alone
+does not save it (IPA mod/ref still proves the call dead). Fix pattern:
+external linkage (or otherwise escape the address) for ROI data + a
+noinline kernel call between the markers. rt_c_v_matmul survived only
+because V intrinsics are opaque to IPA.
 
-**How to apply:** before quoting any fixture's hybrid figure, check the
-marker span with objdump (see [[feedback-verify-codegen-with-objdump]]) or
-run `--cosim` and read the "N ROI retires" line. The fixture fix (not yet
-done): give the marker asm a real ordering dependency on the kernel's
-data, not just a "memory" clobber, or call a noinline kernel like
-rt_c_v_matmul does.
+Guard: tests/fixtures/test_fixture_roi_content.sh statically asserts the
+marker span carries the promised kernel (run it after touching fixtures
+or bumping the toolchain). Quick dynamic check: --cosim prints the true
+ROI retire count. After the fix: 8x8x8 GEMM (16^3 was ~322k vsim cycles,
+too close to harness timeouts), 4683 ROI retires, ~45k cycles. See
+[[feedback-verify-codegen-with-objdump]] and [[cosim-roi]].
