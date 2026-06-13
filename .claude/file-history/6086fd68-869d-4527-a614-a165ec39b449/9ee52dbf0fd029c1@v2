@@ -1,0 +1,213 @@
+// StepDriver (cosim_redesign F2): dcsr.step single-stepping over DMI.
+// enable() RMWs dcsr.step (+ best-effort stopcount) and verifies the WARL
+// write took; step_one() resumes for exactly one instruction (or one trap)
+// and waits for debug re-entry; disable() clears the bits.
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/resume_driver.hpp"
+#include "hybrid/step_driver.hpp"
+#include "recording_bus.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <cstdint>
+#include <optional>
+#include <utility>
+#include <vector>
+
+using hybrid::test::DmiOp;
+using hybrid::test::kDmstatusHaltedAndAcked;
+using hybrid::test::RecordingBus;
+using RD = hybrid::ResumeDriver;
+using SD = hybrid::StepDriver;
+
+namespace
+{
+
+// All abstract-command WRITES to `regno`: (op index, 64-bit value from the
+// DATA0/DATA1 writes immediately preceding the COMMAND write).
+auto abstract_writes_to(const std::vector<DmiOp>& ops, uint16_t regno)
+  -> std::vector<std::pair<std::size_t, uint64_t>>
+{
+  std::vector<std::pair<std::size_t, uint64_t>> hits;
+  uint32_t data0 = 0;
+  uint32_t data1 = 0;
+  for (std::size_t i = 0; i < ops.size(); ++i) {
+    const auto& op = ops[i];
+    if (op.kind != DmiOp::Kind::Write) continue;
+    if (op.reg == RD::kData0) { data0 = op.value; continue; }
+    if (op.reg == RD::kData1) { data1 = op.value; continue; }
+    if (op.reg != RD::kCommand) continue;
+    const auto target   = static_cast<uint16_t>(op.value & 0xFFFFu);
+    const bool is_write = ((op.value >> 16) & 1u) != 0u;
+    if (is_write && target == regno)
+      hits.emplace_back(i, (static_cast<uint64_t>(data1) << 32) | data0);
+  }
+  return hits;
+}
+
+// dcsr with xdebugver=4, cause=haltreq, prv=M -- a plausible halted value.
+constexpr uint64_t kDcsrBase = 0x400000C3ULL;
+
+}  // namespace
+
+TEST_CASE("enable RMWs dcsr: step + stopcount set on top of the read value")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  // Readback verification sees the regfile value; pre-program step set so
+  // the WARL verify passes (the mock does not apply writes).
+  bus.regfile[hybrid::regno_csr(RD::kCsrDcsr)] = kDcsrBase | SD::kDcsrStep;
+
+  hybrid::StepDriver step(bus);
+  step.enable();
+
+  const auto writes =
+    abstract_writes_to(bus.ops, hybrid::regno_csr(RD::kCsrDcsr));
+  REQUIRE(!writes.empty());
+  const uint64_t written = writes.front().second;
+  CHECK((written & SD::kDcsrStep) != 0u);
+  CHECK((written & SD::kDcsrStopcount) != 0u);
+  // RMW: the unrelated dcsr fields from the read survive.
+  CHECK((written & kDcsrBase) == kDcsrBase);
+}
+
+TEST_CASE("enable throws when the RTL WARL-pins dcsr.step to 0")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_csr(RD::kCsrDcsr)] = kDcsrBase;  // step stays 0
+
+  hybrid::StepDriver step(bus);
+  CHECK_THROWS_WITH_AS(step.enable(),
+                       doctest::Contains("dcsr.step"), std::runtime_error);
+}
+
+TEST_CASE("enable tolerates a pinned stopcount (best effort, no throw)")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  // step verifies, stopcount reads back 0.
+  bus.regfile[hybrid::regno_csr(RD::kCsrDcsr)] = kDcsrBase | SD::kDcsrStep;
+
+  hybrid::StepDriver step(bus);
+  CHECK_NOTHROW(step.enable());
+  CHECK_FALSE(step.stopcount_active());
+}
+
+TEST_CASE("enable reports stopcount_active when the readback holds the bit")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_csr(RD::kCsrDcsr)] =
+    kDcsrBase | SD::kDcsrStep | SD::kDcsrStopcount;
+
+  hybrid::StepDriver step(bus);
+  step.enable();
+  CHECK(step.stopcount_active());
+}
+
+TEST_CASE("step_one returns on completed-step evidence: minstret advanced "
+          "by exactly one")
+{
+  // dmstatus bits are NOT trusted: right after the resumereq write both
+  // allresumeack and allhalted still hold their stale pre-resume values
+  // (the race found on ax45mpv RTL). The step is complete only when
+  // minstret == before+1 (retire) or DPC moved (trap).
+  hybrid::test::SteppingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_csr(RD::kCsrDcsr)] = kDcsrBase | SD::kDcsrStep;
+  bus.regfile[hybrid::regno_csr(RD::kCsrDpc)] = 0x80000000ULL;
+  bus.regfile[hybrid::regno_csr(RD::kCsrMinstret)] = 41;
+
+  hybrid::StepDriver step(bus);
+  step.enable();
+  const auto ops_before = bus.ops.size();
+  step.step_one();
+
+  // Exactly one DMCONTROL write after enable: resumereq, no haltreq.
+  std::optional<std::size_t> resume_at;
+  for (std::size_t i = ops_before; i < bus.ops.size(); ++i) {
+    const auto& op = bus.ops[i];
+    if (op.kind == DmiOp::Kind::Write && op.reg == RD::kDmcontrol) {
+      CHECK(!resume_at.has_value());
+      resume_at = i;
+      CHECK((op.value & RD::kDmcontrolResumereq) != 0u);
+      CHECK((op.value & RD::kDmcontrolHaltreq) == 0u);
+    }
+  }
+  REQUIRE(resume_at.has_value());
+
+  // The minstret baseline was read BEFORE the resume request.
+  std::optional<std::size_t> baseline_minstret;
+  for (std::size_t i = 0; i < *resume_at; ++i) {
+    const auto& op = bus.ops[i];
+    if (op.kind == DmiOp::Kind::Write && op.reg == RD::kCommand
+        && (op.value & 0xFFFFu)
+             == hybrid::regno_csr(RD::kCsrMinstret))
+      baseline_minstret = i;
+  }
+  CHECK(baseline_minstret.has_value());
+}
+
+TEST_CASE("step_one accepts a trapped step: DPC moved, minstret unchanged")
+{
+  // A step that traps re-enters debug mode at the handler entry without
+  // retiring -- minstret stays, DPC jumps to mtvec.
+  struct TrapBus final : RecordingBus
+  {
+    void write(uint8_t reg, uint32_t value) override
+    {
+      if (reg == RD::kDmcontrol
+          && (value & RD::kDmcontrolResumereq) != 0u)
+        regfile[hybrid::regno_csr(RD::kCsrDpc)] = 0x800;  // mtvec
+      RecordingBus::write(reg, value);
+    }
+  } bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_csr(RD::kCsrDcsr)] = kDcsrBase | SD::kDcsrStep;
+  bus.regfile[hybrid::regno_csr(RD::kCsrDpc)] = 0x80000000ULL;
+  bus.regfile[hybrid::regno_csr(RD::kCsrMinstret)] = 41;
+
+  hybrid::StepDriver step(bus);
+  step.enable();
+  CHECK_NOTHROW(step.step_one());
+}
+
+TEST_CASE("step_one times out loudly when no step evidence ever appears")
+{
+  // Static regfile: minstret never advances, DPC never moves -- the stale
+  // halted bit alone must NOT satisfy step_one.
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_csr(RD::kCsrDcsr)] = kDcsrBase | SD::kDcsrStep;
+  bus.regfile[hybrid::regno_csr(RD::kCsrDpc)] = 0x80000000ULL;
+  bus.regfile[hybrid::regno_csr(RD::kCsrMinstret)] = 41;
+
+  hybrid::StepDriver step(bus);
+  step.enable();
+  CHECK_THROWS_AS(step.step_one(), std::runtime_error);
+}
+
+TEST_CASE("disable clears step and stopcount with one RMW write")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_csr(RD::kCsrDcsr)] =
+    kDcsrBase | SD::kDcsrStep | SD::kDcsrStopcount;
+
+  hybrid::StepDriver step(bus);
+  step.enable();
+  const auto ops_before = bus.ops.size();
+  step.disable();
+
+  const auto writes =
+    abstract_writes_to(bus.ops, hybrid::regno_csr(RD::kCsrDcsr));
+  REQUIRE(!writes.empty());
+  const auto& [idx, written] = writes.back();
+  CHECK(idx >= ops_before);
+  CHECK((written & SD::kDcsrStep) == 0u);
+  CHECK((written & SD::kDcsrStopcount) == 0u);
+  CHECK((written & kDcsrBase) == kDcsrBase);
+}
