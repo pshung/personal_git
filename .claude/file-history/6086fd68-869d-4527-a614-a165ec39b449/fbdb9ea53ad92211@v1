@@ -1,0 +1,690 @@
+// StateDrain is the dual of ResumeDriver: halt the hart via the Debug Module,
+// read x1..x31 + DPC via Abstract Commands, populate hybrid_state_v1.
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/resume_driver.hpp"
+#include "hybrid/state_abi.h"
+#include "hybrid/state_drain.hpp"
+#include "recording_bus.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <optional>
+
+#include <cstdint>
+#include <cstring>
+#include <utility>
+#include <vector>
+
+using hybrid::test::DmiOp;
+using hybrid::test::kDmstatusHaltedAndAcked;
+using hybrid::test::RecordingBus;
+using RD = hybrid::ResumeDriver;
+
+TEST_CASE("state_drain primes dmactive then issues haltreq before any read")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid::StateDrain drain(bus);
+  (void) drain.drain();
+
+  REQUIRE(bus.ops.size() >= 2);
+  CHECK(bus.ops[0].kind == DmiOp::Kind::Write);
+  CHECK(bus.ops[0].reg == RD::kDmcontrol);
+  CHECK((bus.ops[0].value & RD::kDmcontrolDmactive) != 0u);
+  CHECK((bus.ops[0].value & RD::kDmcontrolHaltreq) == 0u);
+
+  CHECK(bus.ops[1].kind == DmiOp::Kind::Write);
+  CHECK(bus.ops[1].reg == RD::kDmcontrol);
+  CHECK((bus.ops[1].value & RD::kDmcontrolDmactive) != 0u);
+  CHECK((bus.ops[1].value & RD::kDmcontrolHaltreq) != 0u);
+}
+
+TEST_CASE("state_drain reads x1..x31 via Abstract Commands, skipping x0")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  for (uint16_t i = 0; i < 32; ++i)
+    bus.regfile[hybrid::regno_gpr(i)] = 0xa00000000ULL + i;
+
+  hybrid::StateDrain drain(bus);
+  const auto state = drain.drain();
+
+  for (int i = 1; i < 32; ++i) {
+    CHECK(state.gpr[i] == 0xa00000000ULL + i);
+  }
+  for (const auto& op : bus.ops) {
+    if (op.kind == DmiOp::Kind::Write && op.reg == RD::kCommand) {
+      const uint16_t regno = op.value & 0xffffu;
+      CHECK(regno != hybrid::regno_gpr(0));
+    }
+  }
+}
+
+TEST_CASE("state_drain captures pc from DPC")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_csr(RD::kCsrDpc)] = 0x12345678'9ABCDEF0ULL;
+
+  hybrid::StateDrain drain(bus);
+  const auto state = drain.drain();
+
+  CHECK(state.pc == 0x12345678'9ABCDEF0ULL);
+}
+
+TEST_CASE("state_drain populates header fields (magic, version, flags)")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid::StateDrain drain(bus);
+  const auto state = drain.drain();
+
+  CHECK(state.magic == HYBRID_STATE_MAGIC);
+  CHECK(state.version == HYBRID_STATE_VERSION);
+  CHECK((state.flags & HYBRID_FLAG_RV64) != 0u);
+}
+
+TEST_CASE("state_drain issues a COMMAND read for each x1..x31 + DPC")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid::StateDrain drain(bus);
+  (void) drain.drain();
+
+  std::size_t cmd_count = 0;
+  for (const auto& op : bus.ops)
+    if (op.kind == DmiOp::Kind::Write && op.reg == RD::kCommand) ++cmd_count;
+  CHECK(cmd_count >= 32u);
+}
+
+TEST_CASE("drain() does NOT issue Abstract Commands for FPRs/CSRs/PMPs - those "
+          "fields are zero in the bare drain output and merged in by "
+          "drain_with_passthrough")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  for (uint16_t i = 0; i < 32; ++i)
+    bus.regfile[hybrid::regno_fpr(i)] = 0xf000000000000000ULL + i;
+
+  hybrid::StateDrain drain(bus);
+  const auto state = drain.drain();
+
+  for (int i = 0; i < 32; ++i) CHECK(state.fpr[i] == 0u);
+  CHECK(state.mstatus == 0u);
+  CHECK(state.satp    == 0u);
+  CHECK(state.vlenb   == 0u);
+}
+
+TEST_CASE("drain_with_passthrough copies CSR/PMP/V-payload slots from input and "
+          "freshly drains GPRs/PC from the DM")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_csr(RD::kCsrDpc)] = 0x80001234ULL;
+  for (uint16_t i = 0; i < 32; ++i)
+    bus.regfile[hybrid::regno_gpr(i)] = 0x10000000ULL + i;
+
+  hybrid_state_v1 input{};
+  input.magic   = HYBRID_STATE_MAGIC;
+  input.version = HYBRID_STATE_VERSION;
+  input.flags   = HYBRID_FLAG_RV64;
+  input.priv    = 3;
+  input.mstatus = 0x1800ULL;
+  input.satp    = 0x8000000080000000ULL;
+  for (int i = 0; i < HYBRID_PMP_CFG_NUM; ++i)  input.pmpcfg[i]  = 0xa0 + i;
+  for (int i = 0; i < HYBRID_PMP_ADDR_NUM; ++i) input.pmpaddr[i] = 0xb0 + i;
+  input.vlenb = 64;
+  for (std::size_t i = 0; i < sizeof(input.vreg); ++i) input.vreg[i] = i & 0xff;
+
+  hybrid::StateDrain drain(bus);
+  const auto state = drain.drain_with_passthrough(input);
+
+  CHECK(state.mstatus == 0x1800ULL);
+  CHECK(state.satp    == 0x8000000080000000ULL);
+  CHECK(state.pmpcfg[5]  == uint64_t(0xa5));
+  CHECK(state.pmpaddr[7] == uint64_t(0xb7));
+  CHECK(state.vlenb == 64ULL);
+  CHECK(state.vreg[100] == uint8_t(100));
+
+  // GPRs/PC come from the DM read, not the input.
+  for (int i = 1; i < 32; ++i)
+    CHECK(state.gpr[i] == 0x10000000ULL + uint64_t(i));
+  CHECK(state.pc == 0x80001234ULL);
+}
+
+TEST_CASE("drain_with_passthrough with HYBRID_FLAG_FP: FPRs read from DM, not input")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  for (uint16_t i = 0; i < 32; ++i)
+    bus.regfile[hybrid::regno_fpr(i)] = 0xf000000000000000ULL + i;
+
+  hybrid_state_v1 input{};
+  input.magic   = HYBRID_STATE_MAGIC;
+  input.version = HYBRID_STATE_VERSION;
+  input.flags   = HYBRID_FLAG_RV64 | HYBRID_FLAG_FP;
+  input.priv    = 3;
+  // Stale QEMU1 values that must be overwritten by the DM reads.
+  for (int i = 0; i < 32; ++i) input.fpr[i] = 0xdeadbeef00000000ULL + i;
+
+  hybrid::StateDrain drain(bus);
+  const auto state = drain.drain_with_passthrough(input);
+
+  for (int i = 0; i < 32; ++i)
+    CHECK(state.fpr[i] == 0xf000000000000000ULL + uint64_t(i));
+}
+
+TEST_CASE("drain_with_passthrough with HYBRID_FLAG_FP: FP reads issued after GPR reads")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid_state_v1 input{};
+  input.magic   = HYBRID_STATE_MAGIC;
+  input.version = HYBRID_STATE_VERSION;
+  input.flags   = HYBRID_FLAG_RV64 | HYBRID_FLAG_FP;
+  input.priv    = 3;
+
+  hybrid::StateDrain drain(bus);
+  (void) drain.drain_with_passthrough(input);
+
+  std::optional<std::size_t> last_gpr_cmd;
+  std::optional<std::size_t> first_fpr_cmd;
+  for (std::size_t i = 0; i < bus.ops.size(); ++i) {
+    const auto& op = bus.ops[i];
+    if (op.kind != DmiOp::Kind::Write || op.reg != RD::kCommand) continue;
+    const uint16_t regno = op.value & 0xFFFFu;
+    if (regno >= hybrid::regno_gpr(1) && regno <= hybrid::regno_gpr(31))
+      last_gpr_cmd = i;
+    if (!first_fpr_cmd
+        && regno >= hybrid::regno_fpr(0) && regno <= hybrid::regno_fpr(31))
+      first_fpr_cmd = i;
+  }
+  REQUIRE(last_gpr_cmd.has_value());
+  REQUIRE(first_fpr_cmd.has_value());
+  CHECK(*last_gpr_cmd < *first_fpr_cmd);
+}
+
+TEST_CASE("L20: drain_with_passthrough with HYBRID_FLAG_FP: fcsr read from "
+          "DM, not input")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_csr(RD::kCsrFcsr)] = 0x45;  // frm=RDN | NX|UF
+
+  hybrid_state_v1 input{};
+  input.magic   = HYBRID_STATE_MAGIC;
+  input.version = HYBRID_STATE_VERSION;
+  input.flags   = HYBRID_FLAG_RV64 | HYBRID_FLAG_FP;
+  input.priv    = 3;
+  input.fcsr    = 0x21;  // stale QEMU1 value; must be overwritten
+
+  hybrid::StateDrain drain(bus);
+  const auto state = drain.drain_with_passthrough(input);
+
+  CHECK(state.fcsr == 0x45u);
+}
+
+TEST_CASE("L20: drain_with_passthrough without HYBRID_FLAG_FP: fcsr stays "
+          "pass-through, no CSR 0x003 read")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_csr(RD::kCsrFcsr)] = 0x45;
+
+  hybrid_state_v1 input{};
+  input.magic   = HYBRID_STATE_MAGIC;
+  input.version = HYBRID_STATE_VERSION;
+  input.flags   = HYBRID_FLAG_RV64;  // no HYBRID_FLAG_FP
+  input.priv    = 3;
+  input.fcsr    = 0x21;
+
+  hybrid::StateDrain drain(bus);
+  const auto state = drain.drain_with_passthrough(input);
+
+  CHECK(state.fcsr == 0x21u);
+  for (const auto& op : bus.ops) {
+    if (op.kind != DmiOp::Kind::Write || op.reg != RD::kCommand) continue;
+    CHECK((op.value & 0xFFFFu) != hybrid::regno_csr(RD::kCsrFcsr));
+  }
+}
+
+TEST_CASE("drain_with_passthrough without HYBRID_FLAG_FP: no FPR Abstract Commands issued")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid_state_v1 input{};
+  input.magic   = HYBRID_STATE_MAGIC;
+  input.version = HYBRID_STATE_VERSION;
+  input.flags   = HYBRID_FLAG_RV64;  // no HYBRID_FLAG_FP
+  input.priv    = 3;
+  for (int i = 0; i < 32; ++i) input.fpr[i] = 0xdeadbeef00000000ULL + i;
+
+  hybrid::StateDrain drain(bus);
+  const auto state = drain.drain_with_passthrough(input);
+
+  // No FPR COMMAND reads issued.
+  for (const auto& op : bus.ops) {
+    if (op.kind != DmiOp::Kind::Write || op.reg != RD::kCommand) continue;
+    const uint16_t regno = op.value & 0xFFFFu;
+    const bool is_fpr = regno >= hybrid::regno_fpr(0)
+                     && regno <= hybrid::regno_fpr(31);
+    CHECK_FALSE(is_fpr);
+  }
+
+  // FPR slots remain pass-through from input (stale QEMU1 snapshot).
+  for (int i = 0; i < 32; ++i)
+    CHECK(state.fpr[i] == 0xdeadbeef00000000ULL + uint64_t(i));
+}
+
+TEST_CASE("drain_with_passthrough with HYBRID_FLAG_V: V CSRs read from DM, not input")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  // DM holds post-vsim values.
+  bus.regfile[hybrid::regno_csr(RD::kCsrVstart)] = 7;
+  bus.regfile[hybrid::regno_csr(RD::kCsrVxsat)]  = 1;
+  bus.regfile[hybrid::regno_csr(RD::kCsrVxrm)]   = 2;
+  bus.regfile[hybrid::regno_csr(RD::kCsrVcsr)]   = 5;
+  bus.regfile[hybrid::regno_csr(RD::kCsrVtype)]  = 0xC1ULL;
+  bus.regfile[hybrid::regno_csr(RD::kCsrVl)]     = 16;
+
+  hybrid_state_v1 input{};
+  input.magic   = HYBRID_STATE_MAGIC;
+  input.version = HYBRID_STATE_VERSION;
+  input.flags   = HYBRID_FLAG_RV64 | HYBRID_FLAG_V;
+  input.priv    = 3;
+  // Stale QEMU1 values that must be overwritten by DM reads.
+  input.vstart = 99;
+  input.vxsat  = 88;
+  input.vxrm   = 77;
+  input.vcsr   = 66;
+  input.vtype  = 55;
+  input.vl     = 44;
+
+  hybrid::StateDrain drain(bus);
+  const auto state = drain.drain_with_passthrough(input);
+
+  CHECK(state.vstart == 7u);
+  CHECK(state.vxsat  == 1u);
+  CHECK(state.vxrm   == 2u);
+  CHECK(state.vcsr   == 5u);
+  CHECK(state.vtype  == 0xC1ULL);
+  CHECK(state.vl     == 16u);
+}
+
+TEST_CASE("drain_with_passthrough with HYBRID_FLAG_V: V CSR reads issued after GPR reads")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid_state_v1 input{};
+  input.magic   = HYBRID_STATE_MAGIC;
+  input.version = HYBRID_STATE_VERSION;
+  input.flags   = HYBRID_FLAG_RV64 | HYBRID_FLAG_V;
+  input.priv    = 3;
+
+  hybrid::StateDrain drain(bus);
+  (void) drain.drain_with_passthrough(input);
+
+  // Find the last GPR COMMAND read and the first V CSR COMMAND read.
+  std::optional<std::size_t> last_gpr_cmd;
+  std::optional<std::size_t> first_vcsr_cmd;
+  const std::initializer_list<uint16_t> vcsr_regnos = {
+    hybrid::regno_csr(RD::kCsrVstart),
+    hybrid::regno_csr(RD::kCsrVxsat),
+    hybrid::regno_csr(RD::kCsrVxrm),
+    hybrid::regno_csr(RD::kCsrVcsr),
+    hybrid::regno_csr(RD::kCsrVtype),
+    hybrid::regno_csr(RD::kCsrVl),
+  };
+  for (std::size_t i = 0; i < bus.ops.size(); ++i) {
+    const auto& op = bus.ops[i];
+    if (op.kind != DmiOp::Kind::Write || op.reg != RD::kCommand) continue;
+    const uint16_t regno = op.value & 0xFFFFu;
+    // Only register READS matter here. The V-data dump sweep also issues GPR
+    // WRITES (x5/x6/x7 scratch) at the end of drain; those are not the
+    // architectural GPR reads this ordering check is about.
+    const bool is_read = ((op.value >> 16) & 1u) == 0u;
+    if (is_read && regno >= hybrid::regno_gpr(1) && regno <= hybrid::regno_gpr(31))
+      last_gpr_cmd = i;
+    for (uint16_t vcsr : vcsr_regnos)
+      if (is_read && !first_vcsr_cmd && regno == vcsr)
+        first_vcsr_cmd = i;
+  }
+  REQUIRE(last_gpr_cmd.has_value());
+  REQUIRE(first_vcsr_cmd.has_value());
+  CHECK(*last_gpr_cmd < *first_vcsr_cmd);
+}
+
+TEST_CASE("drain_with_passthrough without HYBRID_FLAG_V: no V CSR Abstract Commands issued")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid_state_v1 input{};
+  input.magic   = HYBRID_STATE_MAGIC;
+  input.version = HYBRID_STATE_VERSION;
+  input.flags   = HYBRID_FLAG_RV64;  // no HYBRID_FLAG_V
+  input.priv    = 3;
+
+  hybrid::StateDrain drain(bus);
+  (void) drain.drain_with_passthrough(input);
+
+  const std::initializer_list<uint16_t> vcsr_regnos = {
+    hybrid::regno_csr(RD::kCsrVstart),
+    hybrid::regno_csr(RD::kCsrVxsat),
+    hybrid::regno_csr(RD::kCsrVxrm),
+    hybrid::regno_csr(RD::kCsrVcsr),
+    hybrid::regno_csr(RD::kCsrVtype),
+    hybrid::regno_csr(RD::kCsrVl),
+  };
+  for (const auto& op : bus.ops) {
+    if (op.kind != DmiOp::Kind::Write || op.reg != RD::kCommand) continue;
+    const uint16_t regno = op.value & 0xFFFFu;
+    for (uint16_t vcsr : vcsr_regnos)
+      CHECK(regno != vcsr);
+  }
+}
+
+TEST_CASE("drain_with_passthrough with HYBRID_FLAG_V: PB dumps v0..v31 to scratch "
+          "after the architectural counter/CSR reads")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid_state_v1 input{};
+  input.magic   = HYBRID_STATE_MAGIC;
+  input.version = HYBRID_STATE_VERSION;
+  input.flags   = HYBRID_FLAG_RV64 | HYBRID_FLAG_V;
+  input.priv    = 3;
+  input.vlenb   = 64;
+
+  hybrid::StateDrain drain(bus);
+  (void) drain.drain_with_passthrough(input);
+
+  // (a) every v0..v31 is dumped via a vse8.v executed in the Program Buffer.
+  std::vector<int> missing;
+  std::optional<std::size_t> first_vse_idx;
+  for (uint16_t v = 0; v < 32; ++v) {
+    const uint32_t want = hybrid::encode_vse8_v(static_cast<uint8_t>(v), 7);
+    std::optional<std::size_t> at;
+    for (std::size_t i = 0; i < bus.ops.size(); ++i) {
+      const auto& op = bus.ops[i];
+      if (op.kind == DmiOp::Kind::Write && op.reg == hybrid::kProgbuf0
+          && op.value == want) { at = i; break; }
+    }
+    if (!at) { missing.push_back(v); continue; }
+    if (!first_vse_idx || *at < *first_vse_idx) first_vse_idx = at;
+  }
+  CHECK(missing.empty());
+  REQUIRE(first_vse_idx.has_value());
+
+  // (b) the dump sweep runs AFTER the mcycle/minstret reads, so the sweep's
+  //     vse8.v insns (and any counter increments) cannot corrupt the drained
+  //     counters. minstret(0xB02) is the last counter read before the sweep.
+  std::optional<std::size_t> minstret_read_idx;
+  for (std::size_t i = 0; i < bus.ops.size(); ++i) {
+    const auto& op = bus.ops[i];
+    if (op.kind != DmiOp::Kind::Write || op.reg != RD::kCommand) continue;
+    const auto regno   = static_cast<uint16_t>(op.value & 0xFFFFu);
+    const bool is_read = ((op.value >> 16) & 1u) == 0u;
+    if (is_read && regno == hybrid::regno_csr(0xB02)) minstret_read_idx = i;
+  }
+  REQUIRE(minstret_read_idx.has_value());
+  CHECK(*minstret_read_idx < *first_vse_idx);
+}
+
+// ---- drain_checkpoint (cosim_roi F1): drain, undo clobbers, resume ----
+
+namespace
+{
+
+// Index of the last DMCONTROL write in the op log.
+auto last_dmcontrol_write(const std::vector<DmiOp>& ops)
+  -> std::optional<std::size_t>
+{
+  std::optional<std::size_t> at;
+  for (std::size_t i = 0; i < ops.size(); ++i)
+    if (ops[i].kind == DmiOp::Kind::Write && ops[i].reg == RD::kDmcontrol)
+      at = i;
+  return at;
+}
+
+// Index of the last Program Buffer slot-0 write carrying `insn`.
+auto last_progbuf_insn(const std::vector<DmiOp>& ops, uint32_t insn)
+  -> std::optional<std::size_t>
+{
+  std::optional<std::size_t> at;
+  for (std::size_t i = 0; i < ops.size(); ++i)
+    if (ops[i].kind == DmiOp::Kind::Write && ops[i].reg == hybrid::kProgbuf0
+        && ops[i].value == insn)
+      at = i;
+  return at;
+}
+
+// All abstract-command WRITES to `regno`: (op index of COMMAND, 64-bit value
+// assembled from the DATA0/DATA1 writes immediately preceding it).
+auto abstract_writes_to(const std::vector<DmiOp>& ops, uint16_t regno)
+  -> std::vector<std::pair<std::size_t, uint64_t>>
+{
+  std::vector<std::pair<std::size_t, uint64_t>> hits;
+  uint32_t data0 = 0;
+  uint32_t data1 = 0;
+  for (std::size_t i = 0; i < ops.size(); ++i) {
+    const auto& op = ops[i];
+    if (op.kind != DmiOp::Kind::Write) continue;
+    if (op.reg == RD::kData0) { data0 = op.value; continue; }
+    if (op.reg == RD::kData1) { data1 = op.value; continue; }
+    if (op.reg != RD::kCommand) continue;
+    const auto target  = static_cast<uint16_t>(op.value & 0xFFFFu);
+    const bool is_write = ((op.value >> 16) & 1u) != 0u;
+    if (is_write && target == regno)
+      hits.emplace_back(i, (static_cast<uint64_t>(data1) << 32) | data0);
+  }
+  return hits;
+}
+
+}  // namespace
+
+TEST_CASE("drain_checkpoint resumes the hart: resumereq is the final DMCONTROL "
+          "write, followed by the resumeack poll")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid_state_v1 input{};
+  input.magic   = HYBRID_STATE_MAGIC;
+  input.version = HYBRID_STATE_VERSION;
+  input.flags   = HYBRID_FLAG_RV64;
+  input.priv    = 3;
+
+  hybrid::StateDrain drain(bus);
+  (void) drain.drain_checkpoint(input);
+
+  const auto at = last_dmcontrol_write(bus.ops);
+  REQUIRE(at.has_value());
+  CHECK((bus.ops[*at].value & RD::kDmcontrolResumereq) != 0u);
+  CHECK((bus.ops[*at].value & RD::kDmcontrolHaltreq) == 0u);
+
+  // The resumeack poll reads dmstatus after the resume request.
+  bool polled = false;
+  for (std::size_t i = *at + 1; i < bus.ops.size(); ++i)
+    if (bus.ops[i].kind == DmiOp::Kind::Read && bus.ops[i].reg == RD::kDmstatus)
+      polled = true;
+  CHECK(polled);
+}
+
+TEST_CASE("drain_checkpoint returns the same architectural state as "
+          "drain_with_passthrough")
+{
+  hybrid_state_v1 input{};
+  input.magic   = HYBRID_STATE_MAGIC;
+  input.version = HYBRID_STATE_VERSION;
+  input.flags   = HYBRID_FLAG_RV64 | HYBRID_FLAG_FP | HYBRID_FLAG_V;
+  input.priv    = 3;
+  input.mstatus = 0x1800ULL;
+  input.vlenb   = 64;
+
+  const auto program = [](RecordingBus& bus) {
+    bus.dmstatus_value = kDmstatusHaltedAndAcked;
+    bus.regfile[hybrid::regno_csr(RD::kCsrDpc)] = 0x80001234ULL;
+    for (uint16_t i = 0; i < 32; ++i) {
+      bus.regfile[hybrid::regno_gpr(i)] = 0x10000000ULL + i;
+      bus.regfile[hybrid::regno_fpr(i)] = 0xf000000000000000ULL + i;
+    }
+    bus.regfile[hybrid::regno_csr(RD::kCsrVl)]    = 16;
+    bus.regfile[hybrid::regno_csr(RD::kCsrVtype)] = 0xC1ULL;
+  };
+
+  RecordingBus bus_a;
+  RecordingBus bus_b;
+  program(bus_a);
+  program(bus_b);
+
+  hybrid::StateDrain plain(bus_a);
+  hybrid::StateDrain ckpt(bus_b);
+  const auto want = plain.drain_with_passthrough(input);
+  const auto got  = ckpt.drain_checkpoint(input);
+
+  CHECK(std::memcmp(&want, &got, sizeof(want)) == 0);
+}
+
+TEST_CASE("drain_checkpoint with HYBRID_FLAG_V undoes the dump sweep's clobbers "
+          "(vtype/vl via vsetvl, vstart, x5/x6/x7) before resuming")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_csr(RD::kCsrVl)]     = 16;
+  bus.regfile[hybrid::regno_csr(RD::kCsrVtype)]  = 0xC1ULL;
+  bus.regfile[hybrid::regno_csr(RD::kCsrVstart)] = 7;
+  bus.regfile[hybrid::regno_gpr(5)] = 0x55;
+  bus.regfile[hybrid::regno_gpr(6)] = 0x66;
+  bus.regfile[hybrid::regno_gpr(7)] = 0x77;
+
+  hybrid_state_v1 input{};
+  input.magic   = HYBRID_STATE_MAGIC;
+  input.version = HYBRID_STATE_VERSION;
+  input.flags   = HYBRID_FLAG_RV64 | HYBRID_FLAG_V;
+  input.priv    = 3;
+  input.vlenb   = 64;
+
+  hybrid::StateDrain drain(bus);
+  (void) drain.drain_checkpoint(input);
+
+  // (a) the undo vsetvl runs AFTER the dump sweep's last vse8.v (v31).
+  const auto last_vse =
+    last_progbuf_insn(bus.ops, hybrid::encode_vse8_v(31, 7));
+  const auto undo_vsetvl =
+    last_progbuf_insn(bus.ops, hybrid::encode_vsetvl(0, 5, 6));
+  REQUIRE(last_vse.has_value());
+  REQUIRE(undo_vsetvl.has_value());
+  CHECK(*last_vse < *undo_vsetvl);
+
+  // (b) the undo vsetvl is staged with the DRAINED vl/vtype (not the sweep's
+  //     e8/m1 constants): the last x5/x6 writes before it carry 16 / 0xC1.
+  const auto x5_writes = abstract_writes_to(bus.ops, hybrid::regno_gpr(5));
+  const auto x6_writes = abstract_writes_to(bus.ops, hybrid::regno_gpr(6));
+  std::optional<uint64_t> staged_vl;
+  std::optional<uint64_t> staged_vtype;
+  for (const auto& [i, v] : x5_writes)
+    if (i < *undo_vsetvl) staged_vl = v;
+  for (const auto& [i, v] : x6_writes)
+    if (i < *undo_vsetvl) staged_vtype = v;
+  REQUIRE(staged_vl.has_value());
+  REQUIRE(staged_vtype.has_value());
+  CHECK(*staged_vl == 16u);
+  CHECK(*staged_vtype == 0xC1ULL);
+
+  // (c) vstart is restored via PB csrrw after the vsetvl (which zeroes it).
+  const auto vstart_csrrw =
+    last_progbuf_insn(bus.ops, hybrid::encode_csrrw(0, RD::kCsrVstart, 7));
+  REQUIRE(vstart_csrrw.has_value());
+  CHECK(*undo_vsetvl < *vstart_csrrw);
+  const auto x7_writes = abstract_writes_to(bus.ops, hybrid::regno_gpr(7));
+  std::optional<uint64_t> staged_vstart;
+  for (const auto& [i, v] : x7_writes)
+    if (i > *undo_vsetvl && i < *vstart_csrrw) staged_vstart = v;
+  REQUIRE(staged_vstart.has_value());
+  CHECK(*staged_vstart == 7u);
+
+  // (d) the scratch GPRs are restored LAST with the drained values.
+  REQUIRE(!x5_writes.empty());
+  REQUIRE(!x6_writes.empty());
+  REQUIRE(!x7_writes.empty());
+  CHECK(x5_writes.back().second == 0x55u);
+  CHECK(x6_writes.back().second == 0x66u);
+  CHECK(x7_writes.back().second == 0x77u);
+  CHECK(x5_writes.back().first > *vstart_csrrw);
+
+  // (e) resume comes after everything above.
+  const auto resume = last_dmcontrol_write(bus.ops);
+  REQUIRE(resume.has_value());
+  CHECK((bus.ops[*resume].value & RD::kDmcontrolResumereq) != 0u);
+  CHECK(*resume > x7_writes.back().first);
+}
+
+TEST_CASE("drain_checkpoint without HYBRID_FLAG_V issues no Program Buffer ops "
+          "and still resumes")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid_state_v1 input{};
+  input.magic   = HYBRID_STATE_MAGIC;
+  input.version = HYBRID_STATE_VERSION;
+  input.flags   = HYBRID_FLAG_RV64 | HYBRID_FLAG_FP;
+  input.priv    = 3;
+
+  hybrid::StateDrain drain(bus);
+  (void) drain.drain_checkpoint(input);
+
+  for (const auto& op : bus.ops) {
+    const bool progbuf_write =
+      op.kind == DmiOp::Kind::Write && op.reg == hybrid::kProgbuf0;
+    CHECK_FALSE(progbuf_write);
+  }
+
+  const auto resume = last_dmcontrol_write(bus.ops);
+  REQUIRE(resume.has_value());
+  CHECK((bus.ops[*resume].value & RD::kDmcontrolResumereq) != 0u);
+}
+
+TEST_CASE("L6: drain reads the hart privilege from dcsr.prv")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  // dcsr: xdebugver=4, cause=3 (haltreq), prv=1 (S-mode at halt).
+  bus.regfile[hybrid::regno_csr(RD::kCsrDcsr)] = 0x400000C1ULL;
+
+  hybrid::StateDrain drain(bus);
+  const auto state = drain.drain();
+
+  CHECK(state.priv == 1u);
+}
+
+TEST_CASE("L6: drain_with_passthrough reports the freshly drained privilege, "
+          "not the QEMU1 snapshot's")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_csr(RD::kCsrDcsr)] = 0x40000000ULL;  // prv=0 (U)
+
+  hybrid_state_v1 input{};
+  input.magic   = HYBRID_STATE_MAGIC;
+  input.version = HYBRID_STATE_VERSION;
+  input.flags   = HYBRID_FLAG_RV64;
+  input.priv    = 3;  // stale: QEMU1 drained M before the ROI dropped to U
+
+  hybrid::StateDrain drain(bus);
+  const auto state = drain.drain_with_passthrough(input);
+
+  CHECK(state.priv == 0u);
+}

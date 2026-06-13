@@ -1,0 +1,253 @@
+hhhh cosim_redesign -- lock-step DV co-sim + instruction-exact ROI narrowing
+
+Status: PROPOSED (PM decisions recorded 2026-06-13):
+  1. Traps ARE in scope: generated testbenches contain illegal insns,
+     exceptions, ecall on purpose. Trap CSRs are compared; alignment must
+     survive non-retiring instructions.
+  2. CLI shape: per-model `--cosim`. `--model cycle --cosim` = lock-step
+     from boot; `--model hybrid --cosim` = ROI window co-sim (today's
+     behavior); `--cosim-refine` (opt-in) narrows the window to the exact
+     instruction.
+  3. Refine is OPT-IN: default hybrid --cosim keeps the window-only report.
+
+Supersedes nothing: cosim_roi.md F1-F4 stay shipped and are reused as-is.
+This file adds the two new usages on top.
+
+## Problem
+
+cosim_roi.md gives a window, for one topology only:
+
+1. No lock-step from reset. `--hybrid-cosim` requires `--resume-from-qemu`
+   + marker/pc trigger, and `drain_checkpoint` needs the QEMU1 passthrough
+   snapshot. A small testbench from a constraint-based generator has no
+   QEMU1 leg, no markers, and no trap-free guarantee.
+2. Window, not instruction. Localization stops at the N-insn window;
+   narrowing is manual (re-run with smaller N), vsim only accepts an
+   interval, and haltreq slack (0-3 retires ax45mpv, 5+ ax66) means even
+   N=1 cannot land on every retire.
+
+## Core model
+
+One comparison engine, two front-ends. The engine: two state streams,
+aligned record-by-record, diffed with the existing diff_states policy;
+first mismatch wins. vsim is the DUT, QEMU is the golden model. Memory is
+never shared and never compared (register + CSR state only, unchanged).
+
+## Usage 1: lock-step (`run --model cycle --cosim`)
+
+```
+QEMU (oracle): boot -> plugin arms at entry pc -> drain BEFORE every
+               execution attempt -> append record to <out>.ckpts -> exit
+vsim (DUT):    boot -> arm at entry pc -> halt -> record 0 ->
+               dcsr.step loop: step, full drain, append record ->
+               stop at K records (K = oracle record count)
+driver:        diff record i vs record i -> first mismatch = exact insn
+```
+
+- No handoff, no shared mmap, no fast-forward. Each engine boots the same
+  ELF on its own RAM. Arm point defaults to the ELF entry (`e_entry`);
+  `--pc-start` overrides. Record 0 is the entry state, so a pre-entry boot
+  divergence fails at record 0.
+- Stepping is dcsr.step, NOT haltreq: exact one-attempt granularity, zero
+  slack. The dcsr RMW primitive exists (resume_driver.hpp L6 prv path).
+- Trap alignment (PM decision 1): both sides emit one record per execution
+  ATTEMPT. QEMU exec callbacks fire pre-execution, so a trapping insn gets
+  a callback and the handler's first insn gets the next one. A dcsr.step
+  on a trapping insn enters debug mode at the handler entry (debug spec).
+  Record i on both sides = state before attempt i+1, traps included.
+  minstret is compared as data and catches any counting drift loudly.
+- Trap CSRs are drained for real (F1) and compared: mepc, mcause, mtval,
+  mscratch, mtvec, mie, mip, satp, plus mstatus side effects (MPP/MPIE).
+- Run order: oracle FIRST (MHz-fast, fails fast on a bad ELF, defines the
+  record count K), then vsim bounded to K records -- a diverged DUT cannot
+  run away.
+- Cost: one step = resume/halt handshake + ~70 abstract reads (+ V sweep
+  if V). Tens of steps/s expected -> a 10k-insn testbench takes minutes.
+  Acceptable for DV. `--cosim-interval N` remains usable as a coarse
+  haltreq-checkpoint pass for oversized testbenches.
+
+Out of scope / hard assumptions:
+- Asynchronous interrupts: out of scope. QEMU and RTL take them at
+  different attempt indices by nature; testbenches must be interrupt-free
+  (synchronous exceptions are fully supported).
+- Memory compare: rejected previously, stays rejected. A store bug is
+  caught when the value is loaded back or via the testbench's own
+  signature check.
+
+## Usage 2: ROI narrowing (`run --model hybrid --cosim --cosim-refine`)
+
+```
+pass 1 (shipped): ckpt every N -> first bad window (lo, hi]
+pass 2..k:        restore mmap snapshot, re-run vsim leg from the SAME
+                  handoff entry with ~16 explicit targets inside the
+                  window (vsim finishes at the last target); oracle
+                  re-runs at the same deltas; window shrinks ~16x
+final:            window <= halt slack -> one ckpt at lo, then dcsr.step
+                  across the window -> exact retire index + pc + fields
+```
+
+- mmap snapshot: after QEMU1, `cp` the shared mmap file (/dev/shm, 128 MB,
+  ~50 ms). Checkpoints are register-only, so every refinement pass re-runs
+  the vsim leg from the handoff entry; the snapshot makes that re-run
+  possible. QEMU1 runs exactly once. The live mmap is restored from the
+  snapshot before each pass.
+- Convergence: N=10000, subdivision 16 -> ceil(log16(10000)) = 4 vsim
+  re-runs, each bounded to `hi` retires (shorter every pass).
+- Alignment stays retire-count based (minstret deltas), as shipped: the
+  hybrid ROI is trap-free by contract, so attempt == retire there.
+- If the engine RTL WARL-pins dcsr.step (empirical, like prv), the final
+  pass falls back to reporting the slack-wide bracket with a clear note.
+
+## Report format (both usages)
+
+```
+[cosim] FAIL: first divergence at retire 18342 after entry
+        pc  vsim=0x80002a1c  qemu=0x80002a1c   (vec_madd+0x4c)
+        x14 vsim=0x00000000deadbeef  qemu=0x00000000deadbeee
+[cosim] PASS: 10000 records match (lock-step, 1 attempt/record)
+```
+
+Symbol annotation reuses the driver's existing pc-trigger symbol
+resolution; raw pc is always printed.
+
+## Stream file format
+
+Numbered `.ckpt<k>` files do not scale to per-insn records (10k files).
+New single stream file `<out>.ckpts`: concatenated `hybrid_state_v1`
+records, count = filesize / sizeof. Per the rewrite-over-patch rule, the
+hybrid checkpoint path migrates to the stream format too (one code path);
+run_plan.cpp and test_andes_sim_cosim.sh update in the same feature.
+
+## Features
+
+## F1: StateDrain full-read mode
+State: todo
+Description: `drain_full()` -- same capture as drain_with_passthrough but
+the trap CSR block (mepc, mcause, mtval, mscratch, mtvec, medeleg,
+mideleg, mip, mie, satp) is READ via abstract commands instead of copied
+from a QEMU1 snapshot, and flags are probed from the hart (misa for
+FP/V/RV64, vlenb for the V block) at the boot halt. Lock-step has no
+passthrough input. Unit tests on the recording bus assert the read
+sequence and flag probing.
+Key files: verilator/src/hybrid/state_drain.hpp,
+verilator/tests/hybrid/state_drain.test.cpp
+Dependencies: none
+
+## F2: dcsr.step primitive
+State: todo
+Description: `step_one()` in the debug-access layer: RMW dcsr.step=1
+(verify the write took -- WARL-pinned step aborts with a clear engine
+error, same pattern as L6 prv), resumereq, poll allhalted, leave step set
+across a stepping loop, clear on exit. Investigate dcsr.stopcount here
+(freeze minstret/mcycle in debug mode) and set it if implemented. Unit
+tests on the recording bus.
+Key files: verilator/src/hybrid/resume_driver.hpp (or a new
+step_driver.hpp), verilator/tests/hybrid/
+Dependencies: none
+
+## F3: vsim cosim targets + stream output
+State: todo
+Description: `--hybrid-cosim` accepts an explicit ascending target list
+`a:b:c` (mirror of the plugin's cosim_counts) in addition to interval N;
+with an explicit list the run FINISHES at the last target (drain + exit
+200) instead of waiting for the exit trigger. Checkpoint records append to
+`<handoff_out>.ckpts` (stream format above); the numbered-file path is
+removed, driver + tests migrate in this feature. HandoffController unit
+tests cover list targets and finish-at-last.
+Key files: verilator/src/hybrid/handoff_controller.hpp,
+verilator/src/simulator.hpp, verilator/src/main.cpp, driver/run_plan.cpp,
+verilator/tests/hybrid/handoff_controller.test.cpp,
+tests/andes_sim/test_andes_sim_cosim.sh
+Dependencies: none
+
+## F4: vsim lock-step mode
+State: todo
+Description: new vsim mode (program ELF, no --resume-from-qemu):
+`--cosim-lockstep --cosim-out <file> [--cosim-arm-pc 0x..]
+[--cosim-max-records K]`. Boot normally; on the first retire at the arm
+pc, halt via haltreq, drain_full -> record 0; then step_one + drain_full
+per record until K records or program exit (SimControl), appending to the
+stream. Mutually exclusive with all hybrid args. Unit tests with a fake
+trigger + recording bus; smoke: stream record count and ascending-or-flat
+minstret (flat = trap).
+Key files: verilator/src/hybrid/handoff_controller.hpp (or a sibling
+lockstep_controller.hpp), verilator/src/simulator.hpp,
+verilator/src/main.cpp
+Dependencies: F1, F2, F3 (stream format)
+
+## F5: plugin lock-step oracle mode
+State: todo
+Description: plugin args `lockstep_pc=0x...` + `lockstep_out=<file>`
+(exclusive with all other modes): per-insn exec callback; arm when
+vaddr == lockstep_pc; from then on drain the full state BEFORE every
+execution attempt and append to the stream; stop at program exit (the
+existing SimControl/atexit path) or `lockstep_max=K`. Reuses the existing
+drain core; record 0 = entry state, identical indexing to F4 by
+construction (callbacks are pre-execution).
+Key files: qemu_plugin/hybrid_handoff.c,
+tests/plugin/test_plugin_lockstep.sh (new)
+Dependencies: F3 (stream format)
+
+## F6: driver `run --model cycle --cosim`
+State: todo
+Description: orchestration: leg 1 = pure QEMU with lockstep_pc/out (arm pc
+resolved from e_entry or --pc-start), count its records K; leg 2 = vsim
+--cosim-lockstep bounded to K records; diff record i vs i via diff_states
+(now including trap CSRs); report PASS with record count or FAIL with the
+exact attempt index, both pcs, symbol, field diffs; rc 1. Usage errors:
+--cosim with --model fast, --cosim-interval rules. Gate fixtures:
+rt_c_hello-class (no V), a V fixture, and a NEW trap fixture
+(rt_trap_ecall: ecall + illegal insn + mret round-trip) -- the trap
+fixture empirically settles attempt-alignment and the minstret/stopcount
+risk.
+Key files: driver/cli.cpp/.hpp, driver/cmd_run.cpp, driver/plan.hpp,
+driver/run_plan.cpp, tests/fixtures/rt_trap_ecall.S (new),
+tests/andes_sim/test_andes_sim_cosim_lockstep.sh (new)
+Dependencies: F4, F5
+
+## F7: driver `--cosim-refine` (hybrid narrowing, opt-in)
+State: todo
+Description: after pass-1 finds window k: snapshot the post-QEMU1 mmap
+(cp on /dev/shm) before the first vsim leg; loop { restore mmap, re-run
+vsim with ~16 explicit targets subdividing the window (F3 list form),
+re-run oracle at the achieved deltas, diff } until window <= engine halt
+slack; final pass = one target at window start + step_one loop across the
+window. Report the exact retire index after entry (or the slack bracket if
+dcsr.step is pinned). `--cosim-refine` requires `--cosim`; default off
+(PM decision 3). window_cycles stays suppressed.
+Key files: driver/cmd_run.cpp, driver/run_plan.cpp,
+tests/andes_sim/test_andes_sim_cosim_refine.sh (new)
+Dependencies: F2, F3
+
+## Risks
+
+- dcsr.step support is per-RTL (empirical, like NDS_NUM_PRIVILEGE_LEVELS).
+  F2 verifies the write; unsupported engines get a clear abort (lock-step)
+  or the bracket fallback (refine).
+- minstret/mcycle incrementing in debug mode inflates alignment; F2 sets
+  dcsr.stopcount if implemented; the F6 trap fixture is the gate.
+- Fetch-faulting instructions may not get a QEMU exec callback at all
+  (translation fails before the tb is built). If observed, the record
+  streams skew by one at that point; the diff still fails loudly there,
+  but the index attribution may point at the neighbor. Note in docs;
+  revisit only if a real testbench hits it.
+- Lock-step throughput (~tens of steps/s) caps practical testbench size at
+  ~10-50k attempts. Mitigation: coarse haltreq pass first
+  (--cosim-interval), then refine -- same loop as F7 but from boot.
+
+## Docs
+
+Each feature updates docs/USER_GUIDE.md in its own change set: F6 adds the
+lock-step subsection (DV flow, trap support, interrupt exclusion, sizing
+guidance); F7 extends the --cosim subsection with --cosim-refine and the
+mmap-snapshot note. F5 adds the plugin-arg rows (2.3).
+
+## Rejected
+
+- Streaming trace-compare (Option B in cosim_roi.md): still rejected;
+  vsim's retire hook stays pc-only, full value compare needs RTL probing.
+  The step-drain loop reaches per-instruction granularity without it.
+- Memory co-sim: stays rejected (register + CSR only).
+- minstret-keyed record alignment: unnecessary -- attempt-index alignment
+  is trap-robust by construction (pre-execution callbacks == post-step
+  debug entries); minstret is compared as data instead.
