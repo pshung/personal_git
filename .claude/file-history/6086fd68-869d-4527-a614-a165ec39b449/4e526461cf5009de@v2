@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# run --cosim --cosim-refine contract (cosim_redesign F7): the hybrid window
+# narrowing. On a divergence, --cosim-refine re-runs QEMU1->vsim with explicit
+# targets subdividing the bad window ~16x per pass until it reaches the halt
+# slack, localizing the instruction far tighter than the coarse interval.
+#
+# The narrowing loop only ENGAGES on a real divergence, which the matching
+# fixtures (vsim == QEMU by the suite's correctness invariant) never exhibit;
+# the subdivision math is unit-tested in andes-sim-cosim-lockstep-test. This
+# e2e covers the plumbing: refine is accepted, leaves the passing case intact,
+# and the usage gates hold.
+#
+#   1. --cosim --cosim-refine on a matching fixture -> PASS, rc 0
+#   2. usage errors: refine needs --cosim + --model hybrid
+#   3. dev-only help surface
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+. "$SCRIPT_DIR/../lib/paths.sh"
+
+BIN="$ROOT/build/andes-sim"
+bash "$ROOT/scripts/build_driver.sh" >/dev/null 2>&1 || fail "build_driver.sh failed"
+
+FIXTURE="${FIXTURE:-rt_c_v_matmul}"
+hybrid_resolve_paths
+ENGINE="${ENGINE:-vsim:ax45mpv_premium}"
+
+# 1. refine on a matching workload: pass 1 finds no divergence, so the narrow
+#    loop is never entered and the verdict is the same PASS as plain --cosim.
+OUT=$("$BIN" run --model hybrid --trigger marker --engine "$ENGINE" \
+      --cosim --cosim-refine --cosim-interval 500 "$VSIM_ELF" 2>&1)
+RC=$?
+[ "$RC" -eq 0 ] || fail "refine matching rc=$RC: $OUT"
+printf '%s\n' "$OUT" | grep -q '\[cosim\] PASS' \
+  || fail "refine: no [cosim] PASS on a matching fixture: $OUT"
+ok "hybrid --cosim --cosim-refine: passing case intact (no spurious narrowing)"
+
+# 2. usage errors.
+expect 2 'cosim-refine requires --model hybrid --cosim' \
+  "$BIN" run --model hybrid --cosim-refine --engine "$ENGINE" "$VSIM_ELF"
+expect 2 'cosim-refine requires --model hybrid --cosim' \
+  "$BIN" run --model cycle --cosim --cosim-refine --engine "$ENGINE" "$VSIM_ELF"
+expect 2 'cosim requires --model hybrid or cycle' \
+  "$BIN" run --model fast --cosim --cosim-refine "$VSIM_ELF"
+ok "--cosim-refine usage errors (needs --cosim + --model hybrid)"
+
+# 3. dev-only help surface.
+expect 0 'cosim-refine' env ANDES_SIM_DEV=1 "$BIN" run --help
+OUT=$("$BIN" run --help 2>&1)
+printf '%s\n' "$OUT" | grep -q -- '--cosim-refine' && fail "release help leaks --cosim-refine"
+ok "--cosim-refine help is dev-only"
+
+ok "run --cosim --cosim-refine hybrid window narrowing"

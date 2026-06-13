@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# run --model cycle --cosim contract (cosim_redesign F6): lock-step DV co-sim.
+# A QEMU oracle and the vsim DUT each boot the same ELF from reset, drain one
+# full record per execution attempt from the arm pc, and the streams are
+# diffed by attempt index to localize the first diverging instruction.
+#
+#   1. self-initializing trap fixture, armed after init -> PASS (the ecall
+#      traps round-trip identically; mcause/mepc compared and match)
+#   2. a workload that relies on QEMU's boot-arg reset convention -> FAIL at
+#      attempt 0 (the RTL resets GPRs to 0; the tool localizes it), rc 1
+#   3. usage errors: fast model, --cosim-max-records gating
+#   4. dev-only help surface
+#
+# Slow: each vsim step is a DMI single-step + full drain (~5s/record on
+# ax45mpv). Bounded with --cosim-max-records to keep the gate to a few minutes.
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+. "$SCRIPT_DIR/../lib/paths.sh"
+
+BIN="$ROOT/build/andes-sim"
+bash "$ROOT/scripts/build_driver.sh" >/dev/null 2>&1 || fail "build_driver.sh failed"
+
+ENGINE="${ENGINE:-vsim:ax45mpv_premium}"
+TRAP_ELF="$ROOT/tests/fixtures/rt_trap_ecall.elf"
+HELLO_ELF="$ROOT/tests/fixtures/rt_c_hello.elf"
+[ -f "$TRAP_ELF" ] || fail "missing $TRAP_ELF (make -C tests/fixtures rt_trap_ecall.elf)"
+
+# 1. PASS: self-init trap fixture, armed at roi_start, bounded to cross both
+#    ecall traps and their handler round-trips.
+OUT=$("$BIN" run --model cycle --cosim --engine "$ENGINE" \
+      --pc-start roi_start --cosim-max-records 10 "$TRAP_ELF" 2>&1)
+RC=$?
+[ "$RC" -eq 0 ] || fail "trap lock-step rc=$RC: $OUT"
+printf '%s\n' "$OUT" | grep -Eq '\[cosim\] PASS: 10 records match' \
+  || fail "trap: expected PASS with 10 records: $OUT"
+ok "cycle --cosim: self-init trap fixture lock-steps (ecall traps match)"
+
+# 2. FAIL localization: rt_c_hello relies on QEMU seeding a0/a1/.. at reset;
+#    the RTL resets GPRs to 0, so the streams diverge at the first attempt.
+OUT=$("$BIN" run --model cycle --cosim --engine "$ENGINE" \
+      --cosim-max-records 2 "$HELLO_ELF" 2>&1)
+RC=$?
+[ "$RC" -eq 1 ] || fail "hello lock-step expected rc 1 (divergence), got $RC: $OUT"
+printf '%s\n' "$OUT" | grep -Eq '\[cosim\] FAIL: first divergence at attempt 0' \
+  || fail "hello: expected divergence at attempt 0: $OUT"
+printf '%s\n' "$OUT" | grep -Eq 'pc +vsim=0x[0-9a-f]+ +qemu=0x[0-9a-f]+' \
+  || fail "hello: divergence report missing both pcs: $OUT"
+ok "cycle --cosim: divergence localized to the exact attempt with both pcs"
+
+# 3. usage errors.
+expect 2 'cosim requires --model hybrid or cycle' \
+  "$BIN" run --model fast --cosim "$TRAP_ELF"
+expect 2 'cosim-max-records requires --model cycle --cosim' \
+  "$BIN" run --model hybrid --cosim-max-records 10 --engine "$ENGINE" "$TRAP_ELF"
+ok "cycle --cosim usage errors (model / --cosim-max-records gating)"
+
+# 4. dev-only help surface.
+expect 0 'cosim-max-records' env ANDES_SIM_DEV=1 "$BIN" run --help
+ok "cycle --cosim help is dev-only"
+
+ok "run --model cycle --cosim lock-step DV co-simulation"
