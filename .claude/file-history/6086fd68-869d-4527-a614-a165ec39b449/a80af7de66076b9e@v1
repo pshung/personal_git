@@ -1,0 +1,78 @@
+// Recording DmiBus mock shared by the StateDrain, HandoffController, and
+// ResumeDriver tests. Captures the (op, reg, value) sequence and latches
+// abstract-command read responses so test fixtures can pre-program a
+// regfile and assert on the resulting DMI traffic.
+
+#pragma once
+
+#include "hybrid/resume_driver.hpp"
+
+#include <cstdint>
+#include <unordered_map>
+#include <vector>
+
+namespace hybrid::test
+{
+
+struct DmiOp
+{
+  enum class Kind
+  {
+    Write,
+    Read,
+  };
+  Kind kind;
+  uint8_t reg;
+  uint32_t value;
+};
+
+struct RecordingBus final : hybrid::DmiBus
+{
+  std::vector<DmiOp> ops;
+
+  // Test-controlled response values for the polled status registers.
+  uint32_t dmstatus_value   = 0;
+  uint32_t abstractcs_value = 0;
+
+  // For abstract-command reads: maps DM regno -> 64-bit value. When the
+  // driver writes COMMAND with read=true, we latch the matching regfile
+  // entry into pending_data{0,1} so the next DATA0/DATA1 reads return it.
+  std::unordered_map<uint16_t, uint64_t> regfile;
+
+  uint32_t pending_data0 = 0;
+  uint32_t pending_data1 = 0;
+
+  void write(uint8_t reg, uint32_t value) override
+  {
+    ops.push_back({DmiOp::Kind::Write, reg, value});
+    if (reg == hybrid::ResumeDriver::kCommand) {
+      const uint16_t regno = value & 0xffffu;
+      const bool is_write  = ((value >> 16) & 1u) != 0;
+      if (!is_write) {
+        const auto it = regfile.find(regno);
+        const uint64_t v = (it == regfile.end()) ? 0 : it->second;
+        pending_data0 = static_cast<uint32_t>(v & 0xffffffffu);
+        pending_data1 = static_cast<uint32_t>((v >> 32) & 0xffffffffu);
+      }
+    }
+  }
+
+  auto read(uint8_t reg) -> uint32_t override
+  {
+    ops.push_back({DmiOp::Kind::Read, reg, 0});
+    if (reg == hybrid::ResumeDriver::kDmstatus)   return dmstatus_value;
+    if (reg == hybrid::ResumeDriver::kAbstractcs) return abstractcs_value;
+    if (reg == hybrid::ResumeDriver::kData0)      return pending_data0;
+    if (reg == hybrid::ResumeDriver::kData1)      return pending_data1;
+    return 0;
+  }
+};
+
+// Compose the dmstatus bits the polls expect: hart halted + last
+// resume acknowledged. Pre-programs a bus that lets tests skip past
+// the poll loops without iteration.
+inline constexpr uint32_t kDmstatusHaltedAndAcked =
+  hybrid::ResumeDriver::kDmstatusAllhalted
+  | hybrid::ResumeDriver::kDmstatusAllresumeack;
+
+}  // namespace hybrid::test
