@@ -1,0 +1,48 @@
+// rt_csr_survival.S
+//
+// 2-phase guard (L23): the M-mode software scratch CSR `mscratch` round-trips
+// across the QEMU1 -> vsim handoff. A value stashed before the ROI is readable
+// inside it (ResumeDriver restores mscratch) and a value written inside the ROI
+// is captured at drain (StateDrain::drain_with_passthrough re-reads it).
+//
+// History: this fixture predates the 2-phase redesign. It used to read the CSRs
+// back in a `phase_c` AFTER the exit marker and exit with the index of the
+// first mismatch -- but once the QEMU2 handback leg was removed, vsim drains and
+// exits AT the exit marker, so phase_c never ran and the guard was silently
+// dead. The check now lives INSIDE the ROI, where the vsim leg actually runs.
+//
+// Self-check (works in the plain e2e harness, no --verify needed): read
+// mscratch back inside the ROI and compare against the stashed sentinel (held
+// in a1, which the GPR restore round-trips). On a regressed restore the values
+// differ, so the fixture spins -- vsim never reaches the exit marker, times
+// out, and the harness reports "vsim expected exit 200". With VERIFY=1 the
+// oracle additionally compares a0 (the read-back) and the mscratch CSR field
+// (the in-ROI write) against a pure-QEMU run.
+//
+// Only mscratch is asserted: mtvec is restored but not re-drained, and
+// mepc/mcause/mtval/satp/mip/mie are neither (trap/paging/interrupt machinery,
+// deferred to the L3/L4 envelope work -- see docs/andes_sim_limitations.ipynb).
+
+.section .text
+.globl _start
+_start:
+    li      a1, 0xCAFEBABEDEADBEEF
+    csrw    mscratch, a1            // stash sentinel BEFORE the ROI (QEMU leg)
+
+    slti    x0, x0, 0x5A0           // ENTER ROI -> hand off to vsim
+
+    csrr    a0, mscratch            // read back INSIDE the ROI: must be restored
+    bne     a0, a1, regress         // restore lost? spin -> timeout -> test FAIL
+    li      a2, 0xBADC0FFEE0DDF00D
+    csrw    mscratch, a2            // overwrite; drain must re-read this value
+
+    slti    x0, x0, 0x5A1           // EXIT ROI -> vsim drains a0+mscratch, exits 200
+
+    // Unreached on hybrid (vsim stops at the exit marker). Engine-portable
+    // SimControl exit so the same ELF still runs to completion standalone.
+    li      t0, 0xe0080000
+    sw      x0, 0(t0)
+1:  j       1b
+
+regress:
+    j       regress                 // mscratch NOT restored: hang -> harness FAIL

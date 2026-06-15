@@ -1,0 +1,267 @@
+// StateDrain halts the hart via the Debug Module and populates a
+// hybrid_state_v1 with the architectural register file. Reuses
+// ResumeDriver's DM register constants and DmiBus interface.
+
+#pragma once
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/dmi_poll.hpp"
+#include "hybrid/resume_driver.hpp"
+#include "hybrid/state_abi.h"
+#include "hybrid/v_regfile_xfer.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <span>
+
+namespace hybrid
+{
+
+class StateDrain
+{
+public:
+  using RD = ResumeDriver;
+
+  explicit StateDrain(DmiBus& bus)
+      : bus_{bus}
+  {}
+
+  // F16: stash the warmup-window snapshot (mcycle, minstret captured K
+  // retires after vsim entry). Both drain() and drain_with_passthrough()
+  // copy these into the returned state. Zero when MeasureStartSnapshot
+  // never fired (K=0 or workload exited inside the warmup window).
+  void set_warmup_snapshot(uint64_t mcycle, uint64_t minstret)
+  {
+    warmup_mcycle_   = mcycle;
+    warmup_minstret_ = minstret;
+  }
+
+  // Drain x1..x31 + PC. FP/CSR/V slots remain zero; merge them in via
+  // drain_with_passthrough when the QEMU 1 snapshot is available.
+  auto drain() -> hybrid_state_v1
+  {
+    bus_.write(RD::kDmcontrol, RD::kDmcontrolDmactive);
+    bus_.write(RD::kDmcontrol, RD::kDmcontrolDmactive | RD::kDmcontrolHaltreq);
+    poll_until_set(bus_, RD::kDmstatus, RD::kDmstatusAllhalted,
+                   "StateDrain halt");
+
+    hybrid_state_v1 state{};
+    state.magic   = HYBRID_STATE_MAGIC;
+    state.version = HYBRID_STATE_VERSION;
+    state.flags   = HYBRID_FLAG_RV64;
+    // L6: dcsr.prv holds the privilege the hart was in when the halt landed.
+    state.priv = read_register_64(bus_, regno_csr(RD::kCsrDcsr),
+                                  "StateDrain DCSR") & 0x3u;
+
+    for (uint16_t i = 1; i < 32; ++i)
+      state.gpr[i] = read_register_64(bus_, regno_gpr(i), "StateDrain GPR");
+
+    state.pc = read_register_64(bus_, regno_csr(RD::kCsrDpc), "StateDrain DPC");
+    state.mcycle_at_measure_start   = warmup_mcycle_;
+    state.minstret_at_measure_start = warmup_minstret_;
+    return state;
+  }
+
+  // Returns the input snapshot with x1..x31 and PC overwritten by a fresh
+  // DM read. When HYBRID_FLAG_FP is set, also freshly reads f0..f31 + fcsr
+  // (L20) so post-vsim FP modifications are captured (otherwise the stale
+  // QEMU 1 snapshot leaks into the drained state). When HYBRID_FLAG_V is set, also
+  // freshly reads the six V CSRs (vstart/vxsat/vxrm/vcsr/vtype/vl); vlenb
+  // and vreg remain pass-through (read-only / too large for DM).
+  // mcycle/minstret are always refreshed (F-T2.4): the vsim phase's
+  // contribution would otherwise be discarded as the passthrough preserves
+  // QEMU1's pre-handoff value.
+  auto drain_with_passthrough(const hybrid_state_v1& input) -> hybrid_state_v1
+  {
+    auto state       = input;
+    const auto fresh = drain();
+    std::copy(std::begin(fresh.gpr) + 1, std::end(fresh.gpr),
+              std::begin(state.gpr) + 1);
+    state.pc   = fresh.pc;
+    state.priv = fresh.priv;  // L6: privilege at the exit halt, not QEMU1's
+
+    if (input.flags & HYBRID_FLAG_FP) {
+      for (uint16_t i = 0; i < 32; ++i)
+        state.fpr[i] = read_register_64(bus_, regno_fpr(i), "StateDrain FPR");
+      // L20: fcsr (frm + sticky fflags) accumulated by the vsim phase.
+      state.fcsr = read_register_64(bus_, regno_csr(RD::kCsrFcsr));
+    }
+
+    if (input.flags & HYBRID_FLAG_V) {
+      state.vstart = read_register_64(bus_, regno_csr(RD::kCsrVstart));
+      state.vxsat  = read_register_64(bus_, regno_csr(RD::kCsrVxsat));
+      state.vxrm   = read_register_64(bus_, regno_csr(RD::kCsrVxrm));
+      state.vcsr   = read_register_64(bus_, regno_csr(RD::kCsrVcsr));
+      state.vtype  = read_register_64(bus_, regno_csr(RD::kCsrVtype));
+      state.vl     = read_register_64(bus_, regno_csr(RD::kCsrVl));
+    }
+
+    // L23: mscratch round-trips now (ResumeDriver restores it), so re-read it
+    // from the hart -- otherwise an in-ROI write to the software scratch CSR is
+    // dropped and the stale QEMU1 value passes through into the drained state.
+    state.mscratch = read_register_64(bus_, regno_csr(RD::kCsrMscratch));
+
+    state.mcycle   = read_register_64(bus_, regno_csr(RD::kCsrMcycle));
+    state.minstret = read_register_64(bus_, regno_csr(RD::kCsrMinstret));
+
+    // V data regfile: dump v0..v31 to the shared scratch region via the
+    // Program Buffer LAST -- after every architectural read above -- so the
+    // sweep's clobbers (vtype/vl/vstart, x5/x6/x7) and its counter increments
+    // cannot corrupt the values already captured. The simulator's
+    // read_v_from_scratch then lifts the scratch bytes into state.vreg[].
+    // Stride is HYBRID_VLEN_BYTES_MAX (the wire-format per-register span).
+    if (input.flags & HYBRID_FLAG_V)
+      pb_v_data_sweep(bus_, kVScratchGpa, HYBRID_VLEN_BYTES_MAX, input.vlenb,
+                      /*load=*/false);
+
+    state.mcycle_at_measure_start   = warmup_mcycle_;
+    state.minstret_at_measure_start = warmup_minstret_;
+    return state;
+  }
+
+  // cosim_roi F1: checkpoint drain. Same capture as drain_with_passthrough,
+  // but the hart must keep running afterwards. The exit drain may clobber
+  // freely (the run ends there); a checkpoint must undo the dump sweep's
+  // clobbers -- vtype/vl/vstart and the x5/x6/x7 scratch -- from the freshly
+  // drained values, then resume. DPC is untouched, so the hart continues
+  // exactly where the halt landed.
+  auto drain_checkpoint(const hybrid_state_v1& input) -> hybrid_state_v1
+  {
+    const auto state = drain_with_passthrough(input);
+
+    if (input.flags & HYBRID_FLAG_V)
+      undo_v_sweep_clobbers(state);
+
+    bus_.write(RD::kDmcontrol,
+               RD::kDmcontrolDmactive | RD::kDmcontrolResumereq);
+    poll_until_set(bus_, RD::kDmstatus, RD::kDmstatusAllresumeack,
+                   "StateDrain checkpoint resume");
+    return state;
+  }
+
+  // cosim_redesign F1: full drain with NO QEMU1 passthrough input -- every
+  // populated field comes from the hart. Flags are probed from misa, vlenb
+  // from its CSR, and the trap CSR block + PMP are read via (tolerant)
+  // Abstract Commands. Non-destructive: the V dump sweep's clobbers are
+  // undone and a force-enabled FS/VS is restored, so the hart can continue
+  // (lock-step record loop). The hart is left HALTED -- the caller decides
+  // between step, resume, or exit.
+  auto drain_full() -> hybrid_state_v1
+  {
+    auto state = drain();  // halt + GPRs/pc/priv, flags = RV64
+
+    const uint64_t misa =
+      read_register_64(bus_, regno_csr(RD::kCsrMisa), "StateDrain misa");
+    if (misa & (kMisaF | kMisaD)) state.flags |= HYBRID_FLAG_FP;
+    if (misa & kMisaV) state.flags |= HYBRID_FLAG_V;
+
+    state.mstatus  = read_register_64(bus_, regno_csr(RD::kCsrMstatus));
+    state.mepc     = read_register_64(bus_, regno_csr(RD::kCsrMepc));
+    state.mtvec    = read_register_64(bus_, regno_csr(RD::kCsrMtvec));
+    state.mcause   = read_register_64(bus_, regno_csr(RD::kCsrMcause));
+    state.mtval    = read_register_64(bus_, regno_csr(RD::kCsrMtval));
+    state.mscratch = read_register_64(bus_, regno_csr(RD::kCsrMscratch));
+    state.medeleg  = read_register_64(bus_, regno_csr(RD::kCsrMedeleg));
+    state.mideleg  = read_register_64(bus_, regno_csr(RD::kCsrMideleg));
+    state.mip      = read_register_64(bus_, regno_csr(RD::kCsrMip));
+    state.mie      = read_register_64(bus_, regno_csr(RD::kCsrMie));
+    state.satp     = read_register_64(bus_, regno_csr(RD::kCsrSatp));
+
+    // PMP: read_register_64 maps a missing entry to 0 (tolerant), matching
+    // the resume side's tolerant writes. Odd pmpcfg CSRs do not exist on
+    // RV64 and stay zero.
+    for (uint16_t i = 0; i < HYBRID_PMP_ADDR_NUM; ++i)
+      state.pmpaddr[i] =
+        read_register_64(bus_, regno_csr(RD::kCsrPmpaddr0 + i));
+    for (uint16_t i = 0; i < HYBRID_PMP_CFG_NUM; i += 2)
+      state.pmpcfg[i] =
+        read_register_64(bus_, regno_csr(RD::kCsrPmpcfg0 + i));
+
+    // FS/VS at Off NACKs the FPR / V accesses below. Force the minimal
+    // enable for the reads, restore the architectural mstatus afterwards;
+    // the record keeps the original value either way.
+    uint64_t live_mstatus = state.mstatus;
+    if ((state.flags & HYBRID_FLAG_FP)
+        && (live_mstatus & RD::kMstatusFsMask) == 0)
+      live_mstatus |= RD::kMstatusFsInitial;
+    if ((state.flags & HYBRID_FLAG_V)
+        && (live_mstatus & RD::kMstatusVsMask) == 0)
+      live_mstatus |= RD::kMstatusVsInitial;
+    const bool mstatus_forced = live_mstatus != state.mstatus;
+    if (mstatus_forced) write_csr_tolerant(RD::kCsrMstatus, live_mstatus);
+
+    if (state.flags & HYBRID_FLAG_FP) {
+      for (uint16_t i = 0; i < 32; ++i)
+        state.fpr[i] = read_register_64(bus_, regno_fpr(i), "StateDrain FPR");
+      state.fcsr = read_register_64(bus_, regno_csr(RD::kCsrFcsr));
+    }
+
+    if (state.flags & HYBRID_FLAG_V) {
+      state.vlenb  = read_register_64(bus_, regno_csr(RD::kCsrVlenb));
+      state.vstart = read_register_64(bus_, regno_csr(RD::kCsrVstart));
+      state.vxsat  = read_register_64(bus_, regno_csr(RD::kCsrVxsat));
+      state.vxrm   = read_register_64(bus_, regno_csr(RD::kCsrVxrm));
+      state.vcsr   = read_register_64(bus_, regno_csr(RD::kCsrVcsr));
+      state.vtype  = read_register_64(bus_, regno_csr(RD::kCsrVtype));
+      state.vl     = read_register_64(bus_, regno_csr(RD::kCsrVl));
+    }
+
+    state.mcycle   = read_register_64(bus_, regno_csr(RD::kCsrMcycle));
+    state.minstret = read_register_64(bus_, regno_csr(RD::kCsrMinstret));
+
+    // V data dump LAST (same reasoning as drain_with_passthrough), then undo
+    // the sweep's clobbers so the hart can keep executing.
+    if (state.flags & HYBRID_FLAG_V) {
+      pb_v_data_sweep(bus_, kVScratchGpa, HYBRID_VLEN_BYTES_MAX, state.vlenb,
+                      /*load=*/false);
+      undo_v_sweep_clobbers(state);
+    }
+
+    if (mstatus_forced) write_csr_tolerant(RD::kCsrMstatus, state.mstatus);
+    return state;
+  }
+
+private:
+  // misa extension letters used by the drain_full flag probe.
+  static constexpr uint64_t kMisaD = 1ULL << 3;
+  static constexpr uint64_t kMisaF = 1ULL << 5;
+  static constexpr uint64_t kMisaV = 1ULL << 21;
+
+  // Undo the dump sweep's clobbers -- vtype/vl/vstart and the x5/x6/x7
+  // scratch -- from the freshly drained values, so the hart can continue.
+  void undo_v_sweep_clobbers(const hybrid_state_v1& state)
+  {
+    // vtype+vl atomically via vsetvl (direct vtype write sets vill; vl is
+    // read-only), staged in x5/x6 like the ResumeDriver Tier-B restore.
+    write_register_abstract(bus_, regno_gpr(5), state.vl);
+    write_register_abstract(bus_, regno_gpr(6), state.vtype);
+    const std::array<uint32_t, 1> pb_vsetvl = { encode_vsetvl(0, 5, 6) };
+    exec_progbuf(bus_, std::span<const uint32_t>{pb_vsetvl});
+    // vstart AFTER vsetvl (vsetvl zeroes it), via PB csrrw staged in x7 --
+    // still scratch until the GPR rewrite below.
+    write_register_abstract(bus_, regno_gpr(7), state.vstart);
+    const std::array<uint32_t, 1> pb_vstart = {
+      encode_csrrw(0, RD::kCsrVstart, 7) };
+    exec_progbuf(bus_, std::span<const uint32_t>{pb_vstart});
+    // Scratch GPRs back to the drained architectural values.
+    write_register_abstract(bus_, regno_gpr(5), state.gpr[5]);
+    write_register_abstract(bus_, regno_gpr(6), state.gpr[6]);
+    write_register_abstract(bus_, regno_gpr(7), state.gpr[7]);
+  }
+
+  // Abstract CSR write that clears a sticky cmderr instead of blocking the
+  // remaining drain (mirror of ResumeDriver::write_csr_tolerant).
+  void write_csr_tolerant(uint16_t csr, uint64_t value)
+  {
+    write_register_abstract(bus_, regno_csr(csr), value);
+    if ((bus_.read(RD::kAbstractcs) & RD::kAbstractcsCmderrMask) != 0u)
+      bus_.write(RD::kAbstractcs, RD::kAbstractcsCmderrMask);
+  }
+
+  DmiBus& bus_;
+  uint64_t warmup_mcycle_   = 0;  // F16: zero when warmup boundary never fired
+  uint64_t warmup_minstret_ = 0;
+};
+
+}  // namespace hybrid
