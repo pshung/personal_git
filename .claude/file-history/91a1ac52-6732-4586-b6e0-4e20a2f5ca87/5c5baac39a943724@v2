@@ -1,0 +1,47 @@
+// break_vscratch.S
+//
+// Bug: kVScratchGpa (0x00FF0000) is unconditionally overwritten by the V
+// register transport during ResumeDriver::resume() on every V-capable core,
+// even for programs that never execute a V instruction.  User data placed at
+// that address is silently corrupted before the ROI runs its first instruction.
+//
+// The linker script marks 0x00FF0000 as V_SCRATCH in its comment, but there is
+// no hardware guard and no documented trap for programs that access it directly.
+//
+// Expected outcome (V-capable core, e.g. ax45mpv_premium):
+//   - ResumeDriver::pb_v_data_sweep loads v0..v31 FROM 0x00FF0000 into the
+//     vector regfile.  stage_v_to_scratch wrote vreg[] (QEMU1-drained bytes,
+//     usually zeros for a program that never used V) into that region first.
+//   - The sentinel 0xDEADBEEFCAFEBABE is gone; in-ROI check fires -> hang.
+//   - Harness timeout -> FAIL.
+//
+// Expected outcome (non-V core or HYBRID_FLAG_V not set): PASS (no transport).
+//
+// Scope: bare-metal, no async interrupts.
+
+.section .text
+.globl _start
+_start:
+    // Write a known sentinel to kVScratchGpa before the ROI.
+    li   t0, 0x00FF0000
+    li   t1, 0xDEADBEEFCAFEBABE
+    sd   t1, 0(t0)              // sentinel lives at scratch GPA
+
+    // t0 and t1 survive the GPR restore because they are drained here by
+    // QEMU1 and restored after the V sweep (ResumeDriver restores GPRs last).
+    slti x0, x0, 0x5A0          // ENTER ROI
+
+    // After resume: V transport wrote v0's register bytes to 0x00FF0000.
+    // On a fresh program that never used V, those bytes are zeros (QEMU1
+    // drained v0..v31 = zero).
+    ld   t2, 0(t0)              // reload from scratch GPA
+    bne  t2, t1, regress        // corrupted? -> infinite loop -> harness FAIL
+
+    slti x0, x0, 0x5A1          // EXIT ROI (only reached if V transport absent)
+
+    li   t0, 0xe0080000         // SimControl: exit code 0 for standalone run
+    sw   x0, 0(t0)
+1:  j    1b
+
+regress:
+    j    regress                // V transport clobbered sentinel -> hang
