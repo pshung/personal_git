@@ -1,0 +1,64 @@
+// break_mscratch.S
+//
+// A program that BREAKS the andes-sim hybrid round-trip with NOTHING exotic:
+// bare-metal, single privilege (M), no async interrupt, no trap, no paging,
+// no atomics. It only uses `mscratch`, the standard M-mode software scratch
+// CSR (CSR 0x340) -- the register the ISA provides precisely so M-mode code
+// can stash a 64-bit value. Using it across the ROI silently corrupts state.
+//
+// This is NOT one of the documented limitations:
+//   - L2 is PMP; L3 is satp/paging; L4 is TRAP state (mepc/mcause/mtval after
+//     an exception). None of them describe a plain, trap-free program that
+//     just reads/writes mscratch across the measurement window.
+//   - The repo's own guard for this exact property, rt_csr_survival.S, is dead
+//     code: it was written for the 3-phase design (QEMU1 -> vsim -> QEMU2) and
+//     checks mscratch in a `phase_c` that lives AFTER the exit marker. The
+//     QEMU2 leg was deleted, so vsim now drains+exits at the exit marker and
+//     phase_c never runs. The break has been unguarded ever since.
+//
+// Root cause (two independent halves, same CSR):
+//   1. RESUME gap  -- resume_driver.hpp restores only mstatus/mtvec/mcycle/
+//      minstret/fcsr (+dcsr.prv,+PMP for S/U). It never writes mscratch into
+//      the vsim hart, so the value stashed before the ROI is invisible inside
+//      it: the in-ROI read returns vsim's reset value, not the stashed one.
+//   2. DRAIN gap   -- state_drain.hpp::drain_with_passthrough re-reads GPRs/
+//      FPR/V-CSRs/mcycle/minstret from vsim but PASSES mscratch through from
+//      the QEMU1 snapshot. So a value WRITTEN to mscratch inside the ROI is
+//      dropped from the drained state.
+//
+// How to see it (the simulator's own oracle reports the divergence):
+//   make -C tests/fixtures TOOLCHAIN=/local/nick/build-ast540 break_mscratch.elf
+//   ./build/andes-sim run --model hybrid --trigger marker --verify --engine vsim:ax45mpv_premium tests/fixtures/break_mscratch.elf
+//
+//   --verify diffs the hybrid drain against a pure-QEMU oracle. It flags the
+//   resume gap directly (a0 lands in a GPR, which IS compared):
+//     * x10/a0   : ref(QEMU) = 0xCAFEBABEDEADBEEF   got(vsim) = 0x0  (resume gap)
+//   The drain gap (mscratch overwrite dropped) is real but INVISIBLE to
+//   --verify: state_diff.cpp excludes the passthrough CSRs, so the drained
+//   mscratch silently stays 0xCAFEBABEDEADBEEF instead of 0xBADC0FFEE0DDF00D.
+
+.section .text
+.globl _start
+_start:
+    // ---- Phase 1 (QEMU): stash a sentinel in mscratch BEFORE the ROI. ----
+    li      a1, 0xCAFEBABEDEADBEEF
+    csrw    mscratch, a1
+
+    slti    x0, x0, 0x5A0           // ENTER ROI  -> hand off to vsim
+
+    // ---- Phase 2 (vsim, INSIDE the ROI): use mscratch like normal M-mode
+    //      software would. Both operations are corrupted by the round-trip. ----
+    csrr    a0, mscratch            // (1) read back: SHOULD be 0xCAFE... ; vsim
+                                    //     never had it restored -> wrong value.
+    li      a2, 0xBADC0FFEE0DDF00D
+    csrw    mscratch, a2            // (2) overwrite: drain never re-reads
+                                    //     mscratch -> this store is dropped.
+
+    slti    x0, x0, 0x5A1           // EXIT ROI  -> vsim drains a0+CSRs, exits 200
+
+    // ---- Unreached on hybrid (vsim stops at the exit marker). Engine-portable
+    //      SimControl exit so the SAME ELF still runs to completion under
+    //      --model fast / --model cycle as a plain bare-metal program. ----
+    li      t0, 0xe0080000          // SimControl (modeled by QEMU + vsim)
+    sw      x0, 0(t0)               // write 0 -> exit code 0
+1:  j       1b
