@@ -1,0 +1,340 @@
+#pragma once
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/dmi_poll.hpp"
+#include "hybrid/program_buffer.hpp"
+#include "hybrid/state_abi.h"
+#include "hybrid/v_regfile_xfer.hpp"
+
+#include <array>
+#include <cstdint>
+#include <optional>
+#include <stdexcept>
+#include <string>
+
+namespace hybrid {
+
+struct DmiBus
+{
+  virtual ~DmiBus() = default;
+  virtual void write(uint8_t reg, uint32_t value) = 0;
+  virtual auto read(uint8_t reg) -> uint32_t = 0;
+};
+
+inline auto read_register_64(DmiBus& bus, uint16_t regno,
+                             const char* poll_label) -> uint64_t;
+
+class ResumeDriver
+{
+public:
+  // data0/data1/abstractcs/command are defined once in abstract_command.hpp;
+  // dmcontrol/dmstatus are run-control registers specific to this driver.
+  static constexpr uint8_t kData0      = kDmiData0;
+  static constexpr uint8_t kData1      = kDmiData1;
+  static constexpr uint8_t kDmcontrol  = 0x10;
+  static constexpr uint8_t kDmstatus   = 0x11;
+  static constexpr uint8_t kAbstractcs = kDmiAbstractcs;
+  static constexpr uint8_t kCommand    = kDmiCommand;
+
+  static constexpr uint16_t kCsrDpc      = 0x7B1;
+  static constexpr uint16_t kCsrDcsr     = 0x7B0;
+  static constexpr uint16_t kCsrPmpcfg0  = 0x3A0;
+  static constexpr uint16_t kCsrPmpaddr0 = 0x3B0;
+  static constexpr uint16_t kCsrFcsr     = 0x003;
+  static constexpr uint16_t kCsrMstatus  = 0x300;
+  static constexpr uint16_t kCsrMisa     = 0x301;
+  static constexpr uint16_t kCsrMedeleg  = 0x302;
+  static constexpr uint16_t kCsrMideleg  = 0x303;
+  static constexpr uint16_t kCsrMie      = 0x304;
+  static constexpr uint16_t kCsrMtvec    = 0x305;
+  static constexpr uint16_t kCsrMscratch = 0x340;
+  static constexpr uint16_t kCsrMepc     = 0x341;
+  static constexpr uint16_t kCsrMcause   = 0x342;
+  static constexpr uint16_t kCsrMtval    = 0x343;
+  static constexpr uint16_t kCsrMip      = 0x344;
+  static constexpr uint16_t kCsrSatp     = 0x180;
+  static constexpr uint16_t kCsrMcycle   = 0xB00;
+  static constexpr uint16_t kCsrMinstret = 0xB02;
+  static constexpr uint16_t kCsrVlenb    = 0xC22;
+  static constexpr uint16_t kCsrVstart   = 0x008;
+  static constexpr uint16_t kCsrVxsat    = 0x009;
+  static constexpr uint16_t kCsrVxrm     = 0x00A;
+  static constexpr uint16_t kCsrVcsr     = 0x00F;
+  static constexpr uint16_t kCsrVtype    = 0xC21;
+  static constexpr uint16_t kCsrVl       = 0xC20;
+
+  static constexpr uint32_t kDmcontrolDmactive  = 1u << 0;
+  static constexpr uint32_t kDmcontrolResumereq = 1u << 30;
+  static constexpr uint32_t kDmcontrolHaltreq   = 1u << 31;
+
+  static constexpr uint32_t kDmstatusAllhalted    = 1u << 9;
+  static constexpr uint32_t kDmstatusAllresumeack = 1u << 17;
+
+  static constexpr uint32_t kAbstractcsBusy        = hybrid::kAbstractcsBusy;
+  static constexpr uint32_t kAbstractcsCmderrMask  = hybrid::kAbstractcsCmderrMask;
+
+  // mstatus extension-state fields: FS (bits 14:13), VS (bits 10:9).
+  // "Initial" (01) is the minimal enable the abstract FPR / V writes require.
+  static constexpr uint64_t kMstatusFsMask    = 0x6000ULL;
+  static constexpr uint64_t kMstatusFsInitial = 0x2000ULL;
+  static constexpr uint64_t kMstatusVsMask    = 0x600ULL;
+  static constexpr uint64_t kMstatusVsInitial = 0x200ULL;
+
+  static constexpr unsigned kPollIterations = kDmiPollIterations;
+
+  explicit ResumeDriver(DmiBus& bus)
+      : bus_{bus}
+  {}
+
+  void resume(const hybrid_state_v1& state)
+  {
+    if (state.magic != HYBRID_STATE_MAGIC)
+      throw std::runtime_error("ResumeDriver::resume: bad magic");
+    if (state.version != HYBRID_STATE_VERSION)
+      throw std::runtime_error("ResumeDriver::resume: unsupported version");
+    // L6: only U(0)/S(1)/M(3) fit dcsr.prv; 2 is the reserved encoding.
+    if (state.priv == 2 || state.priv > 3)
+      throw std::runtime_error("ResumeDriver::resume: invalid privilege");
+
+    // dmactive must transition 0->1 in its own write before any other
+    // DMCONTROL bit is honored (RISC-V Debug Spec).
+    bus_.write(kDmcontrol, kDmcontrolDmactive);
+    request_halt();
+    poll_until_set(bus_, kDmstatus, kDmstatusAllhalted, "ResumeDriver halt");
+
+    // mstatus: enable FS / VS so the following FPR / V abstract writes are
+    // accepted (FS or VS == Off disables the extension and the hart NACKs
+    // the writes). The drained state.mstatus may legitimately carry FS or
+    // VS at Off (e.g. an OS context-switched the regs away before the
+    // trigger fired) -- gating the write on the drained field skips the
+    // enable and silently NACKs every subsequent FPR / V-CSR write. Always
+    // write mstatus when either extension is in scope; force-OR Initial
+    // when the drained field is Off. This enable is local to the vsim
+    // phase; the state.mstatus written to the handoff file is left
+    // unmodified.
+    if (state.flags & (HYBRID_FLAG_FP | HYBRID_FLAG_V)) {
+      uint64_t enable_mstatus = state.mstatus;
+      if ((state.flags & HYBRID_FLAG_FP) && (enable_mstatus & kMstatusFsMask) == 0)
+        enable_mstatus |= kMstatusFsInitial;  // FS = Initial
+      if ((state.flags & HYBRID_FLAG_V)  && (enable_mstatus & kMstatusVsMask) == 0)
+        enable_mstatus |= kMstatusVsInitial;  // VS = Initial
+      write_csr_abstract_or_pb(kCsrMstatus, enable_mstatus);
+    }
+
+    // FPR restore (requires mstatus.FS enabled above).
+    if (state.flags & HYBRID_FLAG_FP) {
+      for (uint16_t i = 0; i < 32; ++i)
+        write_64bit_register(regno_fpr(i), state.fpr[i]);
+      // L20: fcsr (frm + sticky fflags). Same FS gate as the FPRs; PB
+      // fallback scratch x5 is overwritten by the GPR loop below.
+      write_csr_abstract_or_pb(kCsrFcsr, state.fcsr);
+    }
+
+    // Tier-A V CSR restore (before GPRs: PB fallback uses x5 as scratch;
+    // the GPR loop overwrites x5 afterward so state is preserved).
+    if (state.flags & HYBRID_FLAG_V) {
+      // V data regfile: reload v0..v31 from the shared scratch region via the
+      // Program Buffer. Runs BEFORE the architectural V-CSR restore below
+      // because the sweep's own vsetvl (e8/m1) clobbers vtype/vl/vstart, which
+      // the restore then overwrites with the architectural values. The sweep
+      // uses x5/x6/x7 as scratch (x7 is the base pointer); the GPR loop below
+      // restores all three. The wire format reserves HYBRID_VLEN_BYTES_MAX per
+      // register, so that -- not the runtime vlenb -- is the scratch stride.
+      pb_v_data_sweep(bus_, kVScratchGpa, HYBRID_VLEN_BYTES_MAX, state.vlenb,
+                      /*load=*/true);
+
+      // Tier-B: vtype+vl via vsetvl x0,x5,x6 in PB.
+      // Direct csrrw to vtype sets vill; vl is read-only. Stage operands in
+      // scratch GPRs x5(vl) and x6(vtype) then let vsetvl set both atomically.
+      // x5/x6 are overwritten by the GPR loop below, so no leakage.
+      write_64bit_register(regno_gpr(5), state.vl);
+      write_64bit_register(regno_gpr(6), state.vtype);
+      const std::array<uint32_t, 1> pb_vsetvl = { encode_vsetvl(0, 5, 6) };
+      exec_progbuf(bus_, std::span<const uint32_t>{pb_vsetvl});
+      // vstart must come AFTER vsetvl: vsetvl resets vstart to 0.
+      write_csr_abstract_or_pb(kCsrVstart, state.vstart);
+      write_csr_abstract_or_pb(kCsrVxsat,  state.vxsat);
+      write_csr_abstract_or_pb(kCsrVxrm,   state.vxrm);
+      write_csr_abstract_or_pb(kCsrVcsr,   state.vcsr);
+    }
+
+    // L6: dret resumes into dcsr.prv, which is M after the boot halt. For an
+    // S/U-mode handoff, read-modify-write the prv field so the ROI executes
+    // in the drained privilege; M-mode states skip the write (prv already 3).
+    // Before the GPR loop: a PB fallback would clobber scratch x5.
+    if (state.priv != 3) {
+      // L2 slice: with PMP implemented and no matching entry, every S/U
+      // access faults (priv spec v1.10) -- mirror the producer's PMP block
+      // so the ROI can fetch at all. All pmpaddr before any pmpcfg (a locked
+      // cfg discards later addr writes); odd pmpcfg CSRs do not exist on
+      // RV64. Tolerant writes: entries beyond what the hart implements
+      // mirror as no-ops. M-mode handoffs keep PMP pass-through-only (L2).
+      for (uint16_t i = 0; i < HYBRID_PMP_ADDR_NUM; ++i)
+        write_csr_tolerant(kCsrPmpaddr0 + i, state.pmpaddr[i]);
+      for (uint16_t i = 0; i < HYBRID_PMP_CFG_NUM; i += 2)
+        write_csr_tolerant(kCsrPmpcfg0 + i, state.pmpcfg[i]);
+
+      const uint64_t dcsr =
+        read_register_64(bus_, regno_csr(kCsrDcsr), "ResumeDriver dcsr");
+      write_csr_abstract_or_pb(kCsrDcsr,
+                               (dcsr & ~uint64_t{0x3}) | state.priv);
+      // An M-only core WARL-pins dcsr.prv to 3; resuming anyway would
+      // silently measure the ROI in the wrong privilege. Verify and abort.
+      const uint64_t got =
+        read_register_64(bus_, regno_csr(kCsrDcsr), "ResumeDriver dcsr verify")
+        & 0x3u;
+      if (got != state.priv)
+        throw std::runtime_error(
+          "ResumeDriver::resume: engine does not implement privilege level "
+          + std::to_string(state.priv)
+          + " (dcsr.prv pinned to " + std::to_string(got)
+          + "); pick an S/U-capable engine");
+    }
+
+    // GPRs + DPC (after V CSRs so PB scratch x5 is safe to overwrite).
+    for (uint16_t i = 1; i < 32; ++i)
+      write_64bit_register(regno_gpr(i), state.gpr[i]);
+    write_64bit_register(regno_csr(kCsrDpc), state.pc);
+
+    write_csr_tolerant(kCsrMtvec, state.mtvec);
+
+    // L23: mscratch is the M-mode software scratch CSR -- a pure read/write
+    // register with no hardware side effects, legal to use inside a trap-free
+    // ROI. Restore it so a value stashed before the handoff survives into the
+    // vsim phase.
+    write_csr_tolerant(kCsrMscratch, state.mscratch);
+
+    // L24: the writable M-mode trap/interrupt CSRs. In the trap-free,
+    // interrupt-free ROI envelope these are ordinary read/write registers, so a
+    // value stashed before the handoff must survive into the vsim phase (same
+    // round-trip as mscratch). Tolerant writes: a WARL / read-only field (mip's
+    // hardware-driven pending bits, or mtval on a core that hardwires it)
+    // mirrors as a no-op. medeleg/mideleg/satp stay unrestored -- they are
+    // S-mode CSRs the M-only default engine does not implement (L3/L4).
+    write_csr_tolerant(kCsrMepc,   state.mepc);
+    write_csr_tolerant(kCsrMcause, state.mcause);
+    write_csr_tolerant(kCsrMtval,  state.mtval);
+    write_csr_tolerant(kCsrMie,    state.mie);
+    write_csr_tolerant(kCsrMip,    state.mip);
+
+    // F-T2.4: restore mcycle/minstret so the vsim phase continues counting
+    // from QEMU1's drain value. Without this, vsim's local counter starts
+    // at zero, so the drained mcycle delta (vsim minus QEMU 1) would no
+    // longer measure the ROI. PB fallback uses x5 as scratch; safe to
+    // overwrite here as the GPR loop already ran.
+    write_csr_abstract_or_pb(kCsrMcycle,   state.mcycle);
+    write_csr_abstract_or_pb(kCsrMinstret, state.minstret);
+
+    clear_cmderr_if_set();
+    request_resume();
+    poll_until_set(bus_, kDmstatus, kDmstatusAllresumeack,
+                   "ResumeDriver resume");
+  }
+
+private:
+  void request_halt()
+  {
+    bus_.write(kDmcontrol, kDmcontrolDmactive | kDmcontrolHaltreq);
+  }
+
+  void request_resume()
+  {
+    bus_.write(kDmcontrol, kDmcontrolDmactive | kDmcontrolResumereq);
+  }
+
+  void write_64bit_register(uint16_t regno, uint64_t value)
+  {
+    write_register_abstract(bus_, regno, value);
+  }
+
+  // Abstract-first CSR write with Program Buffer fallback.
+  // Tries an abstract register write; if the DM signals cmderr, clears it,
+  // stages the value in scratch_gpr via abstract GPR write, then executes a
+  // one-instruction PB (`csrrw x0, csr, scratch_gpr`).  scratch_gpr defaults
+  // to x5 (t0) which the GPR restore loop overwrites later.
+  void write_csr_abstract_or_pb(uint16_t csr, uint64_t value,
+                                 uint8_t scratch_gpr = 5)
+  {
+    write_64bit_register(regno_csr(csr), value);
+    if ((bus_.read(kAbstractcs) & kAbstractcsCmderrMask) == 0u) return;
+    bus_.write(kAbstractcs, kAbstractcsCmderrMask);  // W1C: clear sticky error
+    write_64bit_register(regno_gpr(scratch_gpr), value);
+    const std::array<uint32_t, 1> pb = { encode_csrrw(0, csr, scratch_gpr) };
+    exec_progbuf(bus_, std::span<const uint32_t>{pb});
+  }
+
+  // Write a CSR-addressable register and clear any cmderr the DM raised.
+  // Used for CSRs whose abstract-access support may be implementation
+  // dependent; a missing CSR mirrors as a no-op rather than blocking the
+  // remaining writes.
+  void write_csr_tolerant(uint16_t csr, uint64_t value)
+  {
+    write_64bit_register(regno_csr(csr), value);
+    clear_cmderr_if_set();
+  }
+
+  // abstractcs.cmderr is sticky per the Debug Spec - a subsequent command
+  // is rejected until the bits are W1C-cleared. We tolerate per-register
+  // failures (e.g. unimplemented FPR/CSR Abstract access) by clearing the
+  // error before resuming so the hart isn't left in a stuck state.
+  // B17: record the last observed non-zero cmderr and a clear count so a
+  // partially-broken restore is observable via the public accessors
+  // instead of silently swallowed.
+  void clear_cmderr_if_set()
+  {
+    const auto status = bus_.read(kAbstractcs);
+    const auto code = (status & kAbstractcsCmderrMask) >> 8;
+    if (code != 0u) {
+      last_observed_cmderr_ = code;
+      ++cmderr_clear_count_;
+      bus_.write(kAbstractcs, kAbstractcsCmderrMask);
+    }
+  }
+
+  DmiBus& bus_;
+  uint32_t last_observed_cmderr_ = 0;
+  uint64_t cmderr_clear_count_   = 0;
+
+public:
+  // B17: diagnostic side channel. Non-zero last_observed_cmderr() means
+  // at least one abstract write tripped a sticky cmderr the restore
+  // tolerated by clearing. cmderr_clear_count() is the total number of
+  // such clears across all calls into clear_cmderr_if_set() this run.
+  auto last_observed_cmderr() const -> uint32_t { return last_observed_cmderr_; }
+  auto cmderr_clear_count() const -> uint64_t   { return cmderr_clear_count_; }
+};
+
+// Read a 64-bit hart register (GPR / FPR / CSR by abstract regno) over DMI
+// via an Abstract Command. Halts-and-reads contract: caller must have the
+// hart in the halted state. Shared by StateDrain (drain at exit), and by
+// MeasureStartSnapshot (snapshot at K-th retire). If abstractcs.cmderr
+// goes sticky after the command, the helper clears it and reports 0
+// rather than blocking the caller -- a missing CSR mirrors as zero
+// instead of corrupting the adjacent field.
+inline auto read_register_64_checked(DmiBus& bus, uint16_t regno,
+                                     const char* poll_label
+                                       = "read_register_64")
+  -> std::optional<uint64_t>
+{
+  using RD = ResumeDriver;
+  bus.write(RD::kCommand,
+            access_register_command(regno, AarSize::Bits64, /*write=*/false));
+  poll_until_clear(bus, RD::kAbstractcs, RD::kAbstractcsBusy, poll_label);
+  const auto status = bus.read(RD::kAbstractcs);
+  if ((status & RD::kAbstractcsCmderrMask) != 0u) {
+    bus.write(RD::kAbstractcs, RD::kAbstractcsCmderrMask);
+    return std::nullopt;
+  }
+  const uint64_t lo = bus.read(RD::kData0);
+  const uint64_t hi = bus.read(RD::kData1);
+  return lo | (hi << 32);
+}
+
+inline auto read_register_64(DmiBus& bus, uint16_t regno,
+                             const char* poll_label = "read_register_64")
+  -> uint64_t
+{
+  return read_register_64_checked(bus, regno, poll_label).value_or(0u);
+}
+
+}  // namespace hybrid
