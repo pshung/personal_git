@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# RED-then-green test for gemm_modes.md F2: the markerless GEMM twin ELF.
+#
+# F1 made rt_c_v_matmul.c serve both builds; F2 adds the Makefile rule that
+# emits `rt_c_v_matmul_free.elf` (same source, compiled -DHYBRID_MARKERLESS).
+# Asserts the built twin:
+#   1. builds via the fixtures Makefile,
+#   2. keeps vmatmul_kernel as a symbol (icount mode anchors on it),
+#   3. carries NO ROI marker HINTs (so the count-driven plugin modes are
+#      not drained at a marker before reaching their count target).
+#
+# Reachability (icount target landing inside the kernel) is asserted by the
+# end-to-end icount round-trip, not here -- this test needs no QEMU,
+# only the toolchain.
+
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/../lib/paths.sh"
+
+. "$SCRIPT_DIR/../lib/log.sh"
+
+if [ -z "${HYBRID_TOOLCHAIN:-}" ] || [ ! -x "$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-nm" ]; then
+  echo "SKIP test_gemm_markerless_twin: HYBRID_TOOLCHAIN not set/usable"
+  exit 77
+fi
+NM="$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-nm"
+OBJDUMP="$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-objdump"
+
+cd "$SCRIPT_DIR"
+TWIN=rt_c_v_matmul_free.elf
+
+# --- 1. the Makefile rule builds the twin ----------------------------------
+make -s TOOLCHAIN="$HYBRID_TOOLCHAIN" "$TWIN" >/dev/null 2>&1 \
+  || fail "make $TWIN failed (no Makefile rule yet?)"
+[ -s "$TWIN" ] || fail "$TWIN built but empty"
+ok "make builds the markerless twin $TWIN"
+
+# --- 2. kernel symbol survives ---------------------------------------------
+# here-strings (not `cmd | grep -q`) so grep -q's early exit can't SIGPIPE the
+# producer into a spurious pipefail failure.
+syms=$("$NM" "$TWIN")
+grep -qw vmatmul_kernel <<<"$syms" \
+  || fail "twin dropped vmatmul_kernel symbol"
+ok "twin keeps vmatmul_kernel as a linkable symbol"
+
+# --- 3. no ROI marker HINTs (5a002013 enter / 5a102013 exit) ----------------
+dump=$("$OBJDUMP" -d "$TWIN")
+if grep -qw 5a002013 <<<"$dump" || grep -qw 5a102013 <<<"$dump"; then
+  fail "twin still contains an ROI marker HINT (HYBRID_MARKERLESS not applied)"
+fi
+ok "twin carries no ROI enter/exit markers"
+
+echo "PASS test_gemm_markerless_twin"
