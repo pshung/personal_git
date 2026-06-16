@@ -1,0 +1,77 @@
+// Unit tests for resolve_pc (F9): the pc-trigger boundary resolver. A boundary
+// is either a "0x"-prefixed hex address (used verbatim, prefix stripped) or a
+// symbol name looked up in the ELF .symtab -> st_value. C++ port of
+// tests/lib/roi.sh:resolve_pc, but reading the symtab directly (no `nm`).
+//
+// Fixtures are real built ELFs: handoff_roundtrip.elf defines `_start` at
+// 0x100000 (a stable linker-script entry). Plain assert-and-count harness.
+#include <string>
+
+#include "elf_syms.hpp"
+#include "repo_root.hpp"
+#include "test_check.hpp"
+
+using namespace andes_sim;
+
+int main() {
+  const std::string elf =
+      (repo_root() / "tests" / "fixtures" / "handoff_roundtrip.elf").string();
+
+  // A 0x address resolves to itself with the prefix stripped (verbatim, no
+  // symtab touched) -- matches roi.sh `${boundary#0[xX]}`.
+  {
+    std::string err;
+    CHECK(resolve_pc(elf, "0x100000", err) == "100000");
+    CHECK(err.empty());
+  }
+  // 0X (capital) prefix is also stripped; the remaining digits are kept as-is.
+  {
+    std::string err;
+    CHECK(resolve_pc(elf, "0X1ABC", err) == "1ABC");
+    CHECK(err.empty());
+  }
+  // A defined symbol resolves to its st_value as bare lowercase hex.
+  {
+    std::string err;
+    CHECK(resolve_pc(elf, "_start", err) == "100000");
+    CHECK(err.empty());
+  }
+  // An undefined symbol is a hard error (empty result + message naming it).
+  {
+    std::string err;
+    CHECK(resolve_pc(elf, "definitely_not_a_symbol_xyz", err).empty());
+    CHECK(!err.empty());
+    CHECK(err.find("definitely_not_a_symbol_xyz") != std::string::npos);
+  }
+  // An unreadable ELF is an error, not a crash.
+  {
+    std::string err;
+    CHECK(resolve_pc("/no/such/file.elf", "_start", err).empty());
+    CHECK(!err.empty());
+  }
+
+  // L26/F3: elf_load_top -- the highest byte of the ELF's static image
+  // (max p_paddr + p_memsz over PT_LOAD). handoff_roundtrip has one LOAD
+  // segment at 0x100000; its top sits just past the base and well below any
+  // realistic --mem-size ceiling, so the driver's scratch-overlap guard never
+  // false-fires on it.
+  {
+    std::string err;
+    const uint64_t top = elf_load_top(elf, err);
+    CHECK(err.empty());
+    CHECK(top > 0x100000ull);          // base + segment content
+    CHECK(top < 0x00110000ull);        // tiny fixture: within 64 KiB of base
+    // Clearance decision the driver makes: image must end at/below the scratch
+    // GPA (= ram_base + program_mem). Fits a 128 MiB program, overlaps a 1 MiB.
+    CHECK(top <= 128ull * 1024 * 1024);     // 128M ceiling -> OK
+    CHECK(top > 1ull * 1024 * 1024);        // 1M ceiling   -> would overlap
+  }
+  // An unreadable / non-ELF file is an error (0 + message), not a crash.
+  {
+    std::string err;
+    CHECK(elf_load_top("/no/such/file.elf", err) == 0u);
+    CHECK(!err.empty());
+  }
+
+  return andes_sim::test::report("elf-syms");
+}

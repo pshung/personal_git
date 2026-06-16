@@ -1,0 +1,221 @@
+// See elf_syms.hpp. Reads the ELF .symtab directly (no `nm` shell-out).
+#include "elf_syms.hpp"
+
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <vector>
+
+#include <elf.h>
+
+namespace andes_sim {
+namespace {
+
+// Lowercase, minimal-width hex -- matches the bare hex a stripped "0x" address
+// yields, so a symbol and its literal address resolve to the same string.
+std::string to_hex(uint64_t v) {
+  std::ostringstream ss;
+  ss << std::hex << v;
+  return ss.str();
+}
+
+bool slurp(const std::string& path, std::vector<char>& buf) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return false;
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  const std::string s = ss.str();
+  buf.assign(s.begin(), s.end());
+  return true;
+}
+
+// memcpy a POD header out of the buffer at `off`; false if it would overrun
+// (buffers may be truncated/malformed -- never read past the end).
+template <class T>
+bool load(const std::vector<char>& buf, size_t off, T& out) {
+  if (off + sizeof(T) > buf.size()) return false;
+  std::memcpy(&out, buf.data() + off, sizeof(T));
+  return true;
+}
+
+}  // namespace
+
+std::string resolve_pc(const std::string& elf_path, const std::string& boundary,
+                       std::string& err) {
+  err.clear();
+
+  // A "0x"/"0X" address is used verbatim with the prefix stripped (roi.sh
+  // `${boundary#0[xX]}`); the .symtab is never touched.
+  if (boundary.starts_with("0x") || boundary.starts_with("0X")) {
+    std::string addr = boundary.substr(2);
+    if (addr.empty()) {
+      err = "malformed address '" + boundary + "'";
+      return "";
+    }
+    return addr;
+  }
+
+  std::vector<char> buf;
+  if (!slurp(elf_path, buf)) {
+    err = "cannot read ELF '" + elf_path + "'";
+    return "";
+  }
+
+  Elf64_Ehdr eh;
+  if (!load(buf, 0, eh) || std::memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0) {
+    err = "not an ELF file: " + elf_path;
+    return "";
+  }
+  if (eh.e_ident[EI_CLASS] != ELFCLASS64) {
+    err = "not an RV64 (ELFCLASS64) file: " + elf_path;
+    return "";
+  }
+
+  // Scan section headers for a symbol table; resolve names through its linked
+  // string table (sh_link).
+  for (unsigned i = 0; i < eh.e_shnum; ++i) {
+    Elf64_Shdr sym_sh;
+    if (!load(buf, eh.e_shoff + static_cast<size_t>(i) * eh.e_shentsize, sym_sh))
+      break;
+    if (sym_sh.sh_type != SHT_SYMTAB || sym_sh.sh_entsize == 0) continue;
+
+    Elf64_Shdr str_sh;
+    if (sym_sh.sh_link >= eh.e_shnum ||
+        !load(buf, eh.e_shoff + static_cast<size_t>(sym_sh.sh_link) * eh.e_shentsize,
+              str_sh))
+      continue;
+
+    const size_t nsym = sym_sh.sh_size / sym_sh.sh_entsize;
+    for (size_t s = 0; s < nsym; ++s) {
+      Elf64_Sym sym;
+      if (!load(buf, sym_sh.sh_offset + s * sym_sh.sh_entsize, sym)) break;
+      if (sym.st_shndx == SHN_UNDEF) continue;  // --defined-only
+
+      const size_t noff = str_sh.sh_offset + sym.st_name;
+      if (noff >= buf.size()) continue;
+      const char* name = buf.data() + noff;
+      const size_t avail = buf.size() - noff;
+      if (::strnlen(name, avail) == avail) continue;  // unterminated in bounds
+      if (boundary == name) return to_hex(sym.st_value);
+    }
+  }
+
+  err = "symbol '" + boundary + "' not defined in " + elf_path;
+  return "";
+}
+
+uint64_t elf_entry(const std::string& elf_path, std::string& err) {
+  err.clear();
+  std::vector<char> buf;
+  if (!slurp(elf_path, buf)) {
+    err = "cannot read ELF '" + elf_path + "'";
+    return 0;
+  }
+  Elf64_Ehdr eh;
+  if (!load(buf, 0, eh) || std::memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0) {
+    err = "not an ELF file: " + elf_path;
+    return 0;
+  }
+  if (eh.e_ident[EI_CLASS] != ELFCLASS64) {
+    err = "not an RV64 (ELFCLASS64) file: " + elf_path;
+    return 0;
+  }
+  return eh.e_entry;
+}
+
+uint64_t elf_load_top(const std::string& elf_path, std::string& err) {
+  err.clear();
+  std::vector<char> buf;
+  if (!slurp(elf_path, buf)) {
+    err = "cannot read ELF '" + elf_path + "'";
+    return 0;
+  }
+  Elf64_Ehdr eh;
+  if (!load(buf, 0, eh) || std::memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0) {
+    err = "not an ELF file: " + elf_path;
+    return 0;
+  }
+  if (eh.e_ident[EI_CLASS] != ELFCLASS64) {
+    err = "not an RV64 (ELFCLASS64) file: " + elf_path;
+    return 0;
+  }
+  // Top of the static image: the highest (p_paddr + p_memsz) over PT_LOAD.
+  // p_paddr is the guest-physical placement (== p_vaddr for the identity-mapped
+  // bare-metal fixtures), the space the V-scratch GPA also lives in.
+  uint64_t top = 0;
+  for (uint16_t i = 0; i < eh.e_phnum; ++i) {
+    Elf64_Phdr ph;
+    const size_t off = static_cast<size_t>(eh.e_phoff) +
+                       static_cast<size_t>(i) * eh.e_phentsize;
+    if (!load(buf, off, ph)) {
+      err = "truncated program header table in '" + elf_path + "'";
+      return 0;
+    }
+    if (ph.p_type != PT_LOAD) continue;
+    const uint64_t end = ph.p_paddr + ph.p_memsz;
+    if (end > top) top = end;
+  }
+  return top;  // 0 (empty err) when the ELF has no loadable segments
+}
+
+std::string symbolize(const std::string& elf_path, uint64_t addr) {
+  std::vector<char> buf;
+  if (!slurp(elf_path, buf)) return "";
+
+  Elf64_Ehdr eh;
+  if (!load(buf, 0, eh) || std::memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
+      eh.e_ident[EI_CLASS] != ELFCLASS64)
+    return "";
+
+  // Track the highest-valued FUNC symbol whose range covers addr (st_value <=
+  // addr < st_value + st_size), falling back to the nearest preceding FUNC
+  // when sizes are absent.
+  std::string best_name;
+  uint64_t best_value = 0;
+  bool found = false;
+
+  for (unsigned i = 0; i < eh.e_shnum; ++i) {
+    Elf64_Shdr sym_sh;
+    if (!load(buf, eh.e_shoff + static_cast<size_t>(i) * eh.e_shentsize, sym_sh))
+      break;
+    if (sym_sh.sh_type != SHT_SYMTAB || sym_sh.sh_entsize == 0) continue;
+
+    Elf64_Shdr str_sh;
+    if (sym_sh.sh_link >= eh.e_shnum ||
+        !load(buf, eh.e_shoff + static_cast<size_t>(sym_sh.sh_link) * eh.e_shentsize,
+              str_sh))
+      continue;
+
+    const size_t nsym = sym_sh.sh_size / sym_sh.sh_entsize;
+    for (size_t s = 0; s < nsym; ++s) {
+      Elf64_Sym sym;
+      if (!load(buf, sym_sh.sh_offset + s * sym_sh.sh_entsize, sym)) break;
+      if (sym.st_shndx == SHN_UNDEF) continue;
+      if (ELF64_ST_TYPE(sym.st_info) != STT_FUNC) continue;
+      if (sym.st_value > addr) continue;
+      // With a size, require coverage; without, accept as a preceding label.
+      if (sym.st_size != 0 && addr >= sym.st_value + sym.st_size) continue;
+      if (found && sym.st_value <= best_value) continue;
+
+      const size_t noff = str_sh.sh_offset + sym.st_name;
+      if (noff >= buf.size()) continue;
+      const char* name = buf.data() + noff;
+      const size_t avail = buf.size() - noff;
+      if (::strnlen(name, avail) == avail) continue;
+
+      best_name = name;
+      best_value = sym.st_value;
+      found = true;
+    }
+  }
+
+  if (!found) return "";
+  const uint64_t off = addr - best_value;
+  if (off == 0) return best_name;
+  std::ostringstream ss;
+  ss << best_name << "+0x" << std::hex << off;
+  return ss.str();
+}
+
+}  // namespace andes_sim
