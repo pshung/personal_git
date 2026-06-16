@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# F2 proof for the 2 GiB memory target: a hybrid run with --mem-size 2G,
+# where phase 1 (QEMU) writes a pattern 4 KiB below the top of the 2 GiB
+# AE350 DRAM window and the ROI (vsim) reads it back through the shared
+# mmap. Passing means the whole stack -- driver cap, sparse backing file,
+# QEMU memory backend, vsim RAM window -- agrees on 2 GiB end to end.
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+
+BIN="$ROOT/build/andes-sim"
+
+. "$ROOT/config.env" 2>/dev/null || true
+GCC="${HYBRID_TOOLCHAIN:-}/bin/riscv64-unknown-elf-gcc"
+
+bash "$ROOT/scripts/build_driver.sh" >/dev/null 2>&1 || fail "build_driver.sh failed"
+[ -x "$BIN" ] || fail "missing executable: $BIN"
+[ -x "$GCC" ] || { echo "SKIP: no riscv toolchain"; exit 0; }
+[ -d "$ROOT/build/runtime" ] || { echo "SKIP: vplat runtime not built"; exit 0; }
+
+TMP=$(mktemp -d -t mmap2g.XXXXXX)
+trap 'rm -rf "$TMP"' EXIT
+
+cat > "$TMP/hi2g.c" <<'EOF'
+#include <stdint.h>
+#include <stdio.h>
+#include <andes_sim/ROI.h>
+
+/* 4 KiB below the 2 GiB AE350 DRAM window top. */
+#define HI ((volatile uint64_t *)0x7FFFF000ull)
+
+int main(void)
+{
+  HI[0] = 0x1122334455667788ull;   /* phase 1: QEMU writes near the top */
+  HI[1] = 0xCAFEF00DDEADBEEFull;
+  andes_sim_ROI_begin();
+  /* ROI runs on vsim over the same mmap; vplat printf is MMIO-backed,
+   * so reporting from inside the ROI is allowed. */
+  uint64_t a = HI[0], b = HI[1];
+  if (a == 0x1122334455667788ull && b == 0xCAFEF00DDEADBEEFull)
+    printf("PASS: 2G window pattern survived the handoff\n");
+  else
+    printf("FAIL: high-memory pattern lost (a=%lx b=%lx)\n",
+           (unsigned long)a, (unsigned long)b);
+  andes_sim_ROI_end();
+  return 0;
+}
+EOF
+
+"$GCC" -march=rv64gc -mabi=lp64d -O1 \
+  -I "$ROOT/build/runtime/include" \
+  -B "$ROOT/build/runtime" -specs=andes-sim.specs \
+  "$TMP/hi2g.c" -o "$TMP/hi2g.elf" \
+  || fail "fixture build failed"
+
+out=$("$BIN" run --model hybrid --trigger marker --engine vsim:ax45mpv_premium \
+        --mem-size 2G "$TMP/hi2g.elf" </dev/null 2>&1); rc=$?
+[ "$rc" -eq 0 ] || fail "hybrid --mem-size 2G rc=$rc:"$'\n'"$out"
+echo "$out" | grep -q "\[hsim mmap\] 2.0 GiB" \
+  || fail "mmap status line should show 2.0 GiB:"$'\n'"$out"
+echo "$out" | grep -q "PASS: 2G window pattern survived the handoff" \
+  || fail "high-memory pattern check did not pass:"$'\n'"$out"
+echo "$out" | grep -q "window_cycles" || fail "no cycle figure:"$'\n'"$out"
+
+ok "2 GiB end to end (QEMU writes at 0x7FFFF000, vsim reads it back)"
