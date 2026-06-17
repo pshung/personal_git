@@ -1,0 +1,247 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# andes-sim: the hot-pluggable engine interface\n",
+    "\n",
+    "`andes-sim` drives several simulator backends behind one CLI, yet the driver\n",
+    "contains **zero per-engine code**. A new simulator (`vsim:<cpu>`, `alioth`,\n",
+    "`sid`, ...) joins by being *dropped in as a binary* - the driver is never\n",
+    "recompiled to add one. This notebook explains the contract that makes that\n",
+    "work and walks through every field an engine reports.\n",
+    "\n",
+    "## The mental model: an engine describes itself\n",
+    "\n",
+    "The driver does not store a table of \"engine X takes these args, supports\n",
+    "these triggers, reports its cycles here.\" Instead it asks each binary one\n",
+    "question and trusts the answer:\n",
+    "\n",
+    "```\n",
+    "  andes-sim  --(runs)-->  <engine-binary> --describe  --(prints)-->  one JSON object\n",
+    "```\n",
+    "\n",
+    "That JSON object IS the contract. It carries everything the driver needs:\n",
+    "identity, hardware params, which capabilities the engine has, how to invoke it,\n",
+    "and where to read the result. Add a field-less binary and it cannot be driven;\n",
+    "add `--describe` and it becomes a first-class engine.\n",
+    "\n",
+    "> Why a self-describing flag instead of a config file? The binary that knows\n",
+    "> its real VLEN and argv is the one reporting them, so they cannot drift out of\n",
+    "> sync with a separate file. And there is no central registry to edit: discovery\n",
+    "> is just \"scan a directory, ask each binary.\""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Setup\n",
+    "\n",
+    "The single cell below is the only Python in this notebook: it finds the repo\n",
+    "root, switches to it, and puts `build/` on `PATH`, so every later cell can call\n",
+    "`!andes-sim` directly. It walks up to the `build/andes-sim` binary, so there is\n",
+    "no hardcoded path - it works wherever the repo lives.\n",
+    "\n",
+    "Prerequisite: the driver and at least one simulator are built\n",
+    "(`build/andes-sim`, `verilator/build/sim_*`). If missing:\n",
+    "`bash scripts/build_driver.sh` (driver only) or `source ./setup.sh` (everything)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "from pathlib import Path\n",
+    "root = next(str(d) for d in (Path.cwd(), *Path.cwd().parents)\n",
+    "            if (d / \"build\" / \"andes-sim\").exists())\n",
+    "os.chdir(root)\n",
+    "os.environ[\"PATH\"] = f\"{root}/build:\" + os.environ[\"PATH\"]\n",
+    "print(\"working dir:\", root)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. The engines already plugged in\n",
+    "\n",
+    "`list engines` runs discovery and prints what it found. `qemu` is built in;\n",
+    "every `vsim:<cpu>` row was discovered by scanning and calling `--describe`.\n",
+    "The columns (XLEN/VLEN/DLEN/ELEN) are fields straight out of each descriptor."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "!andes-sim list engines"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Notice the spread: `vsim:ax66_makatau` reports `VLEN 128 / ELEN 64`,\n",
+    "`vsim:d23` is a 32-bit core with no vector unit, the others are `VLEN 512`.\n",
+    "None of that is coded into the driver - each engine reported its own numbers."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. The contract: `--describe`\n",
+    "\n",
+    "Ask one engine binary directly. It prints exactly one JSON object to **stdout**\n",
+    "and exits 0. This is the entire interface between a simulator and the framework."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "!verilator/build/sim_ax45mpv_premium --describe"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "A 32-bit, vector-less core reports a smaller object - omitted fields simply\n",
+    "default (no `vlen`/`dlen`/`elen`). Same contract, fewer capabilities."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "!verilator/build/sim_d23 --describe"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": "## 3. The information entries\n\nEvery field, grouped by the job it does for the driver. `id` and `type` are the\nonly required fields; the parser is strict JSON and **ignores unknown fields**,\nso the schema can grow without breaking older engines.\n\n### Identity - which engine is this\n\n| Field  | Type   | Required | Meaning |\n|--------|--------|----------|---------|\n| `id`   | string | **yes**  | Unique engine id; what you pass to `--engine`. Convention: `verilator:<cfg>`, `alioth`, `sid`. First id wins on a collision. |\n| `type` | string | **yes**  | Family: `qemu` \\| `verilator` \\| `alioth` \\| `sid` \\| ... |\n| `kind` | string | no       | `functional` or `cycle-accurate`. Shown by `list engines`. |\n\n### Hardware params - the core's shape\n\nThese become the XLEN/VLEN/DLEN/ELEN columns in `list engines`. They matter\nbecause the hybrid fast leg inherits the engine's VLEN, so the value must come\nfrom the engine, never a guess.\n\n| Field  | Type   | Meaning |\n|--------|--------|---------|\n| `xlen` | number | 32 or 64. |\n| `vlen` | number | RVV `VLEN` in bits (0 / omit if no vector unit). |\n| `dlen` | number | Vector datapath width in bits. |\n| `elen` | number | Max vector element width in bits. |\n\n### Capabilities - what the engine can do\n\nThe driver uses these to refuse combinations an engine cannot serve (e.g. it\nwill not ask `qemu` to be the cycle-accurate leg).\n\n| Field      | Type            | Meaning |\n|------------|-----------------|---------|\n| `triggers` | array\\<string\\> | ROI delimiters understood: `marker` \\| `pc`. |\n| `roles`    | array\\<string\\> | Parts it can play: `standalone` \\| `fast-leg` \\| `accurate-leg`. |\n| `state`    | array\\<string\\> | `hybrid_state_v1` it can exchange: `resume`, `drain`. Empty = standalone-only (no ABI conformance needed). |\n\nThe three roles:\n\n- `standalone` - run a whole program alone (the `fast` and `cycle` models).\n  Transparent passthrough: the user's post-`--` args are forwarded verbatim and\n  the engine's own stdout/stderr/exit code is the result.\n- `fast-leg` - the QEMU fast-forward leg of a `hybrid` run: execute up to the\n  ROI entry, then **drain** `hybrid_state_v1`.\n- `accurate-leg` - the cycle-accurate leg of a `hybrid` run: **resume** from a\n  drained state, execute the ROI, then **drain** again. Its `mcycle` delta is\n  the reported cycle figure.\n\n### Invocation - how to build the command\n\n| Field    | Type   | Meaning |\n|----------|--------|---------|\n| `invoke` | object | Maps each role to its argv template. The driver substitutes `{placeholders}` (next table) to build the real command line. |\n\n### Result - where the measurement is\n\n| Field    | Type   | Meaning |\n|----------|--------|---------|\n| `result` | string | `stderr:<word>` (scrape the integer next to `<word>` from stderr - vsim prints `<n> cycles simulated`) or `state.mcycle` (read it from the drained state). |"
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": "## 4. `invoke` placeholders\n\nAn `invoke` template is a literal argv with `{placeholders}` the driver fills at\nrun time. A placeholder may appear anywhere inside a token, so\n`mem-path={mmap},size={mmap_size}` expands correctly. The full set the executor\nsubstitutes (`driver/run_plan.cpp`):\n\n| Placeholder    | Filled with |\n|----------------|-------------|\n| `{bin}`        | the engine binary path (resolved by discovery) |\n| `{elf}`        | the workload ELF |\n| `{state_in}`   | the input state file (resume leg) |\n| `{state_out}`  | the output state file (drain leg) |\n| `{mmap}`       | the shared-memory backing file |\n| `{mmap_size}`  | shared-memory size in bytes |\n| `{mmap_base}`  | guest physical base address of the mmap |\n| `{plugin}`     | the QEMU TCG plugin path (fast-leg only) |\n| `{trigger}`    | the QEMU-plugin trigger comma-suffix (e.g. `,enter_pc=0x..`; empty for marker) |\n| `{vlen}`       | the engine's VLEN, threaded into the fast leg |\n\nA `standalone` template is usually just `[\"{bin}\", \"{elf}\"]`; the user's `--`\nargs are appended after it."
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 5. Discovery - how the framework finds engines\n",
+    "\n",
+    "`list engines` (and every other engine-using command) runs the same discovery\n",
+    "(`driver/engine_registry.cpp`):\n",
+    "\n",
+    "1. The built-in `qemu` descriptor is always present. QEMU does not implement\n",
+    "   `--describe`, so its descriptor is hardcoded; its binary path honors\n",
+    "   `$VSIM_QEMU`, else `build/qemu/qemu-system-riscv64`.\n",
+    "2. Pick the scan directory:\n",
+    "   - `$ANDES_SIM_ENGINES_DIR` if set (colon-separated; **replaces** the default\n",
+    "     and accepts **any** executable name - this is where you drop `alioth`/`sid`),\n",
+    "   - otherwise `verilator/build`, filtered to `sim_*` binaries.\n",
+    "3. For each candidate, run `<bin> --describe`. On non-zero exit, a hang past a\n",
+    "   5 s timeout, or non-JSON output, fall back to a sidecar file `<bin>.json`\n",
+    "   holding the same descriptor - the escape hatch for binaries that cannot add\n",
+    "   the flag.\n",
+    "\n",
+    "So the naming convention (`sim_*`) lives only in the default call site, not in\n",
+    "the scanner: a user-curated engines dir accepts any name."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 6. ABI conformance (only if you move state)\n",
+    "\n",
+    "An engine that lists `resume` or `drain` in `state` must exchange architectural\n",
+    "state through `struct hybrid_state_v1` (`include/hybrid/state_abi.h`)\n",
+    "byte-for-byte: GPRs, FPRs, M-mode CSRs, PMP, and the V block; little-endian; V\n",
+    "data registers travel through the shared-memory scratch region by the\n",
+    "convention the header documents. An engine that only claims `standalone` (no\n",
+    "`state`) is exempt - this is why a functional-only or third-party standalone\n",
+    "simulator can join with nothing but a `--describe` flag."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 7. Adding your own engine - the checklist\n",
+    "\n",
+    "To make `myeng` a first-class engine:\n",
+    "\n",
+    "1. Implement `myeng --describe` to print one JSON object (or ship a\n",
+    "   `myeng.json` sidecar next to the binary).\n",
+    "2. Claim only the roles you actually serve. The minimum useful engine is\n",
+    "   `standalone`-only:\n",
+    "\n",
+    "```json\n",
+    "{\n",
+    "  \"id\":       \"myeng\",\n",
+    "  \"type\":     \"myeng\",\n",
+    "  \"kind\":     \"cycle-accurate\",\n",
+    "  \"xlen\":     64,\n",
+    "  \"triggers\": [],\n",
+    "  \"roles\":    [\"standalone\"],\n",
+    "  \"state\":    [],\n",
+    "  \"invoke\":   { \"standalone\": [\"{bin}\", \"{elf}\"] },\n",
+    "  \"result\":   \"stderr:cycles\"\n",
+    "}\n",
+    "```\n",
+    "\n",
+    "3. If you claim `resume`/`drain`, also speak the `hybrid_state_v1` ABI (section 6).\n",
+    "4. Drop the binary in a dir on `$ANDES_SIM_ENGINES_DIR` (or build it as\n",
+    "   `verilator/build/sim_*`).\n",
+    "5. `andes-sim list engines` - your engine appears, no driver rebuild.\n",
+    "\n",
+    "### Source map\n",
+    "\n",
+    "| Where | What |\n",
+    "|-------|------|\n",
+    "| `docs/engine_interface.md` | the normative spec for this interface |\n",
+    "| `driver/engine_descriptor.hpp` | `EngineDescriptor` struct + `descriptor_from_json` parser |\n",
+    "| `driver/engine_registry.cpp` | `builtin_qemu`, `describe_one`, `discover_engines` |\n",
+    "| `driver/argv.cpp` | placeholder substitution |\n",
+    "| `driver/run_plan.cpp` | the placeholder values supplied per leg |"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.12.11"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 4
+}
