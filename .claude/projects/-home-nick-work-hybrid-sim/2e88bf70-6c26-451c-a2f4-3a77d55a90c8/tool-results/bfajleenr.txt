@@ -1,0 +1,636 @@
+====================================================================================================
+CELL 12 [markdown]
+====================================================================================================
+## Tier 2 - Will break when you scale up
+
+### L6. Whole-program (S/U-mode) privilege is forced to M-mode  (F-T2.1)
+
+- When it bit: a kernel/Linux-style workload that is in S- or U-mode at
+  the trigger boundary was silently measured in M-mode (both sides
+  hardcoded `priv = 3`; DCSR.prv was never written, so `dret` always
+  resumed in M-mode).
+- Status: RESOLVED 2026-06-13. The privilege now round-trips:
+  - QEMU plugin drains the gdbstub `priv` virtual register
+    (`hybrid_handoff.c`).
+  - `ResumeDriver` read-modify-writes `dcsr.prv` before `dret` and reads
+    it back: an RTL without S/U (the default `ax45mpv_premium` has
+    `NDS_NUM_PRIVILEGE_LEVELS=1`) WARL-pins the field and the resume
+    aborts with a pick-an-S/U-capable-engine error instead of measuring
+    the wrong privilege. Reserved `priv=2` is rejected up front.
+  - For S/U states the producer's PMP block (64 `pmpaddr` + 8 even
+    `pmpcfg`, addr before cfg) is mirrored into the hart first: with PMP
+    implemented and no matching entry, every S/U access faults (this is
+    the L2 slice S/U execution cannot run without).
+  - `StateDrain` reads `dcsr.prv` at the exit halt, so the drained file
+    records the privilege the ROI actually ran in, and `--verify`
+    compares it against the QEMU oracle.
+- Residual envelope: the ROI must stay in ONE privilege (no traps/xRET),
+  paging stays off (L3), and S-mode CSRs are still not transported -- an
+  S-mode ROI that reads `stvec`/`sscratch`/... sees vsim reset values.
+- e2e: `rt_priv_smode` / `rt_priv_umode` (CHECK_PRIV=1/0) on the
+  S/U-capable `ax66_makatau` engine paired with QEMU `-cpu andes-ax66`.
+
+The old one-line-per-side hardcode is gone; only the plugin's atexit
+count record (no vCPU context, minstret-only consumer) keeps a static 3:
+
+====================================================================================================
+CELL 13 [code]
+====================================================================================================
+!grep -n "priv" verilator/src/hybrid/state_drain.hpp qemu_plugin/hybrid_handoff.c | grep -E "= 3|dcsr|0x3"
+
+====================================================================================================
+CELL 14 [markdown]
+====================================================================================================
+### L7. [PARTIAL 2026-06-16: static-image fit check landed (L26/F3); runtime growth still unchecked] No check that the workload fits guest RAM; overflow corrupts silently  (F-T2.2)
+
+- Note (2026-06-12 retitle): 128 MB is only the DEFAULT, not the limit.
+  `--mem-size` sets the program RAM up to 2 GiB - 4 KiB; the driver maps that
+  PLUS one 4 KiB V-transport scratch page on top (L26), so mmap = QEMU memory
+  backend = vsim RAM window. The old title "must fit in the 128 MB shared
+  mmap" was misleading. The real limitation is now the RUNTIME-growth fit
+  check plus the 2 GiB ceiling.
+- When it bites: heap, stack, or static data extends past the size in
+  effect (default 128 MB), or the workload needs more than 2 GiB at all.
+- What happens: the STATIC image is now checked -- a load-time guard
+  (`elf_load_top` + `cmd_run.cpp`, L26/F3) rejects an ELF whose PT_LOAD
+  segments reach past `--mem-size` (into the reserved scratch page) with a
+  clear "raise --mem-size" message. But RUNTIME growth (heap or stack past
+  the ceiling) still has no startup check: vsim's memory rejects or truncates
+  the access, QEMU may see it as MMIO, and nothing names `--mem-size` as the
+  cause. Separately, 2 GiB is a hard wall: the AE350 DRAM window is
+  `0x00000000..0x80000000`, QEMU rejects a larger `ram_size`, and the driver
+  pre-caps `--mem-size` at 2 GiB - 4 KiB (the window minus the scratch page)
+  -- no setting runs a > 2 GiB workload.
+- Where: `driver/cmd_run.cpp:353` (128 MB default), `:363` (2 GiB - 4 KiB
+  pre-cap), `:369` (the L26/F3 static-image guard, via `driver/elf_syms.hpp`
+  `elf_load_top`); `QEMU/hw/riscv/andes_ae350.c` (DRAM window + ram_size
+  check); `verilator/src/main.cpp` (vsim RAM window sized from
+  `--shared-mem-size`).
+- Status: PARTIALLY ADDRESSED. The static PT_LOAD fit check landed (L26/F3)
+  and the V scratch can no longer be clobbered (it moved above program RAM,
+  L26); runtime heap/stack overflow past the ceiling still corrupts silently.
+  Workaround: pass `--mem-size` large enough by hand (USER_GUIDE 2.5);
+  > 2 GiB workloads cannot run.
+
+### L8. Single hart only  (F-T2.3)
+
+- When it bites: any multi-hart config (`_NDS_NHART=2`), IPIs, hart-to-hart
+  sync.
+- What happens: the resume/drain code only handles hart 0. The icount
+  counter is a single `uint64_t` (`icount_trigger.hpp:14-15`); BBV emit is
+  single-hart (`bbv_emit.h:9`). Resuming hart 1 from hart 0 state corrupts
+  both.
+- Where: `resume_driver.hpp`, `state_drain.hpp`, `icount_trigger.hpp:14`,
+  `qemu_plugin/bbv_emit.h:9`.
+- Status: OPEN.
+
+### L9. MMIO inside the ROI: only the vplat device set is handled  (F-T2.5)
+
+- When it bites: the ROI touches any device OTHER than the vplat set - PLIC,
+  the timer (`mtime`/`mtimecmp`), ROM, or aliased/device memory - or expects
+  device STATE to survive the handoff.
+- What happens: UART2 (`0xf0300000`) and SimControl/HTIF (`0xe0080000`) are
+  modeled by BOTH engines (QEMU: `hw/misc/andes_sim_control.c` + the ae350
+  memmap; vsim: the AE350 RTL platform natively), so vplat stdio / exit /
+  file io inside the ROI work and the hybrid leg relays vsim's UART output.
+  Any other device range is engine-specific behavior. And no device state
+  (UART FIFO contents, pending interrupts, timer compare) crosses the
+  handoff - only RAM is shared; each engine has its own device instances.
+- Where: `QEMU/hw/riscv/andes_ae350.c:95,107` (SimControl + UART2 memmap);
+  `QEMU/hw/misc/andes_sim_control.c`; `runtime/vplat_syscalls.c`.
+- Status: PARTIALLY SUPPORTED (2026-06): vplat device set works; everything
+  else and cross-handoff device state still OPEN.
+
+====================================================================================================
+CELL 15 [markdown]
+====================================================================================================
+## Tier 3 - Configuration and accuracy limits
+
+### L10. Engines are pluggable now, but machine + scratch GPA stay fixed
+
+- When it bites: any machine other than `andes_ae350`, any CPU outside the
+  `andes-ax45mpv` family, or any RAM base other than 0.
+- What happens: engines are now drop-in (`andes-sim list engines`,
+  `--engine ID`, discovered via `--describe` or a `.json` sidecar), and the
+  QEMU leg's `-cpu ...,vlen={vlen}` is filled from the chosen engine's
+  descriptor (`driver/engine_registry.cpp:46`). But `-machine andes_ae350`
+  and the `andes-ax45mpv` CPU name are still literals
+  (`engine_registry.cpp:46,54`). The V-register scratch address is NO LONGER a
+  fixed constant -- it is the mmap's top page (`v_scratch_gpa(ram_base,
+  ram_size)`, L26), derived from the runtime RAM base + size, so it adapts to
+  any base and is no longer a porting blocker. The retired Python golden
+  (`tools/orchestrator/spawn.py`) keeps its own hardcoded copies.
+- Where: `driver/engine_registry.cpp:46,54`.
+- Status: PARTIALLY RELAXED: engine variant + VLEN are pluggable, and the
+  scratch GPA is now runtime-derived (L26); the machine and the CPU family are
+  still literals that block porting to another core.
+
+### L11. [RESOLVED 2026-06-12: ceiling raised to VLEN 1024, over-limit aborts] VLEN ceiling  (F-T3.4)
+
+- Was: the wire format reserved 64 bytes per vector register (VLEN 512)
+  and the plugin CLAMPED the drained bytes to that with no warning - a
+  wider engine silently lost the upper bytes of every V register. The
+  standalone fast model also hardcoded `vlen=512`.
+- Now (supported range: VLEN 128..1024):
+  - `HYBRID_VLEN_BYTES_MAX = 128` (`state_abi.h`), state version 2;
+    every reader (driver `state.hpp`, vsim `state_loader.hpp`,
+    orchestrator `abi.py`) rejects version-1 files loudly.
+  - The plugin REFUSES to drain an over-ceiling vlenb
+    (`hybrid_v_drain_policy`, `include/hybrid/v_drain_policy.h`) instead
+    of clamping; vsim's `load_state` rejects an over-ceiling state file
+    the same way.
+  - Inside `andes-sim run` the legs still cannot disagree (descriptor
+    sync, unchanged). A standalone fast run overrides the built-in
+    `vlen=512` via the passthrough tail:
+    `andes-sim run --model fast app.elf -- -cpu andes-ax45mpv,vlen=1024`
+    (the last `-cpu` wins).
+- Tests: `tests/hybrid/e2e_vlen1024_drain.sh` (QEMU leg at vlen=1024
+  drains vlenb=128 with the full 128-byte register intact + the fast
+  standalone override); fixture `tests/fixtures/rt_c_v_fill.c`
+  (whole-register fill, in-ROI self-check; runs in the marker/pc
+  suites); unit cases in `state_abi.test.cpp`, `v_drain_policy.test.cpp`,
+  `state_loader.test.cpp`.
+- Verified per VLEN (2026-06-12). Drain checks: drained `vlenb` ==
+  VLEN/8, the LAST live byte of v8 carries the fill pattern (truncation
+  would zero it), and the byte just past the live span is 0:
+
+| VLEN | plugin drain (QEMU leg) | fast standalone | hybrid round-trip on RTL    |
+|------|-------------------------|-----------------|------------------------------|
+| 128  | pass (vlenb=16)         | pass            | pass (`vsim:ax66_makatau`)   |
+| 256  | pass (vlenb=32)         | pass            | no RTL config built          |
+| 512  | pass (vlenb=64)         | pass            | pass (e2e 39/39 + `--verify` on `vsim:ax45mpv_premium`) |
+| 1024 | pass (vlenb=128)        | pass            | no RTL config built          |
+
+- Residual (tracked as ROADMAP F-ENG-03): hand-driven legs at two
+  DIFFERENT under-ceiling VLENs are caught only by the fixture
+  self-check; a vsim-side compare of the live hart vlenb against
+  `state.vlenb` at resume is still open. No built RTL engine reports
+  VLEN 256 or 1024 today (`ax46mpv_advanced`'s cfg sets `NDS_VLEN 1024`
+  but its built binary describes `vlen=512`), so those two widths are
+  validated on the QEMU side; the vsim transport is vlenb-driven by
+  construction. With a real VLEN-1024 RTL build, `rt_c_v_fill` through
+  `--model hybrid --verify` is the ready-made acceptance test.
+- Status: RESOLVED (2026-06-12) for the supported range 128..1024.
+
+### L12. [RESOLVED: the CSR-write trigger was replaced by marker HINTs] CSR 0x7C0 collision
+
+- The old default trigger matched `csrwi 0x7C0, 0/1`, so a real write to
+  that CSR would false-trigger a handoff. The default trigger is now the
+  marker HINT pair `slti x0, x0, 0x5A0/0x5A1` - rd=x0 makes them
+  architectural NOPs, no CSR is repurposed, and a compiler never emits them
+  on its own (users get them from `<andes_sim/ROI.h>`). Binaries you cannot
+  edit use `--trigger pc` instead.
+- Where: `qemu_plugin/hybrid_handoff.c:663-671` (marker matcher);
+  `verilator/src/hybrid/csr_trigger.hpp` (now matches the same HINTs).
+- Status: RESOLVED by the trigger redesign.
+
+### L13. [RESOLVED: exact by construction for SLTI] marker must be a 32-bit instruction  (B18)
+
+- The matcher still skips any instruction whose size is not 4 bytes, but
+  the markers are now `slti x0, x0, imm` and SLTI has no compressed form,
+  so the `sz != 4` skip is exact rather than an approximation
+  (`hybrid_handoff.c:663-671`, comment says exactly this).
+- Status: RESOLVED (was a documented caveat of the old CSR marker).
+
+### L14. The SimPoint cycle estimate is an approximation, not a measurement
+
+- When it bites: any `--mode simpoint` / `./hsim.py estimate` run where you
+  read the headline `estimated_cycles` as if it were exact.
+- What happens: each phase CPI is sampled from a single window of
+  `vsim_icount` instructions at the slice boundary (`hsim.py:1126-1225`,
+  `_run_simpoint_pipeline`), and the whole-program figure is
+  `N_total * weighted_CPI`. Two accuracy gaps:
+  1. The microarchitectural state (caches, branch predictor) is cold at
+     each window start unless you pass `--vsim-warmup-icount`. Without
+     warmup the CPI is biased high.
+  2. No error bound or confidence interval is reported. The estimate
+     inherits SimPoint's usual phase-approximation error.
+- Where: `hsim.py:1126-1225` (`_run_simpoint_pipeline`). Note: SimPoint
+  still runs only on the Python golden (`./hsim.py`); the C++ port has not
+  landed.
+- Status: by design; mitigate with `--vsim-warmup-icount`.
+
+### L21. Andes vendor CSRs are only partially transported  (new 2026-05-28; cache/misc pair landed 2026-06-16)
+
+- When it bites: any workload whose behavior or cycle figure depends on
+  Andes-specific CSRs OTHER than the cache / misc pair (`mmsc_cfg,
+  micm_cfg, mdcm_cfg, mxstatus, mdcause, mnvec, mslideleg`, ...).
+- What happens: the cache machine-setup pair `mcache_ctl` (0x7CA) and
+  `mmisc_ctl` (0x7D0) now round-trips. crt0 enables the L1 I/D caches via
+  `csrw mcache_ctl`, but that write runs on the cache-less functional
+  engine; without carrying it the cycle engine resumed at the ROI with
+  caches at their reset default -- DISABLED -- so the whole window ran
+  uncached and the figure was inflated severalfold (hello `main`->`_exit`:
+  14707 -> 2871 cycles). All OTHER Andes vendor CSRs still do not appear
+  in `hybrid_state_v1`; vsim runs the ROI with whatever its reset /
+  boot-time values were, so remaining prefetcher / branch-predictor / ECC
+  controls can still shape the cycle count -- an accuracy hazard for those.
+- Where: `include/hybrid/state_abi.h` (mcache_ctl/mmisc_ctl fields, rest
+  absent); `qemu_plugin/hybrid_handoff.c` (drains the pair by gdbstub
+  name); `resume_driver.hpp` (tolerant restore, `kCsrMcacheCtl` /
+  `kCsrMmiscCtl`).
+- Status: PARTIAL. The cycle-shaping cache pair is transported (the L20
+  fix recipe: one `uint64` each carved from `reserved[]`, drained by name,
+  restored via abstract-or-PB, no version bump). The remaining vendor CSRs
+  await a v2 Andes block labelling each as microarch-only (read-only /
+  boot-set) or software-visible (must round-trip).
+
+### L26. [RESOLVED 2026-06-16] V transport scratch moved above the program's RAM  (new 2026-06-15)
+
+- **Was**: the V-register transport staged 32 vector registers through a fixed
+  guest address `kVScratchGpa = 0x00FF0000` (15 MiB), INSIDE the program's RAM.
+  On every resume on a V-capable core -- the V flag is set from register
+  ADVERTISEMENT, not use, so even a program that issues no V instruction
+  triggers it -- `ResumeDriver` wrote the drained V bytes there, silently
+  clobbering any program data at that address. Repro: `break_vscratch.S`.
+- **Why a scratch page is needed at all**: the RISC-V Debug Module has no
+  abstract command for `v0..v31`, so vsim moves them by executing `vle8.v` /
+  `vse8.v` in the Program Buffer against a known guest-RAM staging page
+  (`v_regfile_xfer.hpp`, `program_buffer.hpp`).
+- **Fix (scheme D; F1+F2+F3, see `docs/archive/vscratch_reservation.md`)**:
+  1. The scratch is no longer a constant -- it is the TOP page of the mapped
+     RAM span, `v_scratch_gpa(ram_base, ram_size) = ram_base + ram_size -
+     HYBRID_V_SCRATCH_BYTES`. ResumeDriver/StateDrain take it as a required-
+     when-V argument; a V handoff with it unset throws (no silent transport
+     through a bogus address).
+  2. The driver maps ONE PAGE MORE than `--mem-size` (`shm.cpp`
+     `physical_mmap_bytes`), so the scratch sits at `ram_base + --mem-size` --
+     just ABOVE the program's declared RAM. No program layout (low stack,
+     top-of-RAM stack, or a heap grown to the ceiling) can reach a page past its
+     own RAM, so the scratch can never be clobbered. `--mem-size` is capped at
+     2 GiB minus the page.
+  3. A load-time guard (`elf_load_top` + `cmd_run.cpp`) rejects an ELF whose
+     static image extends into the reserved page (linked for more RAM than
+     `--mem-size` grants) with a clear "raise --mem-size" message, instead of
+     silent corruption.
+- **Effect on users**: none visible -- you get your full `--mem-size`; the
+  reservation is one hidden page the simulator adds on top, and no address
+  within your declared RAM is off-limits.
+- **Tests**: `v_regfile_xfer` / `resume_driver` / `state_drain` unit suites
+  (top-page GPA + unset guard); `infra-test` (physical size + cap); `elf-syms`
+  (load-top + reject). `break_vscratch.S` now PASSES (0x00FF0000 is no longer
+  used); new `break_vscratch_top.S` PASSES (a sentinel at the program's LAST
+  page survives the transport, proving the scratch sits above program RAM);
+  full marker e2e 22/22 + V e2e 4/4.
+- **Status**: RESOLVED (2026-06-16).
+
+====================================================================================================
+CELL 16 [markdown]
+====================================================================================================
+## Tier 4 - Robustness and tooling gaps
+
+### L15. Value-level handoff check: shipped for marker/pc, missing for icount/simpoint  (F-T3.1)
+
+- When it bites: any bug that copies the wrong register, byte-swaps, or
+  truncates a 64-bit value in the icount or simpoint paths.
+- What happens: `run --verify` (marker/pc only, dev tier) re-runs the ELF
+  on a pure-QEMU oracle and diffs the FULL drained state field by field
+  (`driver/cmd_run.cpp:245-282`); `--cosim [--cosim-interval N]` goes
+  further and localizes a divergence to the first bad N-retire window
+  (it suppresses the cycle figure - the checkpoint drains pollute it; rerun
+  without `--cosim` to measure). Both are manual, not CI-wired. The icount
+  trigger and the SimPoint pipeline (`hsim.py`) still assert only exit code
+  and PC range - a wrong register value there passes silently.
+- Where: `driver/cmd_run.cpp:156` (marker/pc gate), `:245-282` (oracle);
+  `hsim.py` (`_run_drain_pair`, `_run_simpoint_pipeline`) - unchecked.
+- Status: PARTIALLY CLOSED (2026-06): marker/pc covered by
+  `--verify`/`--cosim`; icount + simpoint coverage and CI wiring still OPEN.
+
+### L22. Lock-step co-sim cannot handle asynchronous interrupts  (new 2026-06-15)
+
+- When it bites: a `--model cycle --cosim` DV run whose testbench takes a
+  timer / software / external interrupt (anything NOT caused by the current
+  instruction). Synchronous exceptions (`ecall`, illegal, `mret`) ARE
+  supported - this is only about async interrupts.
+- What happens: the QEMU oracle and the RTL DUT run on independent clocks
+  (QEMU is functional with no real cycles, the RTL is cycle-accurate), so
+  each takes the same interrupt at a DIFFERENT retired-instruction index.
+  Records are aligned by attempt index, so from the interrupt onward every
+  record compares handler-vs-mainloop and the diff reports a flood of false
+  divergences. Testbenches must be interrupt-free today.
+- Where: `cosim_redesign.md` Usage 1 ("Out of scope / hard assumptions");
+  the lock-step path in `driver/cosim_lockstep.cpp`, `driver/run_plan.cpp`.
+- Status: OPEN. Designed fix is the opt-in `--cosim-async` mode (the RTL
+  leads the interrupt schedule, QEMU replays it via an inject hook + a
+  frozen timer) - features F8-F10 in `cosim_redesign.md`, not yet built.
+  Distinct from L4 / the ROI envelope rule, which make the HYBRID
+  measurement window interrupt-free; L22 is the lock-step DV path, which
+  otherwise DOES support synchronous traps.
+
+### L16. [REMOVED: the QEMU2 handback leg was deleted 2026-06-09] CSR restore to QEMU2 silently skipped
+
+- The QEMU2 leg restored CSRs by gdbstub name and skipped quietly when the
+  stub did not advertise one. The leg no longer exists.
+- Status: REMOVED.
+
+### L17. [REMOVED: the QEMU2 handback leg was deleted 2026-06-09] gdbstub timeout + racy port pick
+
+- The handback's fixed 10 s gdbstub timeout and TOCTOU port pick died with
+  the leg.
+- Status: REMOVED.
+
+### L18. Wire format is little-endian / same-arch only
+
+- When it bites: running any component on a big-endian host, or mixing
+  hosts with different struct alignment.
+- What happens: the state struct is exchanged byte-for-byte with no
+  byte-swap path (`state_abi.h:7-9`). The Python mirror (golden only) uses
+  a native-endian `ctypes.Structure` (`abi.py:28-31`), so a BE host would
+  mis-parse the body while the `<II` magic check still passes - a silent
+  mis-read.
+- Where: `state_abi.h:7-9`, `abi.py:28-31`.
+- Status: by design (x86-64 host + RV64 guest only).
+
+### L19. Other un-guarded failure paths  (F-T3.3, F-T3.5, F-T3.6, F-T3.8)
+
+- Determinism is not guaranteed across re-runs (reserved bytes, CSR drain
+  order); no test pins byte-identical output.
+- Submodule version drift (QEMU plugin ABI, vsim DM, pinned SimPoint
+  `17783e5`) has no CI gate.
+- Failure injection is thin: partial drain, disk full, mmap truncated
+  mid-run are not covered.
+- Status: all OPEN, lower priority.
+
+====================================================================================================
+CELL 17 [markdown]
+====================================================================================================
+### L25. ROI code that reads or writes time-variant CSRs produces engine-dependent results  (new 2026-06-15)
+
+- **The rule**: code inside the ROI must treat `mcycle` (0xB00), `minstret`
+  (0xB02), `mip` (0x344), and `time` (0xC01) as opaque.  No branches,
+  arithmetic, or writes on these CSRs inside the ROI.
+- **Why**: QEMU approximates both cycle and instruction counts with a CPI≈1
+  model; vsim counts actual RTL pipeline cycles and retires.  `mip` pending
+  bits (MTIP, MEIP, MSIP) reflect live timer/platform state that differs
+  between QEMU's functional clock and vsim's cycle clock.  These values
+  diverge at every architectural moment inside the ROI -- by construction,
+  not by bug.
+- **What happens if the rule is broken**:
+  - *Branch on `mcycle`/`minstret`*: the `--verify` oracle (pure QEMU)
+    takes a different branch than the hybrid run (vsim); the diff reports a
+    GPR or PC mismatch.  The plain run passes; only `--verify` exposes it.
+  - *Write `mcycle`* (e.g. `csrw mcycle, zero` to reset a performance
+    counter): `StateDrain` re-reads the reset value at the exit marker; the
+    reported cycle delta is near-zero or underflows -- silently wrong.
+- **Where**: any `csrr`/`csrw` on `mcycle`, `minstret`, `mip`, or `time`
+  between the entry and exit markers.
+- **Demonstrated by**: `tests/fixtures/break_mcycle_write.S` (write corrupts
+  delta), `tests/fixtures/break_verify_diverge.S` (branch diverges under
+  `--verify`).
+- **Distinction from L22**: L22 is about async interrupts in the lock-step
+  DV path; L25 is about the hybrid measurement path and any code that reads
+  or modifies time-variant state inside the ROI.
+- **Status**: by design.  A static linter on the ELF could warn on in-ROI
+  reads/writes of these CSRs (not built).
+
+====================================================================================================
+CELL 18 [markdown]
+====================================================================================================
+## Quick reference
+
+| ID  | Limitation                              | Severity | Status |
+|-----|-----------------------------------------|----------|--------|
+| L1  | Semihosting in ROI fatal; vplat is the supported I/O path | blocker | resolved in-tree |
+| L2  | PMP not restored to vsim (M-mode handoffs; S/U mirror it since L6) | high | partial |
+| L3  | Paging (satp) off in ROI                | high     | open   |
+| L4  | Trap state lost across ROI (trap CSRs round-trip since L24) | high | partial |
+| L5  | LR/SC cannot cross handoff              | high     | open   |
+| L6  | Privilege forced to M-mode              | high     | resolved |
+| L7  | Runtime-fit check missing (static image guarded, L26); 2 GiB - 4 KiB max | medium | partial |
+| L8  | Single hart only                        | medium   | open   |
+| L9  | MMIO in ROI: vplat device set only      | medium   | partial |
+| L10 | Engines pluggable; machine + CPU family still literal (scratch GPA now runtime-derived) | medium | partial |
+| L11 | VLEN ceiling 1024; over-limit aborts loudly | medium | resolved |
+| L12 | CSR 0x7C0 trigger collision             | low      | resolved |
+| L13 | Marker must be 32-bit                   | low      | resolved |
+| L14 | SimPoint estimate is approximate        | medium   | by design |
+| L15 | Value-level check: marker/pc only       | medium   | partial |
+| L16 | CSR restore silently skipped if missing | medium   | removed |
+| L17 | Fixed gdbstub timeout + racy port       | low      | removed |
+| L18 | Little-endian / same-arch only          | low      | by design |
+| L19 | Determinism / drift / fault-injection   | low      | open   |
+| L20 | fcsr/frm/fflags not transported         | high     | resolved |
+| L21 | Andes vendor CSRs: cache/misc-ctl transported (cycle fix); rest open | high | partial |
+| L22 | Async interrupts unsupported in lock-step cosim | medium | open |
+| L23 | mscratch software CSR not restored / re-read    | high   | resolved |
+| L24 | Writable M-mode trap/interrupt CSRs not restored / re-read | high | resolved |
+| L25 | ROI reads/writes time-variant CSRs (mcycle, mip, time) -> engine-dependent | medium | by design |
+| L26 | V scratch moved above program RAM (was: 0x00FF0000 clobbered) | high | resolved |
+
+====================================================================================================
+CELL 19 [markdown]
+====================================================================================================
+## Commercial product quality rating  (assessed 2026-05-28)
+
+> Re-check 2026-06-12: five areas moved since this assessment. The vplat
+> runtime gives a supported I/O path inside the ROI (L1/L9; every in-tree
+> C fixture now links it, so L1 is resolved in-tree); `--verify` and
+> `--cosim` add a value-level oracle check for marker/pc runs (L15); engines
+> are drop-in with VLEN synced from the descriptor, and L11 is now
+> resolved (2026-06-12): the wire format carries VLEN 128..1024 and an
+> over-ceiling vlenb aborts loudly instead of truncating (L10 partial); the marker
+> HINT trigger retired the CSR-collision caveats (L12/L13); and `fcsr`
+> now round-trips with an FP-rounding fixture in the e2e suite (L20
+> resolved - five CSRs restore into vsim now, and the silent FP-rounding
+> gap in blocker 1 below is closed). L6 is resolved (2026-06-13): the privilege
+> level round-trips (plugin gdbstub `priv` -> `dcsr.prv` write+verify ->
+> exit-drain readback), S/U handoffs mirror the producer's PMP block
+> (L2 partial), an M-only engine aborts loudly, and `rt_priv_smode` /
+> `rt_priv_umode` run in the e2e suite on the ax66_makatau engine. The
+> remaining state coverage and ROI envelope items (L2-L5, L21) are
+> unchanged, so the overall scores below still stand.
+>
+> Re-check 2026-06-15: `mscratch` (L23) then the writable M-mode trap/
+> interrupt CSRs `mepc`/`mcause`/`mtval`/`mie`/`mip` (L24) now round-trip --
+> 11 CSRs restore into vsim now, re-read at drain, and (except `mip`)
+> compared by `--verify`; `rt_csr_survival` guards them and blocker 4 below
+> is updated. The trap-CSR *data* round-trips, but taking a trap inside the
+> ROI is still untested (L4 partial). Still a narrow envelope (L2-L5, L21
+> unchanged).
+
+Honest scorecard for "is this a shippable commercial product today?".
+Rated against industry baselines (Synopsys VCS, Cadence Xcelium,
+gem5 + functional warmup) for a CPU vendor's hybrid sim offering.
+
+**Overall: 4/10 as a shippable commercial product. ~7/10 as an internal
+/ research tool inside its narrow design envelope.**
+
+### Axis breakdown
+
+| Axis                                  | Score | Note |
+|---------------------------------------|-------|------|
+| Architecture clarity                  | 8/10  | Two-phase handoff is clean; shared ABI is a single header. |
+| Engineering discipline                | 7/10  | TDD gate, doctest, parallel CI, a candid limitations doc. |
+| State coverage (correctness surface)  | 3/10  | 24 documented limitations; 11 CSRs round-trip into vsim. |
+| Generality of workload                | 2/10  | ROI must be single-privilege (M/S/U since L6), trap-free, paging-off (L1-L5). |
+| ISA completeness                      | 3/10  | ~~No S/U mode~~ (L6 2026-06-13), ~~no fcsr~~ (L20); still no HPM, zero Andes vendor CSRs (vendor IS Andes). |
+| Wire-format extensibility             | 4/10  | v1 only; growth happens by carving `reserved[216]` ad-hoc. No v2 path. |
+| Robustness / errors                   | 5/10  | `cmderr` is cleared and swallowed; only a private diagnostic side channel. |
+| Docs / onboarding                     | 7/10  | `CLAUDE.md`, `USER_GUIDE.md`, and this notebook are unusually honest. |
+| Test fixtures                         | 6/10  | Solid asm + C-runtime e2e; FP-rounding (rt_c_fcsr) and S/U-privilege (rt_priv_*) covered now; still no trap fixtures. |
+| Portability                           | 4/10  | x86-64 host + little-endian assumed (L18); pinned Andes toolchain; podman-only vsim build. |
+
+### What blocks commercial shipping
+
+1. **Silent correctness gaps.** ~~`fcsr/frm/fflags` never round-trip
+   (L20)~~ - resolved 2026-06-12; `fcsr` now transports and `--verify`
+   compares it. Still standing: `cmderr` is W1C-cleared so a partial CSR
+   restore is observable only through a private counter
+   (`resume_driver.hpp:196-205`).
+2. **ROI envelope is too narrow.** ~~M-mode only~~ (S/U privilege
+   transports since L6, 2026-06-13, on an S/U-capable engine), but "no
+   traps, no paging, no semihosting inside the window" (L1-L5) still
+   rules out every real OS-bearing benchmark - SPEC under Linux, any
+   driver code, anything with page faults. The vplat runtime covers
+   bare-metal I/O only.
+3. **No Andes vendor CSRs.** For an Andes product, shipping zero
+   `mmsc_cfg / mcache_ctl / mmisc_ctl` transport (L21) is a
+   credibility hit and an accuracy hazard - cache and prefetcher
+   controls shape the cycle count.
+4. **Only 11 CSRs restored into vsim** (mstatus, mtvec, mscratch, mepc,
+   mcause, mtval, mie, mip, mcycle, minstret, fcsr), plus `dcsr.prv` and
+   - for S/U handoffs - the PMP block (L6, 2026-06-13). `satp` and
+   `medeleg/mideleg` (S-mode CSRs the M-only default engine lacks; and
+   PMP on M-mode handoffs) are drained but never written back into vsim
+   (`resume_driver.hpp`). They exist in the wire format but not in the
+   simulator. Any future need for paging or S-mode delegation inside
+   the ROI needs `resume_driver` extended.
+5. **Wire format is v1-locked with ad-hoc growth.** Each new field
+   steals from `reserved[]` (warmup metadata ate 16 bytes, fcsr another
+   8; `state_abi.h`). No deprecation path, no feature bits beyond
+   the three `HYBRID_FLAG_*` bits.
+6. **Build/test infrastructure is single-host.** Podman-required vsim
+   build, hardcoded `JOBS=8` ceiling on 128-core hosts,
+   `/dev/shm`-backed fixtures - all fine for a lab, painful for a
+   commercial CI matrix.
+
+### What it does well (the 7/10 internal-tool score)
+
+- Two-phase handoff is a clear, documented contract.
+- `state_abi.h` plus `static_assert`s pin layout - good ABI hygiene.
+- The team writes down what does NOT work (this notebook, 22 entries plus
+  the state-coverage section) instead of hiding it. Commercially that
+  is the release-blocker checklist; internally it is exemplary.
+- SimPoint integration for whole-program cycle estimation (L14) is a
+  real differentiator over a pure functional sim.
+
+### Bottom line
+
+Ship-grade architecture, research-grade coverage. For commercial
+release you need:
+
+- v2 wire format with feature bits and a deprecation path
+- traps + paging supported inside ROI (close L3, L4);
+  ~~privilege transport (L6)~~ done 2026-06-13
+- Andes vendor CSR transport (close L21)
+- ~~`fcsr` fix (close L20)~~ done 2026-06-12
+- A proper error policy instead of `cmderr` swallowing
+- The existing `--verify`/`--cosim` oracle (L15) extended to
+  icount/simpoint and wired into CI
+
+Rough effort: 6-9 months of focused hardening, not weeks.
+
+====================================================================================================
+CELL 20 [markdown]
+====================================================================================================
+## Commercial product quality rating  (assessed 2026-05-28)
+
+> Re-check 2026-06-12: five areas moved since this assessment. The vplat
+> runtime gives a supported I/O path inside the ROI (L1/L9; every in-tree
+> C fixture now links it, so L1 is resolved in-tree); `--verify` and
+> `--cosim` add a value-level oracle check for marker/pc runs (L15); engines
+> are drop-in with VLEN synced from the descriptor, and L11 is now
+> resolved (2026-06-12): the wire format carries VLEN 128..1024 and an
+> over-ceiling vlenb aborts loudly instead of truncating (L10 partial); the marker
+> HINT trigger retired the CSR-collision caveats (L12/L13); and `fcsr`
+> now round-trips with an FP-rounding fixture in the e2e suite (L20
+> resolved - five CSRs restore into vsim now, and the silent FP-rounding
+> gap in blocker 1 below is closed). L6 is resolved (2026-06-13): the privilege
+> level round-trips (plugin gdbstub `priv` -> `dcsr.prv` write+verify ->
+> exit-drain readback), S/U handoffs mirror the producer's PMP block
+> (L2 partial), an M-only engine aborts loudly, and `rt_priv_smode` /
+> `rt_priv_umode` run in the e2e suite on the ax66_makatau engine. The
+> remaining state coverage and ROI envelope items (L2-L5, L21) are
+> unchanged, so the overall scores below still stand.
+
+Honest scorecard for "is this a shippable commercial product today?".
+Rated against industry baselines (Synopsys VCS, Cadence Xcelium,
+gem5 + functional warmup) for a CPU vendor's hybrid sim offering.
+
+**Overall: 4/10 as a shippable commercial product. ~7/10 as an internal
+/ research tool inside its narrow design envelope.**
+
+### Axis breakdown
+
+| Axis                                  | Score | Note |
+|---------------------------------------|-------|------|
+| Architecture clarity                  | 8/10  | Two-phase handoff is clean; shared ABI is a single header. |
+| Engineering discipline                | 7/10  | TDD gate, doctest, parallel CI, a candid limitations doc. |
+| State coverage (correctness surface)  | 3/10  | 21 documented limitations; only 4 CSRs round-trip into vsim. |
+| Generality of workload                | 2/10  | ROI must be single-privilege (M/S/U since L6), trap-free, paging-off (L1-L5). |
+| ISA completeness                      | 3/10  | ~~No S/U mode~~ (L6 2026-06-13), ~~no fcsr~~ (L20); still no HPM, zero Andes vendor CSRs (vendor IS Andes). |
+| Wire-format extensibility             | 4/10  | v1 only; growth happens by carving `reserved[216]` ad-hoc. No v2 path. |
+| Robustness / errors                   | 5/10  | `cmderr` is cleared and swallowed; only a private diagnostic side channel. |
+| Docs / onboarding                     | 7/10  | `CLAUDE.md`, `USER_GUIDE.md`, and this notebook are unusually honest. |
+| Test fixtures                         | 6/10  | Solid asm + C-runtime e2e; FP-rounding (rt_c_fcsr) and S/U-privilege (rt_priv_*) covered now; still no trap fixtures. |
+| Portability                           | 4/10  | x86-64 host + little-endian assumed (L18); pinned Andes toolchain; podman-only vsim build. |
+
+### What blocks commercial shipping
+
+1. **Silent correctness gaps.** ~~`fcsr/frm/fflags` never round-trip
+   (L20)~~ - resolved 2026-06-12; `fcsr` now transports and `--verify`
+   compares it. Still standing: `cmderr` is W1C-cleared so a partial CSR
+   restore is observable only through a private counter
+   (`resume_driver.hpp:196-205`).
+2. **ROI envelope is too narrow.** ~~M-mode only~~ (S/U privilege
+   transports since L6, 2026-06-13, on an S/U-capable engine), but "no
+   traps, no paging, no semihosting inside the window" (L1-L5) still
+   rules out every real OS-bearing benchmark - SPEC under Linux, any
+   driver code, anything with page faults. The vplat runtime covers
+   bare-metal I/O only.
+3. **No Andes vendor CSRs.** For an Andes product, shipping zero
+   `mmsc_cfg / mcache_ctl / mmisc_ctl` transport (L21) is a
+   credibility hit and an accuracy hazard - cache and prefetcher
+   controls shape the cycle count.
+4. **Only 5 CSRs restored into vsim** (mstatus, mtvec, mcycle,
+   minstret, fcsr), plus `dcsr.prv` and - for S/U handoffs - the PMP
+   block (L6, 2026-06-13). `satp`, `mepc/mcause/mtval`, `mscratch`,
+   `mip/mie` (and PMP on M-mode handoffs) are drained but never written
+   back into vsim (`resume_driver.hpp`). They exist in the wire format
+   but not in the simulator. Any future need for traps or dynamic
+   PMP needs `resume_driver` extended.
+5. **Wire format is v1-locked with ad-hoc growth.** Each new field
+   steals from `reserved[]` (warmup metadata ate 16 bytes, fcsr another
+   8; `state_abi.h`). No deprecation path, no feature bits beyond
+   the three `HYBRID_FLAG_*` bits.
+6. **Build/test infrastructure is single-host.** Podman-required vsim
+   build, hardcoded `JOBS=8` ceiling on 128-core hosts,
+   `/dev/shm`-backed fixtures - all fine for a lab, painful for a
+   commercial CI matrix.
+
+### What it does well (the 7/10 internal-tool score)
+
+- Two-phase handoff is a clear, documented contract.
+- `state_abi.h` plus `static_assert`s pin layout - good ABI hygiene.
+- The team writes down what does NOT work (this notebook, 21 entries plus
+  the state-coverage section) instead of hiding it. Commercially that
+  is the release-blocker checklist; internally it is exemplary.
+- SimPoint integration for whole-program cycle estimation (L14) is a
+  real differentiator over a pure functional sim.
+
+### Bottom line
+
+Ship-grade architecture, research-grade coverage. For commercial
+release you need:
+
+- v2 wire format with feature bits and a deprecation path
+- traps + paging supported inside ROI (close L3, L4);
+  ~~privilege transport (L6)~~ done 2026-06-13
+- Andes vendor CSR transport (close L21)
+- ~~`fcsr` fix (close L20)~~ done 2026-06-12
+- A proper error policy instead of `cmderr` swallowing
+- The existing `--verify`/`--cosim` oracle (L15) extended to
+  icount/simpoint and wired into CI
+
+Rough effort: 6-9 months of focused hardening, not weeks.
+
