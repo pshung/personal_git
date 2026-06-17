@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""Generate docs/andes_sim_engine_describe_config.ipynb from the session's design review."""
+import json, sys, pathlib
+
+cells = []
+
+def md(text):
+    cells.append({"cell_type": "markdown", "metadata": {}, "source": text.splitlines(keepends=True)})
+
+def code(text):
+    cells.append({"cell_type": "code", "metadata": {}, "execution_count": None,
+                  "outputs": [], "source": text.splitlines(keepends=True)})
+
+md(r"""# What `--describe` must carry: config-driven drain/restore and QEMU ISA matching
+
+A design review of the engine self-description contract. The companion
+`docs/andes_sim_engine_interface.ipynb` explains the *mechanism* (`--describe`
+prints one JSON object, the driver needs zero per-engine code). This notebook
+asks the next question: **is that JSON carrying enough?**
+
+## The problem
+
+`describe_engine()` (`verilator/src/main.cpp`) extracts only four hardware
+numbers from the embedded `config.inc` blob: `xlen`, `vlen`, `dlen`, `elen`.
+Everything else in the descriptor is a hardcoded literal.
+
+But a vsim binary's `config.inc` holds **hundreds** of `NDS_*` knobs that decide
+two things the driver must get right for a `hybrid` run:
+
+1. **What architectural state actually exists** - so the QEMU->vsim handoff
+   drains and restores exactly those blocks (e.g. a core with zero PMP entries
+   should not carry 64 `pmpaddr` + 16 `pmpcfg`).
+2. **What ISA the functional leg must speak** - so QEMU's `-cpu` enables the
+   same extensions as the cycle core.
+
+Today the QEMU fast leg is hardcoded to `-cpu andes-ax45mpv,vlen={vlen}`
+(`driver/engine_registry.cpp`), regardless of which vsim engine is the accurate
+leg. Pair QEMU with `vsim:d23` (rv32, no V, no FPU) or any differently
+configured core and the two legs silently run **different ISAs**. The ground
+truth lives in `config.inc`; `--describe` has to carry it.
+
+> Mental model: `config.inc` is the RTL truth. `--describe` should report the
+> *decisions* derived from it (which state blocks, which ISA), not the raw RTL
+> knobs.""")
+
+md(r"""## Setup
+
+Finds the repo root via `build/andes-sim`, picks a real `config.inc` to inspect,
+and locates the built QEMU binary. The later cells grep these live, so the
+numbers in this notebook are the actual ones, not transcribed.""")
+
+code(r'''import os, glob
+from pathlib import Path
+root = next(str(d) for d in (Path.cwd(), *Path.cwd().parents)
+            if (d / "build" / "andes-sim").exists())
+os.chdir(root)
+os.environ["PATH"] = f"{root}/build:" + os.environ["PATH"]
+
+# Pick a config.inc to inspect (prefer ax45mpv_premium, else any obj_sc one).
+cands = (glob.glob("verilator/build/Vax45mpv_premium/obj_sc/config.inc")
+         or glob.glob("verilator/build/V*/obj_sc/config.inc"))
+os.environ["CONFIG"] = cands[0] if cands else ""
+
+# The built QEMU (honors $VSIM_QEMU like the driver does).
+qemu = os.environ.get("VSIM_QEMU") or "build/qemu/qemu-system-riscv64"
+os.environ["QEMU"] = qemu
+
+print("root   :", root)
+print("CONFIG :", os.environ["CONFIG"] or "(none built)")
+print("QEMU   :", qemu, "(exists)" if Path(qemu).exists() else "(NOT built)")''')
+
+md(r"""## 1. The raw material - `config.inc` has hundreds of knobs
+
+The blob `--describe` already reads is mostly RAM widths, cache geometry, and
+bus parameters - irrelevant to the handoff. The handful that matter are the ISA
+**support gates** (`..._SUPPORT`, `FPU_TYPE`, `ISA_BASE`).""")
+
+code(r'''import subprocess, os
+cfg = os.environ["CONFIG"]
+if not cfg:
+    print("no config.inc built; run: source ./setup.sh  (or --what vsim)")
+else:
+    n = subprocess.run(["bash","-c",
+        f"grep -oE 'NDS_[A-Z0-9_]+' {cfg} | sort -u | wc -l"],
+        capture_output=True, text=True).stdout.strip()
+    print(f"distinct NDS_* tokens in this config : {n}\n")
+    print("the ISA-relevant gates:")
+    subprocess.run(["bash","-c",
+        f"grep -E '`define NDS_(ISA_BASE|FPU_TYPE|RVA|RVB|RVC|RVN|RVV|DSP|"
+        f"CODENSE|FP16|BFLOAT16|ZFBFMIN|ZVFBFMIN|ZVFBFWMA|QMAC|VECTOR_SINT|"
+        f"VECTOR_PACKED_FP16|ISA_V5_PERFORMANCE)[A-Z_]* ' {cfg} "
+        f"| grep -v '_INT' | sort"])''')
+
+md(r"""## 2. Two decision axes
+
+The driver consumes the config for two unrelated jobs, so the fields split into
+two groups:
+
+- **Drain/restore set** - which architectural state blocks exist, so the handoff
+  moves exactly those and `--verify` compares exactly those.
+- **QEMU `-cpu` / machine params** - which ISA extensions and memory layout the
+  functional leg must match.
+
+Some gates feed both axes (RVV gates the V state block *and* the `v` QEMU
+token); some feed only one (PMP entries -> drain set only; CPUID -> QEMU
+identity only).""")
+
+md(r"""## 3. Group A - gates the drain/restore set
+
+| Config entry | What it gates | Status today |
+|---|---|---|
+| `NDS_XLEN` | `HYBRID_FLAG_RV64`; GPR/CSR width | done (`xlen`) |
+| `NDS_ISA_BASE` | `rv32e` => 16 GPRs not 32 (drain count) | not read |
+| `NDS_FPU_TYPE` | `HYBRID_FLAG_FP`; FPR block + fcsr (`sp`=F, `dp`=F+D, `none`=skip) | flag hardcoded |
+| `NDS_RVV_SUPPORT` | `HYBRID_FLAG_V`; whole V block + V-scratch page | flag hardcoded |
+| `NDS_VLEN`/`DLEN`/`ELEN`/`VALEN` | V block sizing, scratch stride, vstart width | partial (no VALEN) |
+| `NDS_PMP_ENTRIES` | PMP drain/restore; **0 => skip 64 pmpaddr+16 pmpcfg** | always carried |
+| `NDS_PMA_ENTRIES` | Andes PMA CSRs (not in ABI yet) | not drained |
+| `NDS_NUM_PRIVILEGE_LEVELS` | priv transport + S-mode CSR block; 1=M-only | drives L6 split, not from describe |
+| `NDS_MMU_SCHEME` | satp + paging state | not read |
+| `NDS_PERFORMANCE_MONITOR` + `NDS_PFM_EVENT_WIDTH` | HPM counters (only mcycle/minstret today) | not drained |
+| `NDS_NUM_TRIGGER` | debug trigger CSRs (tdata1/2/3) | not drained |
+
+`NDS_PMP_ENTRIES` is the clean example: it is `0` on `ax45mpv_premium`, yet the
+ABI always reserves the full PMP block.""")
+
+md(r"""## 4. Group B - gates the QEMU `-cpu` flags
+
+These must be ON in QEMU iff ON in the cycle core; otherwise an instruction
+legal on one leg faults or is rejected on the other.
+
+| Config entry | QEMU `-cpu` token |
+|---|---|
+| `NDS_RVA_SUPPORT` | `a` |
+| `NDS_RVB_SUPPORT` | `zba,zbb,zbc,zbs` (or misa `b`) |
+| `NDS_RVC_SUPPORT` | `c` |
+| `NDS_RVV_SUPPORT` + widths | `v,vlen=N,elen=N` |
+| `NDS_FPU_TYPE` | `f` / `f,d` |
+| `NDS_FP16_SUPPORT` | `zfh` / `zfhmin` |
+| `NDS_ZFBFMIN_SUPPORT` | `zfbfmin` |
+| `NDS_ZVFBFMIN_SUPPORT` | `zvfbfmin` |
+| `NDS_ZVFBFWMA_SUPPORT` | `zvfbfwma` |
+| `NDS_VECTOR_PACKED_FP16_SUPPORT` | `zvfh` / `zvfhmin` |
+| `NDS_CODENSE_SUPPORT` | `xandescodenseops` |
+| `NDS_ISA_V5_PERFORMANCE` + `QMAC` + `VECTOR_SINT` | `xandesv5ops,xandesv5isa,xandesvmm` |
+| `NDS_ACE_SUPPORT` | `xandesace,xandesaceextra,xandesacemulti` (+ ACE lib) |
+| `NDS_DSP_SUPPORT` | Andes DSP via model `MMSC_CFG.EDSP` (no plain `dsp=on`) |
+| `NDS_CPUID` / `NDS_CPU_MIMPID` | `marchid` / `mimpid` (only if ROI reads them) |""")
+
+md(r"""## 5. Group C - memory map (lower priority)
+
+`NDS_ILM_BASE/SIZE`, `NDS_DLM_BASE/SIZE`, `NDS_DEVICE_REGION*_BASE/MASK`,
+`NDS_CACHE_LINE_SIZE`. The `andes_ae350` machine and the cycle core must agree
+on these or the shared mmap / ELF layout / MMIO syscalls collide. The current
+fixtures avoid local memory and use one device region, so this only bites later.""")
+
+md(r"""## 6. Deriving the ISA string - it is constructed, not extracted
+
+A natural idea is to have `--describe` emit one ISA string like
+`rv64imafdcb_v_zfh_zfbfmin_xandesv5ops_xandescodenseops`. Two facts make this
+harder than it looks:
+
+1. **There is no ready-made ISA/misa/march string in `config.inc`.** The only
+   base hint is `NDS_ISA_BASE = "rv64i"`. Every other letter is an independent
+   yes/no gate, so the string must be assembled token by token.
+2. **There is no `M`-extension gate at all** - no `NDS_RVM`/mul-div `..._SUPPORT`
+   entry. So `m` has no config source; it is a constant in the mapping table,
+   not derived.
+
+The cell below proves both: it shows there is no `march`-like string, then dumps
+the gates that *do* exist.""")
+
+code(r'''import subprocess, os
+cfg = os.environ["CONFIG"]
+if cfg:
+    print("=== any ready-made isa/misa/march string? (expect: only ISA_BASE) ===")
+    subprocess.run(["bash","-c",
+        f"grep -iE 'isa|misa|march' {cfg} "
+        f"| grep -iv 'REGION|V5ISA|VISA' | sed -E 's/^`define //' | head"])
+    print("\n=== is there any M-extension gate? (expect: nothing) ===")
+    r = subprocess.run(["bash","-c",
+        f"grep -iE 'RVM|MUL_DIV|`define NDS_M_' {cfg}"],
+        capture_output=True, text=True)
+    print(r.stdout or "(none - M is assumed, not gated)")''')
+
+md(r"""### The faithful token -> source mapping
+
+For `ax45mpv_premium`, derived from the gates above:
+
+| Token | Source entry | Note |
+|---|---|---|
+| `rv64` | `NDS_XLEN` / `NDS_ISA_BASE_INT` | |
+| `i` | `NDS_ISA_BASE` | |
+| `m` | **none** | assumed - no gate exists |
+| `a` | `NDS_RVA_SUPPORT` | |
+| `f`,`d` | `NDS_FPU_TYPE` | dp=f+d, sp=f, none=neither |
+| `c` | `NDS_RVC_SUPPORT` | |
+| `b` (zba,zbb,zbc,zbs) | `NDS_RVB_SUPPORT` | one gate -> four tokens |
+| `v` | `NDS_RVV_SUPPORT` | |
+| `zfh` | `NDS_FP16_SUPPORT` | |
+| `zfbfmin` | `NDS_ZFBFMIN_SUPPORT` | |
+| `xandescodenseops` | `NDS_CODENSE_SUPPORT` | |
+| `xandesv5ops`/`xandesv5isa` | `NDS_ISA_V5_PERFORMANCE`+`QMAC`+`VECTOR_SINT` | many gates -> one bundle |
+
+Corrected string:
+
+```
+rv64imafdcb_v_zfh_zfbfmin_xandesv5ops_xandescodenseops
+```
+
+The mapping is **many-to-one in both directions** (one `RVB` gate -> 4 `zb*`
+tokens; 3 V5 gates -> 1 bundle) and has tokens with no gate (`m`). So it cannot
+be auto-generated - it is a hand-maintained table.""")
+
+md(r"""## 7. Finding the QEMU parameter
+
+Given a gate, how do you find the exact `-cpu` token QEMU accepts? Three ways.
+
+**(1) Source of truth** - the property arrays in `QEMU/target/riscv/cpu.c`:
+- single-letter misa exts: `MISA_EXT_INFO(RVx, "x", ...)`
+- standard `z*`: `riscv_cpu_extensions[]`
+- vendor `x*` (the Andes ones): `riscv_cpu_vendor_exts[]`
+
+Any name in those arrays is a legal `-cpu andes-...,<name>=on|off` token.""")
+
+code(r'''import subprocess
+cpu_c = "QEMU/target/riscv/cpu.c"
+import os.path
+if os.path.exists(cpu_c):
+    print("=== single-letter misa exts (i m a f d c v b p ...) ===")
+    subprocess.run(["bash","-c",
+        f"grep -E 'MISA_EXT_INFO\\(RV[A-Z]' {cpu_c} "
+        f"| sed -E 's/.*MISA_EXT_INFO\\((RV[A-Z]), \"([a-z])\".*/  \\2  <- \\1/'"])
+    print("\n=== vendor xandes* tokens (riscv_cpu_vendor_exts[]) ===")
+    subprocess.run(["bash","-c",
+        f"awk '/riscv_cpu_vendor_exts\\[\\]/{{p=1}} p&&/xandes/{{print}} "
+        f"p&&/^}};/{{exit}}' {cpu_c} "
+        f"| sed -E 's/.*BOOL\\(\"([a-z0-9]+)\".*/  \\1/'"])
+else:
+    print("QEMU submodule not checked out at", cpu_c)''')
+
+md(r"""**(2) Runtime probe** - verify a token is accepted by launching with it.
+`-cpu help` lists only models in this build, not flags, so probe one name at a
+time: a bogus name errors with `Property ... not found`; a real name proceeds
+past CPU setup (then complains about the missing `-bios`, which is fine).""")
+
+code(r'''import subprocess, os
+q = os.environ["QEMU"]
+if os.path.exists(q):
+    print("=== bogus token (expect: 'Property ... not found') ===")
+    subprocess.run(["bash","-c",
+        f"timeout 5 {q} -machine andes_ae350 -cpu andes-ax45mpv,NOSUCHEXT=on "
+        f"-nographic </dev/null 2>&1 | head -2"])
+    print("\n=== real token zfbfmin=off (expect: past CPU setup -> bios error) ===")
+    subprocess.run(["bash","-c",
+        f"timeout 5 {q} -machine andes_ae350 -cpu andes-ax45mpv,zfbfmin=off "
+        f"-nographic </dev/null 2>&1 | head -2"])
+else:
+    print("QEMU not built:", q)''')
+
+md(r"""**(3) The model's baked-in set** - each `andes-*` model in `cpu.c` already
+sets a fixed extension list + `MMSC_CFG` bitmask (e.g.
+`rv64_andes_ax45mpv_cpu_init`). The driver only needs to emit `-cpu <model>,...`
+*overrides* for gates where the target config differs from the model default -
+not the full set.""")
+
+md(r"""## 8. Proposed `--describe` additions
+
+Not 40 raw `NDS_*`. The driver wants *decisions*, derived inside
+`describe_engine()` from the blob it already reads:
+
+```json
+"isa": "rv64imafdcb_v_zfh_zfbfmin_xandesv5ops_xandescodenseops",
+"state_blocks": ["gpr","fpr:d","csr_m","vector","pmp:0","priv:1","mmu:bare","hpm:0"]
+```
+
+- `isa` -> the driver maps it to the QEMU `-cpu andes-...,<props>` string,
+  replacing the hardcoded `andes-ax45mpv`.
+- `state_blocks` -> the drain/restore planner reads block presence + parameter
+  (`pmp:0` => skip; `priv:3` => add S-mode CSRs; `fpr:d` vs `fpr:f`), replacing
+  the three `HYBRID_FLAG_*` set blindly today.
+
+**Where the table lives.** The `NDS_* -> token` mapping targets QEMU property
+names, so it is the driver's concern, not the simulator's. Two options:
+
+- (a) the vsim binary builds the `isa` string at describe time (table next to
+  `describe_engine()`),
+- (b) `--describe` emits the raw gates; the driver owns the table.
+
+Lean **(b)**: keep QEMU-property knowledge with the thing that launches QEMU.""")
+
+md(r"""## 9. Priority
+
+The ROI is assumed trap-free / single-privilege / paging-off (CLAUDE.md), so the
+correctness-critical subset **now** is:
+
+1. **`isa` string** -> fix the hardcoded QEMU `-cpu`. This is the real bug: any
+   non-`ax45mpv` engine mismatches the functional leg's ISA.
+2. **`NDS_PMP_ENTRIES`, `NDS_FPU_TYPE`, `NDS_RVV_SUPPORT`** -> stop carrying
+   state blocks that do not exist; stop assuming dp+V.
+
+Deferred until the ROI grows traps/paging/S-mode: HPM counters, PMA, S-mode and
+MMU blocks, the memory map (Group C).
+
+### Source map
+
+| Where | What |
+|-------|------|
+| `verilator/src/main.cpp` | `describe_engine()` - emits the descriptor; reads the config.inc blob |
+| `verilator/build/V*/obj_sc/config.inc` | the RTL truth (all `NDS_*` gates) |
+| `driver/engine_registry.cpp` | `builtin_qemu()` - the hardcoded `-cpu andes-ax45mpv` |
+| `include/hybrid/state_abi.h` | `HYBRID_FLAG_*` + the state blocks the ABI carries |
+| `QEMU/target/riscv/cpu.c` | the three property arrays + per-model baked-in ext set |
+""")
+
+nb = {
+    "cells": cells,
+    "metadata": {
+        "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+        "language_info": {"name": "python", "version": "3.12"},
+    },
+    "nbformat": 4,
+    "nbformat_minor": 4,
+}
+
+out = pathlib.Path(sys.argv[1])
+out.write_text(json.dumps(nb, indent=1) + "\n")
+print(f"wrote {out} ({len(cells)} cells)")
