@@ -299,7 +299,7 @@ function gllvm() {
 # Other setting
 #########################################################################
 # mount sshfs (skip if already mounted)
-mountpoint -q /local/nick/SW_Release || sshfs atcsqa06:/NOBACKUP/sqa3/NFSTest/ /local/nick/SW_Release
+mountpoint -q /local/nick/SW_Release || sshfs atcsqa16:/NOBACKUP/sqa3/NFSTest/ /local/nick/SW_Release
 mountpoint -q /local/nick/atclnx01/home/users3/nick  || sshfs atclnx01:/ /local/nick/atclnx01
 
 #########################################################################
