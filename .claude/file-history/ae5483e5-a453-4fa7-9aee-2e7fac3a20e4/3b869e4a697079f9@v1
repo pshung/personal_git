@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# run --cosim contract (cosim_roi F4): opt-in checkpoint co-simulation.
+#   1. hybrid marker --cosim --cosim-interval 500 -> >=1 checkpoint,
+#      "[cosim] PASS", rc 0 (rt_c_v_matmul: ~1.7k ROI retires -> 3 ckpts)
+#   2. hybrid pc --cosim                          -> same through cosim_pc
+#   3. default (no --cosim)                       -> no cosim output
+#   4. usage errors: model, trigger, interval, --verify exclusivity
+#   5. dev-only help surface
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+. "$SCRIPT_DIR/../lib/paths.sh"
+. "$SCRIPT_DIR/../lib/roi.sh"
+
+BIN="$ROOT/build/andesim"
+bash "$ROOT/scripts/build_driver.sh" >/dev/null 2>&1 || fail "build_driver.sh failed"
+
+FIXTURE="${FIXTURE:-rt_c_v_matmul}"
+hybrid_resolve_paths
+ENGINE="${ENGINE:-vsim:ax45mpv_premium}"
+
+# 1. marker mode with a sub-ROI interval -> real checkpoints.
+OUT=$("$BIN" run --mode hybrid --trigger marker --engine "$ENGINE" \
+      --cosim --cosim-interval 500 "$VSIM_ELF" 2>&1)
+RC=$?
+[ "$RC" -eq 0 ] || fail "marker --cosim rc=$RC: $OUT"
+printf '%s\n' "$OUT" | grep -q '\[cosim\] PASS' || fail "marker: no [cosim] PASS: $OUT"
+printf '%s\n' "$OUT" | grep -Eq '\[cosim\] PASS: [1-9][0-9]* checkpoint' \
+  || fail "marker: expected at least one checkpoint: $OUT"
+printf '%s\n' "$OUT" | grep -q 'window_cycles' \
+  && fail "marker: window_cycles printed under --cosim (the checkpoints pollute it; mutually exclusive): $OUT"
+ok "hybrid marker --cosim: checkpoints + final match the oracle, no cycle figure"
+
+# 2. pc mode (boundaries = the fixture's own marker PCs, like docs 4.2).
+OBJDUMP="${OBJDUMP:-${HYBRID_TOOLCHAIN:+$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-objdump}}"
+OBJDUMP="${OBJDUMP:-riscv64-unknown-elf-objdump}"
+MARKERS=$(roi_markers_from_disasm "$("$OBJDUMP" -d "$VSIM_ELF")") \
+  || fail "no ROI markers in $VSIM_ELF"
+OUT=$("$BIN" run --mode hybrid --trigger pc --engine "$ENGINE" \
+      --pc-start "0x${MARKERS%% *}" --pc-end "0x${MARKERS##* }" \
+      --cosim --cosim-interval 500 "$VSIM_ELF" 2>&1)
+RC=$?
+[ "$RC" -eq 0 ] || fail "pc --cosim rc=$RC: $OUT"
+printf '%s\n' "$OUT" | grep -q '\[cosim\] PASS' || fail "pc: no [cosim] PASS: $OUT"
+ok "hybrid pc --cosim: checkpoints + final match the oracle"
+
+# 3. default off: no cosim leg, no cosim output, cycle figure intact.
+OUT=$("$BIN" run --mode hybrid --trigger marker --engine "$ENGINE" \
+      "$VSIM_ELF" 2>&1)
+RC=$?
+[ "$RC" -eq 0 ] || fail "default hybrid rc=$RC: $OUT"
+printf '%s\n' "$OUT" | grep -qi 'cosim' && fail "default run leaked cosim output: $OUT"
+printf '%s\n' "$OUT" | grep -q 'window_cycles' || fail "default: cycle figure missing: $OUT"
+ok "default: co-simulation stays off, window_cycles stays on"
+
+# 4. usage errors. (cycle --cosim is now valid: lock-step DV, see
+#    test_andes_sim_cosim_lockstep.sh. Only fast is rejected here.)
+expect 2 'cosim requires --mode hybrid or cycle' \
+  "$BIN" run --mode fast --cosim "$VSIM_ELF"
+expect 2 'cosim-interval requires --cosim' \
+  "$BIN" run --mode hybrid --cosim-interval 500 --engine "$ENGINE" "$VSIM_ELF"
+expect 2 'positive integer' \
+  "$BIN" run --mode hybrid --cosim --cosim-interval 0 --engine "$ENGINE" "$VSIM_ELF"
+expect 2 'exclusive' \
+  "$BIN" run --mode hybrid --cosim --verify --engine "$ENGINE" "$VSIM_ELF"
+ok "--cosim usage errors (model/interval/--verify)"
+
+# 5. dev-only help surface.
+expect 0 ' --cosim ' env ANDESIM_DEV=1 "$BIN" run --help
+OUT=$("$BIN" run --help 2>&1)
+printf '%s\n' "$OUT" | grep -q -- '--cosim' && fail "release run --help leaks --cosim"
+ok "--cosim help is dev-only"
+
+ok "run --cosim checkpoint co-simulation"
