@@ -231,7 +231,7 @@ alias rg="rg -L --no-ignore"
 ##############################################
 # gemini
 # ############################################
-alias claude="claude --dangerously-skip-permissions"
+alias claude="export CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude --dangerously-skip-permissions"
 
 ##############################################
 # cd alias
