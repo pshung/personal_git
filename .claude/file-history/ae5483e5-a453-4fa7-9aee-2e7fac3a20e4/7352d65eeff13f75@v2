@@ -1,0 +1,880 @@
+// hotloops -- hot inner-loop detector for baremetal RISC-V ELFs.
+//
+// C++ replacement for QEMU/scripts/hotloops.sh. Runs a baremetal ELF under
+// qemu-system-{arch} with the hotloops TCG plugin and prints a sorted table
+// (or LLM-ready Markdown report) of detected backward branches.
+//
+// Usage: hotloops [opts] <elf>
+//
+// Options:
+//   --arch <riscv32|riscv64|auto>   Target arch (default: auto)
+//   --qemu <path>                   Override qemu-system binary
+//   --plugin <path>                 Override hotloops plugin .so
+//   --machine <name>                -M <name> (default: andes_ae350)
+//   --cpu <spec>                    -cpu <spec>
+//   --qemu-config <file>            -readconfig <file>
+//   --cwd <dir>                     chdir before launching QEMU
+//   --qemu-arg <arg>                Extra arg forwarded to QEMU (repeatable)
+//   --limit <N>                     Top-N loops to print (default: 50)
+//   --min-iters <N>                 Drop loops with fewer than N iters (default: 1)
+//   --objdump <path>                Override objdump
+//   --addr2line <path>              Override addr2line
+//   --no-source                     Disable source file:line resolution
+//   --raw                           Print raw plugin log, no formatting
+//   --optimize-rvv / --no-optimize-rvv  RVV-only filter (default: on)
+//   --llm / --no-llm                LLM Markdown report vs. plain table (default: on)
+//   -h | --help                     Show this help
+
+#include "elf_syms.hpp"
+#include "process.hpp"
+#include "repo_root.hpp"
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <optional>
+#include <regex>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <vector>
+
+#include <elf.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+namespace fs = std::filesystem;
+
+// ─── TempFile ────────────────────────────────────────────────────────────────
+
+struct TempFile {
+  std::string path;
+  TempFile() {
+    char tmpl[] = "/tmp/hotloops.XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) throw std::runtime_error("mkstemp failed");
+    close(fd);
+    path = tmpl;
+  }
+  ~TempFile() { if (!path.empty()) ::unlink(path.c_str()); }
+  TempFile(const TempFile&) = delete;
+  TempFile& operator=(const TempFile&) = delete;
+};
+
+// ─── Config ──────────────────────────────────────────────────────────────────
+
+struct Config {
+  std::string arch        = "auto";
+  std::string qemu;
+  std::string plugin;
+  std::string machine     = "andes_ae350";
+  std::string cpu         = "andes-ax45mpv,vext_spec=v1.0,vlen=1024";
+  std::string qemu_config;
+  std::string qemu_cwd;
+  std::vector<std::string> extra_qemu_args;
+  int limit               = 50;
+  int min_iters           = 1;
+  std::string objdump;
+  std::string addr2line_bin;
+  bool no_source          = false;
+  bool raw                = false;
+  bool optimize_rvv       = true;
+  bool llm                = true;
+  std::string elf;
+};
+
+static void usage(const char* prog) {
+  fprintf(stderr,
+    "Usage: %s [opts] <elf>\n\n"
+    "  --arch <riscv32|riscv64|auto>   Target arch (default: auto)\n"
+    "  --qemu <path>                   Override qemu-system binary\n"
+    "  --plugin <path>                 Override plugin .so\n"
+    "  --machine <name>                -M <name> (default: andes_ae350)\n"
+    "  --cpu <spec>                    -cpu <spec>\n"
+    "  --qemu-config <file>            -readconfig <file>\n"
+    "  --cwd <dir>                     chdir before launching QEMU\n"
+    "  --qemu-arg <arg>                Extra QEMU arg (repeatable)\n"
+    "  --limit <N>                     Top-N loops (default: 50)\n"
+    "  --min-iters <N>                 Drop loops with fewer iters (default: 1)\n"
+    "  --objdump <path>                Override objdump\n"
+    "  --addr2line <path>              Override addr2line\n"
+    "  --no-source                     Disable source file:line resolution\n"
+    "  --raw                           Print raw plugin output\n"
+    "  --optimize-rvv / --no-optimize-rvv  RVV-only filter (default: on)\n"
+    "  --llm / --no-llm                LLM report vs. table (default: on)\n"
+    "  -h | --help                     Show this help\n",
+    prog);
+  exit(0);
+}
+
+static Config parse_args(int argc, char** argv) {
+  Config c;
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    auto next = [&]() -> std::string {
+      if (i + 1 >= argc) { fprintf(stderr, "error: %s requires an argument\n", argv[i]); exit(2); }
+      return argv[++i];
+    };
+    if (a == "--arch")         c.arch         = next();
+    else if (a == "--qemu")    c.qemu         = next();
+    else if (a == "--plugin")  c.plugin       = next();
+    else if (a == "--machine") c.machine      = next();
+    else if (a == "--cpu")     c.cpu          = next();
+    else if (a == "--qemu-config") c.qemu_config = next();
+    else if (a == "--cwd")     c.qemu_cwd     = next();
+    else if (a == "--qemu-arg") c.extra_qemu_args.push_back(next());
+    else if (a == "--limit")   c.limit        = std::stoi(next());
+    else if (a == "--min-iters") c.min_iters  = std::stoi(next());
+    else if (a == "--objdump") c.objdump      = next();
+    else if (a == "--addr2line") c.addr2line_bin = next();
+    else if (a == "--no-source")    c.no_source    = true;
+    else if (a == "--raw")          c.raw          = true;
+    else if (a == "--optimize-rvv") c.optimize_rvv = true;
+    else if (a == "--no-optimize-rvv") c.optimize_rvv = false;
+    else if (a == "--llm")          c.llm          = true;
+    else if (a == "--no-llm")       c.llm          = false;
+    else if (a == "-h" || a == "--help") usage(argv[0]);
+    else if (a.starts_with("-")) {
+      fprintf(stderr, "error: unknown option: %s\n", a.c_str()); exit(2);
+    } else {
+      if (!c.elf.empty()) { fprintf(stderr, "error: unexpected positional arg: %s\n", a.c_str()); exit(2); }
+      c.elf = a;
+    }
+  }
+  if (c.elf.empty()) { fprintf(stderr, "error: ELF path required\n"); exit(2); }
+  if (!fs::exists(c.elf)) { fprintf(stderr, "error: not found: %s\n", c.elf.c_str()); exit(2); }
+  return c;
+}
+
+// ─── ELF arch detection ──────────────────────────────────────────────────────
+
+static std::string detect_arch(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return "";
+  uint8_t buf[20];
+  f.read(reinterpret_cast<char*>(buf), 20);
+  if (!f || buf[0] != 0x7f || buf[1] != 'E' || buf[2] != 'L' || buf[3] != 'F')
+    return "";
+  uint16_t e_machine = static_cast<uint16_t>(buf[18]) | (static_cast<uint16_t>(buf[19]) << 8);
+  if (e_machine != 0xF3) return "";  // not RISC-V (EM_RISCV=243)
+  return (buf[4] == ELFCLASS64) ? "riscv64" : "riscv32";
+}
+
+// ─── Symbol lookup (delegates to elf_syms; ELF is small and OS-page-cached) ──
+
+static std::string sym_at(const std::string& elf, uint64_t pc) {
+  std::string s = andes_sim::symbolize(elf, pc);
+  if (!s.empty()) return s;
+  char buf[20]; snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)pc);
+  return buf;
+}
+
+static std::string sym_func_at(const std::string& elf, uint64_t pc) {
+  std::string s = andes_sim::symbolize(elf, pc);
+  auto p = s.find('+');
+  return (p != std::string::npos) ? s.substr(0, p) : s;
+}
+
+// ─── Subprocess helpers ───────────────────────────────────────────────────────
+
+// Run argv with stdout+stderr redirected to /dev/null; chdir to cwd if set.
+// Returns child exit code, 128+signal if killed, -1 on fork failure.
+static int run_silent(const std::vector<std::string>& argv, const std::string& cwd) {
+  if (argv.empty()) return -1;
+  pid_t pid = fork();
+  if (pid < 0) return -1;
+  if (pid == 0) {
+    if (!cwd.empty() && chdir(cwd.c_str()) != 0) _exit(127);
+    int devnull = open("/dev/null", O_RDWR);
+    if (devnull >= 0) {
+      dup2(devnull, STDIN_FILENO);
+      dup2(devnull, STDOUT_FILENO);
+      dup2(devnull, STDERR_FILENO);
+      if (devnull > 2) close(devnull);
+    }
+    std::vector<char*> cargv;
+    cargv.reserve(argv.size() + 1);
+    for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
+    cargv.push_back(nullptr);
+    execvp(cargv[0], cargv.data());
+    _exit(127);
+  }
+  int status = 0;
+  waitpid(pid, &status, 0);
+  if (WIFEXITED(status)) return WEXITSTATUS(status);
+  if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+  return -1;
+}
+
+// Write lines to argv's stdin; capture its stdout. Used for addr2line.
+static std::string capture_with_stdin(const std::vector<std::string>& argv,
+                                       const std::string& input) {
+  if (argv.empty()) return "";
+  int in_fds[2], out_fds[2];
+  if (pipe(in_fds) != 0) return "";
+  if (pipe(out_fds) != 0) { close(in_fds[0]); close(in_fds[1]); return ""; }
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(in_fds[0]); close(in_fds[1]);
+    close(out_fds[0]); close(out_fds[1]);
+    return "";
+  }
+  if (pid == 0) {
+    close(in_fds[1]); close(out_fds[0]);
+    dup2(in_fds[0], STDIN_FILENO);
+    dup2(out_fds[1], STDOUT_FILENO);
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) { dup2(devnull, STDERR_FILENO); if (devnull > 2) close(devnull); }
+    close(in_fds[0]); close(out_fds[1]);
+    std::vector<char*> cargv;
+    cargv.reserve(argv.size() + 1);
+    for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
+    cargv.push_back(nullptr);
+    execvp(cargv[0], cargv.data());
+    _exit(127);
+  }
+  close(in_fds[0]); close(out_fds[1]);
+  // Write input then close to signal EOF.
+  const char* p = input.data();
+  size_t rem = input.size();
+  while (rem > 0) {
+    ssize_t w = write(in_fds[1], p, rem);
+    if (w < 0) break;
+    p += w; rem -= static_cast<size_t>(w);
+  }
+  close(in_fds[1]);
+  std::string out;
+  char buf[4096];
+  ssize_t n;
+  while ((n = read(out_fds[0], buf, sizeof(buf))) > 0)
+    out.append(buf, static_cast<size_t>(n));
+  close(out_fds[0]);
+  waitpid(pid, nullptr, 0);
+  return out;
+}
+
+static bool cmd_exists(const std::string& cmd) {
+  if (cmd.find('/') != std::string::npos)
+    return access(cmd.c_str(), X_OK) == 0;
+  const char* path_env = getenv("PATH");
+  if (!path_env) return false;
+  std::istringstream ss(path_env);
+  std::string dir;
+  while (std::getline(ss, dir, ':')) {
+    if (!dir.empty() && access((dir + "/" + cmd).c_str(), X_OK) == 0) return true;
+  }
+  return false;
+}
+
+static std::string find_first(const std::vector<std::string>& cands) {
+  for (const auto& c : cands)
+    if (cmd_exists(c)) return c;
+  return "";
+}
+
+// ─── Log parsing ─────────────────────────────────────────────────────────────
+
+struct LogEntry {
+  uint64_t start, end;
+  uint64_t iters;
+};
+
+static std::vector<LogEntry> parse_log(const std::string& path) {
+  std::vector<LogEntry> rows;
+  std::ifstream f(path);
+  if (!f) return rows;
+  static const std::regex re(R"(\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*,\s*(\d+))");
+  std::string line;
+  while (std::getline(f, line)) {
+    std::smatch m;
+    if (!std::regex_search(line, m, re)) continue;
+    rows.push_back({
+      std::stoull(m[1], nullptr, 16),
+      std::stoull(m[2], nullptr, 16),
+      std::stoull(m[3])
+    });
+  }
+  return rows;
+}
+
+// ─── Disassembly parsing ─────────────────────────────────────────────────────
+
+struct InsnInfo {
+  std::string mnemonic;
+  std::string operands;
+};
+
+static std::map<uint64_t, InsnInfo> parse_disasm(const std::string& raw) {
+  std::map<uint64_t, InsnInfo> m;
+  std::istringstream ss(raw);
+  // Matches: optional leading whitespace, hex digits, colon, whitespace,
+  // then mnemonic.  Works for both GNU and LLVM objdump.
+  static const std::regex re(R"(^\s*([0-9a-fA-F]+):\s+(\S+)(?:\s+(.*))?$)");
+  std::string line;
+  while (std::getline(ss, line)) {
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+      line.pop_back();
+    std::smatch sm;
+    if (!std::regex_match(line, sm, re)) continue;
+    uint64_t pc;
+    try { pc = std::stoull(sm[1], nullptr, 16); } catch (...) { continue; }
+    std::string mn = sm[2];
+    std::string ops = sm.size() > 3 ? sm[3].str() : "";
+    // Trim trailing whitespace from ops.
+    while (!ops.empty() && (ops.back() == ' ' || ops.back() == '\t')) ops.pop_back();
+    m[pc] = {std::move(mn), std::move(ops)};
+  }
+  return m;
+}
+
+static bool is_rvv(const std::string& mn) {
+  if (mn.size() < 2) return false;
+  char lo = static_cast<char>(tolower(static_cast<unsigned char>(mn[0])));
+  return lo == 'v' && std::isalpha(static_cast<unsigned char>(mn[1]));
+}
+
+struct RvvInsn { uint64_t pc; std::string mn, ops; };
+struct CallInsn { uint64_t pc; std::string mn, target; };
+
+static const std::set<std::string> CALL_MN = {"jal","jalr","c.jal","c.jalr"};
+
+static std::vector<RvvInsn> rvv_in_range(
+    const std::map<uint64_t, InsnInfo>& disasm,
+    uint64_t s, uint64_t e)
+{
+  std::vector<RvvInsn> out;
+  auto it = disasm.lower_bound(s);
+  while (it != disasm.end() && it->first <= e) {
+    if (is_rvv(it->second.mnemonic))
+      out.push_back({it->first, it->second.mnemonic, it->second.operands});
+    ++it;
+  }
+  return out;
+}
+
+static std::vector<CallInsn> calls_in_range(
+    const std::map<uint64_t, InsnInfo>& disasm,
+    uint64_t s, uint64_t e)
+{
+  std::vector<CallInsn> out;
+  static const std::regex callee_re("<([^>]+)>");
+  auto it = disasm.lower_bound(s);
+  while (it != disasm.end() && it->first <= e) {
+    std::string lo = it->second.mnemonic;
+    std::transform(lo.begin(), lo.end(), lo.begin(),
+                   [](unsigned char c){ return tolower(c); });
+    if (CALL_MN.count(lo)) {
+      std::smatch m;
+      std::string target = "(indirect)";
+      if (std::regex_search(it->second.operands, m, callee_re))
+        target = m[1];
+      out.push_back({it->first, it->second.mnemonic, target});
+    }
+    ++it;
+  }
+  return out;
+}
+
+// ─── Source line resolution ──────────────────────────────────────────────────
+
+static std::map<uint64_t, std::string> resolve_sources(
+    const std::string& addr2line_bin,
+    const std::string& elf_path,
+    const std::vector<uint64_t>& pcs)
+{
+  std::map<uint64_t, std::string> result;
+  if (addr2line_bin.empty() || pcs.empty()) return result;
+
+  // Build input: one hex address per line.
+  std::string input;
+  for (uint64_t pc : pcs) {
+    char buf[20]; snprintf(buf, sizeof(buf), "0x%llx\n", (unsigned long long)pc);
+    input += buf;
+  }
+
+  std::string out = capture_with_stdin({addr2line_bin, "-e", elf_path}, input);
+
+  // One output line per input address.
+  std::istringstream ss(out);
+  std::string line;
+  size_t idx = 0;
+  while (std::getline(ss, line) && idx < pcs.size()) {
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+      line.pop_back();
+    if (!line.empty() && line.find("??") == std::string::npos)
+      result[pcs[idx]] = line;
+    ++idx;
+  }
+  return result;
+}
+
+static std::string src_basename(const std::string& s) {
+  if (s.empty()) return "";
+  // "path:line[ (extra)]" -> "basename(path):line[ ...]"
+  auto sp = s.find(' ');
+  std::string head = (sp != std::string::npos) ? s.substr(0, sp) : s;
+  std::string tail = (sp != std::string::npos) ? s.substr(sp) : "";
+  auto slash = head.rfind('/');
+  return ((slash != std::string::npos) ? head.substr(slash + 1) : head) + tail;
+}
+
+static std::pair<std::string,int> parse_file_line(const std::string& s) {
+  if (s.empty() || s.rfind("??", 0) == 0) return {"", 0};
+  static const std::regex re(R"(^(.+?):(\d+)(?::\d+)?(?:\s|$))");
+  std::smatch m;
+  if (!std::regex_search(s, m, re)) return {"", 0};
+  return {m[1], std::stoi(m[2])};
+}
+
+static std::string read_source_line(const std::string& path, int lineno) {
+  if (path.empty() || lineno <= 0 || !fs::is_regular_file(path)) return "";
+  std::ifstream f(path);
+  std::string line;
+  for (int i = 1; std::getline(f, line); ++i) {
+    if (i == lineno) {
+      while (!line.empty() && (line.back() == '\r' || line.back() == '\n' ||
+                                line.back() == ' '  || line.back() == '\t'))
+        line.pop_back();
+      auto s = line.find_first_not_of(" \t");
+      return (s != std::string::npos) ? line.substr(s) : line;
+    }
+  }
+  return "";
+}
+
+// ─── Loop structures + nesting ───────────────────────────────────────────────
+
+struct Loop {
+  std::string id;
+  uint64_t start, end, iters;
+  Loop* parent = nullptr;
+  std::vector<Loop*> children;
+};
+
+static std::vector<Loop> build_loops(
+    const std::vector<LogEntry>& rows, int limit)
+{
+  std::vector<Loop> loops;
+  int n = std::min(static_cast<int>(rows.size()), limit);
+  loops.reserve(static_cast<size_t>(n));
+  for (int i = 0; i < n; ++i)
+    loops.push_back({"L" + std::to_string(i + 1),
+                     rows[static_cast<size_t>(i)].start,
+                     rows[static_cast<size_t>(i)].end,
+                     rows[static_cast<size_t>(i)].iters,
+                     nullptr, {}});
+
+  // Compute parent: smallest enclosing range.
+  for (auto& loop : loops) {
+    Loop* best = nullptr;
+    uint64_t best_sz = UINT64_MAX;
+    for (auto& cand : loops) {
+      if (&cand == &loop) continue;
+      if (cand.start == loop.start && cand.end == loop.end) continue; // identical
+      if (cand.start <= loop.start && loop.end <= cand.end) {
+        uint64_t sz = cand.end - cand.start;
+        if (sz < best_sz) { best = &cand; best_sz = sz; }
+      }
+    }
+    loop.parent = best;
+  }
+  for (auto& loop : loops)
+    if (loop.parent) loop.parent->children.push_back(&loop);
+
+  return loops;
+}
+
+// ─── Output: table ───────────────────────────────────────────────────────────
+
+static std::string src_short(const std::map<uint64_t, std::string>& src_map, uint64_t pc) {
+  auto it = src_map.find(pc);
+  return it != src_map.end() ? src_basename(it->second) : "";
+}
+
+static void print_table(
+    const std::vector<LogEntry>& rows,
+    const std::string& elf_path,
+    const std::map<uint64_t, std::string>& src_map,
+    int min_iters, bool optimize_rvv)
+{
+  bool have_src = !src_map.empty();
+
+  auto srcpair = [&](uint64_t s, uint64_t e) -> std::string {
+    std::string a = src_short(src_map, s), b = src_short(src_map, e);
+    if (!a.empty() && a == b) return a;
+    return (a.empty() ? "?" : a) + " -> " + (b.empty() ? "?" : b);
+  };
+
+  printf("# hot loops (iters >= %d", min_iters);
+  if (optimize_rvv) printf(", RVV-only");
+  printf("), sorted desc, top %zu\n", rows.size());
+
+  size_t w_iter = 5;  // strlen("iters")
+  for (const auto& r : rows) {
+    char buf[24]; snprintf(buf, sizeof(buf), "%llu", (unsigned long long)r.iters);
+    w_iter = std::max(w_iter, strlen(buf));
+  }
+  const size_t w_pc = 18;
+  size_t w_sym = 8;  // strlen("location")
+  for (const auto& r : rows) {
+    std::string loc = sym_at(elf_path, r.start) + " -> " + sym_at(elf_path, r.end);
+    w_sym = std::max(w_sym, loc.size());
+  }
+
+  if (have_src) {
+    printf("%*s | %-*s -> %-*s | %-*s | source\n",
+           static_cast<int>(w_iter), "iters",
+           static_cast<int>(w_pc), "start_pc",
+           static_cast<int>(w_pc), "end_pc",
+           static_cast<int>(w_sym), "location");
+  } else {
+    printf("%*s | %-*s -> %-*s | location\n",
+           static_cast<int>(w_iter), "iters",
+           static_cast<int>(w_pc), "start_pc",
+           static_cast<int>(w_pc), "end_pc");
+  }
+  size_t sep = w_iter + 3 + w_pc + 4 + w_pc + 3 + w_sym;
+  if (have_src) sep += 3 + 12;
+  printf("%s\n", std::string(sep, '-').c_str());
+
+  for (const auto& r : rows) {
+    std::string loc = sym_at(elf_path, r.start) + " -> " + sym_at(elf_path, r.end);
+    if (have_src)
+      printf("%*llu | 0x%016llx -> 0x%016llx | %-*s | %s\n",
+             static_cast<int>(w_iter), (unsigned long long)r.iters,
+             (unsigned long long)r.start, (unsigned long long)r.end,
+             static_cast<int>(w_sym), loc.c_str(),
+             srcpair(r.start, r.end).c_str());
+    else
+      printf("%*llu | 0x%016llx -> 0x%016llx | %s\n",
+             static_cast<int>(w_iter), (unsigned long long)r.iters,
+             (unsigned long long)r.start, (unsigned long long)r.end,
+             loc.c_str());
+  }
+}
+
+// ─── Output: LLM Markdown ────────────────────────────────────────────────────
+
+static void print_llm(
+    const std::vector<Loop>& loops,
+    uint64_t total_iters_all,
+    const std::string& elf_path,
+    const std::map<uint64_t, std::string>& src_map,
+    const std::map<uint64_t, InsnInfo>& disasm,
+    int min_iters, bool optimize_rvv)
+{
+  auto pct = [&](uint64_t n) -> double {
+    return total_iters_all ? 100.0 * n / total_iters_all : 0.0;
+  };
+  auto src_full = [&](uint64_t pc) -> std::string {
+    auto it = src_map.find(pc); return it != src_map.end() ? it->second : "";
+  };
+
+  // Header + TL;DR
+  {
+    const auto& top = loops[0];
+    auto rvv = rvv_in_range(disasm, top.start, top.end);
+    std::string rvv_str;
+    if (!rvv.empty()) {
+      std::vector<std::string> uniq;
+      for (const auto& r : rvv)
+        if (std::find(uniq.begin(), uniq.end(), r.mn) == uniq.end())
+          uniq.push_back(r.mn);
+      rvv_str = "RVV (";
+      for (size_t i = 0; i < std::min(uniq.size(), size_t{3}); ++i) {
+        if (i) rvv_str += ", ";
+        rvv_str += uniq[i];
+      }
+      if (uniq.size() > 3) { rvv_str += ", +" + std::to_string(uniq.size()-3) + " more"; }
+      rvv_str += ")";
+    } else {
+      rvv_str = "scalar";
+    }
+    std::string fn = sym_func_at(elf_path, top.start);
+    std::string src_s = src_short(src_map, top.start); if (src_s.empty()) src_s = "?";
+    std::string nest_str = top.parent
+                         ? "nested inside " + top.parent->id
+                         : "top-level (no parent loop)";
+    std::string child_str;
+    if (!top.children.empty()) {
+      child_str = "and contains " + std::to_string(top.children.size()) + " inner loop(s): ";
+      for (size_t i = 0; i < top.children.size(); ++i) {
+        if (i) child_str += ", ";
+        child_str += top.children[i]->id;
+      }
+    } else {
+      child_str = "and contains no inner loop";
+    }
+    printf("# Hotloops Report\n");
+    printf("target:           %s\n", fs::path(elf_path).filename().c_str());
+    printf("total_iters:      %llu\n", (unsigned long long)total_iters_all);
+    printf("reported_loops:   %zu\n", loops.size());
+    printf("min_iters:        %d\n", min_iters);
+    printf("rvv_filter:       %s\n", optimize_rvv ? "on" : "off");
+    printf("\n## TL;DR\n");
+    printf("Hottest loop is %s in `%s` (%s), %llu iters = %.1f%% of total. "
+           "Body is %s. It is %s, %s.\n",
+           top.id.c_str(), fn.c_str(), src_s.c_str(),
+           (unsigned long long)top.iters, pct(top.iters),
+           rvv_str.c_str(), nest_str.c_str(), child_str.c_str());
+    printf("\n## Loops\n");
+  }
+
+  for (size_t idx = 0; idx < loops.size(); ++idx) {
+    const auto& loop = loops[idx];
+    printf("\n### %s%s  (%.1f%% of total)\n",
+           loop.id.c_str(), idx == 0 ? " [hottest]" : "", pct(loop.iters));
+    printf("iters:        %llu\n", (unsigned long long)loop.iters);
+    printf("function:     %s -> %s\n",
+           sym_at(elf_path, loop.start).c_str(),
+           sym_at(elf_path, loop.end).c_str());
+
+    // measure: whole enclosing function (entry -> ret).
+    auto [fn_entry, fn_end] = andes_sim::fn_range(elf_path, loop.start);
+    if (fn_entry != 0 && fn_end != 0) {
+      uint64_t ret_pc = fn_end - 4;  // safe default (standard ret is 4 bytes)
+      auto it = disasm.lower_bound(fn_end);
+      if (it != disasm.begin()) { --it; if (it->first >= fn_entry) ret_pc = it->first; }
+      printf("measure:      --pc-start 0x%llx --pc-end 0x%llx"
+             "  (all of %s: entry -> ret)\n",
+             (unsigned long long)fn_entry, (unsigned long long)ret_pc,
+             sym_func_at(elf_path, loop.start).c_str());
+    }
+
+    std::string sf = src_full(loop.start), se = src_full(loop.end);
+    if (!sf.empty() && !se.empty() && sf == se)
+      printf("source:       %s\n", src_basename(sf).c_str());
+    else
+      printf("source:       %s -> %s\n",
+             (sf.empty() ? "?" : src_basename(sf)).c_str(),
+             (se.empty() ? "?" : src_basename(se)).c_str());
+
+    {
+      auto [path, lineno] = parse_file_line(sf);
+      std::string snippet = read_source_line(path, lineno);
+      if (!snippet.empty()) {
+        if (snippet.size() > 200) snippet = snippet.substr(0, 197) + "...";
+        printf("code:         %s\n", snippet.c_str());
+      }
+    }
+
+    auto rvv = rvv_in_range(disasm, loop.start, loop.end);
+    if (!rvv.empty()) {
+      printf("rvv:          yes (%zu insn%s)\n", rvv.size(), rvv.size() == 1 ? "" : "s");
+      printf("rvv_insns:\n");
+      for (size_t i = 0; i < std::min(rvv.size(), size_t{8}); ++i)
+        printf("  - 0x%llx  %-10s %s\n",
+               (unsigned long long)rvv[i].pc, rvv[i].mn.c_str(), rvv[i].ops.c_str());
+      if (rvv.size() > 8) printf("  - ... (%zu more)\n", rvv.size() - 8);
+    } else {
+      printf("rvv:          no\n");
+    }
+
+    printf("parent:       %s\n", loop.parent ? loop.parent->id.c_str() : "-");
+    if (!loop.children.empty()) {
+      printf("children:     [");
+      for (size_t i = 0; i < loop.children.size(); ++i) {
+        if (i) printf(", ");
+        printf("%s", loop.children[i]->id.c_str());
+      }
+      printf("]\n");
+    } else {
+      printf("children:     []\n");
+    }
+
+    auto callees = calls_in_range(disasm, loop.start, loop.end);
+    if (!callees.empty()) {
+      printf("calls:\n");
+      for (size_t i = 0; i < std::min(callees.size(), size_t{8}); ++i)
+        printf("  - 0x%llx  %s -> %s\n",
+               (unsigned long long)callees[i].pc,
+               callees[i].mn.c_str(), callees[i].target.c_str());
+      if (callees.size() > 8) printf("  - ... (%zu more)\n", callees.size() - 8);
+    } else {
+      printf("calls:        []\n");
+    }
+  }
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
+int main(int argc, char** argv) {
+  Config cfg = parse_args(argc, argv);
+
+  // Arch detection.
+  if (cfg.arch == "auto") {
+    cfg.arch = detect_arch(cfg.elf);
+    if (cfg.arch.empty()) {
+      fprintf(stderr, "error: cannot auto-detect arch (not RISC-V?), pass --arch\n");
+      return 2;
+    }
+  }
+
+  // Locate QEMU binary. QEMU is integrated as an external prebuilt binary:
+  // QEMU_BIN_DIR (config.env, exported by setup.sh) holds qemu-system-{arch}.
+  if (cfg.qemu.empty()) {
+    if (const char* dir = std::getenv("QEMU_BIN_DIR"); dir && *dir) {
+      cfg.qemu = std::string(dir) + "/qemu-system-" + cfg.arch;
+    } else {
+      try {
+        cfg.qemu = (andes_sim::repo_root() / "build" / "qemu" /
+                    ("qemu-system-" + cfg.arch)).string();
+      } catch (...) {
+        cfg.qemu = "qemu-system-" + cfg.arch;
+      }
+    }
+  }
+  if (!fs::is_regular_file(cfg.qemu) || access(cfg.qemu.c_str(), X_OK) != 0) {
+    fprintf(stderr, "error: qemu not found/executable: %s\n", cfg.qemu.c_str());
+    return 2;
+  }
+
+  // Locate hotloops plugin.
+  if (cfg.plugin.empty()) {
+    try {
+      cfg.plugin = (andes_sim::repo_root() / "build" / "qemu" /
+                    "contrib" / "plugins" / "libhotloops.so").string();
+    } catch (...) {}
+  }
+  if (!fs::is_regular_file(cfg.plugin)) {
+    fprintf(stderr, "error: plugin not built: %s\n", cfg.plugin.c_str());
+    return 2;
+  }
+
+  // Temp log file.
+  TempFile log_file;
+
+  // Build QEMU command.
+  std::string plugin_arg = cfg.plugin +
+                           ",limit=" + std::to_string(cfg.limit) +
+                           ",min_iters=" + std::to_string(cfg.min_iters);
+  std::vector<std::string> qemu_cmd = {
+    cfg.qemu,
+    "-plugin", plugin_arg,
+    "-d", "plugin", "-D", log_file.path,
+    "-M", cfg.machine,
+    "-cpu", cfg.cpu,
+    "-nographic", "-semihosting",
+    "-bios", cfg.elf
+  };
+  if (!cfg.qemu_config.empty()) { qemu_cmd.push_back("-readconfig"); qemu_cmd.push_back(cfg.qemu_config); }
+  for (const auto& a : cfg.extra_qemu_args) qemu_cmd.push_back(a);
+
+  run_silent(qemu_cmd, cfg.qemu_cwd);
+
+  // --raw: dump log and exit.
+  if (cfg.raw) {
+    std::ifstream f(log_file.path);
+    std::cout << f.rdbuf();
+    return 0;
+  }
+
+  // Parse log.
+  auto rows = parse_log(log_file.path);
+  if (rows.empty()) {
+    fprintf(stderr, "hotloops: no backward edges observed\n");
+    return 0;
+  }
+  uint64_t total_iters_all = 0;
+  for (const auto& r : rows) total_iters_all += r.iters;
+
+  // Locate objdump. Prefer the cross objdump from $HYBRID_TOOLCHAIN so that
+  // RISC-V vendor extensions (RVV, Andes custom) are decoded correctly.
+  // Generic llvm-objdump on old distros (e.g. LLVM 14) may not support RVV.
+  if (cfg.objdump.empty()) {
+    // Resolve HYBRID_TOOLCHAIN: env var first, then config.env in repo root.
+    std::string hybrid_tc;
+    if (const char* tc = std::getenv("HYBRID_TOOLCHAIN"); tc && *tc) {
+      hybrid_tc = tc;
+    } else {
+      try {
+        std::ifstream cenv(andes_sim::repo_root() / "config.env");
+        std::string line;
+        while (std::getline(cenv, line)) {
+          auto eq = line.find('=');
+          if (eq == std::string::npos) continue;
+          if (line.substr(0, eq) == "HYBRID_TOOLCHAIN")
+            hybrid_tc = line.substr(eq + 1);
+        }
+      } catch (...) {}
+    }
+    std::vector<std::string> cands;
+    if (!hybrid_tc.empty()) {
+      std::string tcbin = hybrid_tc + "/bin/";
+      cands.push_back(tcbin + "riscv64-unknown-elf-objdump");
+      cands.push_back(tcbin + "riscv32-unknown-elf-objdump");
+    }
+    cands.insert(cands.end(), {"riscv64-unknown-elf-objdump",
+                               "riscv32-unknown-elf-objdump",
+                               "llvm-objdump", "objdump"});
+    cfg.objdump = find_first(cands);
+  }
+
+  // Build disassembly map (needed for RVV filter and --llm).
+  std::map<uint64_t, InsnInfo> disasm;
+  if (!cfg.objdump.empty() && (cfg.optimize_rvv || cfg.llm)) {
+    std::string raw = andes_sim::run_process(
+      {cfg.objdump, "-d", "--no-show-raw-insn", cfg.elf}, 60000).out;
+    disasm = parse_disasm(raw);
+  }
+
+  // Filter rows.
+  rows.erase(std::remove_if(rows.begin(), rows.end(),
+    [&](const LogEntry& r){ return static_cast<int>(r.iters) < cfg.min_iters; }),
+    rows.end());
+  if (cfg.optimize_rvv) {
+    rows.erase(std::remove_if(rows.begin(), rows.end(),
+      [&](const LogEntry& r){ return rvv_in_range(disasm, r.start, r.end).empty(); }),
+      rows.end());
+  }
+  std::sort(rows.begin(), rows.end(),
+            [](const LogEntry& a, const LogEntry& b){ return a.iters > b.iters; });
+  if (static_cast<int>(rows.size()) > cfg.limit)
+    rows.resize(static_cast<size_t>(cfg.limit));
+
+  if (rows.empty()) {
+    fprintf(stderr, "hotloops: no loops with iters >= %d%s\n",
+            cfg.min_iters, cfg.optimize_rvv ? " containing RVV instructions" : "");
+    return 0;
+  }
+
+  // Source line resolution.
+  std::map<uint64_t, std::string> src_map;
+  if (!cfg.no_source) {
+    if (cfg.addr2line_bin.empty())
+      cfg.addr2line_bin = find_first({"llvm-addr2line", "addr2line",
+                                      "riscv64-unknown-elf-addr2line",
+                                      "riscv32-unknown-elf-addr2line",
+                                      "riscv64-linux-gnu-addr2line"});
+    if (!cfg.addr2line_bin.empty()) {
+      // Collect unique PCs from all rows.
+      std::vector<uint64_t> pcs;
+      for (const auto& r : rows) {
+        pcs.push_back(r.start);
+        pcs.push_back(r.end);
+      }
+      std::sort(pcs.begin(), pcs.end());
+      pcs.erase(std::unique(pcs.begin(), pcs.end()), pcs.end());
+      src_map = resolve_sources(cfg.addr2line_bin, cfg.elf, pcs);
+    }
+  }
+
+  // Output.
+  if (cfg.llm) {
+    auto loops = build_loops(rows, cfg.limit);
+    print_llm(loops, total_iters_all, cfg.elf, src_map, disasm,
+              cfg.min_iters, cfg.optimize_rvv);
+  } else {
+    print_table(rows, cfg.elf, src_map, cfg.min_iters, cfg.optimize_rvv);
+  }
+  return 0;
+}
