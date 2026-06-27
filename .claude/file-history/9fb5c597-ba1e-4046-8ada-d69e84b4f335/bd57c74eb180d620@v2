@@ -1,0 +1,169 @@
+// Wire contract between the QEMU TCG plugin and vsim. Both sides write/read
+// `struct hybrid_state_v1` byte-for-byte through a shared file.
+//
+// Stability: never repurpose offsets within a published version. Add new
+// fields by consuming bytes from `reserved`, or by introducing v2 alongside.
+//
+// Endianness: multi-byte fields are little-endian (native on RV64 + x86-64
+// host). The format is not endian-portable; cross-endian use would need an
+// explicit byte-swap path.
+//
+// C and C++ both compile this header.
+
+#ifndef HYBRID_STATE_ABI_H
+#define HYBRID_STATE_ABI_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define HYBRID_STATE_MAGIC   0x42594841u  // 'AHYB' little-endian
+// Version 3 (Andes F0): append struct hybrid_andes_csr after mmisc_ctl, which
+// grows the struct. Version 2 (L11) widened vreg[] to 128 bytes/register.
+// Readers reject older files loudly (all three consumers check magic + version
+// + size) instead of mis-parsing them.
+#define HYBRID_STATE_VERSION 3u
+
+#define HYBRID_FLAG_RV64  (1u << 0)
+#define HYBRID_FLAG_FP    (1u << 1)
+#define HYBRID_FLAG_V     (1u << 2)
+// v3: the struct hybrid_andes_csr block carries live values (the producer ran
+// on an Andes core that implements at least one of those CSRs). Clear means the
+// block is all-zero and consumers skip restore/re-read/compare of it.
+#define HYBRID_FLAG_ANDES (1u << 3)
+
+// VLEN upper bound, in bytes: 128 covers the supported engine range
+// VLEN 128..1024 (L11; also QEMU's RV_VLEN_MAX). This is the wire-format
+// span per vector register; the LIVE width is the runtime `vlenb` field
+// below, so one struct layout serves every engine config and the legs
+// never disagree on offsets. A producer whose vlenb exceeds this ceiling
+// must refuse to drain (see hybrid_v_drain_policy) rather than truncate.
+#define HYBRID_VLEN_BYTES_MAX 128
+
+// L26: bytes reserved for the V-register transport scratch page -- 32 vector
+// registers at the wire-format span. The driver maps this many bytes ABOVE
+// the program's --mem-size (so the scratch sits past the program's RAM), and
+// vsim's v_scratch_gpa() / kVScratchBytes use the same count. Shared here so
+// the producer (driver mmap sizing) and consumer (vsim sweep) never disagree.
+#define HYBRID_V_SCRATCH_BYTES (32 * HYBRID_VLEN_BYTES_MAX)
+
+// 64 PMP entries; pmpcfg slots reserved at 16 so the layout works for both
+// RV64 (8 entries/CSR) and a future RV32 (4 entries/CSR) packing.
+#define HYBRID_PMP_CFG_NUM  16
+#define HYBRID_PMP_ADDR_NUM 64
+
+// v3 Andes CSR block. PMA is 16 entries: pmacfg packs them at one byte each, so
+// on RV64 only the even-numbered cfg CSRs exist -- 16 entries live in pmacfg0
+// (0xBC0) + pmacfg2 (0xBC2), hence 2 cfg slots; 16 pmaaddr (0xBD0..0xBDF).
+#define HYBRID_PMA_CFG_NUM  2
+#define HYBRID_PMA_ADDR_NUM 16
+#define HYBRID_PMA_CFG0_CSR   0xBC0
+#define HYBRID_PMA_ADDR0_CSR  0xBD0
+
+// Single source of truth for the SCALAR Andes CSRs transported in v3: X(field,
+// csr_addr, gdb_name). Every consumer (QEMU plugin drain, ResumeDriver restore,
+// StateDrain re-read, driver state_diff verify) iterates this list, so adding a
+// CSR is one line here -- no consumer edits drift out of sync. PMA (arrays) is
+// transported separately, mirroring the existing PMP loops. Each field is a
+// 64-bit CSR value; 0 means the producing engine did not implement it (a
+// tolerant no-op on restore). Order fixes the struct layout -- append only.
+#define HYBRID_ANDES_CSR_LIST(X)            \
+  X(mxstatus,       0x7C4, "mxstatus")      \
+  X(mpft_ctl,       0x7C5, "mpft_ctl")      \
+  X(mclk_ctl,       0x7DF, "mclk_ctl")      \
+  X(milmb,          0x7C0, "milmb")         \
+  X(mdlmb,          0x7C1, "mdlmb")         \
+  X(mecc_code,      0x7C2, "mecc_code")     \
+  X(mhsp_ctl,       0x7C6, "mhsp_ctl")      \
+  X(msp_bound,      0x7C7, "msp_bound")     \
+  X(msp_base,       0x7C8, "msp_base")      \
+  X(mcountermask_m, 0x7D1, "mcountermask_m")\
+  X(uitb,           0x800, "uitb")          \
+  X(jvt,            0x017, "jvt")           \
+  X(ucode,          0x801, "ucode")
+
+// The Andes V5 machine/user CSRs a bare-metal Andes core sets up before the ROI
+// (boot-static memory system + extension config) plus the DSP overflow flag.
+// Restored at resume, re-read at drain, and verified -- live only when
+// HYBRID_FLAG_ANDES is set. 13 scalar fields (above) + PMA = 31 * uint64_t.
+struct hybrid_andes_csr {
+#define HYBRID_ANDES_FIELD(field, addr, name) uint64_t field;
+  HYBRID_ANDES_CSR_LIST(HYBRID_ANDES_FIELD)
+#undef HYBRID_ANDES_FIELD
+  uint64_t pmacfg[HYBRID_PMA_CFG_NUM];
+  uint64_t pmaaddr[HYBRID_PMA_ADDR_NUM];
+};
+
+// All fields are naturally 8-byte aligned, so __attribute__((packed)) is
+// unnecessary and would force unaligned access codegen. Layout is locked by
+// the static_asserts in state_abi_check.h.
+struct hybrid_state_v1 {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t flags;
+  uint32_t hart_id;
+  uint64_t pc;
+  uint64_t priv;  // 0=U, 1=S, 3=M
+
+  uint64_t gpr[32];
+  uint64_t fpr[32];
+
+  uint64_t mstatus;
+  uint64_t mepc;
+  uint64_t mtvec;
+  uint64_t mcause;
+  uint64_t mtval;
+  uint64_t mscratch;
+  uint64_t medeleg;
+  uint64_t mideleg;
+  uint64_t mip;
+  uint64_t mie;
+  uint64_t mcycle;
+  uint64_t minstret;
+  uint64_t satp;
+
+  uint64_t pmpcfg[HYBRID_PMP_CFG_NUM];
+  uint64_t pmpaddr[HYBRID_PMP_ADDR_NUM];
+
+  uint64_t vstart;
+  uint64_t vtype;
+  uint64_t vl;
+  uint64_t vlenb;
+  uint8_t  vreg[32 * HYBRID_VLEN_BYTES_MAX];
+  uint64_t vxsat;
+  uint64_t vxrm;
+  uint64_t vcsr;
+
+  // L20: FP control/status -- frm[7:5] | fflags[4:0], live when
+  // HYBRID_FLAG_FP is set. Drained by the plugin, restored by ResumeDriver,
+  // re-read by StateDrain. Pre-L20 state files carry 0 here (reserved bytes
+  // are written as zero), which reads back as the reset value (RNE, no
+  // flags) -- exactly the old behavior, so no version bump.
+  uint64_t fcsr;
+
+  // Andes machine-setup CSRs: mcache_ctl (0x7CA) enables the L1 I/D caches,
+  // mmisc_ctl (0x7D0) holds misc machine config. crt0 writes them once at
+  // boot; transporting them keeps the cycle engine from resuming caches-off
+  // (ResumeDriver has the full rationale). Drained by the plugin, restored by
+  // ResumeDriver, but NOT re-read by StateDrain: they are boot-static and the
+  // drained value is unused (no QEMU2 leg). Old state files carry 0 here
+  // (reset value), which is the pre-existing behavior, so no version bump.
+  uint64_t mcache_ctl;
+  uint64_t mmisc_ctl;
+
+  // v3: Andes V5 CSR block (live when HYBRID_FLAG_ANDES). 31 * 8 = 248 bytes.
+  struct hybrid_andes_csr andes;
+
+  uint8_t  reserved[64];  // zero-initialise on write; v3-compatible growth room
+};
+
+#ifdef __cplusplus
+}  // extern "C"
+#endif
+
+#include "hybrid/state_abi_check.h"
+
+#endif  // HYBRID_STATE_ABI_H
