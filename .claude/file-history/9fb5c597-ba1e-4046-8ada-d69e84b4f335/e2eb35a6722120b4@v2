@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Runtime-lib F2 contract: `make -C runtime` produces a linkable library
+# under build/runtime/ so users stop listing the 4 runtime sources:
+#
+#   build/runtime/libandesim_runtime.a   (trap.o handler.o vplat_syscalls.o)
+#   build/runtime/crt0.o                   (startfile; OUTSIDE the archive)
+#   build/runtime/andesim.ld             (linker script)
+#
+# Probe: link vplat_hello.c with the raw library line (no specs file yet)
+# and run it on the cycle engine -- prints via UART, exits 0 via SimControl.
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+
+# shellcheck disable=SC1091
+. "$ROOT/config.env" 2>/dev/null
+export HYBRID_TOOLCHAIN="${HYBRID_TOOLCHAIN:?config.env missing}"
+GCC="$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-gcc"
+NM="$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-nm"
+
+SIM="${VSIM_BIN_DIR:-$ROOT/verilator/build}/sim_ax45mpv_premium"
+[ -x "$SIM" ] || fail "cycle engine not built: $SIM"
+
+make -C "$ROOT/runtime" || fail "runtime lib build failed"
+
+RT="$ROOT/build/runtime"
+[ -f "$RT/libandesim_runtime.a" ] || fail "missing $RT/libandesim_runtime.a"
+[ -f "$RT/crt0.o" ] || fail "missing $RT/crt0.o"
+[ -f "$RT/andesim.ld" ] || fail "missing $RT/andesim.ld"
+
+# crt0 must be a standalone startfile: the archive never gets _start pulled.
+# (grep without -q: early-exit + pipefail turns a MATCH into SIGPIPE failure)
+"$NM" "$RT/crt0.o" | grep ' T _start' >/dev/null \
+  || fail "crt0.o does not define _start"
+"$NM" "$RT/libandesim_runtime.a" | grep ' T _write' >/dev/null \
+  || fail "archive does not define _write"
+"$NM" "$RT/libandesim_runtime.a" | grep ' T m_trap_entry' >/dev/null \
+  || fail "archive does not define m_trap_entry"
+
+# Raw (non-specs) link: what a non-gcc-driver build system would write.
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+"$GCC" -march=rv64gc -mabi=lp64d -O1 -static -nostartfiles -nodefaultlibs \
+  -T "$RT/andesim.ld" "$RT/crt0.o" "$ROOT/tests/fixtures/vplat_hello.c" \
+  -L "$RT" -Wl,--start-group -landesim_runtime -lc -lgcc -Wl,--end-group \
+  -o "$TMP/hello.elf" || fail "raw -landesim_runtime link failed"
+
+OUT=$(timeout 120 "$SIM" "$TMP/hello.elf" </dev/null 2>&1); RC=$?
+printf '%s\n' "$OUT" | grep -q 'hello from vplat' \
+  || fail "cycle: missing 'hello from vplat' in: $OUT"
+[ "$RC" -eq 0 ] || fail "cycle: exit code $RC != 0 (output: $OUT)"
+
+ok "F2 libandesim_runtime.a links and runs on the cycle engine"

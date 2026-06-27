@@ -1,0 +1,123 @@
+# ROADMAP: externalize verilator (drop the submodule, mirror the QEMU pattern)
+
+Follows the same move already done for QEMU (commits "drop the QEMU submodule,
+integrate a prebuilt external QEMU" + "set QEMU_BIN_DIR"). andesim stops nesting
+verilator as a submodule; it consumes a prebuilt vsim from an external location
+(e.g. `/home/nick/work/vsim_andesim/build`) via `VSIM_BIN_DIR`, exactly like
+`QEMU_BIN_DIR` points at the external qemu.
+
+## Why / end state
+
+```
+BEFORE:  andesim/verilator  (submodule, andesim builds + records it)
+AFTER:   andesim            (no verilator submodule)
+         vsim_andesim/      (external sibling repo = hybrid_vsim; built there)
+         config.env: VSIM_BIN_DIR=/home/nick/work/vsim_andesim/build   <- new, mirrors QEMU_BIN_DIR
+```
+
+## Relationship to the abi-split work (already done)
+
+- KEEP: F1 (andesim_abi repo) + F2 (andesim include/ submodule). qemu_plugin and
+  the driver still consume the ABI from include/.
+- KEEP in hybrid_vsim: F3 (external/andesim_abi submodule + CMake swap). vsim_andesim
+  needs it to build standalone. Must reach hybrid_vsim origin (see EX5).
+- REVERT: F4's andesim verilator-pointer bump (commit 815259d). With no submodule,
+  andesim records no verilator commit. EX3 removes the gitlink entirely.
+
+## Safety gate (before EX3, the destructive step)
+
+`619db38` (the F3 ABI-split commit) is only in local checkouts (andesim/verilator
+branch andesim; vsim_andesim branch abi-split-verify), NOT on origin. Before
+deleting andesim/verilator, push the F3 work to hybrid_vsim origin's `andesim`
+branch so vsim_andesim (and any clone) is reproducible. After that, deleting the
+local andesim/verilator loses nothing.
+
+## env-var design (mirror QEMU exactly)
+
+| External thing | env (config.env) | setup.sh exports | driver reads |
+|----------------|------------------|------------------|--------------|
+| qemu           | `QEMU_BIN_DIR`   | `VSIM_QEMU`      | builtin_qemu path |
+| vsim (NEW)     | `VSIM_BIN_DIR`   | `VSIM_BIN_DIR` (+ `ANDESIM_ENGINES_DIR`) | engine scan dir |
+
+Driver already has `ANDESIM_ENGINES_DIR` (scan any executable). New: an explicit
+`VSIM_BIN_DIR` seam that keeps the `sim_` prefix, falling back to the old
+`<repo>/verilator/build` when unset (dev back-compat until the submodule is gone).
+
+## Features (one session each; TDD on the driver C++)
+
+### EX1 -- driver: discover engines from VSIM_BIN_DIR
+- STATE: DONE (commit ff89fd0). vsim_scan_dir() seam + discover_engines +
+  cmd_doctor wired; andesim-engine-registry-test green; `andesim doctor` +
+  discovery follow $VSIM_BIN_DIR (verified against /home/nick/work/vsim_andesim/build).
+- Type: behavioural
+- Desc: add a pure `vsim_scan_dir()` seam: `VSIM_BIN_DIR` if set, else
+  `repo_root()/verilator/build`. `discover_engines()` and `cmd_doctor` use it.
+  Drop cmd_doctor's `verilator/CMakeLists.txt` submodule-presence check.
+- Key files: `driver/engine_registry.cpp`, `driver/cmd_doctor.cpp`,
+  `driver/engine_registry_test.cpp` (new)
+- TDD RED: `vsim_scan_dir()` returns `$VSIM_BIN_DIR` when the env is set; today no
+  such function exists / discover_engines hardcodes verilator/build.
+- Verify: new doctest green; `andesim-plan-itest` still green.
+- Non-destructive (fallback preserved).
+
+### EX2 -- setup.sh + config.env.example: external VSIM_BIN_DIR
+- STATE: DONE (commit 4961631). setup.sh locates external vsim from $VSIM_BIN_DIR
+  (validates sim_*), exports it, no longer builds vsim; `clean vsim` neutered;
+  config.env.example documents VSIM_BIN_DIR. Verified via `source ./setup.sh`.
+- Desc: config.env.example gains `VSIM_BIN_DIR=` (mirrors QEMU_BIN_DIR). setup.sh
+  reads it from config.env instead of hardcoding `$ROOT/verilator/build`,
+  validates a `sim_*` exists (like the qemu-system check), exports `VSIM_BIN_DIR`
+  + `ANDESIM_ENGINES_DIR` for the driver and e2e scripts, and drops the vsim
+  BUILD steps.
+- Key files: `config.env.example`, `setup.sh`
+- Verify: `source ./setup.sh` with VSIM_BIN_DIR=vsim_andesim/build, then
+  `./andesim list engines` lists the external vsim engines.
+- Depends on: EX1
+
+### EX3 -- remove the verilator submodule (DESTRUCTIVE; gated)
+- STATE: DONE (commit 19410bc). Safety gate passed (619db38 pushed to hybrid_vsim
+  origin/andesim). Submodule removed (gitlink + .gitmodules + .git/modules +
+  build_vsim.sh); build_all.sh vsim target dropped; run_e2e.sh + all
+  tests/{vplat,andes_sim,hsim,lib} scripts resolve sim_* from $VSIM_BIN_DIR;
+  cmd_doctor + hsim.py submodule row -> include/(abi); Dockerfile.runtime no
+  longer builds vsim in-container. `git submodule status` shows only include.
+- Desc: revert the F4 pointer bump; `git rm verilator`; drop the `.gitmodules`
+  entry; `rm -rf .git/modules/verilator`; remove `scripts/build_vsim.sh`; update
+  `scripts/build_all.sh` (drop the vsim build leg); resolve `Dockerfile.runtime`
+  (it does `cd verilator && ./build.sh` -- repoint at the external vsim image or
+  drop that stage); fix `tests/vplat/test_vplat_f8.sh` to use VSIM_BIN_DIR.
+- Key files: `.gitmodules`, `verilator` (gitlink), `scripts/build_all.sh`,
+  `scripts/build_vsim.sh`, `Dockerfile.runtime`, `tests/vplat/test_vplat_f8.sh`,
+  `hsim.py` (retired golden -- decide: update or leave frozen)
+- Verify: andesim has no verilator/ submodule; `build_all.sh` + `./andesim run`
+  work against the external vsim.
+- Depends on: EX2 + the safety gate (F3 pushed to hybrid_vsim origin)
+
+### EX4 -- docs
+- STATE: DONE (markdown). CLAUDE.md, README.md, docs/USER_GUIDE.md,
+  docs/engine_interface.md updated: one submodule (abi); QEMU + vsim external via
+  QEMU_BIN_DIR/VSIM_BIN_DIR; build/setup/scan-dir reflect the external vsim.
+  REMAINING (minor follow-up): the .ipynb tutorials (andes_sim_tutorial,
+  andes_sim_limitations) still show in-tree verilator/build + verilator/src paths.
+- Desc: USER_GUIDE.md, CLAUDE.md, docs/engine_interface.md, README reflect the
+  external vsim (build at vsim_andesim, set VSIM_BIN_DIR) and the removed submodule.
+- Depends on: EX3
+
+### EX5 -- publish
+- STATE: DONE. Pushed: andesim_abi (main), hybrid_vsim origin/andesim (619db38),
+  andesim origin/andesim (7ff2f1a). Verified: fresh `git clone --recursive -b
+  andesim` of hybrid_sim has ONLY the include/(abi) submodule (no verilator),
+  abi headers resolve, and `scripts/build_driver.sh` builds `build/andesim` from
+  the clean clone.
+- Desc: push hybrid_vsim `andesim` branch (the F3 ABI-split, =619db38 content) to
+  origin; push andesim_abi (already done F1); push andesim externalization commits.
+  Verify a fresh `git clone --recursive andesim` + external vsim build works.
+- Depends on: EX4
+
+## Notes
+
+- Engine TYPE label "verilator" (driver/engine_descriptor, json, docs) is the
+  engine FAMILY name, normalized to "vsim" for users. It is NOT the submodule
+  path and stays unchanged.
+- The driver's `repo_root()/build/qemu/...` for builtin qemu is separate; this
+  task only touches the vsim scan dir.

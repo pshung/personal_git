@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Runtime-lib F3 contract: the whole link recipe collapses into two flags --
+#
+#   gcc -march=rv64gc -mabi=lp64d -O1 \
+#       -B <repo>/build/runtime -specs=andesim.specs hello.c -o hello.elf
+#
+# The specs file swaps the startfile to our crt0.o, appends -T andesim.ld
+# and rewrites the library sequence to
+# `--start-group -landesim_runtime -lc -lgcc --end-group` (no -lgloss,
+# no semihosting). The produced ELF must run on all three engines.
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+
+# shellcheck disable=SC1091
+. "$ROOT/config.env" 2>/dev/null
+export HYBRID_TOOLCHAIN="${HYBRID_TOOLCHAIN:?config.env missing}"
+GCC="$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-gcc"
+
+BIN="$ROOT/build/andesim"
+SIM="$ROOT/verilator/build/sim_ax45mpv_premium"
+RT="$ROOT/build/runtime"
+[ -x "$BIN" ] || fail "driver not built: $BIN"
+[ -x "$SIM" ] || fail "cycle engine not built: $SIM"
+[ -x "$ROOT/build/qemu/qemu-system-riscv64" ] || fail "qemu not built"
+[ -f "$ROOT/qemu_plugin/libhybrid_handoff.so" ] || fail "plugin not built"
+
+make -C "$ROOT/runtime" >/dev/null || fail "runtime lib build failed"
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+cat > "$TMP/hello.c" <<'EOF'
+#include <stdio.h>
+
+__attribute__((noinline)) void say_hello(void)
+{
+  printf("hello from specs\n");
+}
+
+int main(void)
+{
+  say_hello();
+  __asm__ __volatile__(".globl vplat_roi_end\nvplat_roi_end:" ::: "memory");
+  return 0;
+}
+EOF
+
+# The two-flag user command (plus a link map for the no-gloss assert).
+"$GCC" -march=rv64gc -mabi=lp64d -O1 \
+  -B "$RT" -specs=andesim.specs "$TMP/hello.c" -o "$TMP/hello.elf" \
+  -Wl,-Map,"$TMP/hello.map" || fail "two-flag specs link failed"
+
+grep 'libandesim_runtime\.a' "$TMP/hello.map" >/dev/null \
+  || fail "link map does not pull libandesim_runtime.a"
+if grep 'gloss' "$TMP/hello.map" >/dev/null; then
+  fail "link map pulls a libgloss (semihosting leaked into the link)"
+fi
+
+# cycle
+OUT=$(timeout 120 "$SIM" "$TMP/hello.elf" </dev/null 2>&1); RC=$?
+printf '%s\n' "$OUT" | grep -q 'hello from specs' \
+  || fail "cycle: missing 'hello from specs' in: $OUT"
+[ "$RC" -eq 0 ] || fail "cycle: exit code $RC != 0 (output: $OUT)"
+
+# fast
+OUT=$(timeout 60 "$BIN" run --mode fast "$TMP/hello.elf" </dev/null 2>&1); RC=$?
+printf '%s\n' "$OUT" | grep -q 'hello from specs' \
+  || fail "fast: missing 'hello from specs' in: $OUT"
+[ "$RC" -eq 0 ] || fail "fast: exit code $RC != 0 (output: $OUT)"
+
+# hybrid (pc trigger on the same symbols a user would publish)
+OUT=$(timeout 180 "$BIN" run --mode hybrid --trigger pc \
+        --engine vsim:ax45mpv_premium \
+        --pc-start say_hello --pc-end vplat_roi_end \
+        "$TMP/hello.elf" </dev/null 2>&1)
+RC=$?
+printf '%s\n' "$OUT" | grep -q 'hello from specs' \
+  || fail "hybrid: missing 'hello from specs' in: $OUT"
+printf '%s\n' "$OUT" | grep -Eq '^\[pc window_cycles\] [0-9]+' \
+  || fail "hybrid: missing window_cycles line: $OUT"
+[ "$RC" -eq 0 ] || fail "hybrid: exit code $RC != 0 (output: $OUT)"
+
+ok "F3 -specs=andesim.specs builds one ELF that runs on fast, cycle, hybrid"
