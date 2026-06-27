@@ -1,0 +1,173 @@
+# ROADMAP: Andes V5 CSR transport for bare-metal hybrid
+
+Goal: extend the QEMU1 -> vsim handoff to carry the Andes-specific architectural
+state a bare-metal Andes Core needs, so the vsim leg resumes with the same
+memory system / extension setup the functional leg booted into. Source of truth
+for CSR numbers + semantics: `AndeStar_V5_SPA_UM164_V1.7.pdf` (Table 6 Andes
+M-mode, Table 11 Andes U-mode, sec 9.8 PMA).
+
+Scope (confirmed): full envelope -- CoDense+Zcmt, DSP/P-ext, Local Memory +
+throttle + stack protection, PMA. ABI strategy (confirmed): bump to v3 with a
+dedicated Andes block.
+
+## Mental model: 4 transport classes
+
+- **Class 0 config/RO** (`0xFCx/0xFDx`, crash-save): NOT transported. Hardwired
+  per core; QEMU `-cpu` must equal vsim RTL. Optional one-time consistency assert.
+- **Class 1 boot-static setup**: crt0 writes once before ROI, ROI mostly reads.
+  drain + restore (like today's `mcache_ctl`). Most fields below.
+- **Class 2 live arch state**: changes inside the ROI -> full round-trip
+  (drain + restore + re-drain + `state_diff` verify), like `vxsat`. Only `ucode`.
+- **Class 3 trap/interrupt state** (`mdcause`, `msave*`, CLIC, NMI vectors): NOT
+  in scope; ROI is trap-free/interrupt-free. Deferred to the S/U-envelope work.
+
+## Per-feature precondition (every feature's first RED check)
+
+The plugin drains via QEMU gdbstub `find_reg(name)`; restore writes via vsim DMI.
+So each CSR is transportable only if (1) QEMU gdbstub exports the name AND
+(2) vsim DMI can write it. The unit test asserts both handles exist; if either is
+missing the engine/QEMU lacks that extension and the field stays zero (tolerant
+no-op via `write_csr_tolerant`). Zero in the wire format always means "producer
+did not have this CSR".
+
+## The 3 repos every feature (except F0) touches
+
+| Repo | Path | Role |
+|------|------|------|
+| `andesim_abi` (submodule) | `hybrid/state_abi.h`, `hybrid/state_abi_check.h` | wire struct + layout lock -- **F0 only** |
+| `andesim` | `qemu_plugin/hybrid_handoff.c` | drain (gdbstub read) |
+| `andesim` | `driver/state_diff.{hpp,cpp}` (+ `state_diff_test.cpp`) | `--verify` compare |
+| `andesim` | `tests/fixtures/*` | RED fixtures |
+| `hybrid_vsim` (external `/home/nick/work/vsim_andesim`) | `src/hybrid/resume_driver.hpp` | restore (DMI write; extend the `write_csr_tolerant` list / PMP-style loop) |
+| `hybrid_vsim` (external) | `src/hybrid/state_drain.hpp` | re-drain (DMI read at exit halt) |
+
+Dedup targets (Coding Principle: don't duplicate): restore reuses
+`write_csr_tolerant(addr,val)`; PMA reuses the existing `pmpaddr`/`pmpcfg` loop
+shape; drain reuses the `find_reg` + `read_reg64` pattern.
+
+---
+
+## F0 - v3 ABI + dedicated Andes block  [BLOCKS ALL OTHERS]
+
+Status: TODO. Deps: none.
+
+Define the whole Andes block ONCE so F1..F8 only populate existing fields (no
+later offset reshuffle -> features stay independent). Bump
+`HYBRID_STATE_VERSION` 2 -> 3; add `HYBRID_FLAG_ANDES (1u<<3)` to gate the block
+live; all three readers reject version<3 by magic+version+size.
+
+Proposed block (LE u64; zero = "producer lacked it"):
+
+```c
+struct hybrid_andes_csr {     // v3
+  uint64_t mxstatus;          // 0x7C4  Andes mstatus companion (DME/IME/PFT_EN)
+  uint64_t mpft_ctl;          // 0x7C5  perf throttling (T_LEVEL)
+  uint64_t mclk_ctl;          // 0x7DF  clock control
+  uint64_t milmb;             // 0x7C0  ILM base + enable
+  uint64_t mdlmb;             // 0x7C1  DLM base + enable
+  uint64_t mecc_code;         // 0x7C2  ECC code
+  uint64_t mhsp_ctl;          // 0x7C6  HW stack protection control
+  uint64_t msp_bound;         // 0x7C7
+  uint64_t msp_base;          // 0x7C8
+  uint64_t mcountermask_m;    // 0x7D1  counter mask (cycle hygiene)
+  uint64_t uitb;              // 0x800  CoDense instruction table base
+  uint64_t jvt;               // 0x017  Zcmt jump vector table
+  uint64_t ucode;             // 0x801  DSP/P-ext overflow flag (Class 2)
+  uint64_t pmacfg[2];         // 0xBC0, 0xBC2 (RV64: 16 entries / 2 regs)
+  uint64_t pmaaddr[16];       // 0xBD0..0xBDF
+};                            // 31 u64 = 248 bytes; recompute reserved[]
+```
+
+Key files: `hybrid/state_abi.h`, `hybrid/state_abi_check.h`; size/version gate in
+`qemu_plugin/hybrid_handoff.c`, vsim `state_loader.hpp`/`state_drain.hpp`, and
+`driver/state_diff.cpp`. Coordinated: edit `andesim_abi`, then bump the submodule
+pointer in BOTH `andesim/include` and `hybrid_vsim/external/andesim_abi`.
+
+RED: `state_abi.test.cpp` asserts `version==3`, `HYBRID_FLAG_ANDES`, and
+`offsetof`/`sizeof` of the new block + every named field (layout lock). All
+fields zero on legacy producers.
+
+---
+
+## F1 - CoDense + Zcmt table bases (`uitb` 0x800, `jvt` 0x017)
+
+Status: TODO. Deps: F0. Class 1. (crt0 already emits both conditionally -- the
+smallest real gap; good first feature.)
+
+RED fixture: ROI uses `exec.it` (needs `uitb`) and/or `cm.jt`/`cm.jalt` (needs
+`jvt`); without transport it faults or mis-executes in vsim. Plus round-trip:
+write sentinel pre-ROI, read back inside ROI, `--verify` drain==restore.
+
+GREEN: drain `uitb`/`jvt`; restore via `write_csr_tolerant`; re-drain; compare.
+
+---
+
+## F2 - `mxstatus` (0x7C4)
+
+Status: TODO. Deps: F0. Class 1. Andes companion to `mstatus` (DME/IME misalign
+exception enable, PFT_EN). Writable M-mode -> full round-trip + verify (model on
+`mscratch`). RED: fixture sets `mxstatus` sentinel pre-ROI, reads inside, verify.
+
+---
+
+## F3 - PMA: `pmacfg0/2` + `pmaaddr0..15` (0xBC0/2, 0xBD0..DF)
+
+Status: TODO. Deps: F0. Class 1. Biggest + highest correctness/cycle impact.
+Memory attributes (cacheable / device / NAPOT). Reuse the `pmpaddr`/`pmpcfg`
+loop shape in `resume_driver.hpp`. Gated on `mmsc_cfg.PPMA`.
+
+RED fixture: mark an MMIO region device-type + a RAM region cacheable via PMA
+pre-ROI; without transport vsim resumes PMA-reset -> wrong cache/device behavior.
+Assert via cycle delta (cacheable RAM) and/or a device-ordering check.
+
+---
+
+## F4 - DSP `ucode` (0x801)  [Class 2]
+
+Status: TODO. Deps: F0. The P-ext overflow (OV) flag is LIVE state, like `vxsat`:
+restore BEFORE the ROI, re-drain AFTER, `state_diff` compares it. Gated on P-ext.
+RED: DSP op sets OV; round-trip must preserve the bit.
+
+---
+
+## F5 - Local Memory `milmb` (0x7C0), `mdlmb` (0x7C1) [+ `mecc_code` 0x7C2]
+
+Status: TODO. Deps: F0. Class 1. Base+enable of ILM/DLM. Only live if the linker
+script places sections in LM (check `runtime/andesim.ld`). RED: place a hot array
+in DLM; transport keeps vsim accessing fast LM (cycle delta) vs DRAM/fault.
+
+---
+
+## F6 - Throttle / clock `mpft_ctl` (0x7C5), `mclk_ctl` (0x7DF)
+
+Status: TODO. Deps: F0. Class 1. Cycle-only. Pairs with `mxstatus.PFT_EN` (F2):
+if throttling is enabled, the resumed leg must throttle identically or the cycle
+figure diverges. RED: enable throttle pre-ROI, assert cycle delta matches.
+
+---
+
+## F7 - HW stack protection `mhsp_ctl` (0x7C6), `msp_bound` (0x7C7), `msp_base` (0x7C8)
+
+Status: TODO. Deps: F0. Class 1. If crt0 enables stack overflow/underflow
+detection, the bounds must survive or vsim either misses protection or
+false-traps. RED: enable + set bounds pre-ROI; ROI stack access stays in-bounds.
+
+---
+
+## F8 - Counter mask `mcountermask_m` (0x7D1) [+ `mcountinhibit` 0x320]
+
+Status: TODO. Deps: F0. Cycle-figure hygiene: controls whether `mcycle`/
+`minstret` advance in M-mode. RED: set mask pre-ROI, assert the cycle figure
+reflects it.
+
+---
+
+## Out of scope (record, do not implement now)
+
+- Class 0 config/RO: `micm_cfg`/`mdcm_cfg`/`mmsc_cfg*`/`mvec_cfg`/`mrvarch_cfg*`/
+  `mhvm*`/`mpl2cm_cfg`/`ml1dbf_cfg`/`mccache_ctl_base`, crash-save. (consistency
+  assert only, optional later feature.)
+- Class 3 trap/NMI/CLIC: `mdcause`, `mslideleg`, `msavestatus`/`msaveepc{1,2}`/
+  `msavecause{1,2}`/`msavedcause{1,2}`, `mnvec`/`mrnxvec`, `mirq_entry`/
+  `mintsel_jal`/`pushm*`. Deferred to the trap-bearing / S-U-envelope ROI work.
+- `mppib`/`mfiob` (PPI/FIO base): platform-static; consistency check, not transport.
