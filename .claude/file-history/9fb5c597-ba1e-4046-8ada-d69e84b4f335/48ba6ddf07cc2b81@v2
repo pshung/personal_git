@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+# One-off generator for docs/config_gating_tutorial.ipynb.
+import json, sys
+
+cells = []  # (kind, text)
+
+def md(t):  cells.append(("markdown", t))
+def code(t): cells.append(("code", t))
+
+md(r"""# Tutorial: how the softcore config file drives the hybrid handoff
+
+This page explains, in simple steps, **how one file -- the softcore's
+`config.inc` -- decides what the QEMU -> vsim handoff does**.
+
+Two questions:
+
+1. **What gets exchanged?** How `config.inc` decides which CSRs QEMU *drains*
+   and which CSRs vsim *restores*.
+2. **How do the two engines match?** How the driver fills QEMU's command-line
+   options so QEMU imitates the same engine you picked for vsim.
+
+## The one big idea (an analogy)
+
+- `config.inc` is the **chip's spec sheet** -- the list of parts this CPU has
+  (privilege levels, DSP, stack-safety, ILM/DLM, triggers, PMA, ...).
+- **vsim** is a chip **built from that spec sheet**. It physically only has the
+  parts the sheet lists. Ask it for a part it does not have and the debug module
+  stalls.
+- **QEMU** is a **generic imitator**. It can pretend to be many chips. We must
+  *tell* it which chip to imitate.
+
+The handoff moves a **save game** (the architectural state: GPRs, FPRs, CSRs,
+vector regs) from QEMU to vsim, so vsim can measure the cycle-accurate region.""")
+
+md(r"""## The cast: 3 actors, 1 source of truth
+
+```
+        config.inc   (the chip's spec sheet: NDS_* defines)
+             |
+             |  compiled INTO the vsim binary at build time
+             v
+   +-----------------------+
+   |   vsim  sim_<core>    |  has ONLY the parts the sheet lists
+   +-----------------------+
+             |
+             |  sim_<core> --describe  ->  { "vlen":..., "andes_csrs":[...] }
+             v
+   +-----------------------+
+   |   andesim driver      |  reads --describe, then TELLS QEMU what to imitate
+   +-----------------------+
+             |
+             |  -cpu ...   vlen=...   -plugin ...,outfile=...
+             v
+   +-----------------------+
+   |   QEMU (generic)      |  flexible imitator; matched via options
+   +-----------------------+
+```
+
+`config.inc` is written once, at chip-build time. Everything else **reads** it:
+vsim is compiled from it; `--describe` re-publishes it; the driver uses
+`--describe` to gate verification and to fill QEMU's options.""")
+
+md(r"""---
+# Part 1 -- what gets exchanged (drain vs restore)
+
+The save game is touched **three** times. Only some are filtered by the spec
+sheet.
+
+```
+   QEMU (functional)                       vsim (cycle-accurate)
+   -----------------                       ---------------------
+   run program ...
+   hit ROI trigger
+        |
+   (1) DRAIN  ---- state file (save game) ---->  (2) RESTORE
+       pack ALL CSRs                                 unpack ONLY the CSRs
+       QEMU exposes                                  the spec sheet lists
+       (NOT filtered)                                (caps-gated)
+                                                          |
+                                                     run the ROI
+                                                          |
+                                                     (3) RE-DRAIN
+                                                     read back ONLY the
+                                                     caps-listed CSRs
+                                                          |
+                                                  cycle figure = mcycle delta
+```
+
+| step | who | filtered by config? |
+|------|-----|---------------------|
+| (1) drain   | QEMU plugin       | **No** -- packs everything QEMU exposes (a superset) |
+| (2) restore | vsim ResumeDriver | **Yes** -- writes only CSRs the engine has |
+| (3) re-drain| vsim StateDrain   | **Yes** -- reads only CSRs the engine has |
+| verify (`--verify`) | andesim driver | **Yes** -- compares only the engine's CSRs |
+
+**Why is drain (1) not filtered?** Loading a CSR the chip does not have would
+**hang** the debug module. So the *consumer* (vsim) must filter. The *producer*
+(QEMU) is allowed to be lazy and pack extra -- the consumer throws the extra
+away. One side filters; that is enough.""")
+
+md(r"""## Step A: config.inc -> a set of "gates"
+
+Example lines from a real spec sheet (`ax45mpv_premium`, an M-only core):
+
+```
+NDS_NUM_PRIVILEGE_LEVELS   1        // M-only  (no U, no S)
+NDS_DSP_SUPPORT_INT        NO       // no DSP        -> ucode CSR absent
+NDS_STACKSAFE_SUPPORT_INT  NO       // no stack-safe -> msp_bound/base absent
+NDS_ILM_SIZE_KB            64       // ILM present   -> milmb present
+NDS_NUM_TRIGGER            2        // triggers present
+NDS_PMA_ENTRIES            4        // PMA present
+```
+
+At runtime, `andes_caps_from_config()` turns each `NDS_*` macro into a **gate**
+(on/off). This is the ONE place that binds a feature to its macro
+(`src/hybrid/andes_caps_config.hpp`):
+
+```cpp
+inline AndesCaps andes_caps_from_config() {
+  AndesCaps c = AndesCaps::none();
+#if defined(_NDS_DSP_SUPPORT_INT) && _NDS_DSP_SUPPORT_INT
+  c.set(AndesGate::DSP);            // ucode
+#endif
+#if defined(_NDS_STACKSAFE_SUPPORT_INT) && _NDS_STACKSAFE_SUPPORT_INT
+  c.set(AndesGate::STACKSAFE);      // mhsp_ctl, msp_bound, msp_base
+#endif
+#if defined(_NDS_NUM_PRIVILEGE_LEVELS) && (_NDS_NUM_PRIVILEGE_LEVELS >= 2)
+  c.set(AndesGate::UMODE);          // menvcfg, mcounteren, U-delta CSRs
+#endif
+  // ... one block per feature ...
+  return c;
+}
+```
+
+A macro that is **absent** reads as "feature off" -- so a core whose config
+omits a knob stays safe (never a crash).""")
+
+md(r"""## Step B: a gate -> a yes/no per CSR
+
+`supports_csr(addr)` maps a CSR address to its gate and answers "does this
+engine have it?" (`src/hybrid/andes_caps.hpp`):
+
+```cpp
+constexpr bool supports_csr(uint16_t csr_addr) const {
+  const AndesGate g = andes_gate_for(csr_addr);   // addr -> which gate
+  return g == AndesGate::ALWAYS || gate_on(g);     // ALWAYS, or gate set
+}
+```
+
+So the chain is:
+
+```
+config.inc  --andes_caps_from_config-->  gates  --supports_csr(addr)-->  yes/no
+```""")
+
+code(r"""%%bash
+# LIVE: peek at a real spec sheet. Set VSIM_BIN_DIR to your vsim build/ dir;
+# set ENGINE to inspect a different core (default = the tutorial's example).
+: "${VSIM_BIN_DIR:=/home/nick/work/vsim_andesim/build}"
+: "${ENGINE:=ax45mpv_premium}"
+cfg="$VSIM_BIN_DIR/V${ENGINE}/obj_sc/config.inc"
+[ -f "$cfg" ] || cfg=$(ls "$VSIM_BIN_DIR"/*/obj_sc/config.inc 2>/dev/null | head -1)
+echo "spec sheet: ${cfg:-<not found>}"
+echo "---"
+grep -E 'NDS_(NUM_PRIVILEGE_LEVELS|DSP_SUPPORT_INT|STACKSAFE_SUPPORT_INT|ILM_SIZE_KB|DLM_SIZE_KB|PMA_ENTRIES|NUM_TRIGGER)' "$cfg" 2>/dev/null \
+  || echo "(build the engine, or set VSIM_BIN_DIR, to see live values)" """)
+
+md(r"""## Step C: the gate filters restore and re-drain
+
+**(2) restore** -- vsim writes a CSR only if its engine has it
+(`src/hybrid/resume_driver.hpp`):
+
+```cpp
+#define X(field, addr, name) \
+  if (caps_.supports_csr(addr)) write_csr_tolerant(addr, state.andes.field);
+    HYBRID_ANDES_CSR_LIST(X)        // one line per CSR; gate per line
+#undef X
+```
+
+**(3) re-drain** -- vsim reads a CSR back only if its engine has it
+(`src/hybrid/state_drain.hpp`):
+
+```cpp
+#define X(field, addr, name) \
+  if (caps_.supports_csr(addr)) \
+    state.andes.field = read_register_64(bus_, regno_csr(addr));
+    HYBRID_ANDES_CSR_LIST(X)
+#undef X
+```
+
+The same `caps_` is built from config at startup and handed to both
+(`src/simulator.hpp`):
+
+```cpp
+hybrid::ResumeDriver driver(bus, v_scratch_gpa(),
+                            hybrid::andes_caps_from_config());
+```
+
+**(1) drain** -- QEMU packs every CSR its gdbstub exposes, with **no** caps gate
+(`qemu_plugin/hybrid_handoff.c`):
+
+```c
+// The vsim caps gate decides which of these the cycle engine actually
+// restores, so draining an absent-on-vsim CSR here is harmless.
+#define HYBRID_M_EXT_FIELD(field, addr, name)  \
+    s.m_ext.field = read_reg64(v->m_ext_##field); \
+    if (v->m_ext_##field) has_m_ext = 1;
+    HYBRID_M_EXT_CSR_LIST(HYBRID_M_EXT_FIELD)
+#undef HYBRID_M_EXT_FIELD
+```
+
+Picture the filter (config = M-only, DSP off, ECC off):
+
+```
+   state file:   mxstatus   ucode    milmb    mecc_code
+   supports_csr?    yes       NO       yes        NO
+                    |                   |
+                    v                   v
+   vsim writes:   mxstatus            milmb        (ucode, mecc_code skipped)
+```""")
+
+code(r"""%%bash
+# LIVE: the engine re-publishes its spec sheet as the CSR filter set.
+: "${VSIM_BIN_DIR:=/home/nick/work/vsim_andesim/build}"
+: "${ENGINE:=ax45mpv_premium}"
+sim="$VSIM_BIN_DIR/sim_${ENGINE}"
+[ -x "$sim" ] || sim=$(ls "$VSIM_BIN_DIR"/sim_* 2>/dev/null | grep -vE '\.(json|txt)$' | head -1)
+echo "engine: ${sim:-<not found>}"
+echo "--- CSRs this engine implements (the filter set) ---"
+"$sim" --describe 2>/dev/null | python3 -c '
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception: print("(no --describe output; build the engine first)"); sys.exit()
+print("vlen       =", d.get("vlen"))
+print("andes_csrs =", ", ".join(d.get("andes_csrs", [])) or "(none)")'""")
+
+md(r"""---
+# Part 2 -- how QEMU is matched to the vsim engine
+
+You **pick** a vsim engine (e.g. `sim_ax45mpv_premium`). Its spec sheet is fixed
+(compiled in). QEMU is generic, so the driver must hand it options that make it
+imitate the same chip. Three things to match:
+
+| what | QEMU option | how it is set |
+|------|-------------|---------------|
+| cpu family | `-cpu andes-ax45mpv` | from an invoke **template** |
+| vector width | `vlen=512` | **synced** from the engine's `--describe` |
+| handoff hooks | `-plugin ...,outfile=...,enter_pc=...` | from the run plan (trigger) |""")
+
+md(r"""## The invoke template (with holes to fill)
+
+Each engine carries an argv **template** with `{placeholders}`. QEMU's fast-leg
+template (`driver/engine_registry.cpp`):
+
+```cpp
+d.invoke.push_back(
+  {"fast-leg",
+   {"{bin}", "-object",
+    "memory-backend-file,id=mem,share=on,mem-path={mmap},size={mmap_size}",
+    "-machine", "andes_ae350,memory-backend=mem", "-cpu",
+    "andes-ax45mpv,vlen={vlen}", "-nographic", "-semihosting-config",
+    "enable=on,target=native", "-bios", "{elf}", "-plugin",
+    "{plugin},outfile={state_out}{trigger}"}});
+```
+
+The plan executor fills the holes from a map (`driver/run_plan.cpp`):
+
+```cpp
+const std::map<std::string, std::string> m = {
+    {"bin", eng->bin_path},   {"elf", plan.elf},
+    {"plugin", ctx.plugin_path},
+    {"mmap", ctx.mmap_path},  {"mmap_size", std::to_string(ctx.mem_size)},
+    {"state_out", state_out},
+    {"trigger", lt.plugin_suffix},   // marker: empty;  pc: ",enter_pc=0x..."
+    {"vlen", vlen_str},
+};
+std::vector<std::string> argv = build_argv(*tmpl, m, err);
+```
+
+The key match -- `{vlen}` is taken from the **accurate-leg engine's**
+descriptor, so QEMU's vector width equals vsim's:
+
+```cpp
+// hw-config sync: {vlen} comes from the accurate-leg engine's descriptor.
+long vlen = 0;
+for (const Step& s : plan.steps)
+  if (s.role == "accurate-leg")
+    if (const EngineDescriptor* e = find_engine(engines, s.engine_id))
+      if (e->vlen > 0) vlen = e->vlen;
+```""")
+
+md(r"""## The honest gap: cpu *family* is not auto-derived yet
+
+- **vlen**: auto-synced from `--describe`. Correct for any engine.
+- **plugin args**: built from the trigger you chose. Correct.
+- **cpu family**: the rv64 fast-leg template **hardcodes** `andes-ax45mpv`.
+  There is no engine -> `-cpu` map in the C++ driver today. So picking a
+  *different* family of engine (e.g. `ax66`) through `./andesim` would still
+  launch QEMU as `andes-ax45mpv`.
+
+The shell e2e harness works around this with an explicit `QEMU_CPU` per fixture
+(`scripts/run_e2e.sh`):
+
+```
+rt_priv_smode|... VSIM_BIN=$VSIM_BUILD/sim_ax66_makatau QEMU_CPU=andes-ax66,vlen=128
+```
+
+So today: **vlen matches automatically; the cpu family is fixed (premium) or set
+by hand**. Wiring an engine -> `-cpu` map into the descriptor is the clean fix
+(the descriptor already carries everything else).""")
+
+md(r"""---
+# Summary
+
+- **One source of truth:** `config.inc` (the spec sheet). vsim is built from it.
+- **`--describe`** re-publishes it: `vlen` + the `andes_csrs` filter list.
+- **Drain (QEMU)** packs a superset -- *not* config-gated.
+- **Restore + re-drain + verify** filter by `supports_csr(addr)`, which comes
+  from `andes_caps_from_config()`. One side filtering is enough, and it must be
+  the consumer (writing an absent CSR hangs the debug module).
+- **Matching QEMU to the engine:** an argv template with `{vlen}` synced from the
+  engine's `--describe`; the cpu **family** is still hardcoded/overridden by hand.
+
+### Footnote -- a possible next step
+
+Because drain is a superset, the state file currently contains CSRs the chosen
+vsim will ignore. We *could* also gate the drain by passing the engine's
+`andes_csrs` list (already known from `--describe`) into the plugin as a new arg.
+That would make the producer and consumer follow the same spec sheet, at the cost
+of making the state file engine-specific. Not implemented yet -- see the earlier
+design discussion.""")
+
+# ---- assemble nbformat 4.5 ----
+nb = {"cells": [], "metadata": {
+        "kernelspec": {"display_name": "Python 3 (ipykernel)",
+                       "language": "python", "name": "python3"},
+        "language_info": {"name": "python", "file_extension": ".py",
+                          "mimetype": "text/x-python", "version": "3.14.5",
+                          "nbconvert_exporter": "python",
+                          "pygments_lexer": "ipython3",
+                          "codemirror_mode": {"name": "ipython", "version": 3}}},
+      "nbformat": 4, "nbformat_minor": 5}
+
+for i, (kind, text) in enumerate(cells):
+    src = text.splitlines(keepends=True)
+    cell = {"cell_type": kind, "id": f"cell-{i:02d}", "metadata": {}, "source": src}
+    if kind == "code":
+        cell["outputs"] = []
+        cell["execution_count"] = None
+    nb["cells"].append(cell)
+
+out = "/home/nick/work/andesim/docs/config_gating_tutorial.ipynb"
+with open(out, "w") as f:
+    json.dump(nb, f, indent=1, ensure_ascii=True)
+    f.write("\n")
+print("wrote", out, "cells:", len(cells))
