@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Extract the CSR inventory snapshot from the AndeStar V5 SPA PDF.
+
+Refresh tool for tests/andes_csr/csr_inventory.csv: parses Chapter 5's summary
+tables (Tables 5-12, "Summary of Control & Status Registers") into one row per
+CSR -- addr, privilege, name, mode, section. Run this when the spec revision
+changes, then re-run classify_csr_coverage.py and the guard test.
+
+Requires PyMuPDF (`pip install pymupdf`). Not used in CI -- the committed CSV is
+the checked-in truth the guard test reads; this only regenerates it.
+
+Usage:
+  extract_csr_inventory.py <spec.pdf> [out.csv]   # default out: tests/andes_csr/csr_inventory.csv
+"""
+from __future__ import annotations
+
+import csv
+import re
+import sys
+from pathlib import Path
+
+ADDR_RE = re.compile(r'^0x[0-9A-Fa-f]{3}(~0x[0-9A-Fa-f]{3}|~[0-9A-Fa-f]+)?$')
+PRIV = {"MRW", "MRO", "MRW1C", "SRW", "SRO", "URW", "URO", "DRW", "DRO",
+        "HRW", "HRO"}
+TABLE_MODE = {
+    "Table 5": "M-std", "Table 6": "M-andes", "Table 7": "D-std",
+    "Table 8": "S-std", "Table 9": "S-andes", "Table 10": "U-std",
+    "Table 11": "U-andes", "Table 12": "H-std",
+}
+# Bold group sub-headers that appear inside the summary tables.
+SECTIONS = {
+    "Machine Information Registers", "Machine Trap Setup", "Machine Trap Handling",
+    "Machine Conﬁguration", "Machine Protection and Translation",
+    "Machine Non-Maskable Interrupt Handling", "Counter Related CSRs",
+    "Debug/Trace Registers", "CLIC Extension CSRs",
+    "Machine Indirect CSR Access CSRs", "Machine State Management CSRs",
+    "Conﬁguration Registers", "Crash Debug CSRs", "Memory CSRs",
+    "Hardware Stack Protection & Recording", "Trap related CSR", "Control CSRs",
+    "Enhanced CLIC CSRs", "Physical Memory Attribute CSRs",
+    "Shadow Register CSRs", "Supervisor Trap Setup", "Supervisor Conﬁguration",
+    "Supervisor Trap Handling", "Supervisor Protection and Translation",
+    "State Management CSRs", "SPMP CSRs", "Supervisor Trap Related",
+    "Supervisor Counter Related", "Supervisor Control",
+    "Counter/Timer Registers", "Floating-Point CSRs", "ZCE CSRs",
+    "N Extension CSRs", "Hypervisor Trap Setup",
+    "Virtual supervisor Indirect CSR Access CSRs",
+}
+# Table 11 (AndeStar V5 User Mode) prints no sub-headers; relabel its rows.
+ANDES_USER = {"uitb", "ucode", "uzobctl", "udcause", "ucctlbeginaddr",
+              "ucctlcommand", "wfe", "sleepvalue", "txevt", "umisc_ctl"}
+
+
+def extract(pdf_path):
+    import fitz  # PyMuPDF
+    doc = fitz.open(pdf_path)
+    text = "".join(p.get_text() for p in doc)
+    # The summary chapter: from Table 5 to the "Summary of CSR Existence" table.
+    start = text.index("Table 5: RISC-V Standard Machine Mode CSRs")
+    # "Summary of CSR Existence" also appears in the TOC (before start); take the
+    # body occurrence that follows the Table 5 caption.
+    end = text.index("Summary of CSR Existence", start)
+    lines = [l.strip() for l in text[start:end].splitlines()]
+    rows, mode, sec, i = [], "?", "?", 0
+    while i < len(lines):
+        l = lines[i]
+        tm = [k for k in TABLE_MODE if l.startswith(k + ":")]
+        if tm:
+            mode = TABLE_MODE[tm[0]]; i += 1; continue
+        if l in SECTIONS:
+            sec = l; i += 1; continue
+        if ADDR_RE.match(l) and i + 1 < len(lines):
+            p = lines[i + 1]
+            if p in PRIV or ("/" in p and p.split("/")[0] in PRIV):
+                name = lines[i + 2] if i + 2 < len(lines) else "?"
+                s = "Andes User Mode CSRs" if name in ANDES_USER else sec
+                rows.append([l, p, name, mode, s]); i += 3; continue
+        i += 1
+    return rows
+
+
+def main(argv):
+    if not argv:
+        print(__doc__)
+        return 2
+    pdf = argv[0]
+    out = Path(argv[1]) if len(argv) > 1 else (
+        Path(__file__).resolve().parent.parent
+        / "tests/andes_csr/csr_inventory.csv")
+    rows = extract(pdf)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["addr", "priv", "name", "mode", "section"])
+        w.writerows(rows)
+    print(f"wrote {out} ({len(rows)} rows)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,64 @@
+// rt_m_ext_counters.S
+//
+// v4 M-ext transport, Counter/perf-monitor section. The writable perf-monitor
+// CSRs the premium (M-only) engine implements must round-trip across the
+// QEMU1 -> vsim handoff: a value stashed before the ROI is restored by
+// ResumeDriver (readable inside the ROI) and re-read by StateDrain at exit.
+//
+// Covered (premium PERF_MONITOR gate, HYBRID_M_EXT_CSR_LIST):
+//   mcountinhibit            -- counter inhibit (bit 3 = hpmcounter3, no effect
+//                               on the mcycle measurement)
+//   mhpmevent3, mhpmevent4   -- performance event selectors (plain R/W config)
+//   mcounterinten            -- counter overflow interrupt-enable mask
+//
+// NOT covered here: the HW perf COUNTERS (mhpmcounter3..6) increment during the
+// ROI, so they are transported+restored but --verify-excluded (like mcycle); and
+// mcounterwen needs U-mode (spec: PMNDS & misa[20]) so an M-only core WARLs it to
+// 0 -- it is gated OFF on premium, transported forward-looking for a U-capable
+// core.
+//
+// Two assertion mechanisms (mirrors rt_csr_survival.S):
+//   1. In-ROI self-check: read each CSR back inside the ROI and bne against the
+//      stashed sentinel in a callee-stable GPR. A regressed restore hangs the
+//      fixture -> vsim never reaches the exit marker -> harness timeout/FAIL.
+//   2. --verify (VERIFY=1): the differential oracle compares the drained CSRs
+//      against a pure-QEMU run, catching any drain-side regression.
+
+.section .text
+.globl _start
+_start:
+    // Stash sentinels into the writable perf-monitor CSRs BEFORE the ROI.
+    // a1/a4/a5/a6 are callee-stable GPRs the GPR restore round-trips, so the
+    // in-ROI reads below can compare against them. Values are small/plain so
+    // WARL legalisation does not alter them.
+    li      a1, 0x0000000000000008   // inhibit hpmcounter3 only (mcycle unaffected)
+    csrw    0x320, a1                // mcountinhibit
+    li      a4, 0x0000000000000002   // event 2
+    csrw    0x323, a4                // mhpmevent3
+    li      a5, 0x0000000000000003   // event 3
+    csrw    0x324, a5                // mhpmevent4
+    li      a6, 0x0000000000000008   // int-enable counter 3
+    csrw    0x7CF, a6                // mcounterinten
+
+    slti    x0, x0, 0x5A0            // ENTER ROI -> hand off to vsim
+
+    // Read each back INSIDE the ROI: ResumeDriver must have restored them.
+    csrr    a0, 0x320
+    bne     a0, a1, regress          // mcountinhibit restore lost? spin -> FAIL
+    csrr    a0, 0x323
+    bne     a0, a4, regress          // mhpmevent3
+    csrr    a0, 0x324
+    bne     a0, a5, regress          // mhpmevent4
+    csrr    a0, 0x7CF
+    bne     a0, a6, regress          // mcounterinten
+
+    slti    x0, x0, 0x5A1            // EXIT ROI -> vsim drains, exits 200
+
+    // Unreached on hybrid (vsim stops at the exit marker). Engine-portable
+    // SimControl exit so the same ELF still runs standalone on every engine.
+    li      t0, 0xe0080000
+    sw      x0, 0(t0)
+1:  j       1b
+
+regress:
+    j       regress                  // a restored CSR is wrong: hang -> FAIL

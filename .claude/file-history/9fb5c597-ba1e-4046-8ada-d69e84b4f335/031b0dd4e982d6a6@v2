@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Completeness guard for the Andes-V5 CSR transport coverage (the flywheel).
+
+Cross-checks three artifacts and fails on any drift, so "nothing missed" is a
+machine-checked invariant, not a hope:
+
+  1. csr_inventory.csv  -- the spec snapshot (every CSR in the SPA Chapter 5)
+  2. csr_coverage.csv   -- each CSR's transport disposition (the matrix)
+  3. include/hybrid/state_abi.h -- what the wire format ACTUALLY transports
+
+Checks (any failure exits non-zero):
+  A. completeness  : matrix covers exactly the inventory's CSR set
+  B. policy parity : re-running scripts/classify_csr_coverage.py reproduces the
+                     committed matrix (offline policy == matrix)
+  C. abi vs matrix : every CSR the ABI transports has a transport-disposition in
+                     the matrix (never an excluded one), and every "carried
+                     today" CSR is actually present in the ABI
+
+NEW/NEW_TRIG/NEW_UDELTA CSRs not yet in the ABI are reported as PENDING (the
+ROADMAP backlog), not failures -- the guard tightens automatically as each
+expansion feature lands and the CSR appears in the ABI.
+
+Usage: check_coverage.py [--abi PATH] [--quiet]
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import re
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+import classify_csr_coverage as policy  # noqa: E402
+
+TRANSPORT = {"TRANSPORT_NOW", "NEW", "NEW_TRIG", "NEW_UDELTA"}
+
+# Standard CSRs named as direct scalar fields in struct hybrid_state_v1.
+STD_FIELDS = {
+    "mstatus", "mepc", "mtvec", "mcause", "mtval", "mscratch", "medeleg",
+    "mideleg", "mip", "mie", "mcycle", "minstret", "satp", "fcsr",
+    "mcache_ctl", "mmisc_ctl",
+}
+# Array groups: matrix rows whose name starts with one of these are transported
+# as a block (pmpcfg[]/pmpaddr[]/pmacfg[]/pmaaddr[] in the ABI).
+ARRAY_PREFIX = ("pmpcfg", "pmpaddr", "pmacfg", "pmaaddr")
+# V CSRs are transported but defined by the RVV spec, not this SPA -> not in the
+# inventory; exclude them from the ABI<->matrix cross-check.
+V_NAMES = {"vstart", "vtype", "vl", "vlenb", "vxsat", "vxrm", "vcsr", "vreg"}
+# CSRs carried inside a composite ABI field, not as their own field. fcsr packs
+# frm[7:5] | fflags[4:0], so both round-trip via the single fcsr field.
+COMPOSITE = {"fflags": "fcsr", "frm": "fcsr"}
+
+
+def norm(name: str) -> str:
+    """Canonical CSR name across representations (case, fi/fl ligatures)."""
+    n = name.strip().lower()
+    return n.replace("ﬂ", "fl").replace("ﬁ", "fi")
+
+
+# gdb/ABI name -> spec name, where the wire format uses a different mnemonic.
+ABI_ALIAS = {"mcirq_entry": "mirq_entry"}
+
+
+def matrix_keys(name: str) -> set:
+    """All names a matrix row can be referenced by: each '/'-alternate, and each
+    member of a 'prefixN~M' range (so the ABI's individual mhpmcounter3 matches
+    the spec's mhpmcounter3~6 row)."""
+    keys = set()
+    for part in name.split("/"):
+        part = part.strip()
+        m = re.match(r"^(.*?)(\d+)~(\d+)$", part)
+        if m:
+            pre, a, b = m.group(1), int(m.group(2)), int(m.group(3))
+            for i in range(a, b + 1):
+                keys.add(norm(pre + str(i)))
+        keys.add(norm(part))
+    return keys
+
+
+def abi_macro_csrs(abi_text: str) -> set:
+    """Normalized names from every X(field, addr, "name") in a *_CSR_LIST macro."""
+    out = set()
+    for m in re.finditer(r'X\(\s*(\w+)\s*,\s*0x[0-9A-Fa-f]+\s*,\s*"[^"]*"\s*\)',
+                         abi_text):
+        out.add(norm(m.group(1)))
+    return out
+
+
+def load(path: Path) -> list:
+    return list(csv.DictReader(path.open()))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--abi", default=str(ROOT / "include/hybrid/state_abi.h"))
+    ap.add_argument("--quiet", action="store_true")
+    args = ap.parse_args()
+
+    inv = load(HERE / "csr_inventory.csv")
+    cov = load(HERE / "csr_coverage.csv")
+    abi = Path(args.abi).read_text()
+    errs: list = []
+
+    # A. completeness: matrix covers exactly the spec inventory.
+    inv_addrs = [r["addr"] for r in inv]
+    if sorted(r["addr"] for r in cov) != sorted(inv_addrs):
+        errs.append("A: coverage CSR set != inventory CSR set")
+    inv_key = {(r["addr"], r["name"]) for r in inv}
+    cov_key = {(r["addr"], r["name"]) for r in cov}
+    if inv_key != cov_key:
+        miss = inv_key - cov_key
+        extra = cov_key - inv_key
+        errs.append(f"A: inventory/coverage row mismatch missing={miss} extra={extra}")
+
+    # B. policy parity: classify(inventory) reproduces the committed matrix.
+    for ir, cr in zip(inv, cov):
+        got = policy.classify(ir["addr"], ir["priv"], ir["name"], ir["mode"],
+                              ir["section"])
+        if got != cr["decision"]:
+            errs.append(f"B: {ir['name']} classify={got} matrix={cr['decision']}")
+
+    # C. abi vs matrix.
+    abi_names = abi_macro_csrs(abi) | {norm(n) for n in STD_FIELDS}
+    cov_by_name = {}
+    for r in cov:
+        for k in matrix_keys(r["name"]):
+            cov_by_name[k] = r["decision"]
+    # forward: nothing the ABI transports may be an excluded CSR
+    for an in sorted(abi_names):
+        if an in V_NAMES:
+            continue
+        dec = cov_by_name.get(ABI_ALIAS.get(an, an))
+        if dec is None:
+            errs.append(f"C: ABI transports '{an}' but it is not in the matrix")
+        elif dec not in TRANSPORT:
+            errs.append(f"C: ABI transports '{an}' but matrix says {dec} (excluded)")
+    # reverse: every carried-today CSR must be present in the ABI
+    abi_spec_names = {ABI_ALIAS.get(n, n) for n in abi_names}
+    pending = []
+    for r in cov:
+        nn = norm(r["name"])
+        pref = next((p for p in ARRAY_PREFIX if nn.startswith(p)), None)
+        in_abi = bool(matrix_keys(r["name"]) & abi_spec_names) \
+            or (pref is not None and f"{pref}[" in abi) \
+            or (COMPOSITE.get(nn) in abi_names)
+        if r["decision"] == "TRANSPORT_NOW":
+            if nn in V_NAMES:
+                continue
+            if not in_abi:
+                errs.append(f"C: carried-today CSR '{r['name']}' missing from ABI")
+        elif r["decision"] in TRANSPORT and not in_abi:
+            pending.append(r["name"])
+
+    if errs:
+        print("CSR COVERAGE GUARD: FAIL", file=sys.stderr)
+        for e in errs:
+            print("  - " + e, file=sys.stderr)
+        return 1
+    if not args.quiet:
+        print(f"CSR coverage guard OK: {len(inv)} CSRs classified, "
+              f"matrix==policy, ABI transports only matrix-approved CSRs")
+        if pending:
+            print(f"  PENDING (ROADMAP backlog, not yet in ABI): "
+                  f"{len(pending)} -> {', '.join(pending)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

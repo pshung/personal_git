@@ -1,0 +1,121 @@
+# ROADMAP: full Andes-V5 CSR transport coverage
+
+**Goal.** For the supported envelope - bare-metal, single-hart, **M-mode or
+M+U-mode**, trap-free ROI - verify the hybrid handoff correctly exchanges state
+for **every** CSR in `AndeStar_V5_SPA_UM164_V1.7`, with a per-section test and a
+machine-checked guarantee that nothing is missed.
+
+**Predecessor.** `docs/andes_csr_transport_ROADMAP.md` (RESOLVED) added the v3
+Andes block - 13 scalar CSRs + PMA - and the capability-gating flywheel. This
+ROADMAP reuses that exact pattern (one X-macro list, capability-gated, parity
+flywheel) to cover the remaining writable M-mode CSRs across the whole spec.
+
+## The reality (why not "all 232 round-trip")
+
+The spec's Chapter 5 yields **232 CSR rows**. They split three ways (full table:
+`docs/csr_coverage.ipynb`, data: `tests/andes_csr/csr_coverage.csv`):
+
+| group | count | what we do |
+|-------|-------|------------|
+| **carried today** | 41 | already round-trip through `hybrid_state_v1` |
+| **ADD** | 49 | writable M-mode plain state -> expand transport (this ROADMAP) |
+| **correctly excluded** | 142 | read-only config (29), RV32 shadows (21), side-effecting (11), N-ext (8), indirect-access (7), debug-internal (6), S/H mode-unsupported (57), other (3) |
+
+"Exchange state" only has meaning for **writable plain architectural state**. A
+read-only config register (`mvendorid`, `mmsc_cfg`) has nothing to exchange - each
+engine derives it. A side-effecting CSR (`pushmcause` pushes to the stack,
+`mcctlcommand` issues a cache op) is an instruction in CSR clothing, not state.
+Those are excluded **with a documented reason**, asserted by the guard - that is
+how "nothing missed" is satisfied without 142 meaningless round-trips.
+
+## Architecture
+
+Three pillars, each reusing a pattern already proven in the repo:
+
+1. **One X-macro list = one source of truth.** New writable M-mode CSRs go in a
+   single `HYBRID_M_EXT_CSR_LIST(X)` in `include/hybrid/state_abi.h`, exactly like
+   the existing `HYBRID_ANDES_CSR_LIST`. Every consumer (QEMU plugin drain,
+   `ResumeDriver` restore, `StateDrain` re-read, driver `state_diff` verify)
+   iterates the list, so **adding a CSR is one line** and no consumer drifts.
+
+2. **Capability-gated, not assumed.** Each new CSR maps to a feature gate in
+   `andes_caps.hpp` (`andes_gate_for`). An engine reports the CSRs it actually
+   implements via `--describe`; the driver skips `--verify` on the rest. Premium
+   (M-only) implements a subset; the gate prevents a hang on an absent CSR. This
+   is the existing capability flywheel, extended.
+
+3. **A completeness guard = the flywheel.** `tests/andes_csr/` holds the spec
+   inventory snapshot + the coverage matrix. The guard test cross-checks
+   inventory <-> matrix <-> `state_abi.h` and **fails CI** on any drift: a CSR the
+   spec adds, a CSR transported that the matrix marks excluded, or a promised CSR
+   missing from the ABI. Refresh path: `scripts/extract_csr_inventory.py`
+   (PDF -> inventory) then `scripts/classify_csr_coverage.py` (inventory -> matrix).
+
+## Per-feature definition of done
+
+Each expansion feature (F3+) is ONE CSR block and must deliver all of:
+
+- [ ] `HYBRID_M_EXT_CSR_LIST` X() line(s) in the ABI submodule (+ pin bump in andesim and vsim)
+- [ ] QEMU plugin drains it (`qemu_plugin/hybrid_handoff.c`)
+- [ ] `ResumeDriver` restores it (tolerant, capability-gated)
+- [ ] `StateDrain` re-reads it
+- [ ] `state_diff` verifies it (with the right exclusions, e.g. HW-driven latches)
+- [ ] `andes_caps.hpp` gate entry + `classify_csr_coverage.py` stays in parity
+- [ ] one per-section round-trip fixture under `tests/fixtures/`, run on premium
+- [ ] guard test still green; ROADMAP state updated
+
+Cross-repo note: the ABI lives in the `andesim_abi` submodule, pinned by BOTH
+andesim and the external vsim. A block touches 3 repos (ABI + vsim consumers +
+qemu_plugin), like the v3 Andes block did.
+
+## Features
+
+| ID | Feature | CSRs | State |
+|----|---------|------|-------|
+| F1 | Completeness guard test | (foundation) | **DONE** (`e0a6891`) |
+| F2 | ABI v4 `HYBRID_M_EXT_CSR_LIST` (51 CSRs) + all consumers + capability gates | (structural) | **DONE** (ABI `1e07582`, vsim `9d972ba`, andesim `8b952d6`) |
+| F5 | Counters / perf-monitor | mcountinhibit, mhpmevent3-6, mcounterinten (+ HW counters restored, verify-excluded) | **DONE** (`fcf5ecb`/`e321da1`) - found + fixed the mcounterwen UMODE gate bug |
+| F6 | Andes trap-save (mdcause subset) | mdcause | **DONE** (`b110977`) - transported; verify-excluded (vsim HW-set) |
+| F11 | Triggers | tselect, tdata2, mcontext (round-trip); tdata1/tcontrol verify-excluded | **DONE** (`b110977`) |
+| F3 | Machine Configuration | menvcfg, mseccfg | FORWARD-LOOKING (premium gates UMODE/EPMP off; no engine to verify) |
+| F4 | NMI handling | mnscratch, mnepc, mncause, mnstatus, mnvec, mrnxvec | FORWARD-LOOKING (SMRNMI off) |
+| F7 | CLIC | mtvt, mintthresh, mcirq_entry | FORWARD-LOOKING (CLIC off) |
+| F8 | State-enable | mstateen0-3 | FORWARD-LOOKING (SMSTATEEN off) |
+| F9 | Memory / peripheral | mppib, mfiob, mcctlbeginaddr, mcctldata | FORWARD-LOOKING (PPI/FIO/CCTL off) |
+| F10 | PMA extend (16 -> 48) | pmacfg4/6/8/10, pmaaddr16-47 | DEFERRED (premium has 4 PMA entries; user chose premium-only) |
+| F12 | U-delta | uzobctl, umisc_ctl, sleepvalue, ucctlbeginaddr | FORWARD-LOOKING (UMODE off; needs M+U engine) |
+| F13 | Docs + verification-status (this section) | (the 142 excluded) | **DONE** |
+
+## Outcome (2026-06-28)
+
+All 51 writable M-mode CSRs are transported in ABI v4, capability-gated. On the
+verification engine (ax45mpv_premium, M-only) **25** are implemented and gated on;
+the other **26** are gated off and ride forward-looking for an engine that
+implements the feature (CLIC, Smrnmi, Smstateen, ePMP, U-mode, ...).
+
+Of the 25 premium-gated CSRs, verification status:
+- **round-trip tested** (in-ROI self-check, marker + pc): mcountinhibit,
+  mhpmevent3/4 (and 5/6 by the same gate), mcounterinten, tselect, tdata2,
+  mcontext (`tests/fixtures/rt_m_ext_counters.S`, `rt_m_ext_trigcause.S`).
+- **transported + restored, verify-excluded** (engine-divergent, like
+  msp_bound/mip): mhpmcounter3-6 (HW counters), mdcause (vsim HW-set),
+  tdata1/tcontrol (trigger defaults), mcontext at arbitrary width.
+
+"Nothing missed" is enforced not by a fixture per CSR but by the machine-checked
+guard (`tests/andes_csr/check_coverage.py`): every one of the 232 spec CSRs is
+classified, the matrix matches the offline policy, and the ABI transports exactly
+the matrix-approved set. The forward-looking sections (F3/F4/F7/F8/F9/F12) are
+verified-correct *as transported-and-gated-off* by the guard + the parity
+flywheel; their round-trip verification waits on a capable engine.
+
+## Risks / judgment calls already baked in
+
+- **Side-effecting CSRs stay excluded even under "expand all"**: `pushmcause`,
+  `pushmepc`, `pushmxstatus`, `mnxti`, `mscratchcsw`, `mscratchcswl`,
+  `mcctlcommand`, `mintsel_jal` - reading/writing performs an action, so the value
+  is not state. Documented per-CSR in the matrix.
+- **Triggers (F11) touch the Debug Module** the handoff itself drives. Transported
+  last, behind its own gate, with a fixture that checks the DM handshake still
+  works.
+- **Premium is M-only**: F12 (U-delta) ships in the ABI but cannot be round-trip
+  tested until an M+U engine run (d23). Marked deferred, not skipped.
