@@ -1,0 +1,253 @@
+/* vplat: one newlib syscall layer that works on EVERY engine.
+ *
+ * Replaces -lgloss_vh (semihosting) so a single ELF runs unmodified on
+ * QEMU (fast), vsim (cycle) and across a hybrid handoff. It only touches
+ * channels both engines model at the same addresses:
+ *
+ *   stdio (fd 0-2)  ATCUART100 UART2: THR @0xf0300020, LSR @0xf0300034.
+ *                   QEMU: serial_mm_init(UART2+0x20, shift 2) = serial_hd(0);
+ *                   vsim: verilator/src/platform/uart.hpp -> host stdout.
+ *   exit            SimControl @0xe0080000: u32 exit code (<256).
+ *                   vsim: sim_control.hpp; QEMU: hw/misc/andes_sim_control.c.
+ *   file io (fd>2)  HTIF magicmem command @0xe0080010, served host-side
+ *                   (vsim: sim_control.hpp syscall table; QEMU: same device).
+ *
+ * No semihosting, no ecall, and no "which engine am I on" probe -- hybrid
+ * migrates the running process between engines, so any boot-time detection
+ * would go stale at the handoff. Every call must be engine-blind.
+ */
+
+#include <stdint.h>
+#include <stddef.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+/* ---- UART2 (console) ------------------------------------------------- */
+
+#define UART_THR (*(volatile uint32_t*) 0xf0300020UL)
+#define UART_LSR (*(volatile uint32_t*) 0xf0300034UL)
+#define UART_LSR_THRE 0x20u
+
+static void uart_putc(char c)
+{
+  while (!(UART_LSR & UART_LSR_THRE))
+    ;
+  UART_THR = (uint32_t) (unsigned char) c;
+}
+
+/* ---- SimControl / HTIF ------------------------------------------------ */
+
+#define SIM_EXIT_ADDR   0xe0080000UL
+#define HTIF_TOHOST_CMD 0xe0080010UL
+
+/* HTIF syscall numbers -- must match the table in
+ * verilator/src/platform/sim_control.hpp (and the QEMU mirror device). */
+#define VH_SYS_GETTIMEOFDAY 5
+#define VH_SYS_OPEN         6
+#define VH_SYS_WRITE        7
+#define VH_SYS_GETCWD       8
+#define VH_SYS_LSEEK        9
+#define VH_SYS_READ         10
+#define VH_SYS_FLEN         11
+#define VH_SYS_CLOSE        12
+#define VH_SYS_ACCESS       13
+#define VH_SYS_FACCESSAT    14
+#define VH_SYS_FSTAT        15
+#define VH_SYS_FSTATAT      16
+#define VH_SYS_LINK         17
+#define VH_SYS_LSTAT        18
+#define VH_SYS_STAT         19
+#define VH_SYS_OPENAT       20
+#define VH_SYS_RENAME       21
+#define VH_SYS_UNLINK       22
+
+static uint64_t magicmem[8] __attribute__((aligned(64)));
+
+/* The host (SimControl) reads magicmem straight from RAM, behind the
+ * hart's caches, so write back L1 (and L2 if present) before handing the
+ * command over. CCTL command 6 = L1D_WBINVAL_ALL, 0x12 = L2_WBINVAL_ALL.
+ * On QEMU the CSR write is accepted and memory is coherent anyway. */
+static void flush_dcache(void)
+{
+  __asm__ __volatile__("csrw mcctlcommand, %0" ::"rK"(6));
+#if __riscv_xlen == 64
+  /* L2 writeback, gated to rv64 because it uses rv64-only ld/sd to reach the
+   * 64-bit L2C MMIO registers (mmsc_cfg bit 46 is the L2-present flag) -- it
+   * cannot COMPILE on rv32. Whether to flush is still decided at runtime by the
+   * bit-46 check inside the asm. An rv32 core WITH an L2C would need a
+   * 32-bit-halves access path here; today's rv32 target (d23) has no L2, so the
+   * L1 writeback above suffices. */
+  __asm__ __volatile__(
+    "csrr    t0, mmsc_cfg\n"
+    "li      t1, 1\n"
+    "slli    t1, t1, 46\n"
+    "and     t2, t0, t1\n"
+    "beqz    t2, 1f\n"
+    "li      t3, 0xe0500008\n"   /* L2C_REG_CTL: enabled? */
+    "ld      t4, 0(t3)\n"
+    "andi    t4, t4, 1\n"
+    "beqz    t4, 1f\n"
+    "li      t5, 0xe0500040\n"   /* L2C_REG_CCTL <- WBINVAL_ALL */
+    "li      t6, 0x12\n"
+    "sd      t6, 0(t5)\n"
+    "2:\n"
+    "li      t2, 0xe0500080\n"   /* poll L2C_REG_CCTL_M0_ST until idle */
+    "ld      t3, 0(t2)\n"
+    "andi    t3, t3, 0xF\n"
+    "li      t5, 1\n"
+    "beq     t3, t5, 2b\n"
+    "1:\n" ::: "t0", "t1", "t2", "t3", "t4", "t5", "t6", "memory");
+#endif
+}
+
+static intptr_t htif_syscall(uint64_t n, uintptr_t a0, uintptr_t a1,
+                             uintptr_t a2, uintptr_t a3)
+{
+  magicmem[0] = n;
+  magicmem[1] = a0;
+  magicmem[2] = a1;
+  magicmem[3] = a2;
+  magicmem[4] = a3;
+  magicmem[5] = 0;
+  magicmem[6] = 0;
+  magicmem[7] = 0;
+  flush_dcache();
+  *(volatile uint64_t*) HTIF_TOHOST_CMD = (uintptr_t) magicmem;
+  __asm__ __volatile__("fence rw,rw" ::: "memory");
+  return (intptr_t) magicmem[0];
+}
+
+/* ---- newlib stubs ------------------------------------------------------ */
+
+__attribute__((used)) ssize_t _write(int fd, const void* ptr, size_t len)
+{
+  if (fd > 2)
+    return htif_syscall(VH_SYS_WRITE, fd, (uintptr_t) ptr, len, 0);
+  for (size_t i = 0; i < len; ++i)
+    uart_putc(((const char*) ptr)[i]);
+  return (ssize_t) len;
+}
+
+__attribute__((used)) ssize_t _read(int fd, void* buf, size_t len)
+{
+  if (fd > 2)
+    return htif_syscall(VH_SYS_READ, fd, (uintptr_t) buf, len, 0);
+  return 0; /* no console input on either engine: EOF */
+}
+
+__attribute__((used)) int _fstat(int fd, struct stat* st)
+{
+  if (fd > 2)
+    return (int) htif_syscall(VH_SYS_FSTAT, fd, (uintptr_t) st, 0, 0);
+  st->st_mode = S_IFCHR; /* char device -> newlib line-buffers stdout */
+  return 0;
+}
+
+__attribute__((used)) int _isatty(int fd) { return fd <= 2; }
+
+__attribute__((used)) int _close(int fd)
+{
+  if (fd > 2)
+    return (int) htif_syscall(VH_SYS_CLOSE, fd, 0, 0, 0);
+  return 0;
+}
+
+__attribute__((used)) off_t _lseek(int fd, off_t offset, int dir)
+{
+  if (fd > 2)
+    return htif_syscall(VH_SYS_LSEEK, fd, offset, dir, 0);
+  return 0;
+}
+
+__attribute__((used)) int _open(const char* name, int flags, int mode, ...)
+{
+  return (int) htif_syscall(VH_SYS_OPEN, (uintptr_t) name, flags, mode, 0);
+}
+
+__attribute__((used)) int _openat(int dirfd, const char* name, int flags, ...)
+{
+  return (int) htif_syscall(VH_SYS_OPENAT, dirfd, (uintptr_t) name, flags, 0);
+}
+
+__attribute__((used)) int _stat(const char* file, struct stat* st)
+{
+  return (int) htif_syscall(VH_SYS_STAT, (uintptr_t) file, (uintptr_t) st, 0, 0);
+}
+
+__attribute__((used)) int _lstat(const char* file, struct stat* st)
+{
+  return (int) htif_syscall(VH_SYS_LSTAT, (uintptr_t) file, (uintptr_t) st, 0, 0);
+}
+
+__attribute__((used)) int _fstatat(int dirfd, const char* file,
+                                   struct stat* st, int flags)
+{
+  return (int) htif_syscall(VH_SYS_FSTATAT, dirfd, (uintptr_t) file,
+                            (uintptr_t) st, flags);
+}
+
+__attribute__((used)) int _access(const char* file, int mode)
+{
+  return (int) htif_syscall(VH_SYS_ACCESS, (uintptr_t) file, mode, 0, 0);
+}
+
+__attribute__((used)) int _faccessat(int dirfd, const char* file, int mode,
+                                     int flags)
+{
+  return (int) htif_syscall(VH_SYS_FACCESSAT, dirfd, (uintptr_t) file, mode,
+                            flags);
+}
+
+__attribute__((used)) int _link(const char* oldn, const char* newn)
+{
+  return (int) htif_syscall(VH_SYS_LINK, (uintptr_t) oldn, (uintptr_t) newn, 0, 0);
+}
+
+__attribute__((used)) int _unlink(const char* file)
+{
+  return (int) htif_syscall(VH_SYS_UNLINK, (uintptr_t) file, 0, 0, 0);
+}
+
+__attribute__((used)) int _rename(const char* oldn, const char* newn)
+{
+  return (int) htif_syscall(VH_SYS_RENAME, (uintptr_t) oldn, (uintptr_t) newn,
+                            0, 0);
+}
+
+__attribute__((used)) int _getcwd(const char* buf, int size)
+{
+  return (int) htif_syscall(VH_SYS_GETCWD, (uintptr_t) buf, size, 0, 0);
+}
+
+__attribute__((used)) int _gettimeofday(struct timeval* tp, void* tzp)
+{
+  return (int) htif_syscall(VH_SYS_GETTIMEOFDAY, (uintptr_t) tp,
+                            (uintptr_t) tzp, 0, 0);
+}
+
+__attribute__((used)) int _kill(int pid, int sig)
+{
+  (void) pid;
+  (void) sig;
+  return -1;
+}
+
+__attribute__((used)) int _getpid(void) { return 1; }
+
+__attribute__((used)) void* _sbrk(intptr_t increment)
+{
+  extern char _end[];
+  static char* p = _end;
+  void* base = p;
+  p += increment;
+  return base;
+}
+
+/* Exit codes stay below 256: sim_control.hpp treats any command < 256 as
+ * the raw exit code (the 0x0123456x magic commands live above). */
+__attribute__((used, noreturn)) void _exit(int exit_status)
+{
+  *(volatile uint32_t*) SIM_EXIT_ADDR = (uint32_t) exit_status & 0xff;
+  for (;;)
+    ;
+}
