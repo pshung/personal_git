@@ -1,0 +1,162 @@
+# Engine interface
+
+How a simulator joins the `andesim` framework.
+
+`andesim` drives several simulator backends behind one CLI. An **engine** is
+one simulator *process* the framework can run: `qemu64`, `qemu32`, `vsim:ax45mpv_premium`,
+`vsim:ax66_makatau`, and -- if they implement this interface -- `alioth`,
+`sid`, or anything else. Engines are **drop-in binaries, not linked libraries**:
+the framework is never recompiled to add one. Everything `andesim` needs to
+know about an engine comes back from a single `--describe` call, so there is
+zero per-engine code in the framework.
+
+To join, an engine does two things:
+
+1. **Self-describe** -- answer `--describe` with one JSON object (below).
+2. **Speak the ABI** for any role it claims that moves architectural state
+   (`resume` / `drain`): read/write `struct hybrid_state_v1`
+   (`include/hybrid/state_abi.h`) byte-for-byte. A functional-only engine that
+   only ever runs standalone needs none of this.
+
+## 1. The `--describe` JSON
+
+Running `<engine-binary> --describe` must print one JSON object to **stdout**
+and exit 0. Example (Verilator):
+
+```json
+{
+  "id":       "verilator:ax45mpv_premium",
+  "type":     "verilator",
+  "kind":     "cycle-accurate",
+  "vlen":     512,
+  "dlen":     512,
+  "elen":     32,
+  "xlen":     64,
+  "triggers": ["csr", "pc"],
+  "roles":    ["standalone", "accurate-leg"],
+  "state":    ["resume", "drain"],
+  "andes_csrs": ["mxstatus", "mclk_ctl", "milmb", "mdlmb", "uitb", "jvt"],
+  "invoke": {
+    "standalone":   ["{bin}", "{elf}"],
+    "accurate-leg": ["{bin}", "{elf}",
+                     "--resume-from-qemu", "{state_in}",
+                     "--handoff-out", "{state_out}",
+                     "--shared-mem-path", "{mmap}",
+                     "--shared-mem-size", "{mmap_size}",
+                     "--shared-mem-base", "{mmap_base}"]
+  },
+  "result":   "stderr:cycles"
+}
+```
+
+The framework silently normalizes the discovered descriptor: type `verilator` → `vsim`, and id `verilator:<cfg>` → `vsim:<cfg>`. Users see and pass the normalized form (e.g. `--engine vsim:ax45mpv_premium`). A non-Verilator engine (alioth, sid) that sets a different `type` passes through untouched.
+
+### Fields
+
+| Field      | Type            | Required | Meaning |
+|------------|-----------------|----------|---------|
+| `id`       | string          | yes      | Unique engine id. Convention: `verilator:<cfg>`, `alioth`, `sid`. First id wins on a collision. |
+| `type`     | string          | yes      | Family: `qemu` \| `verilator` \| `alioth` \| `sid` \| ... |
+| `kind`     | string          | no       | `functional` or `cycle-accurate`. Shown by `list engines`. |
+| `vlen`     | number          | no       | RVV `VLEN` in bits (0 / omit if no V). |
+| `dlen`     | number          | no       | RVV `DLEN` in bits (0 / omit if no V). |
+| `elen`     | number          | no       | RVV `ELEN` in bits (0 / omit if no V). |
+| `xlen`     | number          | no       | 32 or 64. |
+| `triggers` | array\<string\> | no       | ROI delimiters the engine understands: `marker` \| `pc`. The Verilator engine reports the marker trigger under its legacy wire name `csr` (the example above emits `["csr", "pc"]`); unlike `type`/`id`, the framework does **not** normalize this array, so it is stored and shown (`list engines`, `doctor`) verbatim. The array is informational only -- it is never matched against the requested `--trigger`. |
+| `roles`    | array\<string\> | no       | `standalone` \| `fast-leg` \| `accurate-leg` (see below). |
+| `state`    | array\<string\> | no       | `hybrid_state_v1` capabilities: `resume`, `drain`. Omit if none. |
+| `invoke`   | object          | no       | Per-role argv template (see Placeholders). |
+| `result`   | string          | no       | Where the measurement is: `stderr:<word>` or `state.mcycle`. |
+
+The parser is strict JSON (no comments, no trailing commas). Numbers are read
+as integers. Unknown fields are ignored, so the schema can grow.
+
+### Roles
+
+- `standalone` -- run a whole program alone (the `fast` and `cycle` models).
+  Transparent passthrough: `andesim` forwards the user's post-`--` args
+  verbatim and the engine's own stdout/stderr/exit code is the result.
+- `fast-leg` -- the QEMU fast-forward leg of a `hybrid` run: execute up to the
+  ROI entry, then **drain** `hybrid_state_v1`.
+- `accurate-leg` -- the cycle-accurate leg of a `hybrid` run: **resume** from a
+  drained state, execute the ROI, then **drain** again. Its `mcycle` delta is
+  the reported cycle figure.
+
+### invoke + placeholders
+
+`invoke` maps a role to its argv template. The framework substitutes these
+tokens when it builds the command:
+
+| Placeholder   | Filled with |
+|---------------|-------------|
+| `{bin}`       | the engine binary path |
+| `{elf}`       | the workload ELF |
+| `{state_in}`  | the input state file (resume) |
+| `{state_out}` | the output state file (drain) |
+| `{mmap}`      | the shared-memory backing file |
+| `{mmap_size}` | the shared-mmap size in bytes |
+| `{mmap_base}` | the guest physical base address of the mmap (e.g. `0x0`) |
+| `{vlen}`      | the synced VLEN (bits) from the accurate-leg engine's descriptor |
+| `{plugin}`    | the TCG plugin path (fast-leg only) |
+| `{trigger}`   | the plugin comma-suffix for the trigger (e.g. `,enter_pc=0xADDR` for pc; empty for marker) |
+
+`standalone` typically needs only `["{bin}", "{elf}"]`; the user's `--` args are
+appended.
+
+### result
+
+Declares where an engine's standalone measurement lives. `stderr:<word>`
+advertises that the figure is the integer next to `<word>` on stderr (vsim
+prints `<n> cycles simulated`); `state.mcycle` advertises the `mcycle` field of
+the drained `hybrid_state_v1`.
+
+NOTE: the current driver does not yet act on this field. Standalone runs
+(`fast`/`cycle`) pass the engine's stdout/stderr/exit code through verbatim, and
+hybrid runs always read the cycle figure as the accurate-leg `mcycle` delta from
+the drained state files. The field is parsed into the descriptor for forward
+compatibility, not consumed.
+
+## 2. ABI conformance
+
+Any engine listing `resume` or `drain` in `state` must exchange architectural
+state through `struct hybrid_state_v1` exactly as defined in
+`include/hybrid/state_abi.h` (GPRs, FPRs, M-mode CSRs, PMP, and the V block;
+little-endian; `HYBRID_VLEN_BYTES_MAX = 128`). V data registers travel through
+the shared-memory scratch region by the convention the header documents. An
+engine that only claims `standalone` (no `state`) is exempt.
+
+## Discovery (how the framework finds engines)
+
+`andesim list engines` performs discovery; every other engine-using command
+shares it:
+
+1. The built-in `qemu64` (rv64) and `qemu32` (rv32) descriptors are always
+   present (QEMU does not implement `--describe`; their binary paths honor
+   `$VSIM_QEMU` / `$VSIM_QEMU32`, then `$QEMU_BIN_DIR`).
+2. The scan directory is:
+   - `$ANDESIM_ENGINES_DIR` if set (colon-separated; **replaces** the default
+     and accepts **any** executable -- this is where you drop `alioth` / `sid`),
+   - otherwise `$VSIM_BIN_DIR` (the external prebuilt vsim build dir, mirroring
+     `$QEMU_BIN_DIR`; falls back to the legacy in-tree `<repo>/verilator/build`
+     when unset), filtered to `sim_*` binaries.
+3. For each candidate binary the framework runs `<bin> --describe`. If that
+   fails (non-zero, hang past a 5 s timeout, or non-JSON) it falls back to a
+   sidecar file `<bin>.json` containing the same descriptor -- the escape hatch
+   for binaries that cannot add the flag.
+4. Descriptors are deduped by `id`.
+
+Because discovery is pure runtime scan + self-describe, **building a new
+Verilator config and dropping `sim_<cfg>` into the scan dir makes it appear with
+no `andesim` rebuild.** That is the hot-plug guarantee.
+
+## Joining as a new engine (alioth / sid)
+
+1. Implement `--describe` to print the JSON above (set `id`, `type`, `kind`,
+   the roles you support, and `invoke` templates for those roles). If you cannot
+   add the flag, ship a `<bin>.json` sidecar instead.
+2. If you claim `resume`/`drain`, read/write `hybrid_state_v1` per
+   `include/hybrid/state_abi.h`.
+3. Put the binary on `$ANDESIM_ENGINES_DIR` and run `andesim list engines`
+   to confirm it shows up. Done -- no framework change required.
+4. **(Optional) GDB support**: `andesim run --mode cycle --gdb [--gdb-port N]` injects `--jtag-port <N>` (default 9104) into the engine argv before the user passthrough, then exec-replaces itself with ICEman (`$ICEMAN`). If your engine supports a JTAG bitbang port, implement `--jtag-port` to match vsim's interface. If it does not, the framework still builds the argv correctly -- the engine will simply ignore or reject the flag.
+5. **(Optional) QEMU ISA match**: implement `--print-qemu-config` to emit a QEMU `-readconfig` cfg (per-extension `[global]` properties) describing your engine's ISA, so a hybrid run's QEMU fast leg executes the same extensions you model. On a hybrid run the framework runs `<accurate-engine> --print-qemu-config` and passes the result to QEMU via `-readconfig`. If you do not implement it (the flag exits non-zero), the framework falls back to QEMU's default `-cpu` -- no error. vsim bakes this cfg from its `config.inc` at build time (`docs/qemu_match_ROADMAP.md`).
