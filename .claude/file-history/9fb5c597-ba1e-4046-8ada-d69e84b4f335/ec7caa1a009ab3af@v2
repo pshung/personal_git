@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# A missing ELF must fail in the driver with a clear "ELF not found", BEFORE any
+# engine is launched -- never the cryptic downstream
+# "qemu-system-riscv64: Unable to find the RISC-V BIOS ...".
+# Covers fast (the reported case) + cycle; hybrid already guarded (regression).
+# The fix lives at the one shared resolver (abs_elf), so fast/cycle/cycle-gdb
+# all inherit it; this test pins fast + cycle + hybrid.
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"   # fail/ok + cfg_val/vsim_bin_dir
+
+bash "$ROOT/scripts/build_driver.sh" >/dev/null 2>&1 || fail "build_driver.sh failed"
+BIN="$ROOT/build/andesim"
+[ -x "$BIN" ] || fail "need build/andesim"
+
+MISSING="$ROOT/tests/fixtures/__definitely_absent__.elf"
+[ -e "$MISSING" ] && fail "test bug: $MISSING unexpectedly exists"
+
+# assert_missing <label> <args...>: run the driver, require a non-zero exit, the
+# driver's own "ELF not found" diagnostic, and the ABSENCE of any engine spawn
+# ("Unable to find the RISC-V BIOS" proves qemu was reached -- it must not be).
+assert_missing() {
+  local label="$1"; shift
+  local out rc
+  out=$(timeout 30 "$BIN" "$@" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "$label: missing ELF should exit non-zero, got 0: $out"
+  printf '%s\n' "$out" | grep -qi 'ELF not found' \
+    || fail "$label: missing the 'ELF not found' diagnostic: $out"
+  printf '%s\n' "$out" | grep -q 'Unable to find the RISC-V BIOS' \
+    && fail "$label: reached qemu instead of failing in the driver: $out"
+  ok "$label: missing ELF -> clean 'ELF not found', no engine spawn"
+}
+
+# fast: the reported bug -- must not hand the missing path to qemu.
+assert_missing "fast" run --mode fast "$MISSING"
+
+# cycle: reaches the shared resolver only after engine discovery + selection, so
+# it needs a concrete --engine (and VSIM_BIN_DIR for discovery). The existence
+# check is arch-independent -- elf_xlen of a missing file is 0, so no arch
+# mismatch fires first regardless of which engine we pick.
+BINDIR=$(vsim_bin_dir)
+export VSIM_BIN_DIR="$BINDIR"
+eng=$("$BIN" list engines 2>/dev/null | awk '$2=="vsim"{print $1; exit}')
+if [ -n "$eng" ]; then
+  assert_missing "cycle" run --mode cycle --engine "$eng" "$MISSING"
+else
+  ok "SKIP cycle: no vsim engine discoverable under $BINDIR"
+fi
+
+# hybrid: already validates existence up front -- regression guard.
+assert_missing "hybrid" run --mode hybrid "$MISSING"
