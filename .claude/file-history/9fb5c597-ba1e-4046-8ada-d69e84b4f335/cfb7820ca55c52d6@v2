@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""Regenerate docs/config_gating_tutorial.ipynb.
+
+Redesign goals (per PM): concept first, then depth; every demo clean, meaningful,
+and shown FROM THE andesim COMMAND LINE (not by poking sim_/qemu directly).
+
+Structure (~11 cells):
+  Part 0  the one idea + a picture (concept, no code)
+  Part 1  3 live demos, each one `andesim` command:
+            list engines -> run --dry-run (MATCH) -> run (the cycle payoff)
+  Part 2  short "under the hood" appendix (FILTER + MATCH mechanics, file pointers)
+  Summary
+"""
+import json, sys
+
+cells = []
+
+def md(text):
+    cells.append(("markdown", text))
+
+def code(text):
+    cells.append(("code", text))
+
+# Shared, portable preamble for the live demos: resolve the repo root and the
+# andesim binary without hardcoding a user path; pick the first vsim engine if
+# ENGINE is not overridden; skip gracefully if nothing is built.
+PREAMBLE = (
+    'ROOT="${ANDESIM_ROOT:-$(cd "$(git rev-parse --show-toplevel 2>/dev/null '
+    '|| echo .)" && pwd)}"\n'
+    'ANDESIM="$ROOT/build/andesim"\n'
+    '[ -x "$ANDESIM" ] || { echo "(build andesim first: bash $ROOT/scripts/build_all.sh)"; exit 0; }'
+)
+
+# ---------------------------------------------------------------- Part 0
+md(r"""# How `andesim` keeps QEMU and vsim in sync
+
+You ask `andesim` one thing: **run my program and tell me how many cycles the
+hot region takes.**
+
+It answers with two engines and a hand-off between them:
+
+- **QEMU** -- a *fast, generic* engine. It runs your program up to the hot
+  region. It can pretend to be many different chips.
+- **vsim** -- a *cycle-accurate* engine. It takes over the live state, runs the
+  hot region, and counts the cycles. It is **one specific chip**, built from
+  that chip's spec sheet, `config.inc`.
+
+The whole trick is **one rule**: both engines must agree on the **same chip**.
+Otherwise the state QEMU hands over does not fit the chip vsim models.
+
+The single source of that agreement is **`config.inc`**, baked into the vsim
+engine at build time. From it, `andesim` keeps **two promises**:
+
+| promise | meaning |
+|---------|---------|
+| **MATCH**  | make QEMU imitate the *same chip* vsim is -- same ISA, same vector width. |
+| **FILTER** | move only the architectural state this chip actually has (skip parts it does not). |
+
+Everything below is shown **from where you sit: the `andesim` command line.**
+Three commands, then a short look under the hood.""")
+
+md(r"""## The picture
+
+```
+   config.inc   (the chip's spec sheet, baked into vsim at build)
+       |
+       v
+   you pick a chip:   andesim run --engine vsim:<chip> ...
+       |
+       v
+   andesim reads <chip>, then keeps two promises:
+       |
+       |---- MATCH:  make QEMU imitate <chip>  (same ISA + vlen)
+       |---- FILTER: let only <chip>'s state cross into vsim
+       |
+       v
+   QEMU runs your program  ->  hot region
+       |
+       v   (hand the live, filtered state over)
+   vsim (<chip>) runs the hot region  ->  cycle count
+```
+
+`config.inc` is written once. vsim is built from it; `andesim` reads it (through
+the engine) to keep both promises. You never touch it -- you just **pick a
+chip**.""")
+
+# ---------------------------------------------------------------- Part 1
+md(r"""---
+# Part 1 -- see it from `andesim`
+
+Three commands. Each is something you would actually type.
+
+1. **`andesim list engines`** -- the chips you can pick.
+2. **`andesim run --dry-run`** -- watch the **MATCH** promise: the exact QEMU
+   command andesim builds.
+3. **`andesim run`** -- the payoff: your cycle number.""")
+
+md(r"""## 1. `andesim list engines` -- the chips you can pick
+
+`andesim` finds every vsim engine and reads each one's spec **for you**. Notice
+the chips *differ*: `ax66_makatau` has `vlen=128`, `d23` is 32-bit with no
+vector. That per-chip difference is exactly why andesim must MATCH and FILTER
+for the chip you choose.""")
+
+code('%%bash\n' + PREAMBLE + '\n"$ANDESIM" list engines')
+
+md(r"""## 2. `andesim run --dry-run` -- the MATCH promise, in the open
+
+`--dry-run` builds the **exact** commands andesim would run, and prints them
+**without executing**. Read the QEMU (fast) leg and the MATCH is right there:
+
+- `-cpu andes-ax45mpv,vlen=512` -- the vector width **synced** from the chip.
+- `-readconfig .../qemu.cfg` -- the chip's **full ISA**, distilled from
+  `config.inc` at build time (CoDense, Zfh, Zb*, `xandesv5isa`, ...).
+
+The second leg is vsim, told to resume from the state file QEMU writes. (Long
+directories are trimmed below so the matched options stand out.)""")
+
+code('%%bash\n' + PREAMBLE + '\n'
+     'ENGINE="${ENGINE:-$("$ANDESIM" list engines 2>/dev/null | awk \'/^vsim:/{print $1; exit}\')}"\n'
+     'ELF="$ROOT/tests/fixtures/handoff_roundtrip.elf"\n'
+     '[ -n "$ENGINE" ] && [ -f "$ELF" ] || { echo "(need a vsim engine + a fixture ELF)"; exit 0; }\n'
+     'echo "# engine: $ENGINE"\n'
+     '"$ANDESIM" run --mode hybrid --trigger marker --dry-run --engine "$ENGINE" "$ELF" 2>&1 \\\n'
+     "  | sed -E 's#/[^ ,]*/##g'")
+
+md(r"""## 3. `andesim run` -- the payoff
+
+Drop `--dry-run` and it runs for real: the matched QEMU executes up to the hot
+region, hands the live state to vsim, and vsim runs the region and reports the
+cycle count. The **`[marker window_cycles]`** line is your answer.""")
+
+code('%%bash\n' + PREAMBLE + '\n'
+     'ENGINE="${ENGINE:-$("$ANDESIM" list engines 2>/dev/null | awk \'/^vsim:/{print $1; exit}\')}"\n'
+     'ELF="$ROOT/tests/fixtures/handoff_roundtrip.elf"\n'
+     '[ -n "$ENGINE" ] && [ -f "$ELF" ] || { echo "(need a vsim engine + a fixture ELF)"; exit 0; }\n'
+     'echo "# engine: $ENGINE"\n'
+     '"$ANDESIM" run --mode hybrid --trigger marker --engine "$ENGINE" "$ELF" 2>&1 \\\n'
+     "  | grep -vE 'Copyright|^Version'")
+
+# ---------------------------------------------------------------- Part 2
+md(r"""---
+# Part 2 -- under the hood (how the two promises are kept)
+
+Both promises are two readings of the **same `config.inc`**, so QEMU and vsim
+can never disagree on the chip.
+
+### FILTER -- move only the state this chip has
+
+`config.inc` becomes a yes/no answer per CSR:
+
+```
+config.inc --(andes_caps_from_config)--> gates --(supports_csr addr)--> yes / no
+```
+
+The vsim engine restores and re-reads a CSR **only when `supports_csr()` says
+yes** (writing a CSR the chip lacks would hang its debug module). That same set
+is published as the engine's `andes_csrs`, and `andesim` uses it to compare
+**only this chip's CSRs** on `--verify` (`driver/state_diff.cpp`).
+
+QEMU, by contrast, **drains a superset** with no gate
+(`qemu_plugin/hybrid_handoff.c`) -- one side filtering is enough, and it must be
+the *consumer* (vsim), because reading extra in QEMU is harmless but writing
+extra into vsim is not.
+
+### MATCH -- make QEMU the same chip
+
+At vsim **build time**, `config.inc` is distilled into a QEMU `-readconfig` file
+(one `[global]` per extension) and baked into the engine. `sim_<chip>
+--print-qemu-config` dumps it. `andesim` runs that for the chosen engine and
+injects `-readconfig` into the QEMU leg only (`driver/run_plan.cpp`:
+`stage_qemu_cfg` + `plan_argvs`) -- the `-readconfig` line you saw in Demo 2. An
+engine that predates the flag makes andesim fall back to a plain `-cpu`, so
+there is no regression.
+
+> The exact `NDS_*`-macro-to-CSR mapping lives in the vsim engine
+> (`andes_caps_from_config` / `supports_csr`), built from `config.inc`. This page
+> stays at the andesim level on purpose.""")
+
+md(r"""---
+# Summary
+
+- You **pick a chip**; `andesim` makes the two engines agree on it.
+- **MATCH** (`--dry-run` shows it): QEMU gets the chip's `vlen` and its full ISA
+  via `-readconfig`, both from `config.inc`.
+- **FILTER**: only the chip's CSRs are restored / re-read / verified;
+  `supports_csr()` (from `config.inc`) is the gate. QEMU drains a superset; the
+  consumer filters.
+- **One source of truth:** `config.inc`. Everything else just reads it.
+
+Three commands to remember:
+
+```
+andesim list engines        # the chips
+andesim run --dry-run ...    # the matched command (MATCH)
+andesim run ...              # the cycle figure
+```""")
+
+# ---------------------------------------------------------------- emit
+def src(text):
+    lines = text.split("\n")
+    return [l + "\n" for l in lines[:-1]] + [lines[-1]]
+
+nb = {
+    "cells": [],
+    "metadata": {
+        "kernelspec": {"display_name": "Bash", "language": "bash", "name": "bash"},
+        "language_info": {"name": "bash"},
+    },
+    "nbformat": 4,
+    "nbformat_minor": 5,
+}
+for i, (kind, text) in enumerate(cells):
+    cell = {"cell_type": kind, "id": f"c{i}", "metadata": {}, "source": src(text)}
+    if kind == "code":
+        cell["outputs"] = []
+        cell["execution_count"] = None
+    nb["cells"].append(cell)
+
+out = sys.argv[1] if len(sys.argv) > 1 else "docs/config_gating_tutorial.ipynb"
+with open(out, "w") as f:
+    json.dump(nb, f, indent=1, ensure_ascii=True)
+    f.write("\n")
+print(f"wrote {out}: {len(nb['cells'])} cells")
