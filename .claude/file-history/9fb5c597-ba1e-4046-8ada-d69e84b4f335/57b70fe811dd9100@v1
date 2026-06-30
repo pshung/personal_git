@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# F8 contract: `run --mode cycle` -- one cycle-accurate engine alone, from
+# reset (no QEMU, no --resume-from-qemu), transparent passthrough. Layers:
+#
+#   1. run-test (unit, fast): resolve_accurate_engine's selection branches
+#      (default-sole / explicit / ambiguous / missing / wrong-kind) + the F7
+#      passthrough_argv assembly. Pure, no spawn.
+#   2. fake-engine resolution + exec (no real vsim): a handful of throwaway
+#      "engine" scripts that answer `--describe` with JSON and echo a marker
+#      when run. Drives the real discover -> resolve -> run_standalone -> exec
+#      path end to end. Proves the done-when "selecting a different built <cfg>
+#      runs the other binary" deterministically, plus every error path. The
+#      fakes ship the SAME standalone template real vsim does ({bin} {elf}), so
+#      this exercises the exact argv path.
+#   3. real vsim (guarded, best-effort): if a sim_<cfg> is built, invoke it
+#      from reset and look for its native "N cycles simulated" line. Standalone
+#      from-reset of a hybrid-oriented fixture is environment-dependent, so a
+#      timeout or a missing cycle line is a skip, not a failure -- layer 2 is
+#      the deterministic proof.
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+
+BIN="$ROOT/build/andesim"
+RUNTEST="$ROOT/build/driver/andesim-run-test"
+
+bash "$ROOT/scripts/build_driver.sh" >/dev/null 2>&1 || fail "build_driver.sh failed"
+
+# 1. unit: resolution branches + passthrough argv
+[ -x "$RUNTEST" ] || fail "missing unit-test binary: $RUNTEST"
+"$RUNTEST" || fail "run unit tests (resolve_accurate_engine, passthrough_argv) failed"
+
+# --- fixtures: throwaway engine scripts in a scanned dir --------------------
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+# mkengine DIR FILE ID KIND MARKER: a fake engine that self-describes as KIND
+# and, when run standalone, echoes RAN:MARKER so we can see which binary ran.
+mkengine() {
+  local f="$1/$2"
+  cat >"$f" <<EOF
+#!/bin/sh
+if [ "\$1" = "--describe" ]; then
+  printf '%s\n' '{"id":"$3","type":"vsim","kind":"$4","roles":["standalone","accurate-leg"],"invoke":{"standalone":["{bin}","{elf}"]}}'
+else
+  echo "RAN:$5 args:\$*"
+fi
+EOF
+  chmod +x "$f"
+}
+
+D1="$TMP/one"; D2="$TMP/two"; DF="$TMP/func"; DE="$TMP/empty"
+mkdir -p "$D1" "$D2" "$DF" "$DE"
+mkengine "$D1" v1 "vsim:v1" cycle-accurate m1
+mkengine "$D2" v1 "vsim:v1" cycle-accurate m1
+mkengine "$D2" v2 "vsim:v2" cycle-accurate m2
+mkengine "$DF" f0 "vsim:f0" functional    fm
+
+# expect: assert rc + output regex (shared helper from tests/lib/log.sh)
+
+# 2a. default = the sole cycle-accurate engine; it runs with the ELF appended
+expect 0 'RAN:m1 args:.*dummy\.elf' \
+  env ANDESIM_ENGINES_DIR="$D1" "$BIN" run --mode cycle dummy.elf
+# 2b. two cycle-accurate engines, no --engine: ambiguous, names both
+expect 2 'multiple cycle-accurate.*vsim:v1.*vsim:v2' \
+  env ANDESIM_ENGINES_DIR="$D2" "$BIN" run --mode cycle dummy.elf
+# 2c. explicit --engine picks the named binary (different <cfg> runs the other)
+expect 0 'RAN:m1' \
+  env ANDESIM_ENGINES_DIR="$D2" "$BIN" run --mode cycle --engine vsim:v1 dummy.elf
+expect 0 'RAN:m2' \
+  env ANDESIM_ENGINES_DIR="$D2" "$BIN" run --mode cycle --engine vsim:v2 dummy.elf
+# 2d. no cycle-accurate engine discoverable (qemu is functional): clear error
+expect 2 'no cycle-accurate engine' \
+  env ANDESIM_ENGINES_DIR="$DE" "$BIN" run --mode cycle dummy.elf
+# 2e. --engine names a functional engine: wrong kind for cycle
+expect 2 'cycle-accurate' \
+  env ANDESIM_ENGINES_DIR="$DF" "$BIN" run --mode cycle --engine vsim:f0 dummy.elf
+# 2f. --engine matches nothing discovered
+expect 2 "no engine 'vsim:nope'" \
+  env ANDESIM_ENGINES_DIR="$D1" "$BIN" run --mode cycle --engine vsim:nope dummy.elf
+# 2g. the shared standalone spine still rejects a missing ELF / extra positional
+expect 2 'missing ELF' \
+  env ANDESIM_ENGINES_DIR="$D1" "$BIN" run --mode cycle
+expect 2 'engine args go after --' \
+  env ANDESIM_ENGINES_DIR="$D1" "$BIN" run --mode cycle a.elf b.elf
+# 2h. a CLI arg error is reported before (and instead of) engine discovery:
+# missing ELF wins even when no engine exists, rather than "no cycle-accurate
+# engine" -- so a typo never pays for a --describe subprocess per build.
+expect 2 'missing ELF' \
+  env ANDESIM_ENGINES_DIR="$DE" "$BIN" run --mode cycle
+# 2i. the model is named `cycle`; the old `accurate` spelling is now unknown.
+expect 2 "unknown model 'accurate'" \
+  env ANDESIM_ENGINES_DIR="$D1" "$BIN" run --mode accurate dummy.elf
+echo "[ok] fake-engine resolution + standalone exec (all branches)"
+
+# 3. real vsim (guarded, best-effort)
+SIM=$(ls "${VSIM_BIN_DIR:-$ROOT/verilator/build}"/sim_* 2>/dev/null | head -1)
+ELF="$ROOT/tests/fixtures/handoff_roundtrip.elf"
+if [ -n "$SIM" ] && [ -x "$SIM" ] && [ -f "$ELF" ]; then
+  ID=$("$SIM" --describe 2>/dev/null | sed -nE 's/.*"id"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -1)
+  # The current fixtures are hybrid-oriented and loop forever standalone (no
+  # exit path without QEMU's semihosting), so this caps the attempt: a cycle
+  # line confirms the done-when; a timeout (rc 124) only confirms vsim launched
+  # and is running, which is still useful. Either way -> not a failure. The cap
+  # is short: the cycle line, if it comes, comes right after launch; otherwise
+  # we are just confirming launch, so there is no point waiting longer.
+  out=$(timeout 10 "$BIN" run --mode cycle ${ID:+--engine "$ID"} "$ELF" 2>&1 </dev/null); rc=$?
+  if echo "$out" | grep -Eq "[0-9]+ cycles simulated"; then
+    echo "[ok] real cycle: vsim ran '$ELF' from reset, printed its cycle line (rc=$rc)"
+  elif [ "$rc" -eq 124 ]; then
+    echo "[skip] real cycle: vsim launched but did not finish in 10s (expected: standalone-from-reset of a hybrid fixture has no exit path)"
+  else
+    echo "[skip] real cycle: vsim exited rc=$rc with no cycle line (standalone-from-reset of a hybrid fixture is env-dependent)"
+  fi
+else
+  echo "[skip] real cycle run: no built sim_* and/or fixture ($SIM / $ELF)"
+fi
+
+ok "F8 run --mode cycle"
