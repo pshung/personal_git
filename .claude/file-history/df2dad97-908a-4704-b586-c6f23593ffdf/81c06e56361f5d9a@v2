@@ -1,0 +1,199 @@
+// Unit tests for hybrid_trigger (F9): CLI selection -> ROI Trigger, including
+// pc-boundary resolution against a real fixture's .symtab. Pure (no spawn).
+// rt_pc_jump.elf defines `phase_b_landing` (0x100042) and `phase_c`
+// (0x100046). Plain assert-and-count harness.
+#include <string>
+#include <vector>
+
+#include "cli.hpp"
+#include "engine_descriptor.hpp"
+#include "hybrid.hpp"
+#include "plan.hpp"
+#include "repo_root.hpp"
+#include "test_check.hpp"
+
+using namespace andes_sim;
+using andes_sim::test::check_eq;
+
+namespace {
+Cli mk(const std::vector<std::string>& args) { return parse_cli(args); }
+}  // namespace
+
+int main() {
+  const std::string elf =
+      (repo_root() / "tests" / "fixtures" / "rt_pc_jump.elf").string();
+
+  // --- hybrid_hw_check: ISA sync guard -- the fast leg (QEMU) is rv64 ---
+  {
+    EngineDescriptor d;  // an rv32 engine (e.g. vsim:d23) cannot pair with it
+    d.id = "vsim:d23";
+    d.xlen = 32;
+    const std::string err = hybrid_hw_check(d);
+    CHECK(!err.empty());
+    CHECK(err.find("vsim:d23") != std::string::npos);
+    CHECK(err.find("rv64") != std::string::npos);
+  }
+  {
+    EngineDescriptor d;  // matching xlen passes
+    d.id = "vsim:ax45mpv_premium";
+    d.xlen = 64;
+    CHECK(hybrid_hw_check(d).empty());
+  }
+  {
+    EngineDescriptor d;  // an engine that reports no xlen is accepted as-is
+    d.id = "vsim:x";
+    CHECK(hybrid_hw_check(d).empty());
+  }
+
+  // --trigger is REQUIRED for hybrid: there is no silent marker default. (It
+  // used to default to marker, which masked running an unmarked ELF -- the fast
+  // leg then ran to completion instead of draining at the ROI boundary, and the
+  // user only saw a cryptic "expected exit 200, got 0".)
+  {
+    std::string err;
+    hybrid_trigger(mk({"run", "--mode", "hybrid"}), elf, err);
+    CHECK(!err.empty());
+    CHECK(err.find("--trigger") != std::string::npos);
+  }
+
+  // marker stays a valid EXPLICIT choice (no params).
+  {
+    std::string err;
+    Trigger t = hybrid_trigger(
+        mk({"run", "--mode", "hybrid", "--trigger", "marker"}), elf, err);
+    CHECK(err.empty());
+    CHECK(t.kind == "marker");
+    CHECK(t.params.empty());
+  }
+
+  // pc: a symbol start and a 0x end both resolve; stored as 0x-prefixed hex.
+  {
+    std::string err;
+    Trigger t = hybrid_trigger(
+        mk({"run", "--mode", "hybrid", "--trigger", "pc", "--pc-start",
+            "phase_b_landing", "--pc-end", "0x100046"}),
+        elf, err);
+    CHECK(err.empty());
+    CHECK(t.kind == "pc");
+    CHECK(t.params.at("enter_pc") == "0x100042");
+    CHECK(t.params.at("exit_pc") == "0x100046");
+  }
+
+  // pc requires both boundaries.
+  {
+    std::string err;
+    hybrid_trigger(mk({"run", "--mode", "hybrid", "--trigger", "pc",
+                       "--pc-start", "phase_b_landing"}),
+                   elf, err);
+    CHECK(!err.empty());
+  }
+
+  // A zero-length ROI (enter == exit) is rejected: vsim resumes at the enter
+  // PC and the exit trigger fires on that very instruction, so the window
+  // measures nothing. Same symbol on both ends.
+  {
+    std::string err;
+    hybrid_trigger(mk({"run", "--mode", "hybrid", "--trigger", "pc",
+                       "--pc-start", "phase_c", "--pc-end", "phase_c"}),
+                   elf, err);
+    CHECK(!err.empty());
+    CHECK(err.find("same address") != std::string::npos);
+  }
+
+  // Equality is NUMERIC, not textual: a 0x address with leading zeros and the
+  // symbol at that address are different strings but the same PC -- still an
+  // empty ROI. (phase_c == 0x100046.)
+  {
+    std::string err;
+    hybrid_trigger(mk({"run", "--mode", "hybrid", "--trigger", "pc",
+                       "--pc-start", "0x00100046", "--pc-end", "phase_c"}),
+                   elf, err);
+    CHECK(!err.empty());
+    CHECK(err.find("same address") != std::string::npos);
+  }
+
+  // pc with an undefined symbol is an error naming the symbol.
+  {
+    std::string err;
+    hybrid_trigger(mk({"run", "--mode", "hybrid", "--trigger", "pc",
+                       "--pc-start", "nope_sym", "--pc-end", "phase_c"}),
+                   elf, err);
+    CHECK(!err.empty());
+    CHECK(err.find("nope_sym") != std::string::npos);
+  }
+
+  // icount/simpoint were removed: they now report as unknown triggers, not a
+  // silent marker fallback.
+  {
+    std::string err;
+    hybrid_trigger(mk({"run", "--mode", "hybrid", "--trigger", "icount"}), elf,
+                   err);
+    CHECK(!err.empty());
+    hybrid_trigger(mk({"run", "--mode", "hybrid", "--trigger", "simpoint"}),
+                   elf, err);
+    CHECK(!err.empty());
+  }
+
+  // An unknown trigger is an error.
+  {
+    std::string err;
+    hybrid_trigger(mk({"run", "--mode", "hybrid", "--trigger", "bogus"}), elf,
+                   err);
+    CHECK(!err.empty());
+  }
+
+  // --- vsim_extra_args: user-forwarded vsim-leg flags, validated by trigger ---
+  {
+    std::string err;
+    // no user-forwarded flags -- just the driver-derived --drain-minimal
+    // (no --verify here, so the accurate leg drains the counters only).
+    check_eq(vsim_extra_args(mk({"run", "--mode", "hybrid"}), "marker", err),
+             {"--drain-minimal"}, "no-forward-minimal");
+    CHECK(err.empty());
+
+    // kanata (marker/pc): --kanata <f> --kanata-roi.
+    check_eq(
+        vsim_extra_args(mk({"run", "--mode", "hybrid", "--kanata", "k.txt"}),
+                        "marker", err),
+        {"--kanata", "k.txt", "--kanata-roi", "--drain-minimal"}, "kanata");
+    CHECK(err.empty());
+    // kanata + objdump.
+    check_eq(vsim_extra_args(mk({"run", "--mode", "hybrid", "--kanata",
+                                 "k.txt", "--objdump", "o.txt"}),
+                             "pc", err),
+             {"--kanata", "k.txt", "--kanata-roi", "--objdump", "o.txt",
+              "--drain-minimal"},
+             "kanata-objdump");
+    CHECK(err.empty());
+
+    // --kanata is marker/pc only -- rejected under any other kind.
+    vsim_extra_args(mk({"run", "--mode", "hybrid", "--kanata", "k.txt"}),
+                    "bogus", err);
+    CHECK(!err.empty());
+    // --objdump requires --kanata.
+    vsim_extra_args(mk({"run", "--mode", "hybrid", "--objdump", "o.txt"}),
+                    "marker", err);
+    CHECK(!err.empty());
+  }
+
+  // --- #1: --drain-minimal added to the accurate leg iff --verify is OFF ---
+  {
+    auto has = [](const std::vector<std::string>& v, const char* s) {
+      for (const auto& x : v) if (x == s) return true;
+      return false;
+    };
+    std::string err;
+    // Default (no --verify): the driver only reads the mcycle delta, so the
+    // accurate leg drains the counters only.
+    const auto off = vsim_extra_args(mk({"run", "--mode", "hybrid"}), "pc", err);
+    CHECK(err.empty());
+    CHECK(has(off, "--drain-minimal"));
+    // --verify: the oracle diffs the full drained state, so it must stay full.
+    const auto on =
+        vsim_extra_args(mk({"run", "--mode", "hybrid", "--verify"}), "pc", err);
+    CHECK(err.empty());
+    CHECK(!has(on, "--drain-minimal"));
+  }
+
+  return andes_sim::test::report("hybrid");
+}
