@@ -1,0 +1,75 @@
+// Unit tests for VsimFilter (the cycle-mode presentation filter): banner and
+// [info] suppression, cycle-count lifting, and program-output pass-through.
+// Pure -- no spawn. Plain assert-and-count harness.
+#include "vsim_filter.hpp"
+
+#include <string_view>
+
+#include "test_check.hpp"
+
+using andes_sim::parse_cycles_line;
+using andes_sim::strip_vsim_banner;
+using andes_sim::VsimFilter;
+using Dest = andes_sim::VsimFilter::Dest;
+
+int main() {
+  // --- parse_cycles_line: lift the count, ignore every other [info] line ---
+  CHECK(parse_cycles_line("[info] 3573 cycles simulated") == 3573u);
+  CHECK(parse_cycles_line("[info] 0 cycles simulated") == 0u);
+  // the neighbouring timing line has digits but is NOT a cycle count
+  CHECK(!parse_cycles_line("[info] 0.354s elapsed, 10093.220Hz").has_value());
+  CHECK(!parse_cycles_line("[info] loading segment: addr=0x100000").has_value());
+  CHECK(!parse_cycles_line("hello").has_value());
+
+  // --- stderr: drop [info], lift the cycle count, keep real diagnostics ---
+  {
+    VsimFilter f;
+    CHECK(f.classify(2, "[info] loading segment: addr=0x100000") == Dest::kDrop);
+    CHECK(f.classify(2, "[info] hart 0 reset vector: 0x100000") == Dest::kDrop);
+    CHECK(!f.cycles().has_value());  // none seen yet
+    CHECK(f.classify(2, "[info] 3573 cycles simulated") == Dest::kDrop);
+    CHECK(f.cycles() == 3573u);  // ...lifted, not relayed
+    CHECK(f.classify(2, "[info] 0.354s elapsed, 10093.220Hz") == Dest::kDrop);
+    // real diagnostics (above info level) survive to stderr
+    CHECK(f.classify(2, "[warn] something odd") == Dest::kStderr);
+    CHECK(f.classify(2, "[error] boom") == Dest::kStderr);
+  }
+
+  // --- stdout: drop the banner (+ its trailing blank), keep program output ---
+  {
+    VsimFilter f;
+    CHECK(f.classify(1, "Copyright (C) 2013-2026 Andes Technology Corporation. "
+                        "All rights reserved.") == Dest::kDrop);
+    CHECK(f.classify(1, "Version : fcf5ecb") == Dest::kDrop);
+    CHECK(f.classify(1, "") == Dest::kDrop);          // banner's trailing blank
+    CHECK(f.classify(1, "hello") == Dest::kStdout);   // first real output
+    // Past the banner everything passes -- even a blank line, or a "Version :"
+    // the program itself prints (no longer mistaken for the banner).
+    CHECK(f.classify(1, "") == Dest::kStdout);
+    CHECK(f.classify(1, "Version : my-app 2.0") == Dest::kStdout);
+  }
+
+  // --- no cycle line at all -> cycles() stays empty ---
+  {
+    VsimFilter f;
+    f.classify(2, "[info] hart 0 reset vector: 0x100000");
+    CHECK(!f.cycles().has_value());
+  }
+
+  // --- strip_vsim_banner: buffer-mode banner removal for the hybrid relay ---
+  // banner (+ trailing blank) then program output -> only the output survives
+  CHECK(strip_vsim_banner("Copyright (C) 2013-2026 Andes Technology "
+                          "Corporation.\nVersion : fcf5ecb\n\nhello\n") ==
+        "hello\n");
+  // banner only (ROI printed nothing) -> empty
+  CHECK(strip_vsim_banner("Copyright (C) ... Andes\nVersion : fcf5ecb\n\n") == "");
+  // no banner at all -> verbatim (the QEMU leg never has one; defensive)
+  CHECK(strip_vsim_banner("hello\nworld\n") == "hello\nworld\n");
+  // a final line without a trailing newline is preserved without one
+  CHECK(strip_vsim_banner("Version : x\n\nno newline") == "no newline");
+  // multi-line program output after the banner is kept whole
+  CHECK(strip_vsim_banner("Copyright (C) Andes\nVersion : x\n\nA\nB\n") ==
+        "A\nB\n");
+
+  return andes_sim::test::report("vsim-filter");
+}

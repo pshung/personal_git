@@ -1,0 +1,73 @@
+// See vsim_filter.hpp.
+#include "vsim_filter.hpp"
+
+namespace andes_sim {
+namespace {
+
+bool is_blank(std::string_view s) {
+  for (char c : s)
+    if (c != ' ' && c != '\t' && c != '\r') return false;
+  return true;
+}
+
+// vsim's two-line startup banner, emitted on stdout before the program runs.
+bool is_banner_line(std::string_view s) {
+  return s.starts_with("Copyright (C)") || s.starts_with("Version :");
+}
+
+}  // namespace
+
+std::optional<uint64_t> parse_cycles_line(std::string_view line) {
+  constexpr std::string_view kMark = "cycles simulated";
+  const std::size_t pos = line.find(kMark);
+  if (pos == std::string_view::npos) return std::nullopt;
+  // Scan left over the space(s) before "cycles", then over the digit run -- so
+  // "<digits> cycles simulated" matches but "...Hz" / "loading..." do not.
+  std::size_t end = pos;
+  while (end > 0 && line[end - 1] == ' ') --end;
+  std::size_t begin = end;
+  while (begin > 0 && line[begin - 1] >= '0' && line[begin - 1] <= '9') --begin;
+  if (begin == end) return std::nullopt;  // no digit run before "cycles"
+  uint64_t v = 0;
+  for (std::size_t i = begin; i < end; ++i) v = v * 10 + (line[i] - '0');
+  return v;
+}
+
+std::string strip_vsim_banner(std::string_view buf) {
+  VsimFilter filter;
+  std::string out;
+  out.reserve(buf.size());
+  for (std::size_t pos = 0; pos < buf.size();) {
+    const std::size_t nl = buf.find('\n', pos);
+    const bool has_nl = nl != std::string_view::npos;
+    const std::string_view line =
+        buf.substr(pos, (has_nl ? nl : buf.size()) - pos);
+    if (filter.classify(1, line) == VsimFilter::Dest::kStdout) {
+      out.append(line);
+      if (has_nl) out.push_back('\n');
+    }
+    if (!has_nl) break;
+    pos = nl + 1;
+  }
+  return out;
+}
+
+VsimFilter::Dest VsimFilter::classify(int stream, std::string_view line) {
+  if (stream == 2) {  // stderr: vsim's [info] log (cycle count lives here)
+    if (const std::optional<uint64_t> n = parse_cycles_line(line)) {
+      cycles_ = n;          // lift the count; the driver re-prints it
+      return Dest::kDrop;
+    }
+    if (line.starts_with("[info]")) return Dest::kDrop;
+    return Dest::kStderr;   // [warn]/[error]/... -- real diagnostics survive
+  }
+  // stdout: the program's own output, prefixed by vsim's banner. Suppress the
+  // banner (and its trailing blank) only until the first real output line; after
+  // that, relay verbatim so program output is never second-guessed.
+  if (seen_program_output_) return Dest::kStdout;
+  if (is_banner_line(line) || is_blank(line)) return Dest::kDrop;
+  seen_program_output_ = true;
+  return Dest::kStdout;
+}
+
+}  // namespace andes_sim
