@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -u
+SIM=/home/nick/work/vsim_andesim/build/sim_ax45mpv_premium
+QEMU=/home/nick/work/qemu_andesim/build/qemu/qemu-system-riscv64
+PLUGIN=/home/nick/work/andesim/qemu_plugin/libhybrid_handoff.so
+ELF=/home/nick/work/andesim/hello.elf
+MMAP=$(mktemp -p /dev/shm hsim-prof.XXXXXX); truncate -s 134221824 "$MMAP"
+ST0=/tmp/prof-state0.bin; ST1=/tmp/prof-state1.bin; rm -f "$ST0" "$ST1"
+CYC_LOG=/tmp/prof-cycle.log; VS_LOG=/tmp/prof-vsim.log
+
+# timestamp each line with elapsed seconds since command start
+ts(){ stdbuf -oL -eL "$@" 2>&1 | perl -MTime::HiRes=time -ne 'BEGIN{$t=time} printf "%08.3f | %s", time-$t, $_'; }
+wall(){ awk "BEGIN{printf \"%.3f\", $2-$1}"; }
+
+echo "############ A) CYCLE MODE baseline (no handoff) ############"
+S=$(date +%s.%N); ts "$SIM" "$ELF" > "$CYC_LOG"; E=$(date +%s.%N)
+cat "$CYC_LOG"
+echo "[cycle total wall] $(wall $S $E)s   lines=$(wc -l <"$CYC_LOG")"
+
+echo
+echo "############ B1) QEMU FAST-LEG (reset -> enter_pc, drain) ############"
+S=$(date +%s.%N)
+"$QEMU" -object "memory-backend-file,id=mem,share=on,mem-path=$MMAP,size=134221824" \
+  -machine andes_ae350,memory-backend=mem -cpu andes-ax45mpv,vlen=512 \
+  -nographic -semihosting-config enable=on,target=native -bios "$ELF" \
+  -plugin "$PLUGIN,outfile=$ST0,enter_pc=0x10007c" >/tmp/prof-qemu.out 2>&1
+RC=$?; E=$(date +%s.%N)
+echo "[qemu leg wall] $(wall $S $E)s  exit=$RC  st0=$([ -f "$ST0" ] && stat -c %s "$ST0" || echo MISSING)bytes"
+
+echo
+echo "############ B2) VSIM HYBRID LEG (resume + ROI + drain) ############"
+S=$(date +%s.%N)
+ts "$SIM" "$ELF" --resume-from-qemu "$ST0" --handoff-out "$ST1" \
+   --shared-mem-path "$MMAP" --shared-mem-size 134221824 --shared-mem-base 0x0 \
+   --hybrid-exit-pc 0x10047c > "$VS_LOG"; E=$(date +%s.%N)
+echo "[vsim hybrid leg wall] $(wall $S $E)s  lines=$(wc -l <"$VS_LOG")  st1=$([ -f "$ST1" ] && stat -c %s "$ST1" || echo MISSING)bytes"
+echo
+echo "--- first 25 lines ---"; head -25 "$VS_LOG"
+echo "--- last 15 lines ---"; tail -15 "$VS_LOG"
+echo
+echo "--- TOP 20 time gaps between consecutive log lines (gap | elapsed_at | line) ---"
+awk -F' \\| ' 'NR>1{printf "%.3f\t%.3f\t%s\n",$1-p,$1,$2} {p=$1}' "$VS_LOG" | sort -rn | head -20
+rm -f "$MMAP"
