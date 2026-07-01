@@ -4,7 +4,7 @@ unalias -a 2>/dev/null || true
 # Functions
 __arguments () {
 	# undefined
-	builtin autoload -XUz /usr/share/zsh/functions/Completion/Zsh
+	builtin autoload -XUz
 }
 __nvm () {
 	declare previous_word
@@ -514,7 +514,7 @@ compdef () {
 }
 compdump () {
 	# undefined
-	builtin autoload -XUz
+	builtin autoload -XUz /usr/share/zsh/functions/Completion
 }
 compgen () {
 	local opts prefix suffix job OPTARG OPTIND ret=1 
@@ -8370,4 +8370,4 @@ function grep {
     (exec -a ugrep "$_cc_bin" -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclude-dir=.bzr --exclude-dir=.jj --exclude-dir=.sl ${1+"$@"})
   fi
 }
-export PATH=/home/nick/.nvm/versions/node/v22.5.1/bin:/home/nick/.pyenv/shims:/home/nick/.pyenv/bin:/home/nick/.nix-profile/bin/:/home/nick/.python_venv/bin/:/home/nick/myusr/bin:/home/nick/myusr/local/bin:/home/nick/mybin/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/bin/vendor_perl:/home/nick/myTool/arcanist/bin:/usr/share:/home/nick/.cargo/bin/:/home/nick/.local/bin:/home/nick/.fzf/bin:/home/nick/.claude/plugins/cache/claude-plugins-official/ralph-loop/1.0.0/bin
+export PATH=/home/nick/work/vsim_andesim/build:/home/nick/work/qemu_andesim/build/qemu:/home/nick/.nvm/versions/node/v22.5.1/bin:/home/nick/.pyenv/shims:/home/nick/.pyenv/bin:/home/nick/.nix-profile/bin/:/home/nick/.python_venv/bin/:/home/nick/myusr/bin:/home/nick/myusr/local/bin:/home/nick/mybin/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/bin/vendor_perl:/home/nick/myTool/arcanist/bin:/usr/share:/home/nick/.cargo/bin/:/home/nick/.local/bin:/home/nick/.fzf/bin:/home/nick/.claude/plugins/cache/claude-plugins-official/ralph-loop/1.0.0/bin
