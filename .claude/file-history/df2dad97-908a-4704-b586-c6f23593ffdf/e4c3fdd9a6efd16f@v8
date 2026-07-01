@@ -1,0 +1,417 @@
+// Unit tests for hybrid/program_buffer.hpp.
+// Pure compile-time and recording-bus tests -- no SystemC, no hardware.
+
+#include "hybrid/program_buffer.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <array>
+#include <cstdint>
+#include <stdexcept>
+#include <vector>
+
+using namespace hybrid;
+
+// ---- Recording DmiBus stub -------------------------------------------------
+// Captures all writes; returns configurable values per register address.
+struct RecBus
+{
+    struct Op { uint8_t reg; uint32_t val; };
+
+    std::vector<Op> writes;
+    // Per-register read sequences: each call pops the front value.
+    // If the list is empty, returns 0.
+    std::map<uint8_t, std::vector<uint32_t>> read_seq;
+
+    void write(uint8_t reg, uint32_t val) { writes.push_back({reg, val}); }
+
+    uint32_t read(uint8_t reg)
+    {
+        auto it = read_seq.find(reg);
+        if (it == read_seq.end() || it->second.empty()) return 0u;
+        uint32_t v = it->second.front();
+        it->second.erase(it->second.begin());
+        return v;
+    }
+};
+
+// ---- kExecProgbufCmd constant tests ----------------------------------------
+
+TEST_CASE("kExecProgbufCmd: postexec=1, transfer=0, cmdtype=AccessRegister")
+{
+    CHECK(((kExecProgbufCmd >> 18) & 1u) == 1u);   // postexec set
+    CHECK(((kExecProgbufCmd >> 17) & 1u) == 0u);   // transfer NOT set (unlike access_register_command)
+    CHECK(((kExecProgbufCmd >> 24) & 0xFFu) == 0u); // cmdtype = AccessRegister (0)
+}
+
+TEST_CASE("kEbreak encodes a standard ebreak instruction")
+{
+    // ebreak = funct12=000000000001, rs1=0, funct3=0, rd=0, opcode=SYSTEM(0x73)
+    CHECK(kEbreak == 0x00100073u);
+}
+
+TEST_CASE("kProgbufMaxInsns leaves room for ebreak")
+{
+    // 16 slots total (progbuf0..progbuf15); 15 for payload, 1 for ebreak
+    CHECK(kProgbufMaxInsns == 15u);
+    CHECK(kProgbuf0 == 0x20u);
+}
+
+// ---- Instruction encoder tests ---------------------------------------------
+
+TEST_CASE("encode_vsetvl: known encodings")
+{
+    // vsetvl x0, t0, t1  (rd=0, rs1=5, rs2=6)
+    // RVV 1.0: funct7=1000000, opcode=1010111(0x57), funct3=111
+    // 1|000000|00110|00101|111|00000|1010111 = 0x8062F057
+    CHECK(encode_vsetvl(0, 5, 6) == 0x8062F057u);
+
+    // vsetvl x1, a0, a1  (rd=1, rs1=10, rs2=11)
+    // 1|000000|01011|01010|111|00001|1010111 = 0x80B570D7
+    CHECK(encode_vsetvl(1, 10, 11) == 0x80B570D7u);
+
+    // vsetvl x0, x0, x0  (all-zero registers)
+    // 1|000000|00000|00000|111|00000|1010111 = 0x80007057
+    CHECK(encode_vsetvl(0, 0, 0) == 0x80007057u);
+}
+
+TEST_CASE("encode_csrrw: known encodings")
+{
+    // csrrw x0, mstatus(0x300), t0(x5)
+    // [31:20]=0x300, [19:15]=5, [14:12]=001, [11:7]=0, [6:0]=0x73
+    // = 0x30029073
+    CHECK(encode_csrrw(0, 0x300, 5) == 0x30029073u);
+
+    // csrrw x0, vstart(0x008), t1(x6)
+    // [31:20]=0x008, [19:15]=6, [14:12]=001, [11:7]=0, [6:0]=0x73
+    // = 0x00831073
+    CHECK(encode_csrrw(0, 0x008, 6) == 0x00831073u);
+
+    // csrrw x0, vxsat(0x009), t0(x5)
+    // [31:20]=0x009, [19:15]=5, [14:12]=001, [11:7]=0, [6:0]=0x73
+    // = 0x00929073
+    CHECK(encode_csrrw(0, 0x009, 5) == 0x00929073u);
+}
+
+TEST_CASE("encode_vle8_v: known encodings (golden hex from riscv64-elf-as)")
+{
+    // vle8.v vd, (rs1): unit-stride load, EEW=8. vm=1, width=000, mop=00,
+    // mew=0, nf=000, lumop=00000, opcode LOAD-FP=0x07. The single set upper
+    // bit is vm at bit 25. Verified with `riscv64-elf-as -march=rv64gcv`.
+    CHECK(encode_vle8_v(0, 7)  == 0x02038007u);   // vle8.v v0,(x7)
+    CHECK(encode_vle8_v(3, 7)  == 0x02038187u);   // vle8.v v3,(x7)
+    CHECK(encode_vle8_v(31, 7) == 0x02038F87u);   // vle8.v v31,(x7)
+}
+
+TEST_CASE("encode_vse8_v: known encodings (golden hex from riscv64-elf-as)")
+{
+    // vse8.v vs3, (rs1): unit-stride store, EEW=8. Same fields as vle8.v but
+    // opcode STORE-FP=0x27. Verified with `riscv64-elf-as -march=rv64gcv`.
+    CHECK(encode_vse8_v(0, 7)  == 0x02038027u);   // vse8.v v0,(x7)
+    CHECK(encode_vse8_v(3, 7)  == 0x020381A7u);   // vse8.v v3,(x7)
+    CHECK(encode_vse8_v(31, 7) == 0x02038FA7u);   // vse8.v v31,(x7)
+}
+
+TEST_CASE("encode_addi: known encodings (golden hex from riscv64-elf-as)")
+{
+    // addi rd, rs1, imm12: OP-IMM (0x13), funct3=000. The V-data sweep advances
+    // the scratch base pointer x7 by one register-span between batched
+    // transfers. Verified with `riscv64-elf-as -march=rv64gcv`.
+    CHECK(encode_addi(7, 7, 128)  == 0x08038393u);  // addi x7,x7,128
+    CHECK(encode_addi(7, 7, 64)   == 0x04038393u);  // addi x7,x7,64
+    CHECK(encode_addi(5, 5, 2047) == 0x7FF28293u);  // addi x5,x5,2047 (max imm)
+}
+
+TEST_CASE("encode_ld: known encodings (golden hex from riscv64-elf-as)")
+{
+    // ld rd, imm(rs1): LOAD opcode 0x03, funct3=011 (64-bit). The GPR block-load
+    // sweeps x1..x31 from the scratch region via a base register. Verified with
+    // `riscv64-elf-as -march=rv64gcv`.
+    CHECK(encode_ld(1, 31, 0)    == 0x000FB083u);  // ld x1,0(x31)
+    CHECK(encode_ld(5, 31, 32)   == 0x020FB283u);  // ld x5,32(x31)
+    CHECK(encode_ld(31, 31, 240) == 0x0F0FBF83u);  // ld x31,240(x31)
+}
+
+TEST_CASE("encode_fld: known encodings (golden hex from riscv64-elf-as)")
+{
+    // fld rd, imm(rs1): LOAD-FP opcode 0x07, funct3=011 (double). The FPR block-
+    // load sweeps f0..f31 from the scratch region via integer base x5. Same shape
+    // as encode_ld but the FP load opcode. Verified with `riscv64-elf-as`.
+    CHECK(encode_fld(0, 5, 0)    == 0x0002B007u);  // fld f0,0(x5)
+    CHECK(encode_fld(1, 5, 8)    == 0x0082B087u);  // fld f1,8(x5)
+    CHECK(encode_fld(7, 5, 56)   == 0x0382B387u);  // fld f7,56(x5)
+    CHECK(encode_fld(31, 5, 248) == 0x0F82BF87u);  // fld f31,248(x5)
+}
+
+TEST_CASE("encode_sd: known encodings (golden hex from riscv64-elf-as)")
+{
+    // sd rs2, imm(rs1): STORE opcode 0x23, funct3=011 (64-bit). S-type, so the
+    // 12-bit immediate splits imm[11:5] into bits 31:25 and imm[4:0] into 11:7.
+    // The GPR drain sweeps x1..x30 into scratch via integer base x31. Verified
+    // with `riscv64-elf-as`.
+    CHECK(encode_sd(1, 31, 0)    == 0x001FB023u);  // sd x1,0(x31)
+    CHECK(encode_sd(30, 31, 232) == 0x0FEFB423u);  // sd x30,232(x31)
+}
+
+TEST_CASE("encode_fsd: known encodings (golden hex from riscv64-elf-as)")
+{
+    // fsd rs2, imm(rs1): STORE-FP opcode 0x27, funct3=011 (double). Same S-type
+    // shape as encode_sd with the FP-store opcode. The FPR drain sweeps f0..f31
+    // into scratch via integer base x5. Verified with `riscv64-elf-as`.
+    CHECK(encode_fsd(0, 5, 0)    == 0x0002B027u);  // fsd f0,0(x5)
+    CHECK(encode_fsd(31, 5, 248) == 0x0FF2BC27u);  // fsd f31,248(x5)
+}
+
+TEST_CASE("encode_csrrs: known encodings (golden hex from riscv64-elf-as)")
+{
+    // csrrs rd, csr, x0 == `csr r rd, csr`: a pure CSR read (rs1=x0 -> no write
+    // side effect). SYSTEM opcode 0x73, funct3=010. The CSR drain sweeps each
+    // supported Andes/M-ext CSR into a temp GPR, then sd's it to scratch.
+    // Verified with `riscv64-elf-as`.
+    CHECK(encode_csrrs(5, 0x7C4, 0) == 0x7C4022F3u);  // csrr x5, mxstatus
+    CHECK(encode_csrrs(5, 0x30A, 0) == 0x30A022F3u);  // csrr x5, menvcfg
+    CHECK(encode_csrrs(1, 0x341, 0) == 0x341020F3u);  // csrr x1, mepc
+}
+
+// ---- exec_progbuf behavioral tests -----------------------------------------
+
+TEST_CASE("exec_progbuf: single instruction - writes insn, ebreak, exec command")
+{
+    RecBus bus;
+    const std::array<uint32_t, 1> insns{0xDEADBEEFu};
+    exec_progbuf(bus, insns);
+
+    // Writes (in order):
+    //   progbuf0 = insn
+    //   progbuf1 = ebreak
+    //   command  = kExecProgbufCmd
+    // (no pre-clear because bus returns 0 for abstractcs -> no cmderr)
+    REQUIRE(bus.writes.size() == 3u);
+    CHECK(bus.writes[0].reg == kProgbuf0);
+    CHECK(bus.writes[0].val == 0xDEADBEEFu);
+    CHECK(bus.writes[1].reg == kProgbuf0 + 1);
+    CHECK(bus.writes[1].val == kEbreak);
+    CHECK(bus.writes[2].reg == 0x17u);       // kDmiCommand
+    CHECK(bus.writes[2].val == kExecProgbufCmd);
+}
+
+TEST_CASE("exec_progbuf: max instructions fills progbuf0..14, ebreak at progbuf15")
+{
+    RecBus bus;
+    std::array<uint32_t, 15> insns{};
+    for (uint32_t i = 0; i < 15; ++i) insns[i] = 0xAA000000u | i;
+
+    exec_progbuf(bus, insns);
+
+    // 15 payload writes + ebreak + exec command = 17 writes
+    REQUIRE(bus.writes.size() == 17u);
+    for (std::size_t i = 0; i < 15; ++i) {
+        CHECK(bus.writes[i].reg == kProgbuf0 + i);
+        CHECK(bus.writes[i].val == (0xAA000000u | i));
+    }
+    CHECK(bus.writes[15].reg == kProgbuf0 + 15u);
+    CHECK(bus.writes[15].val == kEbreak);
+    CHECK(bus.writes[16].reg == 0x17u);
+    CHECK(bus.writes[16].val == kExecProgbufCmd);
+}
+
+TEST_CASE("exec_progbuf: 16 instructions throws - no bus writes happen")
+{
+    RecBus bus;
+    std::array<uint32_t, 16> insns{};
+    CHECK_THROWS_AS(exec_progbuf(bus, insns), std::runtime_error);
+    CHECK(bus.writes.empty());
+}
+
+TEST_CASE("exec_progbuf: clears sticky cmderr before issuing exec command")
+{
+    RecBus bus;
+    // abstractcs returns cmderr=set on the first read (pre-exec check),
+    // then 0 thereafter (poll + final check)
+    constexpr uint32_t kCmderrMask = 0x7u << 8;
+    bus.read_seq[0x16u] = {kCmderrMask, 0u, 0u};
+
+    const std::array<uint32_t, 1> insns{0x1u};
+    exec_progbuf(bus, insns);
+
+    // Expected writes: progbuf0=insn, progbuf1=ebreak,
+    //                  abstractcs=kCmderrMask (W1C clear),
+    //                  command=kExecProgbufCmd
+    REQUIRE(bus.writes.size() == 4u);
+    CHECK(bus.writes[2].reg == 0x16u);
+    CHECK(bus.writes[2].val == kCmderrMask);
+    CHECK(bus.writes[3].reg == 0x17u);
+    CHECK(bus.writes[3].val == kExecProgbufCmd);
+}
+
+TEST_CASE("exec_progbuf: throws when cmderr set after execution")
+{
+    RecBus bus;
+    constexpr uint32_t kCmderrMask = 0x7u << 8;
+    // reads: [pre-exec cmderr check=0], [busy poll=0], [final cmderr check=set]
+    bus.read_seq[0x16u] = {0u, 0u, kCmderrMask};
+
+    const std::array<uint32_t, 1> insns{0x1u};
+    CHECK_THROWS_AS(exec_progbuf(bus, insns), std::runtime_error);
+}
+
+TEST_CASE("exec_progbuf: polls while busy before returning")
+{
+    RecBus bus;
+    constexpr uint32_t kBusy = 1u << 12;
+    // abstractcs: no pre-cmderr, busy once, then clear, then no post-cmderr
+    bus.read_seq[0x16u] = {0u, kBusy, 0u, 0u};
+
+    const std::array<uint32_t, 1> insns{0x1u};
+    CHECK_NOTHROW(exec_progbuf(bus, insns));
+}
+
+// ---- pb_v_data_sweep batching tests ----------------------------------------
+// Each Program-Buffer execution is one halted-hart DM round-trip (~1000 sim
+// cycles in the busy-poll), so the cost is the NUMBER of executions, not the
+// bytes moved. The sweep batches (transfer; addi) pairs into each execution
+// and advances the base pointer x7 with the in-buffer addi, so 32 registers
+// cost ceil(32/7)=5 executions and ONE x7 abstract write -- instead of 32
+// executions plus 32 per-register x7 writes.
+
+namespace {
+int count_exec_cmds(const RecBus& bus)
+{
+    int n = 0;
+    for (const auto& w : bus.writes)
+        if (w.reg == kDmiCommand && w.val == kExecProgbufCmd) ++n;
+    return n;
+}
+
+int count_x7_abstract_writes(const RecBus& bus)
+{
+    int n = 0;
+    for (const auto& w : bus.writes)
+        if (w.reg == kDmiCommand && (w.val & 0xFFFFu) == regno_gpr(7)
+            && ((w.val >> 16) & 1u) != 0u)
+            ++n;
+    return n;
+}
+
+bool progbuf_holds(const RecBus& bus, uint32_t insn)
+{
+    for (const auto& w : bus.writes)
+        if (w.reg >= kProgbuf0 && w.reg <= kProgbuf0 + kProgbufMaxInsns
+            && w.val == insn)
+            return true;
+    return false;
+}
+
+// Last 64-bit value staged into GPR g via an abstract write: data0/data1 are
+// the two writes immediately preceding the command that targets regno_gpr(g)
+// with the write bit set.
+uint64_t staged_gpr_value(const RecBus& bus, uint16_t g)
+{
+    uint64_t v = 0;
+    for (std::size_t i = 2; i < bus.writes.size(); ++i) {
+        const auto& w = bus.writes[i];
+        if (w.reg == kDmiCommand && (w.val & 0xFFFFu) == regno_gpr(g)
+            && ((w.val >> 16) & 1u) != 0u)
+            v = (uint64_t(bus.writes[i - 1].val) << 32) | bus.writes[i - 2].val;
+    }
+    return v;
+}
+}  // namespace
+
+TEST_CASE("pb_v_data_sweep: LMUL=8 grouping loads all 32 registers in ONE "
+          "PB execution from a single staged base")
+{
+    RecBus bus;
+    constexpr uint64_t kScratch = 0x90000000ull;
+    constexpr uint64_t kVlenb   = 64;          // VLEN=512
+    constexpr uint64_t kGroup   = 8 * kVlenb;  // 512 bytes per LMUL=8 group
+
+    pb_v_data_sweep(bus, kScratch, kVlenb, /*load=*/true);
+
+    // 1 vsetvl execution + 1 grouped execution (all 4 groups fit) = 2
+    // (33 before batching, 6 after addi-batching, 2 with LMUL grouping).
+    CHECK(count_exec_cmds(bus) == 2);
+    // Base staged once; the in-buffer addi advances it by one group (8*vlenb).
+    CHECK(count_x7_abstract_writes(bus) == 1);
+    CHECK(staged_gpr_value(bus, 7) == kScratch);
+    CHECK(progbuf_holds(bus, encode_addi(7, 7, int32_t(kGroup))));
+
+    // vsetvl operands: AVL=x5=8*vlenb (=VLMAX for m8) and vtype=x6=e8/m8.
+    CHECK(staged_gpr_value(bus, 5) == kGroup);
+    CHECK(staged_gpr_value(bus, 6) == kVtypeE8M8);
+
+    // Exactly the 4 group bases are loaded (v0, v8, v16, v24); the other 28
+    // registers ride inside their group, so they are NOT loaded directly.
+    for (uint8_t g = 0; g < 32; g += 8)
+        CHECK(progbuf_holds(bus, encode_vle8_v(g, 7)));
+    CHECK(!progbuf_holds(bus, encode_vle8_v(1, 7)));
+    CHECK(!progbuf_holds(bus, encode_vle8_v(9, 7)));
+}
+
+TEST_CASE("pb_v_data_sweep: load=false stores the 4 register groups via vse8.v")
+{
+    RecBus bus;
+    pb_v_data_sweep(bus, 0x90000000ull, /*vlenb=*/64, /*load=*/false);
+
+    for (uint8_t g = 0; g < 32; g += 8)
+        CHECK(progbuf_holds(bus, encode_vse8_v(g, 7)));
+    CHECK(count_exec_cmds(bus) == 2);
+    CHECK(staged_gpr_value(bus, 6) == kVtypeE8M8);
+}
+
+// ---- csr_sweep behavioral tests --------------------------------------------
+
+TEST_CASE("csr_sweep restore: ld+csrrw per CSR, base seeded with the scratch GPA")
+{
+    RecBus bus;
+    bus.read_seq[kDmiAbstractcs] = {8u << 24};  // progbufsize=8 -> 3 CSRs/exec
+    const std::array<uint16_t, 3> csrs{0x7C4, 0x30A, 0x341};
+    csr_sweep(bus, /*base=*/6, /*base_gpa=*/0xDEAD0000ull, /*val=*/5,
+              std::span<const uint16_t>{csrs}, CsrSweepDir::Restore);
+
+    for (std::size_t k = 0; k < csrs.size(); ++k) {
+        CHECK(progbuf_holds(bus, encode_ld(5, 6, int32_t(k * 8))));
+        CHECK(progbuf_holds(bus, encode_csrrw(0, csrs[k], 5)));
+    }
+    CHECK(!progbuf_holds(bus, encode_csrrs(5, 0x7C4, 0)));  // no drain insns leak
+    CHECK(staged_gpr_value(bus, 6) == 0xDEAD0000ull);       // base seeded once
+}
+
+TEST_CASE("csr_sweep drain: csrr+sd per CSR")
+{
+    RecBus bus;
+    bus.read_seq[kDmiAbstractcs] = {8u << 24};
+    const std::array<uint16_t, 2> csrs{0x7C4, 0xBD0};
+    csr_sweep(bus, 6, 0x1000ull, 5, std::span<const uint16_t>{csrs},
+              CsrSweepDir::Drain);
+
+    for (std::size_t k = 0; k < csrs.size(); ++k) {
+        CHECK(progbuf_holds(bus, encode_csrrs(5, csrs[k], 0)));
+        CHECK(progbuf_holds(bus, encode_sd(5, 6, int32_t(k * 8))));
+    }
+    CHECK(!progbuf_holds(bus, encode_csrrw(0, 0x7C4, 5)));  // no restore insns
+    CHECK(staged_gpr_value(bus, 6) == 0x1000ull);
+}
+
+TEST_CASE("csr_sweep with an empty list does nothing (no seed, no exec)")
+{
+    RecBus bus;
+    bus.read_seq[kDmiAbstractcs] = {8u << 24};
+    const std::array<uint16_t, 0> csrs{};
+    csr_sweep(bus, 6, 0x1000ull, 5, std::span<const uint16_t>{csrs},
+              CsrSweepDir::Restore);
+    CHECK(bus.writes.empty());        // early-out before the base seed
+    CHECK(count_exec_cmds(bus) == 0);
+}
+
+TEST_CASE("csr_sweep batches at (progbufsize-1)/2 CSRs per execution")
+{
+    RecBus bus;
+    bus.read_seq[kDmiAbstractcs] = {8u << 24};  // 7 usable slots -> 3 CSRs/exec
+    const std::array<uint16_t, 7> csrs{0x7C4, 0x30A, 0x341, 0x342,
+                                       0x343, 0x344, 0x345};
+    csr_sweep(bus, 6, 0x1000ull, 5, std::span<const uint16_t>{csrs},
+              CsrSweepDir::Restore);
+    CHECK(count_exec_cmds(bus) == 3);  // 7 CSRs / 3 per exec -> 3+3+1
+}
