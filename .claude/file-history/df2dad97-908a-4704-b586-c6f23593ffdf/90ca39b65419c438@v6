@@ -1,0 +1,141 @@
+// Pure-byte-copy helpers that move state.vreg[] in and out of the V scratch
+// region. L26: the scratch is the TOP kVScratchBytes of the mapped RAM span
+// (v_scratch_gpa = ram_base + ram_size - kVScratchBytes), not a fixed GPA.
+// The host stager copies span-relative (the scratch is the span's top page),
+// so it needs no ram_base; ram_base only enters the GUEST address the
+// Program-Buffer sweep uses, which is what v_scratch_gpa() returns.
+// The unit tests assert: bytes round-trip with no padding loss, the GPA
+// tracks span size + base, and a span smaller than one scratch page throws.
+
+#include "hybrid/state_abi.h"
+#include "hybrid/v_regfile_xfer.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+TEST_CASE("v_regfile_xfer: stage packs registers contiguously at vlenb stride")
+{
+  // The scratch is vlenb-PACKED (register r at offset r*vlenb, no wire-format
+  // padding gap) so 8 consecutive registers form one LMUL=8 group for the
+  // Program-Buffer sweep. Fill only the meaningful (first vlenb) bytes of each
+  // wire slot; leave the padding zero (matches what the QEMU plugin drains).
+  hybrid_state_v1 in{};
+  in.vlenb = 64;  // VLEN=512
+  for (int r = 0; r < 32; ++r)
+    for (size_t b = 0; b < in.vlenb; ++b)
+      in.vreg[r * HYBRID_VLEN_BYTES_MAX + b] =
+          static_cast<uint8_t>((r * 64 + b) & 0xff);
+
+  std::vector<uint8_t> ram(static_cast<size_t>(128) * 1024 * 1024);
+  hybrid::stage_v_to_scratch(in, ram);
+
+  // L26: the scratch window is the TOP page of the span, not a fixed GPA.
+  // Each register sits at off + r*vlenb, contiguous (NOT the 128-byte wire span).
+  const size_t off = ram.size() - hybrid::kVScratchBytes;
+  for (int r = 0; r < 32; ++r)
+    CHECK(std::memcmp(ram.data() + off + static_cast<size_t>(r) * in.vlenb,
+                      in.vreg + r * HYBRID_VLEN_BYTES_MAX, in.vlenb) == 0);
+
+  // Round-trip: read into a zero-init state; meaningful bytes return and the
+  // wire-slot padding stays zero (so the full 128-byte slots equal `in`).
+  hybrid_state_v1 out{};
+  out.vlenb = in.vlenb;
+  hybrid::read_v_from_scratch(out, ram);
+  CHECK(std::memcmp(out.vreg, in.vreg, hybrid::kVScratchBytes) == 0);
+}
+
+TEST_CASE("v_regfile_xfer: stage_gpr packs x1..x31 at the top of the scratch page")
+{
+  // GPR block-load prototype: x1..x31 are staged contiguously (8 bytes each) in
+  // the TOP kGprScratchBytes of the scratch page, so the resume Program-Buffer
+  // ld-sweep reads them below the V region (which grows up from the base).
+  hybrid_state_v1 in{};
+  for (int i = 1; i < 32; ++i)
+    in.gpr[i] = 0xA000000000ULL + static_cast<uint64_t>(i);
+
+  std::vector<uint8_t> ram(static_cast<size_t>(128) * 1024 * 1024);
+  hybrid::stage_gpr_to_scratch(in, ram);
+
+  // All of x1..x31 are staged, x31 into the final slot. After the memory-decoder
+  // off-by-one fix the guest can read that last word, so x31 rides the ld-sweep
+  // like every other GPR (no separate abstract write, no guard slot).
+  const size_t off = ram.size() - hybrid::kGprScratchBytes;
+  for (int i = 1; i < 32; ++i) {
+    uint64_t v;
+    std::memcpy(&v, ram.data() + off + static_cast<size_t>(i - 1) * 8, 8);
+    CHECK(v == in.gpr[i]);
+  }
+}
+
+TEST_CASE("v_regfile_xfer: gpr_scratch_gpa tops the page; fit gated by vlenb")
+{
+  CHECK(hybrid::kGprScratchBytes == static_cast<size_t>(31) * 8);
+  CHECK(hybrid::gpr_scratch_gpa(0x1000)
+        == 0x1000 + hybrid::kVScratchBytes - hybrid::kGprScratchBytes);
+  // V region (32*vlenb) must not overlap the GPR region at the page top.
+  CHECK(hybrid::gpr_scratch_fits(64));    // 2048 + 248 <= 4096
+  CHECK(!hybrid::gpr_scratch_fits(128));  // 4096 + 248 > 4096
+}
+
+TEST_CASE("v_regfile_xfer: stage_fpr packs f0..f31 below the GPR block")
+{
+  // FPR block-load: f0..f31 are staged contiguously (8 bytes each) just BELOW
+  // the GPR block near the page top, so the resume PB fld-sweep reads them
+  // without colliding with the GPR block (above) or the V region (below,
+  // growing up from the base). All 32 f-regs ride the sweep (no f-reg is a
+  // base pointer, unlike x31 for GPRs).
+  hybrid_state_v1 in{};
+  for (int i = 0; i < 32; ++i)
+    in.fpr[i] = 0xF000000000ULL + static_cast<uint64_t>(i);
+
+  std::vector<uint8_t> ram(static_cast<size_t>(128) * 1024 * 1024);
+  hybrid::stage_fpr_to_scratch(in, ram);
+
+  const size_t off =
+      ram.size() - hybrid::kGprScratchBytes - hybrid::kFprScratchBytes;
+  for (int i = 0; i < 32; ++i) {
+    uint64_t v;
+    std::memcpy(&v, ram.data() + off + static_cast<size_t>(i) * 8, 8);
+    CHECK(v == in.fpr[i]);
+  }
+}
+
+TEST_CASE("v_regfile_xfer: fpr_scratch_gpa sits below the GPR block; fit gated by vlenb")
+{
+  CHECK(hybrid::kFprScratchBytes == static_cast<size_t>(32) * 8);
+  CHECK(hybrid::fpr_scratch_gpa(0x1000)
+        == 0x1000 + hybrid::kVScratchBytes - hybrid::kGprScratchBytes
+             - hybrid::kFprScratchBytes);
+  // V region (32*vlenb) must clear BOTH the FPR and GPR blocks at the page top,
+  // so the FPR gate (lower in the page) is tighter than the GPR gate.
+  CHECK(hybrid::fpr_scratch_fits(64));    // 2048 <= 3592
+  CHECK(hybrid::fpr_scratch_fits(112));   // 3584 <= 3592
+  CHECK(!hybrid::fpr_scratch_fits(120));  // 3840 >  3592
+  CHECK(!hybrid::fpr_scratch_fits(128));  // 4096 >  3592
+}
+
+TEST_CASE("v_regfile_xfer: v_scratch_gpa = ram_base + ram_size - kVScratchBytes")
+{
+  // The single source of truth for the scratch's GUEST address: the top page.
+  CHECK(hybrid::v_scratch_gpa(0x0ull, 128ull * 1024 * 1024)
+        == 128ull * 1024 * 1024 - hybrid::kVScratchBytes);            // 0x07FFF000
+  CHECK(hybrid::v_scratch_gpa(0x0ull, 0x80000000ull)
+        == 0x80000000ull - hybrid::kVScratchBytes);                   // 0x7FFFF000
+  // Non-zero base shifts the GPA by the base.
+  CHECK(hybrid::v_scratch_gpa(0x80000000ull, 64ull * 1024 * 1024)
+        == 0x80000000ull + 64ull * 1024 * 1024 - hybrid::kVScratchBytes);
+  // L11: 128 bytes per register (VLEN ceiling 1024) -> 4 KiB scratch.
+  CHECK(hybrid::kVScratchBytes == static_cast<size_t>(32) * 128);
+}
+
+TEST_CASE("v_regfile_xfer: throws when the RAM span is smaller than one scratch page")
+{
+  std::vector<uint8_t> ram(hybrid::kVScratchBytes - 1);  // one byte too small
+  hybrid_state_v1 s{};
+  CHECK_THROWS(hybrid::stage_v_to_scratch(s, ram));
+  CHECK_THROWS(hybrid::read_v_from_scratch(s, ram));
+}
