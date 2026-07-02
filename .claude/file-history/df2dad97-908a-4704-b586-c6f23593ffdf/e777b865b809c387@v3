@@ -1,0 +1,93 @@
+# Capability gating: mapping IM Requirements to engine gates
+
+Three files, three roles (all in the vsim repo):
+
+| File | Role |
+|------|------|
+| `src/hybrid/andes_caps.hpp` | CSR address -> `AndesGate` (spec knowledge, engine-free, unit-testable) |
+| `src/hybrid/andes_caps_config.hpp` | `AndesGate` -> `_NDS_*` config macro (the one binding site) |
+| `build/V<engine>/obj_sc/config.inc` | what THIS engine actually has (ground truth) |
+
+A CSR with no case in `andes_gate_for` defaults to ALWAYS = transported
+unconditionally. Every CSR added to the ABI lists therefore needs a
+deliberate decision: ALWAYS only for base machine CSRs every Andes core
+has (mxstatus, mclk_ctl, mdcause).
+
+## The rules (each one paid for by a real bug)
+
+1. **Gate on the RTL's existence term, exactly -- compound conditions get
+   compound (derived) gates.** Not on a feature that usually comes along
+   with it, and never on HALF the condition. `mcountermask_m` (0x7D1)
+   exists when `(mmsc_cfg.PMNDS==1) & (misa[20]==1)`; it was first gated
+   PERF_MONITOR (missing the privilege half -- faulted on M-only premium),
+   then UMODE (missing the scheme half -- would over-claim on a U-mode
+   Sscofpmf core). The RTL term is `PERF & !SSCOFPMF & multi_level_mode`,
+   so the gate is the derived conjunction `PMNDS_UMODE`, computed once at
+   the binding site (`andes_caps_config.hpp`) from the macros. When a
+   condition spans several knobs, add a derived gate named after the SPEC
+   concept (PMNDS) and document the RTL term next to it.
+
+2. **A standard-extension CSR is not implied by its Andes-classic
+   sibling.** `jvt` (0x017) is Zcmt's table-jump base; classic Andes
+   CoDense is `exec.it` + `uitb` (0x800). Gating jvt on CODENSE faulted the
+   sweep on every CoDense core. When no config.inc knob exists for an
+   extension, add the gate anyway bound to the macro it WOULD be
+   (`_NDS_ZCMT_SUPPORT_INT`): absent reads as off today, and a future
+   config turns it on without a code change.
+
+3. **The tolerant abstract path masks over-claims -- do not trust a passing
+   --verify as caps validation.** `read_register_64` clears a faulting
+   read and mirrors it as zero; QEMU drains zero for a CSR the program
+   never wrote; `--verify` matches zero == zero. Both bugs above were
+   "verified" for months. The batched PB `csr_sweep` is the real
+   validator: one over-claimed CSR faults the whole batch, and the sweep
+   bisects to name it:
+   `csr_sweep: CSR 0x17 raised cmderr -- the caps map over-claims a CSR
+   the hart does not implement (fix andes_caps)`.
+
+4. **QEMU-exposes != vsim-implements.** QEMU's `-cpu andes-ax45mpv` models
+   full M+S+U and its gdbstub advertises CSRs the M-only RTL lacks.
+   Capability is decided from vsim's config.inc, never from what QEMU
+   drains. (To dump what QEMU really exposes: RSP
+   `qXfer:features:read:riscv-csr.xml`.)
+
+## TDD recipe for a caps change
+
+1. RED: in `tests/hybrid/andes_caps.test.cpp`, model the engine's
+   config.inc shape as a helper (see `premium()`) -- set exactly the gates
+   its `_NDS_*` macros turn on. Assert the expected `supports_csr()`
+   verdicts, including the one that currently fails. Run in the vsim build
+   container; show the failure.
+2. GREEN: move/add the `case` in `andes_gate_for` (and the binding in
+   `andes_caps_config.hpp` if the gate is new). Comment the spec condition.
+3. Rebuild the sim target and rerun; then climb the validation ladder.
+
+Keep the test helper honest: if the engine's config changed (or was
+mis-modeled, as premium's perf monitor once was), fix the helper to match
+`config.inc` -- the helper IS the machine-checked record of the engine
+shape.
+
+## Write requirements: what must be true before a restore can SET a CSR
+
+Existence is only half of "can we set it". The restore path has ordering
+prerequisites -- violating them writes values the hart drops or faults:
+
+- `mstatus.FS`/`VS` must be non-Off before any FPR/V access (fld/vle8
+  sweeps AND abstract FPR/V-CSR ops raise illegal-instruction at reset,
+  where both are Off). Resume and the baseline capture both enable them
+  first.
+- `vtype`/`vl` are restorable only via `vsetvl` (direct vtype write sets
+  vill; vl is read-only); `vstart` must be written AFTER vsetvl (vsetvl
+  zeroes it); the V-data sweep's own vsetvl clobbers all three, so
+  architectural V-CSR restore runs after the data sweep.
+- `mcounterwen` gates which counter-mask writes take effect: restore the
+  write-enable before the counters it enables. `msp_bound`/`msp_base`
+  before `mhsp_ctl` (enabling stack-safe with stale bounds traps).
+- WARL fields silently pin: after a write that MUST take (e.g. `dcsr.prv`),
+  read back and verify, and abort with a pick-another-engine error if
+  pinned.
+- The restore-side CSR sweep stays OFF: a `csrrw` to a read-only or
+  WARL-illegal field faults the batch, and unlike the drain there is no
+  idempotent retry story for partially-applied writes. Restores go through
+  the per-CSR tolerant abstract path until a per-CSR writability model
+  exists.
