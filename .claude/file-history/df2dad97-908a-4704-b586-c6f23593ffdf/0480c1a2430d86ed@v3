@@ -1,0 +1,138 @@
+# The three-way audit: spec x config x RTL
+
+Validating a vsim engine's CSR transport means proving THREE sources agree,
+per CSR. Each answers a different question, and any two can agree while
+being wrong -- only the triangle closes the audit:
+
+| Source | Where | Answers |
+|---|---|---|
+| 1. SPEC (SPA PDF) | per-CSR `IM Requirement:` + Table 13 | when does the CSR exist, in ARCHITECTURE terms (`mmsc_cfg.PMNDS & misa[20]`) |
+| 2. CONFIG (vsim config) | `build/V<engine>/obj_sc/config.inc` | which knobs THIS build turned on (`NDS_*` macros) |
+| 3. CPU CORE (RTL) | the decoder's `existent_csr` equation | the EXACT mapping: spec condition as a function of config params |
+
+The RTL is the Rosetta stone. The spec speaks architecture
+(`mmsc_cfg.PMNDS`), the config speaks knobs (`NDS_PERFORMANCE_MONITOR_INT`),
+and nothing in either document says how one maps to the other. The decoder
+equation does -- it is the hardware's own translation, one term per CSR.
+
+## Step 1: find the decoder equation
+
+```sh
+grep -rln existent_csr $VSIM_BIN_DIR/../V<engine>/  # kv_core family:
+# andes_ip/kv_core/ucore/hdl/kv_csr_dec.v
+grep -o "(csr_addr == 12'h7cf)[^|]*" .../kv_csr_dec.v
+```
+
+Real terms from ax46mpv_advanced (line-wrapped):
+
+```
+(csr_addr == 12'h7cf) & (PERFORMANCE_MONITOR_INT == 1) & (SSCOFPMF_SUPPORT == 0)
+(csr_addr == 12'h7d1) & (PERFORMANCE_MONITOR_INT == 1) & (SSCOFPMF_SUPPORT == 0) & multi_level_mode
+(csr_addr == 12'h017) & (ZCE_SUPPORT_INT == 1)
+(csr_addr == 12'h7c5) & (POWERBRAKE_SUPPORT_INT == 1)
+```
+
+## Step 2: build the translation table
+
+For every transported CSR, one row connecting all three languages:
+
+| CSR | Spec condition | RTL term | config.inc knobs |
+|---|---|---|---|
+| mcounterinten 0x7CF | `mmsc_cfg.PMNDS==1` | `PERF_MONITOR & !SSCOFPMF` | `NDS_PERFORMANCE_MONITOR_INT`, `NDS_SSCOFPMF_SUPPORT` |
+| mcountermask_m 0x7D1 | `PMNDS & misa[20]` | `PERF & !SSCOFPMF & multi_level_mode` | + `NDS_NUM_PRIVILEGE_LEVELS >= 2` |
+| jvt 0x017 | Zcmt implemented | `ZCE_SUPPORT_INT == 1` | `NDS_ZCE_SUPPORT_INT` |
+
+The translation is where every real bug so far has lived:
+- spec `PMNDS` is NOT the config's `PERFORMANCE_MONITOR` knob -- it is
+  `PERF && !SSCOFPMF` (the standard Sscofpmf scheme REPLACES the Andes
+  counters). Gating 0x7CF on the perf knob alone over-claimed it on the
+  Sscofpmf-bearing advanced engine and faulted the sweep.
+- spec "User mode implemented" (`misa[20]`) is `NDS_NUM_PRIVILEGE_LEVELS >= 2`.
+- spec "Zcmt" is the `ZCE_SUPPORT` knob, NOT the CoDense knob.
+
+## Step 3: encode the row as code (TDD)
+
+Each row lands in FOUR places that must never drift:
+1. vsim gate map: `src/hybrid/andes_caps.hpp` (`andes_gate_for`)
+2. vsim knob binding: `src/hybrid/andes_caps_config.hpp`
+3. andesim offline mirror: `scripts/config_inc_to_andes_caps.py`
+4. the caps unit test modeling THIS engine's config shape
+   (`tests/hybrid/andes_caps.test.cpp` -- see the `premium()`/`advanced()`
+   helpers; write the failing expectation FIRST)
+
+Drift between 1+2 and 3 is caught by the parity guard
+(`tests/andes_sim/test_andes_sim_caps_parity.sh`, all built engines).
+Drift between the code and the RTL is caught only by Step 4.
+
+## Step 4: confirm against the live engine
+
+Paper agreement is not validation -- the parity guard passed while BOTH
+sides over-claimed 0x7CF together. The empirical check is the batched PB
+CSR sweep, which executes a real `csrr` of every claimed CSR on the RTL:
+
+```sh
+rm -rf ~/.cache/andesim   # force the baseline capture (full drain + sweep)
+./andesim run --mode hybrid --trigger marker --engine vsim:<engine> \
+  --verify tests/fixtures/rt_c_hello.elf
+```
+
+- Over-claim -> the sweep faults and NAMES the CSR
+  (`csr_sweep: CSR 0x7cf raised cmderr...`) -> back to Step 1 for that CSR.
+- Under-claim -> the registration completeness check (see
+  engine-registration.md deliverable 2): every RTL-existent, spec-transportable
+  CSR must be claimed or on a named exclusion.
+- Clean capture + `[verify] PASS` -> the engine's claimed set is proven
+  csrr-able and round-trips. Expect the compared-field count to differ per
+  engine (premium 144, advanced 145) -- the caps decide the set.
+
+## Step 5: write the engine's test cases
+
+A validated engine gets registered with its own permanent tests
+(engine-registration.md has the full contract):
+- the caps unit-test helper modeling its config shape (Step 3.4) -- pins the
+  translation table in code;
+- the parity guard picks the engine up automatically (it loops over built
+  `sim_*` binaries);
+- the registration manifest (every spec CSR: exists/transported/why +
+  empirical reset value) + generated write-survival fixtures;
+- a cold-cache `--verify` run in both trigger modes in the suite, so the
+  sweep validator re-runs on every engine rebuild (the baseline cache key
+  includes the binary identity -- a rebuild self-invalidates and re-proves).
+
+## When the triangle does not close: classify, do not assume
+
+A mismatch has FOUR possible root causes, and the audit must say which --
+"fix the caps map" is the shipping action, not the diagnosis:
+
+| Class | Signature | Action |
+|---|---|---|
+| A. Interpretation error (yours) | two readings of the SAME source disagree: per-CSR section vs Table 13, or your RTL-equation reading vs the empirical probe/sweep | re-extract with the second method; if still conflicting, mark UNRESOLVED in the report -- never guess. PDF table flattening (Table 13's stacked rows) and truncated greps of the long `existent_csr` line are the usual culprits |
+| B. QEMU-model artifact | RTL + spec agree; QEMU differs (it models no local memory, different reset defaults) | verify-exclude with a named reason (precedents: milmb/mdlmb EN bit, msp_bound reset). Not an RTL bug -- do not escalate to the RTL team |
+| C. Suspected RTL bug / undocumented deviation | RTL and the empirical sweep agree with EACH OTHER but contradict the spec's clear condition, while QEMU follows the spec | transport follows the ENGINE (ship), and the discrepancy is ESCALATED to the RTL owners with the quoted equation + spec text. Never silently absorb it |
+| D. Suspected spec error / ambiguity | independent implementations (RTL AND QEMU) agree against the spec text, or the spec self-contradicts | record the chosen reading + escalate to the spec owners |
+
+Triangulation levers, cheapest first: (1) re-read the same source a second
+way (section vs Table 13; grep vs the probe); (2) QEMU as an independent
+implementation of the same spec; (3) sibling engines (does premium's RTL
+carry the same term?); (4) the empirical sweep/probe -- execution evidence
+outranks any reading.
+
+Evidence standard for the report: verbatim quotes with file:line / PDF
+page for every claim in a discrepancy row. A paraphrase cannot be
+re-audited, and class A errors hide in paraphrases.
+
+## Worked example: the 0x7CF find, end to end
+
+1. Symptom: first-ever hybrid run on ax46mpv_advanced died:
+   `csr_sweep: CSR 0x7cf raised cmderr -- the caps map over-claims...`
+2. Config check: `NDS_PERFORMANCE_MONITOR_INT 1` on BOTH engines -- the knob
+   cannot explain premium-works/advanced-faults. So the gate's model of the
+   world is wrong, not the config.
+3. RTL: grep the advanced decoder -> `0x7cf ... & (SSCOFPMF_SUPPORT == 0)`;
+   advanced config.inc: `NDS_SSCOFPMF_SUPPORT 1` (premium: 0). Root cause.
+4. Spec cross-check: SPA Table 13 gates the block on `mmsc_cfg.PMNDS`; the
+   RTL term IS the PMNDS definition in config language.
+5. Fix: PMNDS/PMNDS_UMODE/PMNDS_SMODE gates (vsim + Python mirror), RED
+   test first with an `advanced()` config-shape helper.
+6. Validate: parity on both engines, cold-cache `--verify` PASS on both
+   (advanced: first successful hybrid run, 145 fields), full e2e.
