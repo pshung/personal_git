@@ -1,0 +1,86 @@
+// LG3: cache-file helpers for the engine reset-state baseline (the
+// hybrid_state_v1 the liveness gate compares restores against).
+
+#include "hybrid/reset_baseline.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+
+namespace fs = std::filesystem;
+
+namespace {
+
+auto make_state() -> hybrid_state_v1
+{
+  hybrid_state_v1 s{};
+  s.magic = HYBRID_STATE_MAGIC;
+  s.version = HYBRID_STATE_VERSION;
+  s.flags = HYBRID_FLAG_RV64 | HYBRID_FLAG_ANDES;
+  s.andes.mxstatus = 0x1122;
+  s.mepc = 0x33;
+  s.vreg[100] = 0xAB;
+  return s;
+}
+
+auto tmpdir() -> fs::path
+{
+  const auto d = fs::temp_directory_path() / "reset_baseline_test";
+  fs::remove_all(d);
+  fs::create_directories(d);
+  return d;
+}
+
+}  // namespace
+
+TEST_CASE("cache file name encodes engine, version, and the binary+elf "
+          "identity (the pre-halt free-run makes the state per-ELF)")
+{
+  CHECK(hybrid::reset_baseline_file_name("sim_x", "abc1", 12, 34, 56, 78)
+        == "sim_x-abc1-12-34-56-78.bin");
+}
+
+TEST_CASE("cache root: XDG_CACHE_HOME wins, HOME/.cache is the fallback, "
+          "neither -> empty (cache disabled)")
+{
+  CHECK(hybrid::reset_baseline_cache_root("/xdg", "/home/u")
+        == fs::path("/xdg/andesim"));
+  CHECK(hybrid::reset_baseline_cache_root(nullptr, "/home/u")
+        == fs::path("/home/u/.cache/andesim"));
+  CHECK(hybrid::reset_baseline_cache_root("", "/home/u")
+        == fs::path("/home/u/.cache/andesim"));
+  CHECK(hybrid::reset_baseline_cache_root(nullptr, nullptr).empty());
+}
+
+TEST_CASE("save + load round-trip preserves the state bytes, creating "
+          "parent directories")
+{
+  const auto f = tmpdir() / "a" / "b" / "base.bin";
+  const auto s = make_state();
+  REQUIRE(hybrid::save_reset_baseline(f, s));
+  const auto back = hybrid::try_load_reset_baseline(f);
+  REQUIRE(back.has_value());
+  CHECK(std::memcmp(&*back, &s, sizeof s) == 0);
+}
+
+TEST_CASE("missing, truncated, or bad-magic files load as nullopt")
+{
+  const auto d = tmpdir();
+  CHECK_FALSE(hybrid::try_load_reset_baseline(d / "absent.bin").has_value());
+
+  const auto short_f = d / "short.bin";
+  {
+    std::ofstream out(short_f, std::ios::binary);
+    out << "xyz";
+  }
+  CHECK_FALSE(hybrid::try_load_reset_baseline(short_f).has_value());
+
+  auto bad = make_state();
+  bad.magic = 0x1234;
+  const auto bad_f = d / "bad.bin";
+  REQUIRE(hybrid::save_reset_baseline(bad_f, bad));
+  CHECK_FALSE(hybrid::try_load_reset_baseline(bad_f).has_value());
+}
