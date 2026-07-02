@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# test_all.sh -- run the full andesim test surface. This is the entry point that
+# replaced the former `andesim test` subcommand (which moved out of the binary).
+#
+# Phases (all run, in order, unless named explicitly):
+#   unit      build/driver/andesim-*-test   the C++ driver unit tests
+#   contract  tests/andes_sim/*.sh          driver feature + parity contracts
+#   e2e       scripts/run_e2e.sh            hybrid qemu+vsim round-trips
+#
+# Usage:
+#   scripts/test_all.sh [--dry-run] [unit|contract|e2e ...]
+#
+# --dry-run prints the plan without executing (and without building). The
+# contract and e2e phases need built artifacts -- run scripts/build_all.sh
+# first. FILTER / MODE / JOBS pass through to scripts/run_e2e.sh unchanged.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+DRY_RUN=0
+PHASES=()
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    unit|contract|e2e) PHASES+=("$arg") ;;
+    *)
+      echo "test_all.sh: unknown argument: $arg" >&2
+      echo "usage: test_all.sh [--dry-run] [unit|contract|e2e ...]" >&2
+      exit 2
+      ;;
+  esac
+done
+[ "${#PHASES[@]}" -eq 0 ] && PHASES=(unit contract e2e)
+
+step() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+ok()   { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
+fail() { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; }
+
+pass=0
+failed=0
+declare -a FAILED_NAMES=()
+
+# run_case NAME CMD...  -- execute one case, tally it, dump its log on failure.
+run_case() {
+  local name="$1"; shift
+  if [ "$DRY_RUN" = 1 ]; then printf '  %s\n' "$name"; return; fi
+  local log rc; log=$(mktemp)
+  "$@" >"$log" 2>&1; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    ok "$name"; pass=$((pass + 1))
+  else
+    fail "$name (rc=$rc)"; failed=$((failed + 1)); FAILED_NAMES+=("$name")
+    cat "$log"
+  fi
+  rm -f "$log"
+}
+
+run_unit() {
+  step "[unit] C++ driver unit tests"
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '  %s\n' "scripts/build_driver.sh" "build/driver/andesim-*-test (each)"
+    return
+  fi
+  if ! bash "$ROOT/scripts/build_driver.sh" >/dev/null; then
+    fail "[unit] build_driver.sh failed"; failed=$((failed + 1)); return
+  fi
+  shopt -s nullglob
+  local bins=("$ROOT"/build/driver/andesim-*-test)
+  shopt -u nullglob
+  if [ "${#bins[@]}" -eq 0 ]; then
+    fail "[unit] no unit-test binaries under build/driver"; failed=$((failed + 1)); return
+  fi
+  local t
+  for t in "${bins[@]}"; do run_case "[unit] $(basename "$t")" "$t"; done
+}
+
+run_contract() {
+  step "[contract] driver feature + parity contracts"
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '  %s\n' "tests/andes_sim/parity.sh" "tests/andes_sim/test_andes_sim_*.sh (each)" \
+      "tests/andes_csr/test_*.sh (each)"
+    return
+  fi
+  local s
+  for s in "$ROOT"/tests/andes_sim/parity.sh "$ROOT"/tests/andes_sim/test_andes_sim_*.sh \
+           "$ROOT"/tests/andes_csr/test_*.sh; do
+    [ -f "$s" ] || continue
+    run_case "[contract] $(basename "$s")" bash "$s"
+  done
+}
+
+run_e2e() {
+  step "[e2e] hybrid qemu+vsim round-trips"
+  if [ "$DRY_RUN" = 1 ]; then printf '  %s\n' "scripts/run_e2e.sh"; return; fi
+  run_case "[e2e] run_e2e.sh" bash "$ROOT/scripts/run_e2e.sh"
+}
+
+for p in "${PHASES[@]}"; do
+  case "$p" in
+    unit)     run_unit ;;
+    contract) run_contract ;;
+    e2e)      run_e2e ;;
+  esac
+done
+
+if [ "$DRY_RUN" = 1 ]; then
+  echo
+  echo "(dry-run: nothing executed)"
+  exit 0
+fi
+
+echo
+step "summary: $pass passed, $failed failed"
+if [ "$failed" -gt 0 ]; then
+  fail "failed: ${FAILED_NAMES[*]}"
+  exit 1
+fi
