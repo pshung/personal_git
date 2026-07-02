@@ -1,0 +1,106 @@
+---
+name: csr-transport-bringup
+description: >
+  Bring up or audit the hybrid CSR transport for an Andes RISC-V core, given
+  the AndeStar V5 SPA PDF spec and a built vsim engine. Covers the whole
+  pipeline: mine the spec (CSR inventory, IM Requirement / existence
+  conditions, access modes, reset values), classify transport dispositions,
+  bind capability gates to the engine's config.inc, and validate with the
+  Program-Buffer CSR sweep, --verify, and the e2e suite. Use this skill
+  whenever the user mentions a new core, a new vsim engine, CSR transport /
+  transportation, CSR capability or caps gating, IM Requirement, reset value
+  table, which mode a CSR is supported in, csr_sweep cmderr faults, or
+  --verify field mismatches on Andes/M-ext CSRs -- even if they do not say
+  "bring-up" explicitly.
+---
+
+# CSR transport bring-up for a new Andes core
+
+Inputs you need from the user (ask if missing):
+- The AndeStar V5 SPA PDF for the core family (the repo carries
+  `AndeStar_V5_SPA_UM164_V1.7.pdf` for the current cores).
+- The engine name (e.g. `ax45mpv_premium`) and a built vsim checkout
+  (`VSIM_BIN_DIR` in `config.env` points at its `build/`).
+- Optionally the matching QEMU `-cpu` name for the oracle leg.
+
+The goal: every CSR the core implements and the ROI can touch is restored at
+resume, re-read at drain, and `--verify`-compared -- and every CSR the core
+does NOT implement is gated off, because the batched Program-Buffer sweep
+faults (cmderr=3) on a single over-claimed CSR.
+
+Work in this order. Each phase has a reference file with the details --
+read it when you reach the phase, not before.
+
+## Phase 0: establish ground truth
+
+The engine's compiled-in config is the ONLY truth about what it implements.
+Read `$VSIM_BIN_DIR/V<engine>/obj_sc/config.inc` (the BUILD directory copy --
+the `external/` source tree can differ from what was actually built) and
+`sim_<engine> --describe`. Do not trust QEMU: its gdbstub exposes CSRs the
+vsim RTL does not implement (QEMU models a fuller core), and restoring or
+sweeping one of those stalls or faults the Debug Module.
+
+## Phase 1: mine the spec
+
+Run `scripts/extract_csr_inventory.py <spec.pdf>` to refresh
+`tests/andes_csr/csr_inventory.csv` (needs PyMuPDF; use a venv). Then pull,
+for each CSR the core claims: the IM Requirement (existence condition), the
+Access Mode, and the reset value. The SPA has a fixed per-CSR layout and a
+consolidated existence table (Table 13) -- see
+`references/spec-mining.md` for the exact headers and extraction recipes.
+
+## Phase 2: classify dispositions
+
+Run `scripts/classify_csr_coverage.py tests/andes_csr/csr_inventory.csv` and
+the guard `tests/andes_csr/check_coverage.py`. The guard enforces
+inventory == matrix == ABI (`include/hybrid/state_abi.h`), so a CSR added to
+the wire format without a disposition (or vice versa) fails loudly. New
+transported CSRs are one X-macro line in `state_abi.h`
+(`HYBRID_ANDES_CSR_LIST` / `HYBRID_M_EXT_CSR_LIST`); every consumer
+(plugin drain, restore, drain re-read, verify) iterates the same list.
+
+## Phase 3: bind capability gates
+
+For each transported CSR, map its IM Requirement to a gate in the vsim
+repo's `src/hybrid/andes_caps.hpp` (address -> gate) and bind the gate to a
+`_NDS_*` config macro in `andes_caps_config.hpp` (absent macro reads as
+"off" -- never a compile error). The gate must encode the SPEC's existence
+condition, not a plausibly-related feature; two real bugs came from getting
+this wrong. Follow TDD: model the new engine's config shape as a caps
+helper in `tests/hybrid/andes_caps.test.cpp` and write the failing
+expectation first. Read `references/caps-gating.md` -- it carries the
+hard-won rules and the write-prerequisite (setup ordering) requirements.
+
+## Phase 4: reset values and verify exclusions
+
+Two reset-value sources exist and they legitimately differ:
+- The SPA reset table (documentation; many fields are IM = implementation
+  determined or DC = don't care).
+- The EMPIRICAL baseline the simulator drains from the freshly reset hart
+  (cached per engine build + ELF). The liveness gate compares against this
+  one -- it is self-truthing, so spec IM/DC values need no manual table.
+
+Where QEMU's reset differs from the engine's reset for a CSR the program
+never writes (e.g. `msp_bound`, `milmb` enable bit), a strict compare
+false-positives: add it to `andes_verify_excluded` in
+`driver/state_diff.cpp` with a comment naming the divergence. Do NOT
+exclude a CSR to hide a transport bug -- exclusion is only for
+engine-implementation artifacts.
+
+## Phase 5: validate (the ladder)
+
+Run bottom-up; each rung catches what the one below cannot. The key
+insight: the tolerant abstract path MASKS capability bugs (a faulting read
+mirrors as zero, QEMU drains zero too, --verify falsely matches), so only
+the batched CSR sweep truly validates the caps table -- it faults on an
+over-claim and bisects to NAME the offending CSR. A cold-cache hybrid run
+exercises it via the baseline capture. Full commands, expected outputs, and
+failure playbook: `references/validation.md`.
+
+## Phase 6: commit and document
+
+TDD and Tidy First apply: caps fixes, sweep/transport changes, and docs are
+separate commits, each on a green suite. Update the vsim `ROADMAP.md`
+known-limits and `docs/USER_GUIDE.md` (section 4.4 documents what --verify
+compares). Update `tests/andes_csr/csr_coverage.csv` through the classifier,
+never by hand -- the guard checks policy == matrix.
