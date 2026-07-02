@@ -1,0 +1,198 @@
+// HandoffController glues CsrTrigger and StateDrain. Given a retired PC,
+// decides whether to drain state and returns the populated hybrid_state_v1
+// if so. Pure-logic; no SystemC.
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/csr_trigger.hpp"
+#include "hybrid/handoff_controller.hpp"
+#include "hybrid/insn_match.h"
+#include "hybrid/resume_driver.hpp"
+#include "hybrid/state_abi.h"
+#include "insn_encoders.hpp"
+#include "recording_bus.hpp"
+
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <doctest.h>
+
+#include <array>
+#include <cstdint>
+
+using hybrid::test::as_bytes;
+using hybrid::test::encode_slti;
+using hybrid::test::kDmstatusHaltedAndAcked;
+using hybrid::test::RecordingBus;
+using RD = hybrid::ResumeDriver;
+
+TEST_CASE("HandoffController: EXIT marker triggers drain and returns state")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_gpr(12)] = 3;
+  bus.regfile[hybrid::regno_csr(RD::kCsrDpc)] = 0x80000004;
+
+  hybrid::CsrTrigger trigger;
+  const std::array<uint32_t, 1> code{encode_slti(0, 0, 0x5A1)};
+  trigger.scan_buffer(as_bytes(code), /*base_pc=*/0x80000000);
+
+  hybrid::HandoffController h(std::move(trigger), bus);
+  const auto state = h.on_retire(0x80000000);
+
+  REQUIRE(state);
+  CHECK(state->magic == HYBRID_STATE_MAGIC);
+  CHECK(state->gpr[12] == 3);
+  CHECK(state->pc == 0x80000004);
+}
+
+TEST_CASE("HandoffController: non-trigger PC returns nullopt without drain")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid::CsrTrigger trigger;
+  hybrid::HandoffController h(std::move(trigger), bus);
+
+  const auto state = h.on_retire(0xDEADBEEF);
+  CHECK_FALSE(state.has_value());
+  CHECK(bus.ops.empty());
+}
+
+TEST_CASE("HandoffController: ENTER marker never fires (vsim ignores entry)")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid::CsrTrigger trigger;
+  const std::array<uint32_t, 1> code{encode_slti(0, 0, 0x5A0)};
+  trigger.scan_buffer(as_bytes(code), /*base_pc=*/0x80000000);
+
+  hybrid::HandoffController h(std::move(trigger), bus);
+  const auto state = h.on_retire(0x80000000);
+  CHECK_FALSE(state.has_value());
+  CHECK(bus.ops.empty());
+}
+
+TEST_CASE("HandoffController: PC-mode synthetic EXIT hit drains like marker EXIT")
+{
+  // PC-trigger mode populates the trigger map via add_pc_hit() instead of
+  // scan_buffer(). HandoffController must dispatch on `kind` only and not
+  // depend on a recorded `insn`. This is the single-test contract the PC
+  // mode relies on.
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_gpr(12)] = 7;
+  bus.regfile[hybrid::regno_csr(RD::kCsrDpc)] = 0x80000048;
+
+  hybrid::CsrTrigger trigger;
+  trigger.add_pc_hit(0x80000044, HYBRID_HANDOFF_EXIT);
+
+  hybrid::HandoffController h(std::move(trigger), bus);
+  const auto state = h.on_retire(0x80000044);
+
+  REQUIRE(state);
+  CHECK(state->magic == HYBRID_STATE_MAGIC);
+  CHECK(state->gpr[12] == 7);
+  CHECK(state->pc == 0x80000048);
+}
+
+TEST_CASE("HandoffController: PC-mode hit at unrelated PC stays silent")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+
+  hybrid::CsrTrigger trigger;
+  trigger.add_pc_hit(0x80000044, HYBRID_HANDOFF_EXIT);
+
+  hybrid::HandoffController h(std::move(trigger), bus);
+  const auto state = h.on_retire(0x80000048);
+  CHECK_FALSE(state.has_value());
+  CHECK(bus.ops.empty());
+}
+
+// #v4: set_block_store_drain(true) also enables the Andes+M-ext CSR drain
+// sweep. Safe now that the caps table is exact (0x7D1 was the one mis-gated
+// CSR whose csrr faulted a batched sweep); a full EXIT drain must batch the
+// caps-supported CSRs through the Program Buffer, not one abstract read each.
+TEST_CASE("HandoffController: block-store drain enables the CSR csrr+sd sweep")
+{
+  RecordingBus bus;
+  bus.dmstatus_value   = kDmstatusHaltedAndAcked;
+  bus.abstractcs_value = 8u << 24;  // progbufsize=8
+
+  hybrid_state_v1 input{};
+  input.magic   = HYBRID_STATE_MAGIC;
+  input.version = HYBRID_STATE_VERSION;
+  input.flags   = HYBRID_FLAG_RV64 | HYBRID_FLAG_ANDES | HYBRID_FLAG_M_EXT;
+  input.vlenb   = 0;  // csr_scratch_fits
+
+  hybrid::CsrTrigger trigger;
+  trigger.add_pc_hit(0x80000044, HYBRID_HANDOFF_EXIT);
+
+  hybrid::HandoffController h(std::move(trigger), bus, /*scratch_gpa=*/0x88000000);
+  h.set_passthrough_input(input);
+  h.set_block_store_drain(true);
+
+  REQUIRE(h.on_retire(0x80000044));
+
+  std::vector<uint16_t> addrs;
+  hybrid::for_each_sweep_csr(input, hybrid::AndesCaps::all(),
+    [&](std::size_t, uint16_t addr, const uint64_t&) { addrs.push_back(addr); });
+  REQUIRE(!addrs.empty());
+
+  // The batch rides the Program Buffer (csrr of the first swept CSR present)...
+  bool swept = false;
+  for (const auto& op : bus.ops)
+    if (op.kind == hybrid::test::DmiOp::Kind::Write
+        && op.reg >= hybrid::kProgbuf0
+        && op.reg <= hybrid::kProgbuf0 + hybrid::kProgbufMaxInsns
+        && op.value == hybrid::encode_csrrs(5, addrs[0], 0))
+      swept = true;
+  CHECK(swept);
+  // ...and no swept CSR is drained via an abstract read-COMMAND.
+  int abstract_reads = 0;
+  for (const auto& op : bus.ops) {
+    if (op.kind != hybrid::test::DmiOp::Kind::Write || op.reg != RD::kCommand)
+      continue;
+    if (((op.value >> 16) & 1u) != 0u) continue;  // reads only
+    const uint16_t regno = op.value & 0xFFFFu;
+    for (uint16_t a : addrs)
+      if (regno == hybrid::regno_csr(a)) ++abstract_reads;
+  }
+  CHECK(abstract_reads == 0);
+}
+
+// #1: set_minimal_drain(true) makes an EXIT route to StateDrain's counters-only
+// path -- refresh mcycle/minstret, pass everything else through from the QEMU1
+// snapshot, and issue just two abstract reads instead of the full ~190.
+TEST_CASE("HandoffController: minimal-drain routes EXIT to counters-only drain")
+{
+  RecordingBus bus;
+  bus.dmstatus_value = kDmstatusHaltedAndAcked;
+  bus.regfile[hybrid::regno_csr(RD::kCsrMcycle)]   = 0x111;
+  bus.regfile[hybrid::regno_csr(RD::kCsrMinstret)] = 0x222;
+
+  hybrid_state_v1 input{};
+  input.magic   = HYBRID_STATE_MAGIC;
+  input.version = HYBRID_STATE_VERSION;
+  input.flags   = HYBRID_FLAG_RV64 | HYBRID_FLAG_FP | HYBRID_FLAG_V;
+  input.gpr[12] = 0xABC;  // distinctive: must pass through, never re-read
+
+  hybrid::CsrTrigger trigger;
+  trigger.add_pc_hit(0x80000044, HYBRID_HANDOFF_EXIT);
+
+  hybrid::HandoffController h(std::move(trigger), bus);
+  h.set_passthrough_input(input);
+  h.set_minimal_drain(true);
+
+  const auto state = h.on_retire(0x80000044);
+  REQUIRE(state);
+  CHECK(state->mcycle   == 0x111);
+  CHECK(state->minstret == 0x222);
+  CHECK(state->gpr[12]  == 0xABC);  // passthrough; a full drain would read 0 here
+
+  int reads = 0;
+  for (const auto& op : bus.ops)
+    if (op.kind == hybrid::test::DmiOp::Kind::Write && op.reg == RD::kCommand
+        && ((op.value >> 16) & 1u) == 0u)
+      ++reads;
+  CHECK(reads == 2);
+}
