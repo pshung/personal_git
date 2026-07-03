@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Registration test-coverage gate (ROADMAP F2): every TRANSPORTED CSR must have
+a per-CSR test disposition in safe_write_policy.csv.
+
+Allowed dispositions (actions):
+  write       -- generated write-survival fixture (csr_survival_gen.S): write a
+                 distinctive value pre-ROI, prove restore in-ROI, rewrite for the
+                 drain, --verify compares.
+  readback    -- generated read-back round-trip fixture (csr_survival_gen.S): read
+                 the value pre-ROI, prove it survived resume in-ROI. No write --
+                 for control CSRs that are unsafe to blind-write but safe to read.
+  covered     -- an existing engine-generic fixture already round-trips it.
+  verify-only -- no dedicated fixture is possible (counter / HW-driven / reset-
+                 divergent / passthrough); --verify on real workloads is the
+                 coverage, with the reason recorded in the policy.
+
+A transported CSR whose policy action is missing or anything else (e.g. the
+retired `skip`) is UNTESTED -> FAIL. F1 (check_completeness.py) enforces the
+implemented->transported direction; this enforces transported->tested. Together
+they are "every supported CSR completely tested."
+
+Usage:
+  check_test_coverage.py [manifest.csv ...]   # default: every registered manifest
+"""
+from __future__ import annotations
+
+import csv
+import glob
+import os
+import re
+import sys
+from collections import Counter
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ALLOWED = {"write", "readback", "covered", "verify-only"}
+
+
+def polname(name: str) -> str:
+    """Manifest CSR name -> safe_write_policy key (range rows collapse to the low
+    member, matching gen_fixtures.py)."""
+    m = re.match(r"^(.*?)(\d+)~(\d+)$", name)
+    return f"{m.group(1)}{m.group(2)}" if m else name
+
+
+def load_policy() -> dict[str, str]:
+    p = os.path.join(HERE, "safe_write_policy.csv")
+    return {r["name"]: r["action"] for r in csv.DictReader(open(p))}
+
+
+def scan(path: str, policy: dict[str, str]) -> tuple[int, list[tuple[str, str, object]]]:
+    n = 0
+    miss: list[tuple[str, str, object]] = []
+    for r in csv.DictReader(open(path, newline="")):
+        if r["transported"] not in ("yes", "partial") or not r["access"].endswith("RW"):
+            continue
+        n += 1
+        act = policy.get(polname(r["name"]))
+        if act not in ALLOWED:
+            miss.append((r["addr"], r["name"], act))
+    return n, miss
+
+
+def main(argv: list[str]) -> int:
+    policy = load_policy()
+    paths = argv[1:] or sorted(glob.glob(os.path.join(HERE, "*", "csr_manifest.csv")))
+    if not paths:
+        print("[coverage] no manifests found")
+        return 0
+
+    fails = 0
+    total = 0
+    for p in paths:
+        n, miss = scan(p, policy)
+        total += n
+        rel = os.path.relpath(p, HERE)
+        for addr, name, act in miss:
+            print(
+                f"UNTESTED {addr} {name}: transported but policy action={act!r} "
+                f"not in {sorted(ALLOWED)}  ({rel})"
+            )
+            fails += 1
+
+    if fails:
+        print(f"[coverage] FAIL: {fails} transported CSR(s) without a test disposition")
+        return 1
+    print(
+        f"[coverage] all covered: {len(paths)} manifest(s), {total} transported RW "
+        f"CSR-rows, each write/readback/covered/verify-only"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
