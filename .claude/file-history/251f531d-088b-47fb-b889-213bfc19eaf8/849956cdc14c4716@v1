@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Registration guard (tests/engines contract, deliverable 4).
+#
+# Every BUILT engine must have a registration directory whose config hash
+# matches the binary's embedded build config.inc -- an unregistered engine or
+# a stale registration (engine rebuilt with a different config) fails loudly
+# with "run the bring-up registration". Registrations without a built engine
+# are reported but do not fail: "not built" is not "removed" (the engine may
+# be built elsewhere; see README.md's deregistration section).
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+
+VSIM_BIN_DIR="${VSIM_BIN_DIR:-$ROOT/../vsim_andesim/build}"
+REG_ROOT="${REG_ROOT:-$SCRIPT_DIR}"
+
+checked=0 bad=0
+for ENG in "$VSIM_BIN_DIR"/sim_*; do
+  [ -x "$ENG" ] || continue
+  engine=$(basename "$ENG"); engine=${engine#sim_}
+  CFG="$VSIM_BIN_DIR/V$engine/obj_sc/config.inc"
+  [ -f "$CFG" ] || { echo "[FAIL] $engine: built but its config.inc is missing at $CFG"; bad=$((bad+1)); continue; }
+  hash=$(sha256sum "$CFG" | cut -c1-8)
+  dir="$REG_ROOT/$engine-$hash"
+  if [ ! -d "$dir" ]; then
+    other=$(ls -d "$REG_ROOT/$engine"-* 2>/dev/null | head -1)
+    if [ -n "$other" ]; then
+      echo "[FAIL] $engine: STALE registration ($(basename "$other")) -- built config hashes to $hash."
+      echo "       The config changed: run the bring-up registration for the new build"
+      echo "       (and deregister the old one if that config is retired)."
+    else
+      echo "[FAIL] $engine: UNREGISTERED (need $engine-$hash/) -- run the bring-up registration."
+    fi
+    bad=$((bad+1)); continue
+  fi
+  missing=""
+  for f in engine.env csr_manifest.csv registration_report.md; do
+    [ -f "$dir/$f" ] || missing="$missing $f"
+  done
+  if [ -n "$missing" ]; then
+    echo "[FAIL] $engine: registration $engine-$hash incomplete (missing:$missing)"
+    bad=$((bad+1)); continue
+  fi
+  # engine.env must agree with the directory name (guards hand-edits).
+  env_hash=$(grep -E "^CONFIG_HASH=" "$dir/engine.env" | cut -d= -f2)
+  if [ "$env_hash" != "$hash" ]; then
+    echo "[FAIL] $engine: engine.env CONFIG_HASH=$env_hash != built config hash $hash"
+    bad=$((bad+1)); continue
+  fi
+  echo "[ok] $engine-$hash: registered (manifest + report present)"
+  checked=$((checked+1))
+done
+
+# Orphan registrations: informational only.
+for dir in "$REG_ROOT"/*-????????; do
+  [ -d "$dir" ] || continue
+  engine=$(basename "$dir"); engine=${engine%-*}
+  [ -x "$VSIM_BIN_DIR/sim_$engine" ] || echo "[note] $(basename "$dir"): engine not built here (skipped)"
+done
+
+[ "$bad" -eq 0 ] || fail "registration guard: $bad engine(s) unregistered/stale"
+[ "$checked" -gt 0 ] || { echo "[skip] no built engines under $VSIM_BIN_DIR"; ok "registration guard (skipped)"; exit 0; }
+ok "registration guard: $checked engine(s) registered and hash-matched"
