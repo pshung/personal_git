@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""Generate docs/csr_transport_bringup_tutorial.ipynb (valid nbformat 4.5)."""
+import json, os
+
+cells = []
+
+def md(text):
+    cells.append({"cell_type": "markdown", "metadata": {},
+                  "source": text.strip("\n").splitlines(keepends=True)})
+
+def code(text):
+    cells.append({"cell_type": "code", "metadata": {},
+                  "execution_count": None, "outputs": [],
+                  "source": text.strip("\n").splitlines(keepends=True)})
+
+# ------------------------------------------------------------------ cell 0
+md(r"""
+# The `/csr-transport-bringup` skill, its manifest, and an engine's test files
+
+This page explains three things, in order:
+
+1. **The skill** `/csr-transport-bringup` -- what it does, when it fires, and its 7-phase pipeline.
+2. **`csr_manifest.csv`** -- every one of its 10 columns, with real rows from a registered engine.
+3. **The files under `tests/engines/ax45mpv_premium-ed1cb158/`** -- what each one is and how it is made.
+
+It is a *reference / orientation* page. Two sibling notebooks go deeper on the mechanics and you should read them next:
+
+- `engine_registration_tutorial.ipynb` -- the "three languages, one translator" detective story (SPEC vs CONFIG vs RTL) and the registration contract.
+- `csr_coverage.ipynb` -- the full spec-wide CSR coverage tables.
+
+The code cells read the **committed** artifacts (the manifest, the report, the fixture), so the notebook runs clean even when the vsim engine is not built on this machine. Only the last, optional cell needs a built simulator.
+""")
+
+# ------------------------------------------------------------------ cell 1
+md(r"""
+## Part 0 -- the one problem the skill exists to solve
+
+The hybrid simulator pauses a program on the fast engine (QEMU) and resumes it on the cycle-accurate engine (vsim). To do that it must copy the hart's CSR state across. The catch:
+
+> vsim restores the CSRs in **one batched Program-Buffer sweep**. If that sweep touches even a single CSR the core does **not** implement, the Debug Module faults (`cmderr=3`) and the whole handoff dies.
+
+So for every CSR there are exactly two correct outcomes:
+
+- the core **has** it and the ROI can touch it -> it must be **restored at resume, re-read at drain, and `--verify`-compared**;
+- the core does **not** have it -> it must be **gated OFF**, or the sweep faults.
+
+QEMU cannot be trusted to tell you which is which -- its gdbstub advertises CSRs the vsim RTL never built. The skill is the disciplined procedure for getting this list exactly right for a new core, and for *proving* it stays right.
+""")
+
+# ------------------------------------------------------------------ cell 2
+md(r"""
+## Part 1 -- the skill `/csr-transport-bringup`
+
+A **skill** is a packaged procedure Claude Code loads on demand. This one lives at `.claude/skills/csr-transport-bringup/` and is a folder: a `SKILL.md` router plus five `references/*.md` deep-dives it reads *only when it reaches that phase* (this keeps the always-loaded part small).
+
+### When it fires
+
+The skill's `description` lists the trigger phrases. You do **not** have to say "bring-up". It fires whenever the work touches:
+
+- a **new core** or a **new vsim engine** (or a rebuild of an existing core with a different config);
+- **CSR transport / transportation**, **CSR capability / caps gating**, **IM Requirement**, the **reset value table**, "which mode is this CSR supported in";
+- a **`csr_sweep` cmderr** fault, or a **`--verify` field mismatch** on an Andes / M-ext CSR;
+- **engine registration** work: per-engine test files, CSR manifests, "nothing missed" completeness checks.
+
+### What it asks you for (inputs)
+
+1. The **AndeStar V5 SPA PDF** for the core family (the repo carries `AndeStar_V5_SPA_UM164_V1.7.pdf`).
+2. The **engine name** (e.g. `ax45mpv_premium`) and a **built vsim checkout** (`VSIM_BIN_DIR` in `config.env`).
+3. Optionally the matching **QEMU `-cpu`** name for the oracle leg.
+""")
+
+# ------------------------------------------------------------------ cell 3
+md(r"""
+### The 7-phase pipeline
+
+`SKILL.md` is a router: it names each phase and points at the reference file to read when you get there. Work top to bottom; each phase's check catches what the phase below it cannot.
+
+| Phase | What you do | Reference file to read |
+|---|---|---|
+| **0. Ground truth** | Connect the THREE sources per CSR -- SPEC, CONFIG (`config.inc` + `--describe`), and RTL (`kv_csr_dec.v` `existent_csr` equation). The RTL equation is the Rosetta stone: it states each spec condition in config-knob language. | `references/three-way-audit.md` |
+| **1. Mine the spec** | Pull, per CSR: the **IM Requirement** (existence condition), the **Access Mode**, and the **reset value** from the SPA (fixed per-CSR layout + Table 13). | `references/spec-mining.md` |
+| **2. Classify dispositions** | Decide each CSR's transport disposition; the coverage guard enforces `inventory == matrix == ABI` so nothing drifts. A new transported CSR is one X-macro line in `state_abi.h`. | (coverage matrix) |
+| **3. Bind capability gates** | For each transported CSR, encode its existence term as a **gate** in `andes_caps.hpp`, the `_NDS_*` binding, and the andesim mirror. The gate must encode the RTL's term, not a look-alike feature. | `references/caps-gating.md` |
+| **4. Reset values + verify exclusions** | Use the **empirical** baseline the sim drains from a freshly reset hart (self-truthing), not the spec's IM/DC table. Where QEMU's reset differs from the engine's for a never-written CSR, add a named `--verify` exclusion. | (Phase 4 in SKILL.md) |
+| **5. Validate (the ladder)** | Run bottom-up. Key insight: the tolerant abstract path **masks** caps bugs; only the **batched CSR sweep** truly validates the caps table -- it faults on an over-claim and names the offender. | `references/validation.md` |
+| **6. Register the engine** | Produce the per-engine deliverables (manifest, both-direction completeness check, generated fixtures, registration guard). A rebuild = a NEW registration. | `references/engine-registration.md` |
+| **7. Commit + document** | TDD / Tidy First: caps fixes, transport changes, and docs are separate commits, each on a green suite. Update the USER_GUIDE and coverage CSV. | (Phase 7 in SKILL.md) |
+
+Parts 2 and 3 of this page are the **output of Phase 6** for one real engine.
+""")
+
+# ------------------------------------------------------------------ cell 4  (bash, live-but-safe)
+code(r"""
+%%bash
+ROOT="${ANDESIM_ROOT:-$(cd "$(git rev-parse --show-toplevel 2>/dev/null || echo ..)" && pwd)}"
+SKILL="$ROOT/.claude/skills/csr-transport-bringup"
+echo "== the skill is a folder, not a single file =="
+( cd "$SKILL" && find . -type f | sort )
+echo
+echo "== its front-matter description (the trigger text) =="
+sed -n '/^description:/,/^---$/p' "$SKILL/SKILL.md" | sed '$d'
+""")
+
+# ------------------------------------------------------------------ cell 5
+md(r"""
+## Part 2 -- `csr_manifest.csv`: one row per spec CSR
+
+The manifest is **Deliverable 1** of a registration: a machine-readable table with **one row per spec-inventory CSR** -- all ~232 of them, not just the transported ones. It is generated (never hand-edited) by the engine's `gen_manifest.py` and committed.
+
+**Row vs address.** Some rows are *ranges* (e.g. `0x3B1~3EF pmpaddr1~63` is 63 addresses in one row). So "row counts" (what the file has) and "address / field counts" (what the report quotes, e.g. "147 fields compared") differ. Keep that in mind when a number looks off.
+
+### The 10 columns
+
+| # | column | the question it answers | source |
+|---|---|---|---|
+| 1 | `addr` | CSR address (or range `lo~hi`) | spec inventory |
+| 2 | `name` | CSR name | spec inventory |
+| 3 | `access` | access mode: `MRW` / `MRO` / `SRW` / `URW` / `DRW` / `HRW` / `*1C` ... | spec inventory |
+| 4 | `exists_cond` | **when does this CSR exist**, in spec language (the IM Requirement / Table 13 condition) | SPA |
+| 5 | `implemented` | does **THIS engine** actually have it: `yes` / `no` / `partial` | EMPIRICAL: RTL `existent_csr` machine-evaluated against this build's `config.inc` |
+| 6 | `transported` | does the hybrid handoff **restore + drain** it: `yes` / `no` / `partial` | engine `--describe andes_csrs` / caps |
+| 7 | `gate_or_disposition` | **why** -- either the caps **gate name** (if transported) or an **`EXCL_*` / `NEW` / `CONST_RO`** disposition (if not) | caps map / coverage matrix |
+| 8 | `reset_value` | the engine's **real** reset value (`-` if not drained) | EMPIRICAL: the reset-baseline capture, never the spec column |
+| 9 | `verify` | does `--verify` compare it: `compared` / `excluded:<reason>` / `-` | driver `state_diff.cpp` |
+| 10 | `safe_write` | write-survival fixture treatment: `fixture` / `covered` / `skip` / `review-pending` / `-` | reviewed `safe_write_policy.csv` |
+
+The point of the manifest is that columns 4, 5, and 6 must **agree**: the spec says when it *should* exist, the RTL says whether it *does*, and the caps say whether we *carry* it. A disagreement is a bug the registration is designed to catch.
+""")
+
+# ------------------------------------------------------------------ cell 6  (python, self-verifying)
+code(r"""
+import csv, os, collections
+
+def repo_root():
+    d = os.path.abspath(os.environ.get("ANDESIM_ROOT", "."))
+    for _ in range(6):
+        if os.path.isdir(os.path.join(d, "tests", "engines")):
+            return d
+        d = os.path.dirname(d)
+    return os.path.abspath("..")
+
+ROOT = repo_root()
+MAN  = os.path.join(ROOT, "tests/engines/ax45mpv_premium-ed1cb158/csr_manifest.csv")
+rows = list(csv.DictReader(open(MAN)))
+
+print("manifest:", os.path.relpath(MAN, ROOT))
+print("total rows (one per spec CSR):", len(rows))
+print("columns:", ", ".join(rows[0].keys()))
+print()
+print("implemented:", dict(collections.Counter(r["implemented"] for r in rows)))
+print("transported:", dict(collections.Counter(r["transported"] for r in rows)))
+print()
+
+def show(name):
+    r = next(x for x in rows if x["name"] == name)
+    print(f"  {r['addr']:<10} {r['name']:<14} impl={r['implemented']:<7} tr={r['transported']:<4}"
+          f" gate={r['gate_or_disposition']}")
+    print(f"  {'':<10} exists_cond = {r['exists_cond']}")
+    print(f"  {'':<10} reset={r['reset_value']}  verify={r['verify']}  safe_write={r['safe_write']}\n")
+
+print("three representative rows:\n")
+show("mcounterinten")  # transported (Andes PMNDS), compared, has a fixture
+show("mcache_ctl")     # transported base control CSR, verify-excluded (restored, not re-drained)
+show("satp")           # implemented on some cores, NOT on this M-only one -> not transported
+""")
+
+# ------------------------------------------------------------------ cell 7
+md(r"""
+### Column 7 up close: the disposition vocabulary
+
+`gate_or_disposition` is the single richest column -- it records *why* every CSR is or is not carried. Two families:
+
+**A. Transported (`transported == yes`)** -- the value names the **caps gate** or the CSR's **BASE role**:
+
+| disposition | meaning |
+|---|---|
+| `BASE`, `BASE(...)` | a standard RISC-V M-mode CSR that is always part of the core handoff (mstatus, mepc, mie ...). The `(...)` note records verify handling, e.g. `restored, not re-drained` or `counter; verify-excluded`. |
+| `BASE_FP`, `BASE_FP(via fcsr)` | fcsr, and fflags/frm which ride inside fcsr (gated on `HYBRID_FLAG_FP`). |
+| `BASE_PMP` | the PMP block: pass-through, restored only for S/U handoffs. |
+| `ALWAYS` | an Andes CSR the gate marks always-present on this family (mxstatus, mnvec, mdcause, mclk_ctl). |
+| `PERF_MONITOR` / `PMNDS` | performance-monitor counters/events / the Andes PMNDS enable CSR. |
+| `TRIGGER` | trigger-module CSRs (tselect, tdata1/2, tcontrol, mcontext). |
+| `PMA` | physical-memory-attribute CSRs (pmacfg, pmaaddr). |
+| `ILM` / `DLM` / `CCTL` / `CODENSE` / `ALT_FP` | local-memory base / cache-control / CoDense exec.it table / BF16+ACE control. |
+
+**B. Not transported (`transported == no`)** -- the value says *why not*. `NEW[gate X=off]` / `TRANSPORT_NOW[gate X=off]` mean "there is a gate for it, but feature X is off on this build". `CONST_RO` means read-only / fixed by the core (no need to carry). The `EXCL_*` family is a **deliberate, permanent** exclusion:
+
+| `EXCL_*` code | why it is excluded |
+|---|---|
+| `EXCL_MODE` | belongs to a privilege mode this engine does not implement (S / U / H). |
+| `EXCL_RV32` | an RV32-only high-half CSR; this engine is RV64. |
+| `EXCL_SIDEFX` | read or write has side effects (e.g. mcctlcommand, mnxti, push*) -- unsafe to sweep or restore. |
+| `EXCL_DEBUG` | debug-mode CSR (dcsr, dpc, dscratch*) owned by the Debug Module, not ROI state. |
+| `EXCL_NEXT` | N-extension user-trap CSRs. |
+| `EXCL_INDIRECT` | Smcsrind indirect-access CSRs. |
+| `EXCL_RO` / `EXCL_W1C_HW` / `EXCL_TRAP` | read-only / write-1-to-clear hardware-set / user trap-cause CSR. |
+
+### Columns 9 and 10
+
+- **`verify`**: `compared` (strict-compared by `--verify`), `excluded:<reason>` (carried and round-trips, but not compared -- the reason names an engine artifact like `counter`, `HW-driven bits`, `reset-divergent`, `passthrough`, `restored, not re-drained`), or `-` (not transported).
+- **`safe_write`**: `fixture(policy)` (a generated write-survival fixture writes it), `covered(engine-generic fixture)` (already round-tripped by `rt_csr_survival.S`), `skip(policy)` (control/side-effect CSR -- blind write unsafe, skip-listed with a reason), `review-pending` (transported RW CSR not yet classified), or `-`.
+""")
+
+# ------------------------------------------------------------------ cell 8  (python, grounded counts)
+code(r"""
+import collections
+
+def family(g):
+    return g.split("[")[0].split("(")[0].split(";")[0].strip()
+
+fam = collections.Counter(family(r["gate_or_disposition"]) for r in rows)
+print("gate_or_disposition families (row counts):")
+for k, v in sorted(fam.items(), key=lambda x: -x[1]):
+    print(f"  {v:3d}  {k}")
+
+print("\nverify column:")
+for k, v in collections.Counter(
+        r["verify"].split(":")[0].split("(")[0].strip() for r in rows).most_common():
+    print(f"  {v:3d}  {k!r}")
+
+print("\nsafe_write column:")
+for k, v in collections.Counter(
+        r["safe_write"].split("(")[0].strip() for r in rows).most_common():
+    print(f"  {v:3d}  {k!r}")
+
+# the manifest's whole reason to exist: SPEC(exists) vs RTL(implemented) vs caps(transported) agree.
+# an over-claim = transported but not implemented; the batched sweep would fault on it.
+overclaim = [r for r in rows if r["transported"] == "yes" and r["implemented"] == "no"]
+print("\nover-claims (transported=yes but implemented=no):", len(overclaim), "  <-- must be zero")
+""")
+
+# ------------------------------------------------------------------ cell 9
+md(r"""
+## Part 3 -- the files under `tests/engines/ax45mpv_premium-ed1cb158/`
+
+The directory name **is** the registration identity: `<engine>-<confighash8>`, where the hash is the first 8 hex of the `sha256` of the **build** `config.inc`. Rebuild the core with a different config and you get a different hash -> a different directory -> the old artifacts can never be silently reused.
+
+| path | role | tracked? |
+|---|---|---|
+| `engine.env` | the identity + QEMU pairing (name, hash, XLEN, VLEN, priv levels) | yes |
+| `csr_manifest.csv` | Deliverable 1 (Part 2 above) | yes |
+| `gen_manifest.py` | the **generator** that produces the manifest from the three sources | yes |
+| `registration_report.md` | the human-facing CSR report + the 6-check status | yes |
+| `fixtures/csr_survival_gen.S` | generated per-engine write-survival test | yes |
+| `fixtures/csr_survival_gen.o`, `.elf` | build products of the `.S` | **no** (git-ignored) |
+
+The two enforcement scripts and the shared generator live one level up, in `tests/engines/` (not in this dir): `gen_fixtures.py`, `safe_write_policy.csv`, `test_registration_guard.sh`, `test_registration_fixtures.sh`. They are shared across all engines; the per-engine dir only holds this engine's data.
+""")
+
+# ------------------------------------------------------------------ cell 10  (bash)
+code(r"""
+%%bash
+ROOT="${ANDESIM_ROOT:-$(cd "$(git rev-parse --show-toplevel 2>/dev/null || echo ..)" && pwd)}"
+DIR="$ROOT/tests/engines/ax45mpv_premium-ed1cb158"
+echo "== everything in the dir =="
+( cd "$DIR" && find . -type f | sort )
+echo
+echo "== what git actually tracks (note: .o/.elf are build artifacts, ignored) =="
+git -C "$ROOT" ls-files tests/engines/ax45mpv_premium-ed1cb158/
+echo
+echo "== the .gitignore rule that drops the build products =="
+cat "$ROOT/tests/engines/.gitignore"
+""")
+
+# ------------------------------------------------------------------ cell 11
+md(r"""
+### File 1 -- `engine.env`: the identity
+
+Small and human-readable. It pins the registration key and how to reproduce the build/oracle pairing. The header comment even gives the one-liner to recompute the hash:
+
+```
+sha256sum $VSIM_BIN_DIR/Vax45mpv_premium/obj_sc/config.inc | cut -c1-8
+```
+
+Everything else in the repo (the guard, the matrix runner, `run_e2e.sh`) reads this file to learn which QEMU `-cpu`, VLEN, and privilege count go with this engine.
+""")
+
+# ------------------------------------------------------------------ cell 12  (bash)
+code(r"""
+%%bash
+ROOT="${ANDESIM_ROOT:-$(cd "$(git rev-parse --show-toplevel 2>/dev/null || echo ..)" && pwd)}"
+cat "$ROOT/tests/engines/ax45mpv_premium-ed1cb158/engine.env"
+""")
+
+# ------------------------------------------------------------------ cell 13
+md(r"""
+### File 2 -- `csr_manifest.csv`
+
+Covered in full in Part 2. It is the one file every other artifact keys off: `gen_fixtures.py` reads it to know what this engine transports, and the under-claim check recomputes it to prove nothing implemented was left un-carried.
+""")
+
+# ------------------------------------------------------------------ cell 14
+md(r"""
+### File 3 -- `gen_manifest.py`: the generator (the heart of the registration)
+
+This is the script that *writes* `csr_manifest.csv` and prints the both-direction completeness report. It is **per-engine** and **re-runnable**: after any caps or RTL change, re-run it and the manifest updates itself. Its pipeline, top to bottom:
+
+1. **RTL (implemented)** -- reads the build's `kv_csr_dec.v`, extracts the `existent_csr` equation and its helper wires, resolves the symbolic `CSR12_*` localparams, then **evaluates the equation per address** against this build's config parameters. This is the machine-checked answer to "does the core have it", not a guess.
+2. **CONFIG (transported / claimed)** -- runs `sim_ax45mpv_premium --describe` to get the gated CSR names this binary actually carries, and unions in the always-transported BASE / PMP / PMA blocks.
+3. **Reset values** -- parses the reset-baseline capture (`~/.cache/andesim/*.bin`, a `hybrid_state_v1` struct drained from the freshly reset hart) at the exact ABI offsets.
+4. **SPEC (`exists_cond`)** -- a curated table of the SPA IM Requirement / Table 13 conditions.
+5. **verify / safe_write** -- mirrors the driver's `state_diff.cpp` exclusion rules and joins the reviewed `safe_write_policy.csv`.
+
+Then it emits `csr_manifest.csv` and prints **OVER-CLAIMS** (transported but not RTL-existent -- must be empty) and **UNDER-CLAIMS** (RTL-existent + transportable but not carried, with no `EXCL_*` -- must be empty).
+
+**One honesty note when you read the file:** its module docstring and some comments still name `ax46mpv_advanced` -- this generator was cloned from the advanced engine's copy. The *executable* paths, though, all target premium (`DEC = .../Vax45mpv_premium/...`, `--describe` runs `sim_ax45mpv_premium`, the baseline glob is `sim_ax45mpv_premium-*`). It is the premium generator; only the prose was not fully re-titled.
+""")
+
+# ------------------------------------------------------------------ cell 15  (bash)
+code(r"""
+%%bash
+ROOT="${ANDESIM_ROOT:-$(cd "$(git rev-parse --show-toplevel 2>/dev/null || echo ..)" && pwd)}"
+GEN="$ROOT/tests/engines/ax45mpv_premium-ed1cb158/gen_manifest.py"
+echo "== the three sources it reads (the paths prove it targets premium) =="
+grep -nE "^DEC|--describe|cache/andesim/sim_" "$GEN" | head
+echo
+echo "== the completeness report it prints at the end =="
+grep -nE "OVER-CLAIMS|UNDER-CLAIMS" "$GEN"
+""")
+
+# ------------------------------------------------------------------ cell 16
+md(r"""
+### File 4 -- `registration_report.md`: the human report
+
+Where the manifest is for machines, the report is for people (and for agents re-generating tests). Per the contract in `tests/engines/README.md` it must contain:
+
+1. **Engine shape** -- what this build is (M-only, RV64, VLEN 512, PMNDS live, 64K caches, PMA 4 entries ...).
+2. **The numbers** -- inventory rows, RTL-implemented addresses, claimed set size, `--verify` field count.
+3. **Completeness, both directions** -- the empirical proof: a cold-cache hybrid `--verify` run whose batched sweep faulted on nothing (over-claims: none), and the recomputed under-claim check (none).
+4. **Discrepancies** -- every spec-vs-engine disagreement, classified and dated, with the commit that fixed it. This engine is where the audit trail started: `mcountermask_m` (0x7D1) and `jvt` were once **over-claimed and faulted the sweep**; `mnvec` / `mcctl*` / `umisc_ctl` were **under-claimed**. All five are fixed and pinned by unit tests.
+5. **Reset values** + **test-generation guidance** + the exact **run commands** for this engine.
+6. **Status: REGISTERED** -- a table of the six checks, all PASS.
+
+The Discrepancies section is mandatory *even when it says "none"* -- a validation result you cannot audit is not trustworthy.
+""")
+
+# ------------------------------------------------------------------ cell 17
+md(r"""
+### File 5 -- `fixtures/`: the generated write-survival test
+
+`csr_survival_gen.S` is **Deliverable 3**. It is generated -- the header says `GENERATED by tests/engines/gen_fixtures.py. Do not edit; regenerate instead.` It is the join of two files that live one level up:
+
+- `csr_manifest.csv` -- what **this engine transports**;
+- `safe_write_policy.csv` -- which CSRs are **safe to write blindly** (the `action=write` rows).
+
+A CSR rides the fixture only when **both** agree. For premium that is **7 CSRs** (mhpmevent3-6, tdata2, mcounterinten, uitb). The pattern, straight from the generated assembly:
+
+- **pre-ROI** (runs on QEMU): write a distinctive PRE value, stash it in a callee-saved `s`-register.
+- **in-ROI** (runs on vsim): read the CSR back and `bne` against the stash. A lost restore spins -> the harness times out -> the test FAILS. This proves **resume restored it**.
+- then write a second ROI value; the drain must capture it and `--verify` compares it against the QEMU oracle. This proves **drain read it back**.
+- **exit**: ROI exit marker (vsim drains and exits 200), with a SimControl fallback so the same ELF also runs standalone.
+
+The `.o` and `.elf` next to it are just the assembled products (git-ignored -- `test_registration_fixtures.sh` regenerates, rebuilds, and `--verify`-runs them on every suite pass, so they never need to be committed).
+""")
+
+# ------------------------------------------------------------------ cell 18  (bash)
+code(r"""
+%%bash
+ROOT="${ANDESIM_ROOT:-$(cd "$(git rev-parse --show-toplevel 2>/dev/null || echo ..)" && pwd)}"
+S="$ROOT/tests/engines/ax45mpv_premium-ed1cb158/fixtures/csr_survival_gen.S"
+echo "== the auto-generated header: which 7 CSRs, and their pre/roi values =="
+sed -n '1,16p' "$S"
+echo
+echo "== the proof-of-restore shape for one CSR (read-back-or-spin) =="
+grep -nA2 "csrr    t0, mcounterinten" "$S" | head -4
+""")
+
+# ------------------------------------------------------------------ cell 19
+md(r"""
+## How it all connects -- the flywheel
+
+```
+   SPEC (SPA PDF)   \
+   CONFIG (.inc)     +--->  gen_manifest.py  --->  csr_manifest.csv  --+
+   RTL (existent_csr)/                             + report.md         |
+                                                                       |
+                     safe_write_policy.csv --> gen_fixtures.py <-------+
+                                                     |
+                                                     v
+                                            csr_survival_gen.S
+                                                     |
+   every suite run:                                  v
+     test_registration_guard.sh ....... hash matches the build?
+     test_registration_fixtures.sh .... regen + rebuild + --verify the fixture
+     cold-cache hybrid --verify ....... the batched sweep = the over-claim proof
+```
+
+The compounding effect: once an engine is registered, **adding it to the test matrix is automatic** (`run_e2e.sh` takes the engine axis from the registration dirs), and every future change is re-checked by scripts, not by memory. A new config of the same core costs one `gen_manifest.py` run plus a `gen_fixtures.py` run -- the procedure, not a person, guarantees "nothing missed".
+
+### Cheat sheet -- reproduce this engine's registration
+
+```sh
+# 1. regenerate the manifest from the three sources (needs the built vsim)
+python3 tests/engines/ax45mpv_premium-ed1cb158/gen_manifest.py \
+        tests/engines/ax45mpv_premium-ed1cb158
+
+# 2. regenerate + rebuild + --verify the write-survival fixture
+bash tests/engines/test_registration_fixtures.sh
+
+# 3. the over-claim proof: a cold-cache hybrid --verify (both trigger modes)
+rm -rf ~/.cache/andesim
+./andesim run --mode hybrid --trigger marker --engine vsim:ax45mpv_premium \
+        --verify tests/fixtures/rt_c_hello.elf
+
+# 4. the standing guards (run by scripts/test_all.sh)
+bash tests/engines/test_registration_guard.sh
+```
+
+The optional cell below runs step 1 live if a built vsim is present.
+""")
+
+# ------------------------------------------------------------------ cell 20  (bash, opt-in live)
+code(r"""
+%%bash
+ROOT="${ANDESIM_ROOT:-$(cd "$(git rev-parse --show-toplevel 2>/dev/null || echo ..)" && pwd)}"
+[ -f "$ROOT/config.env" ] && . "$ROOT/config.env"
+VSIM_BIN_DIR="${VSIM_BIN_DIR:-$ROOT/../vsim_andesim/build}"
+[ "${RUN_LIVE:-0}" = "1" ] || { echo "(set RUN_LIVE=1 to regenerate live; needs the built sim_ax45mpv_premium)"; exit 0; }
+[ -x "$VSIM_BIN_DIR/sim_ax45mpv_premium" ] || { echo "(engine not built at $VSIM_BIN_DIR -- skipping)"; exit 0; }
+python3 "$ROOT/tests/engines/ax45mpv_premium-ed1cb158/gen_manifest.py" \
+        "$ROOT/tests/engines/ax45mpv_premium-ed1cb158" | tail -20
+""")
+
+# ------------------------------------------------------------------ assemble
+nb = {
+    "cells": cells,
+    "metadata": {
+        "kernelspec": {"display_name": "Python 3 (ipykernel)",
+                       "language": "python", "name": "python3"},
+        "language_info": {"codemirror_mode": {"name": "ipython", "version": 3},
+                          "file_extension": ".py", "mimetype": "text/x-python",
+                          "name": "python", "nbconvert_exporter": "python",
+                          "pygments_lexer": "ipython3", "version": "3.12.11"},
+    },
+    "nbformat": 4, "nbformat_minor": 5,
+}
+
+out = os.path.join(os.path.dirname(__file__),
+                   "csr_transport_bringup_tutorial.ipynb")
+with open(out, "w") as f:
+    json.dump(nb, f, indent=1, ensure_ascii=True)
+    f.write("\n")
+print("wrote", out, "with", len(cells), "cells")
+# ascii guard
+raw = open(out, "rb").read()
+non = [b for b in raw if b > 127]
+print("non-ascii bytes:", len(non))
