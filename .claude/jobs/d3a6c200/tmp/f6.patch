@@ -1,0 +1,901 @@
+--- /dev/null	2026-06-23 12:17:08.168967066 +0800
++++ /home/nick/work/andesim/.claude/worktrees/f6-last-mile/driver/transport_csrs.hpp	2026-07-03 17:53:06.139551617 +0800
+@@ -0,0 +1,36 @@
++// F6 last mile: drive the accurate leg's Andes-CSR transport from the registered
++// manifest instead of the engine's compiled-in config macros.
++//
++// The registration directory tests/engines/<engine>-<hash>/csr_manifest.csv is
++// the measured ground truth for which CSRs an engine transports. This module
++// turns that table into the `--transport-csrs` address list vsim consumes
++// (hybrid::andes_caps_from_transport_set rebuilds the exact caps from it), so
++// the runtime and the registration audit share ONE source of truth -- retiring
++// the config->caps mirror (scripts/config_inc_to_andes_caps.py) and its parity
++// guard.
++//
++// transported_csr_addrs is the pure, unit-testable core (no filesystem, no
++// subprocess): manifest CSV text in, transported addresses out. The locating +
++// hashing glue lives in run_plan.cpp (integration-tested by the e2e --verify
++// flywheel).
++#ifndef ANDESIM_TRANSPORT_CSRS_HPP
++#define ANDESIM_TRANSPORT_CSRS_HPP
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace andes_sim {
++
++// Parse a csr_manifest.csv and return the `addr` cells of every row whose
++// `transported` column is "yes", in file order. Columns are located by header
++// name (robust to reordering). A range row ("0xLO~HI", e.g. pmpaddr1~63)
++// contributes its LOW address only -- enough for andes_caps_from_transport_set,
++// which keys each address on its shared feature gate, so one member of a
++// gate-group selects the whole group. Blank lines are skipped; a missing header
++// or either required column yields an empty vector.
++std::vector<std::string> transported_csr_addrs(std::string_view manifest_csv);
++
++}  // namespace andes_sim
++
++#endif  // ANDESIM_TRANSPORT_CSRS_HPP
+--- /dev/null	2026-06-23 12:17:08.168967066 +0800
++++ /home/nick/work/andesim/.claude/worktrees/f6-last-mile/driver/transport_csrs.cpp	2026-07-03 17:54:30.667529585 +0800
+@@ -0,0 +1,74 @@
++// See transport_csrs.hpp.
++#include "transport_csrs.hpp"
++
++#include <cstddef>
++
++namespace andes_sim {
++namespace {
++
++// Strip surrounding ASCII whitespace (incl. a trailing CR from CRLF input).
++std::string_view trim(std::string_view s) {
++  const char* ws = " \t\r\n";
++  const size_t b = s.find_first_not_of(ws);
++  if (b == std::string_view::npos) return {};
++  return s.substr(b, s.find_last_not_of(ws) - b + 1);
++}
++
++// Split one CSV line into trimmed fields (no quoting -- the manifest has none).
++std::vector<std::string_view> fields(std::string_view line) {
++  std::vector<std::string_view> out;
++  size_t pos = 0;
++  for (;;) {
++    const size_t comma = line.find(',', pos);
++    const std::string_view cell =
++        line.substr(pos, comma == std::string_view::npos ? comma : comma - pos);
++    out.push_back(trim(cell));
++    if (comma == std::string_view::npos) break;
++    pos = comma + 1;
++  }
++  return out;
++}
++
++// Index of `name` in the header row, or npos.
++size_t col(const std::vector<std::string_view>& hdr, std::string_view name) {
++  for (size_t i = 0; i < hdr.size(); ++i)
++    if (hdr[i] == name) return i;
++  return static_cast<size_t>(-1);
++}
++
++}  // namespace
++
++std::vector<std::string> transported_csr_addrs(std::string_view csv) {
++  std::vector<std::string> out;
++  const size_t npos = static_cast<size_t>(-1);
++  size_t addr_col = npos, xport_col = npos;
++  bool have_header = false;
++
++  size_t pos = 0;
++  while (pos <= csv.size()) {
++    const size_t nl = csv.find('\n', pos);
++    const std::string_view raw =
++        csv.substr(pos, nl == std::string_view::npos ? nl : nl - pos);
++    pos = (nl == std::string_view::npos) ? csv.size() + 1 : nl + 1;
++
++    if (trim(raw).empty()) continue;  // skip blank lines
++    const std::vector<std::string_view> f = fields(raw);
++
++    if (!have_header) {  // first non-blank line names the columns
++      addr_col = col(f, "addr");
++      xport_col = col(f, "transported");
++      have_header = true;
++      if (addr_col == npos || xport_col == npos) return {};  // not a manifest
++      continue;
++    }
++
++    if (f.size() <= addr_col || f.size() <= xport_col) continue;
++    if (f[xport_col] != "yes") continue;
++    // A range row "0xLO~HI" contributes its low address (before '~').
++    std::string_view a = f[addr_col];
++    out.emplace_back(a.substr(0, a.find('~')));
++  }
++  return out;
++}
++
++}  // namespace andes_sim
+--- /dev/null	2026-06-23 12:17:08.168967066 +0800
++++ /home/nick/work/andesim/.claude/worktrees/f6-last-mile/driver/transport_csrs_test.cpp	2026-07-03 17:53:17.573270505 +0800
+@@ -0,0 +1,49 @@
++// Unit tests for the manifest -> transport-csrs parser (F6 last mile).
++#include "transport_csrs.hpp"
++
++#include "test_check.hpp"
++
++using namespace andes_sim;
++
++int main() {
++  // --- transported=yes rows, in file order; range -> low address ---
++  {
++    const std::string csv =
++        "addr,name,access,exists_cond,implemented,transported,"
++        "gate_or_disposition,reset_value,verify,safe_write\n"
++        "0xF11,mvendorid,MRO,Always,yes,no,CONST_RO,-,-,-\n"
++        "0x300,mstatus,MRW,Always,yes,yes,gate=on,0x0,yes,yes\n"
++        "0x3B1~3EF,pmpaddr1~63,MRW,Always,yes,yes,-,-,-,-\n"
++        "0x7C4,mxstatus,MRW,Always,yes,yes,-,yes,yes,yes\n";
++    test::check_eq(transported_csr_addrs(csv), {"0x300", "0x3B1", "0x7C4"},
++                   "addrs");
++  }
++
++  // --- header located by NAME, not position (columns reordered) ---
++  {
++    const std::string csv =
++        "transported,addr,name\n"
++        "no,0xF11,mvendorid\n"
++        "yes,0x7D0,mmisc_ctl\n";
++    test::check_eq(transported_csr_addrs(csv), {"0x7D0"}, "reordered");
++  }
++
++  // --- blank lines skipped; trailing CR tolerated ---
++  {
++    const std::string csv =
++        "addr,name,transported\r\n"
++        "\r\n"
++        "0x340,mscratch,yes\r\n"
++        "\n"
++        "0x341,mepc,yes\r\n";
++    test::check_eq(transported_csr_addrs(csv), {"0x340", "0x341"}, "crlf");
++  }
++
++  // --- empty / no header / missing column -> empty (tolerant fallback) ---
++  {
++    CHECK(transported_csr_addrs("").empty());
++    CHECK(transported_csr_addrs("addr,name\n0x300,mstatus\n").empty());
++  }
++
++  return test::report("transport-csrs");
++}
+--- /dev/null	2026-06-23 12:17:08.168967066 +0800
++++ /home/nick/work/andesim/.claude/worktrees/f6-last-mile/tests/engines/config_hash.sh	2026-07-03 17:56:29.818874577 +0800
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++# Normalized registration identity hash for a vsim build config.inc.
++#
++# config.inc's first line is a build timestamp ("// created on <date>"), so
++# hashing it raw re-stales the registration on every rebuild even when the
++# config is byte-identical otherwise. Strip that line, sha256, take the first 8
++# hex -- the stable per-config identity behind the registration dir name
++# (tests/engines/<engine>-<hash>/). ONE definition, shared by every consumer:
++#   - test_registration_guard.sh (the presence + hash gate)
++#   - the andesim driver's manifest-driven --transport-csrs wiring (run_plan.cpp)
++#   - the engine.env recompute instruction
++# so the identity can never drift between them.
++#
++# Usage: config_hash.sh <path/to/config.inc>   ->   prints 8 hex chars
++set -euo pipefail
++CFG="${1:?usage: config_hash.sh <config.inc>}"
++[ -f "$CFG" ] || { echo "config_hash.sh: no such config.inc: $CFG" >&2; exit 1; }
++grep -v '^// created on ' "$CFG" | sha256sum | cut -c1-8
+--- /home/nick/work/andesim/driver/CMakeLists.txt	2026-06-30 14:45:00.122721623 +0800
++++ /home/nick/work/andesim/.claude/worktrees/f6-last-mile/driver/CMakeLists.txt	2026-07-03 17:57:54.470103363 +0800
+@@ -30,6 +30,7 @@
+   shm.cpp
+   argv.cpp
+   run_plan.cpp
++  transport_csrs.cpp
+   run_passthrough.cpp
+   vsim_filter.cpp
+   engine_registry.cpp
+@@ -45,9 +46,9 @@
+ add_executable(andesim-cli-test cli_test.cpp cli.cpp)
+ add_executable(andesim-json-test json_test.cpp)
+ add_executable(andesim-infra-test infra_test.cpp process.cpp shm.cpp)
+-add_executable(andesim-plan-test plan_test.cpp argv.cpp run_plan.cpp process.cpp shm.cpp)
++add_executable(andesim-plan-test plan_test.cpp argv.cpp run_plan.cpp transport_csrs.cpp process.cpp shm.cpp)
+ # F6 integration acceptance: spawns real qemu+vsim, so it also needs the registry.
+-add_executable(andesim-plan-itest plan_itest.cpp argv.cpp run_plan.cpp process.cpp shm.cpp engine_registry.cpp)
++add_executable(andesim-plan-itest plan_itest.cpp argv.cpp run_plan.cpp transport_csrs.cpp process.cpp shm.cpp engine_registry.cpp)
+ # F7 transparent-passthrough argv assembly (pure; no spawn).
+ add_executable(andesim-run-test run_test.cpp run_passthrough.cpp argv.cpp process.cpp)
+ # cycle-mode output filter: banner/[info] suppression + cycle-count lift (pure).
+@@ -60,6 +61,8 @@
+ add_executable(andesim-state-diff-test state_diff_test.cpp state_diff.cpp)
+ # EX1: vsim scan dir picks $VSIM_BIN_DIR (external vsim, mirrors $QEMU_BIN_DIR).
+ add_executable(andesim-engine-registry-test engine_registry_test.cpp engine_registry.cpp process.cpp)
++# F6 last mile: manifest -> transport-csrs address-list parser (pure).
++add_executable(andesim-transport-csrs-test transport_csrs_test.cpp transport_csrs.cpp)
+ 
+ # hotloops: C++ replacement for QEMU/scripts/hotloops.sh.
+ add_executable(hotloops hotloops.cpp elf_syms.cpp process.cpp)
+@@ -67,7 +70,7 @@
+ target_compile_options(hotloops PRIVATE -Wall -Wextra)
+ set_target_properties(hotloops PROPERTIES
+   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+-foreach(_t andesim-cli-test andesim-json-test andesim-infra-test andesim-plan-test andesim-plan-itest andesim-run-test andesim-vsimfilter-test andesim-elf-syms-test andesim-hybrid-test andesim-state-diff-test andesim-engine-registry-test)
++foreach(_t andesim-cli-test andesim-json-test andesim-infra-test andesim-plan-test andesim-plan-itest andesim-run-test andesim-vsimfilter-test andesim-elf-syms-test andesim-hybrid-test andesim-state-diff-test andesim-engine-registry-test andesim-transport-csrs-test)
+   target_compile_options(${_t} PRIVATE -Wall -Wextra)
+   set_target_properties(${_t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+ endforeach()
+--- /home/nick/work/andesim/driver/run_plan.hpp	2026-06-29 15:23:52.902185723 +0800
++++ /home/nick/work/andesim/.claude/worktrees/f6-last-mile/driver/run_plan.hpp	2026-07-03 17:55:49.061759684 +0800
+@@ -30,6 +30,12 @@
+   // its config.inc (the engine's `--print-qemu-config`). Empty => the fast leg
+   // keeps its descriptor's default `-cpu` (engines without the flag; FA2).
+   std::string qemu_cfg;
++  // F6: a `--transport-csrs` address-list file (one hex CSR per line) for the
++  // vsim accurate leg, built from the registered manifest's transported set so
++  // the runtime transports exactly what registration measured. Empty => the
++  // accurate leg falls back to its compiled-in config caps (unregistered
++  // engine, missing/stale manifest).
++  std::string transport_csrs;
+ };
+ 
+ // hw-config sync: the QEMU fast leg models the hardware the accurate-leg
+--- /home/nick/work/andesim/driver/run_plan.cpp	2026-06-29 15:23:59.745261369 +0800
++++ /home/nick/work/andesim/.claude/worktrees/f6-last-mile/driver/run_plan.cpp	2026-07-03 18:10:56.293277939 +0800
+@@ -4,6 +4,7 @@
+ #include <cstdlib>
+ #include <filesystem>
+ #include <fstream>
++#include <iterator>
+ 
+ #include <unistd.h>
+ 
+@@ -12,6 +13,7 @@
+ #include "repo_root.hpp"
+ #include "shm.hpp"
+ #include "state.hpp"
++#include "transport_csrs.hpp"
+ 
+ namespace fs = std::filesystem;
+ 
+@@ -41,6 +43,68 @@
+ // cheap; this is a safety cap, not a real wait.
+ constexpr int kQemuCfgProbeMs = 5000;
+ 
++// config_hash.sh is a `grep | sha256sum | cut` -- effectively instant; a small
++// cap, not a real wait.
++constexpr int kConfigHashProbeMs = 5000;
++
++// F6: build the vsim accurate leg's --transport-csrs list from its REGISTERED
++// manifest, so the runtime transports exactly the CSR set registration
++// measured. From the engine binary path (<dir>/sim_<name>), hash its build
++// config.inc via the shared tests/engines/config_hash.sh (the same normalized
++// identity the registration guard keys on), locate
++// tests/engines/<name>-<hash>/csr_manifest.csv, and write its transported
++// addresses (one hex per line) to <workdir>/transport-csrs.list. Returns that
++// path, or "" on ANY miss -- a non-sim_ engine, a missing config.inc / hash
++// script / manifest, an unreadable or empty parse -- the tolerant fallback that
++// leaves the accurate leg on its compiled-in config caps (today's behavior).
++std::string stage_transport_csrs(const std::string& workdir,
++                                 const std::string& engine_bin) {
++  try {
++    std::error_code ec;
++    const fs::path bin(engine_bin);
++    const std::string fname = bin.filename().string();
++    constexpr std::string_view kSim = "sim_";
++    if (!fname.starts_with(kSim)) return "";  // not a vsim sim_<name> binary
++    const std::string name = fname.substr(kSim.size());
++
++    const fs::path cfg =
++        bin.parent_path() / ("V" + name) / "obj_sc" / "config.inc";
++    if (!fs::exists(cfg, ec)) return "";
++
++    const fs::path root = repo_root();
++    const fs::path engines_dir = root / "tests" / "engines";
++    const fs::path script = engines_dir / "config_hash.sh";
++    if (!fs::exists(script, ec)) return "";
++
++    const RunResult h = run_process({"bash", script.string(), cfg.string()},
++                                    kConfigHashProbeMs);
++    if (h.spawn_failed || h.timed_out || h.rc != 0) return "";
++    std::string hash = h.out;
++    if (const size_t e = hash.find_last_not_of(" \t\r\n");
++        e != std::string::npos)
++      hash.erase(e + 1);
++    else
++      return "";  // all whitespace
++
++    const fs::path manifest =
++        engines_dir / (name + "-" + hash) / "csr_manifest.csv";
++    std::ifstream mf(manifest, std::ios::binary);
++    if (!mf) return "";
++    const std::string csv((std::istreambuf_iterator<char>(mf)),
++                          std::istreambuf_iterator<char>());
++    const std::vector<std::string> addrs = transported_csr_addrs(csv);
++    if (addrs.empty()) return "";  // unreadable/malformed -> fall back
++
++    const std::string out = workdir + "/transport-csrs.list";
++    std::ofstream f(out, std::ios::binary | std::ios::trunc);
++    for (const std::string& a : addrs) f << a << '\n';
++    if (!f) return "";
++    return out;
++  } catch (...) {
++    return "";  // best-effort: never break a run over the transport-csrs probe
++  }
++}
++
+ }  // namespace
+ 
+ std::string stage_qemu_cfg(const std::string& workdir, const RunResult& probe) {
+@@ -185,6 +249,13 @@
+       argv.push_back("-readconfig");
+       argv.push_back(ctx.qemu_cfg);
+     }
++    // F6: the vsim accurate leg transports the Andes CSRs the registered
++    // manifest measured (--transport-csrs <list>), instead of deriving caps from
++    // its compiled-in config. Empty => keep the config-caps fallback.
++    if (step.role == "accurate-leg" && !ctx.transport_csrs.empty()) {
++      argv.push_back("--transport-csrs");
++      argv.push_back(ctx.transport_csrs);
++    }
+     // Trigger's vsim tokens, then user-forwarded per-leg flags -- both verbatim
+     // after the filled template (matches tests/e2e.sh's ordering).
+     argv.insert(argv.end(), lt.extra.begin(), lt.extra.end());
+@@ -251,6 +322,8 @@
+           e && !e->bin_path.empty()) {
+         ctx.qemu_cfg = stage_qemu_cfg(
+             wd, run_process({e->bin_path, "--print-qemu-config"}, kQemuCfgProbeMs));
++        // F6: drive Andes-CSR transport from this engine's registered manifest.
++        ctx.transport_csrs = stage_transport_csrs(wd, e->bin_path);
+         break;
+       }
+ 
+--- /home/nick/work/andesim/driver/plan_test.cpp	2026-06-29 15:23:00.780553834 +0800
++++ /home/nick/work/andesim/.claude/worktrees/f6-last-mile/driver/plan_test.cpp	2026-07-03 17:55:32.204132506 +0800
+@@ -258,6 +258,40 @@
+         for (const std::string& tok : a) CHECK(tok != "-readconfig");
+   }
+ 
++  // --- plan_argvs: --transport-csrs is appended to the accurate leg only ---
++  // F6 last mile: the driver drives the accurate engine's Andes-CSR transport
++  // from the registered manifest's list file. Only the vsim accurate leg gets
++  // `--transport-csrs <file>`; the QEMU fast leg never does. An empty path
++  // (the default rc) injects nothing (fallback to the engine's config caps).
++  {
++    RuntimeCtx rt = rc;
++    rt.transport_csrs = "/wd/transport-csrs.list";
++    std::string err;
++    std::vector<std::vector<std::string>> argvs =
++        plan_argvs(plan, engines, "/wd", rt, err);
++    CHECK(err.empty());
++    CHECK(argvs.size() == 2);
++    if (argvs.size() == 2) {
++      for (const std::string& a : argvs[0]) CHECK(a != "--transport-csrs");
++      bool acc_has = false;
++      for (size_t k = 0; k + 1 < argvs[1].size(); ++k)
++        if (argvs[1][k] == "--transport-csrs" &&
++            argvs[1][k + 1] == "/wd/transport-csrs.list")
++          acc_has = true;
++      CHECK(acc_has);
++    }
++  }
++  // empty transport_csrs (the default rc) injects no --transport-csrs anywhere
++  {
++    std::string err;
++    std::vector<std::vector<std::string>> argvs =
++        plan_argvs(plan, engines, "/wd", rc, err);
++    CHECK(err.empty());
++    if (argvs.size() == 2)
++      for (const std::vector<std::string>& a : argvs)
++        for (const std::string& tok : a) CHECK(tok != "--transport-csrs");
++  }
++
+   // --- leg_trigger_args: a trigger's per-role argv contribution ---
+   {
+     std::string err;
+--- /home/nick/work/andesim/tests/engines/test_registration_guard.sh	2026-07-03 16:57:39.465649589 +0800
++++ /home/nick/work/andesim/.claude/worktrees/f6-last-mile/tests/engines/test_registration_guard.sh	2026-07-03 17:56:46.729513773 +0800
+@@ -22,10 +22,10 @@
+   engine=$(basename "$ENG"); engine=${engine#sim_}
+   CFG="$VSIM_BIN_DIR/V$engine/obj_sc/config.inc"
+   [ -f "$CFG" ] || { echo "[FAIL] $engine: built but its config.inc is missing at $CFG"; bad=$((bad+1)); continue; }
+-  # Normalize before hashing: config.inc's first line is a build timestamp
+-  # ("// created on <date>"), so hashing it raw changes the identity on every
+-  # rebuild and stales the registration even when the config is identical.
+-  hash=$(grep -v '^// created on ' "$CFG" | sha256sum | cut -c1-8)
++  # Normalize before hashing (config.inc's first line is a build timestamp that
++  # would re-stale the registration on every rebuild) -- via the shared
++  # config_hash.sh so the driver's manifest lookup keys on the same identity.
++  hash=$(bash "$SCRIPT_DIR/config_hash.sh" "$CFG")
+   dir="$REG_ROOT/$engine-$hash"
+   if [ ! -d "$dir" ]; then
+     other=$(ls -d "$REG_ROOT/$engine"-* 2>/dev/null | head -1)
+--- /home/nick/work/andesim/tests/engines/README.md	2026-07-03 15:47:01.616874150 +0800
++++ /home/nick/work/andesim/.claude/worktrees/f6-last-mile/tests/engines/README.md	2026-07-03 18:03:08.370136915 +0800
+@@ -74,9 +74,13 @@
+ ## What must pass (checks, before "supported")
+ 
+ 1. vsim caps unit test modeling this engine's config shape
+-   (`tests/hybrid/andes_caps.test.cpp` helper, e.g. `premium()`/`advanced()`).
+-2. Caps parity guard (`tests/andes_sim/test_andes_sim_caps_parity.sh` --
+-   picks up every built engine automatically).
++   (`tests/hybrid/andes_caps.test.cpp` helper, e.g. `premium()`/`advanced()`) --
++   including `andes_caps_from_transport_set` == config-derived caps, the proof
++   that driving transport from this manifest reconstructs the exact caps.
++2. Manifest-driven transport (F6): the accurate leg's `--transport-csrs` list is
++   built from THIS `csr_manifest.csv` (driver `run_plan.cpp` ->
++   `transported_csr_addrs`), so the runtime transports exactly the measured set.
++   The config->caps python mirror + its parity guard were retired here.
+ 3. Cold-cache hybrid `--verify` PASS on this engine, both trigger modes.
+ 4. Under-claim HARD gate (`check_completeness.py` via
+    `test_registration_completeness.sh`): any `implemented in {yes,partial}` &
+--- /home/nick/work/andesim/scripts/render_csr_matrix.py	2026-07-02 14:02:17.391477980 +0800
++++ /home/nick/work/andesim/.claude/worktrees/f6-last-mile/scripts/render_csr_matrix.py	2026-07-03 18:03:14.006418809 +0800
+@@ -63,9 +63,9 @@
+     # PMA: premium has 4 entries; the ABI carries 16 (pmaaddr0-15 / pmacfg0,2).
+     # The spec's pmaaddr0~47 / pmacfg4-10 (entries 16-47) need PPMA_VER==2 AND an
+     # ABI extension -> those are blocked above; here is the part premium does.
+-    "pmacfg0": "test_andes_sim_caps_parity.sh + handoff_roundtrip.S (Andes PMA cfg; premium 4 entries)",
+-    "pmacfg2": "test_andes_sim_caps_parity.sh + handoff_roundtrip.S (Andes PMA cfg; premium 4 entries)",
+-    "pmaaddr0~47": "test_andes_sim_caps_parity.sh + handoff_roundtrip.S (premium drains pmaaddr0-3; "
++    "pmacfg0": "registration --verify + handoff_roundtrip.S (Andes PMA cfg; premium 4 entries)",
++    "pmacfg2": "registration --verify + handoff_roundtrip.S (Andes PMA cfg; premium 4 entries)",
++    "pmaaddr0~47": "registration --verify + handoff_roundtrip.S (premium drains pmaaddr0-3; "
+                    "ABI carries 0-15; 16-47 need PPMA_VER==2 + ABI extend, deferred)",
+ }
+ # Andes-block scalars premium ACTUALLY implements (its --describe andes_csrs).
+@@ -145,9 +145,9 @@
+         if name.startswith(("pmpcfg", "pmpaddr")):
+             return "done", "handoff_roundtrip.S (M-mode PMP pass-through)"
+         if name.startswith(("pmacfg", "pmaaddr")):
+-            return "done", "test_andes_sim_caps_parity.sh + handoff_roundtrip.S (Andes PMA block)"
++            return "done", "registration --verify + handoff_roundtrip.S (Andes PMA block)"
+         if name in ANDES_DONE:
+-            return "done", "test_andes_sim_caps_parity.sh + handoff_roundtrip.S (Andes block)"
++            return "done", "registration --verify + handoff_roundtrip.S (Andes block)"
+         return "done", "handoff_roundtrip.S"
+     if dec in ("NEW", "NEW_TRIG", "NEW_UDELTA"):
+         return "blocked", "needs a capable engine"
+--- /home/nick/work/andesim/tests/engines/ax45mpv_premium-5bea8bdc/gen_manifest.py	2026-07-03 16:52:12.623436280 +0800
++++ /home/nick/work/andesim/.claude/worktrees/f6-last-mile/tests/engines/ax45mpv_premium-5bea8bdc/gen_manifest.py	2026-07-03 18:04:21.653844300 +0800
+@@ -9,7 +9,7 @@
+ 
+ Empirical:
+   - transported (claimed) set: sim_ax46mpv_advanced --describe andes_csrs
+-    (crosschecked against scripts/config_inc_to_andes_caps.py -- parity OK)
++    (proven == config-derived caps by tests/hybrid/andes_caps.test.cpp)
+   - reset values: the reset-baseline capture ~/.cache/andesim/*.bin
+     (hybrid_state_v1, drained from the freshly reset halted hart; fields the
+     drain does not read stay zero and are reported as "-")
+@@ -83,8 +83,8 @@
+     return bool(eval(EXISTENT, {}, ns))
+ 
+ # ---- the engine's claimed (transported) set ----
+-# gated names exactly as sim_ax46mpv_advanced --describe reported (parity with
+-# scripts/config_inc_to_andes_caps.py on the build config.inc verified).
++# gated names exactly as sim_ax46mpv_advanced --describe reported; this is the
++# transported set the driver feeds to vsim via --transport-csrs (F6).
+ import subprocess, json as _json
+ DESCRIBE = _json.loads(subprocess.run(
+     [VS + "/build/sim_ax45mpv_premium", "--describe"],
+--- /home/nick/work/andesim/tests/engines/ax46mpv_advanced-a13f86a3/gen_manifest.py	2026-07-03 16:53:12.983345555 +0800
++++ /home/nick/work/andesim/.claude/worktrees/f6-last-mile/tests/engines/ax46mpv_advanced-a13f86a3/gen_manifest.py	2026-07-03 18:04:31.747668527 +0800
+@@ -9,7 +9,7 @@
+ 
+ Empirical:
+   - transported (claimed) set: sim_ax46mpv_advanced --describe andes_csrs
+-    (crosschecked against scripts/config_inc_to_andes_caps.py -- parity OK)
++    (proven == config-derived caps by tests/hybrid/andes_caps.test.cpp)
+   - reset values: the reset-baseline capture ~/.cache/andesim/*.bin
+     (hybrid_state_v1, drained from the freshly reset halted hart; fields the
+     drain does not read stay zero and are reported as "-")
+@@ -98,8 +98,8 @@
+     return bool(eval(EXISTENT, {}, ns))
+ 
+ # ---- the engine's claimed (transported) set ----
+-# gated names exactly as sim_ax46mpv_advanced --describe reported (parity with
+-# scripts/config_inc_to_andes_caps.py on the build config.inc verified).
++# gated names exactly as sim_ax46mpv_advanced --describe reported; this is the
++# transported set the driver feeds to vsim via --transport-csrs (F6).
+ import subprocess, json as _json
+ DESCRIBE = _json.loads(subprocess.run(
+     [VS + "/build/sim_ax46mpv_advanced", "--describe"],
+--- /home/nick/work/andesim/docs/engine_registration_completeness_ROADMAP.md	2026-07-03 17:25:07.686759774 +0800
++++ /home/nick/work/andesim/.claude/worktrees/f6-last-mile/docs/engine_registration_completeness_ROADMAP.md	2026-07-03 18:07:09.938975189 +0800
+@@ -142,7 +142,7 @@
+   (`restore? / reason`). = existing `docs/ds220_restore_table_ROADMAP.md`.
+   Needs PyMuPDF (venv). Deps: manifest.
+ 
+-- [~] **F6 Runtime transport from the manifest.** CORE DONE + vsim support done.
++- [x] **F6 Runtime transport from the manifest.** DONE (last mile landed).
+   - `andes_caps_from_transport_set()` (vsim `andes_caps.hpp`): rebuilds the exact
+     caps from the manifest's transported set (the set is a union of complete
+     gate-groups). Unit-tested (`andes_caps.test.cpp` new case) -- PROVEN identical
+@@ -151,13 +151,28 @@
+     -> `active_caps()` returns it instead of `andes_caps_from_config()` at all 4
+     transport sites; config-caps kept as the fallback. Built; fixtures pass with
+     NO regression (fallback path unchanged), `--describe` unchanged.
+-  REMAINING (the last mile -- a driver refactor + its own e2e cycle, deliberately
+-  not rushed): (1) driver auto-wiring -- locate the registration by normalized
+-  config hash, read the manifest's transported addresses, write a list file, and
+-  append `--transport-csrs` to the accurate-leg command in `run_plan.cpp`; then
+-  (2) delete `scripts/config_inc_to_andes_caps.py` + the parity guard (the mirror
+-  is obsolete once the driver drives from the manifest). (2) is irreversible and
+-  flips the transport default, so it must follow a full e2e re-validation.
++  - (1) DONE driver auto-wiring: `transported_csr_addrs()` parses the manifest
++    (`driver/transport_csrs.{hpp,cpp}` + `transport_csrs_test.cpp`, TDD); the
++    accurate leg is located by normalized config hash via the shared
++    `tests/engines/config_hash.sh` (same identity the guard keys on), its
++    `csr_manifest.csv` transported set written to a list file, and
++    `--transport-csrs <file>` appended to the vsim accurate leg in
++    `run_plan.cpp` (`stage_transport_csrs` + `RuntimeCtx::transport_csrs`;
++    unit-tested in `plan_test.cpp`). Tolerant: any miss (non-sim engine, missing
++    config.inc/script/manifest, empty parse) falls back to config caps.
++  - (2) DONE mirror retired: deleted `scripts/config_inc_to_andes_caps.py` +
++    `tests/andes_sim/test_andes_sim_caps_parity.sh`; references in
++    `render_csr_matrix.py`, `README.md`, both `gen_manifest.py` repointed to the
++    surviving proofs (the `andes_caps.test.cpp` unit case + the registration
++    `--verify` flywheel).
++  - e2e re-validation (before deleting the mirror): hybrid `--verify` on BOTH
++    engines through the manifest-driven path -- premium 147 fields, advanced 148,
++    state-diff PASS, verify PASS -- byte-identical to the pre-F6 config-caps run.
++    Parser output proven == the manifests' transported set (40 premium / 43
++    advanced). Follow-up (doc-only, not test-run): 2 stale references in
++    `docs/csr_coverage.ipynb` (regenerable via `render_csr_matrix.py`) and
++    `docs/engine_registration_tutorial.ipynb` (a tutorial step that ran the
++    deleted parity guard) still name the removed files.
+ 
+ ## Order / dependency
+ 
+@@ -169,9 +184,10 @@
+ - **F1 DONE** (under-claim hard gate). **F2 DONE** (coverage gate + split write/
+   readback fixtures, both engines pass hybrid `--verify`). **F4 DONE** (wiring +
+   `tests/engines/README.md` contract).
+-- **F3 / F6 pending** -- vsim-side (probe sub-command; runtime-from-manifest),
+-  cross-repo `hybrid_vsim`, needs a podman rebuild. **F5 pending** -- needs
+-  PyMuPDF (not installed).
++- **F3 DONE** (probe sub-command). **F6 DONE** -- the driver now drives the vsim
++  accurate leg's Andes-CSR transport from the registered manifest
++  (`--transport-csrs`), and the config->caps python mirror + parity guard are
++  retired. **F5 pending** -- needs PyMuPDF (not installed).
+ 
+ ### Resolved: recurring "stale registration" -> ROOT CAUSE was a build timestamp
+ `test_registration_guard.sh` kept FAILING after every vsim rebuild. Root cause
+--- /home/nick/work/andesim/docs/andes_csr_transport_ROADMAP.md	2026-07-02 14:02:17.409173522 +0800
++++ /home/nick/work/andesim/.claude/worktrees/f6-last-mile/docs/andes_csr_transport_ROADMAP.md	2026-07-03 18:07:25.420717102 +0800
+@@ -33,6 +33,12 @@
+   the C++ gate logic in Python; the
+   parity test `tests/andes_sim/test_andes_sim_caps_parity.sh` asserts it is
+   byte-identical to the engine's `--describe` (flywheel / drift guard).
++  RETIRED by F6 (engine_registration_completeness_ROADMAP): the driver now
++  drives transport from the registered `csr_manifest.csv` (`--transport-csrs`),
++  so the config->caps Python mirror + its parity test were deleted. The
++  config->caps agreement is now proven by the `andes_caps.test.cpp` unit case
++  (`andes_caps_from_transport_set` == config-derived caps) + the registration
++  `--verify` flywheel.
+ 
+ End-to-end: the rebuilt premium engine self-reports
+ `mxstatus mclk_ctl milmb mdlmb mcountermask_m uitb jvt pmacfg pmaaddr` (its build
+--- /home/nick/work/andesim/scripts/config_inc_to_andes_caps.py	2026-07-02 15:55:41.101566265 +0800
++++ /dev/null	2026-06-23 12:17:08.168967066 +0800
+@@ -1,261 +0,0 @@
+-#!/usr/bin/env python3
+-"""Derive the andesim hybrid Andes-CSR capability list from a core's config.inc.
+-
+-The OFFLINE checker for the hybrid handoff. It mirrors, in Python, the C++ gate
+-logic the vsim engine compiles in (src/hybrid/andes_caps.hpp +
+-andes_caps_config.hpp). At runtime the engine reports the same list via
+-`sim_<core> --describe` ("andes_csrs"), and the andesim driver uses it to skip
+---verify on CSRs the engine lacks. Running this on the engine's own build
+-config.inc must produce the same list -- a drift guard between the offline
+-config and the built engine (the flywheel; see tests/andes_sim/
+-test_andes_sim_caps_parity.sh).
+-
+-Each Andes CSR is gated by a config.inc feature: a core implements the CSR only
+-when its feature is configured in. Restoring/draining a CSR the core lacks can
+-hang the DM handshake, so the engine and this checker gate on the same map.
+-
+-Self-contained: the config.inc parser below is ported from Andes'
+-cpu_config_to_march_converter (parse_inc / is_yes / _int), so this depends only
+-on the Python stdlib.
+-
+-Usage:
+-  config_inc_to_andes_caps.py <config.inc>                       # print the list
+-  config_inc_to_andes_caps.py --check <config.inc> <csr> [csr...]  # assert exact
+-"""
+-from __future__ import annotations
+-
+-import re
+-import sys
+-from pathlib import Path
+-
+-# --- config.inc parsing (ported from cpu_config_to_march_converter) ----------
+-_DEFINE_RE = re.compile(r'^\s*`define\s+(\w+)(?:\s+(.+?))?\s*(?://\s*(.*))?$')
+-
+-
+-def parse_inc(path) -> dict:
+-    """{macro: string-value} from a Verilog config.inc (`define KEY VALUE)."""
+-    out: dict = {}
+-    for line in Path(path).read_text(errors="replace").splitlines():
+-        m = _DEFINE_RE.match(line)
+-        if not m:
+-            continue
+-        name = m.group(1)
+-        raw = (m.group(2) or "").strip().rstrip(",")
+-        comment = (m.group(3) or "").strip()
+-        if not raw:                                   # bare `define NAME flag
+-            out.setdefault(name, "1")
+-            continue
+-        if raw.startswith('"') and raw.endswith('"'):  # quoted string
+-            out[name] = raw[1:-1]
+-            continue
+-        c = comment.strip().strip('"')                # numeric + // symbolic
+-        if c and " " not in c:
+-            out[name] = c
+-            try:
+-                int(raw, 0)
+-                out.setdefault(name + "_INT", raw)
+-            except ValueError:
+-                pass
+-            continue
+-        out[name] = raw                               # bare integer / token
+-    return out
+-
+-
+-def _str(cfg: dict, key: str) -> str:
+-    if key in cfg:
+-        return cfg[key].strip().strip('"')
+-    if key + "_INT" in cfg:
+-        return cfg[key + "_INT"].strip()
+-    return ""
+-
+-
+-def _int(cfg: dict, key: str):
+-    """Numeric view: prefer the _INT companion macro, else parse the value."""
+-    for k in (key + "_INT", key):
+-        if k in cfg:
+-            try:
+-                return int(cfg[k], 0)
+-            except ValueError:
+-                pass
+-    return None
+-
+-
+-def is_yes(cfg: dict, key: str) -> bool:
+-    s = _str(cfg, key).lower()
+-    if s in ("yes", "true", "on"):
+-        return True
+-    if s in ("no", "false", "off", ""):
+-        return False
+-    n = _int(cfg, key)
+-    return n is not None and n == 1
+-
+-
+-# --- Andes-CSR capability derivation -----------------------------------------
+-def _ecc_any(cfg: dict) -> bool:
+-    """mecc_code exists if ANY RAM block is configured with ECC (type != none)."""
+-    for blk in ("NDS_DCACHE_ECC_TYPE", "NDS_ICACHE_ECC_TYPE",
+-                "NDS_ILM_ECC_TYPE", "NDS_DLM_ECC_TYPE"):
+-        n = _int(cfg, blk)
+-        if n is not None and n > 0:
+-            return True
+-    return False
+-
+-
+-def _any_yes(cfg: dict, *keys: str) -> bool:
+-    return any(is_yes(cfg, k) for k in keys)
+-
+-
+-def gates(cfg: dict) -> dict:
+-    """Feature gates, mirroring andes_caps_from_config() in the vsim binary."""
+-    priv = _int(cfg, "NDS_NUM_PRIVILEGE_LEVELS") or 1   # 1=M, 2=M+U, 3=M+S+U
+-    perf = is_yes(cfg, "NDS_PERFORMANCE_MONITOR")
+-    # Andes PMNDS scheme: the standard Sscofpmf extension REPLACES the Andes
+-    # counter CSRs (RTL existent_csr: PERFORMANCE_MONITOR & !SSCOFPMF).
+-    pmnds = perf and not is_yes(cfg, "NDS_SSCOFPMF_SUPPORT")
+-    return {
+-        "DSP":          is_yes(cfg, "NDS_DSP_SUPPORT"),
+-        "CODENSE":      is_yes(cfg, "NDS_CODENSE_SUPPORT"),
+-        "POWERBRAKE":   is_yes(cfg, "NDS_POWERBRAKE_SUPPORT"),
+-        "STACKSAFE":    is_yes(cfg, "NDS_STACKSAFE_SUPPORT"),
+-        "PERF_MONITOR": perf,
+-        "PMNDS":        pmnds,
+-        "PMNDS_UMODE":  pmnds and priv >= 2,
+-        "PMNDS_SMODE":  pmnds and priv >= 3,
+-        "PMA":          (_int(cfg, "NDS_PMA_ENTRIES") or 0) > 0,
+-        "ILM":          (_int(cfg, "NDS_ILM_SIZE_KB") or 0) > 0,
+-        "DLM":          (_int(cfg, "NDS_DLM_SIZE_KB") or 0) > 0,
+-        "ECC":          _ecc_any(cfg),
+-        # Zcmt (jvt): the RTL gates jvt on ZCE_SUPPORT (newer config.inc
+-        # generations carry the knob; older ones have none -- absent = off).
+-        "ZCMT":         is_yes(cfg, "NDS_ZCMT_SUPPORT")
+-                        or is_yes(cfg, "NDS_ZCE_SUPPORT"),
+-        # umisc_ctl: spec ALT_FP_FMT | CST_CTL; RTL BFLOAT16_ARITH | ACE.
+-        "ALT_FP":       is_yes(cfg, "NDS_BFLOAT16_ARITH_SUPPORT")
+-                        or is_yes(cfg, "NDS_ACE_SUPPORT"),
+-        "ALWAYS":       True,
+-        # v4 M-ext gates.
+-        "UMODE":        priv >= 2,
+-        "SMODE":        priv >= 3,
+-        "TRIGGER":      (_int(cfg, "NDS_NUM_TRIGGER") or 0) > 0,
+-        "EPMP":         _any_yes(cfg, "NDS_SMEPMP", "NDS_EPMP"),
+-        "SMRNMI":       _any_yes(cfg, "NDS_SMRNMI", "NDS_RNMI"),
+-        "EXCSLVL":      (_int(cfg, "NDS_EXCSLVL") or 0) > 0,
+-        "CLIC":         _any_yes(cfg, "NDS_ECLIC", "NDS_CLIC"),
+-        "SMSTATEEN":    is_yes(cfg, "NDS_SMSTATEEN"),
+-        # CCTL: the RTL gates mcctl* on cache presence (no config generation
+-        # emits a dedicated NDS_CCTLCSR knob), so bind the cache sizes too.
+-        "CCTL":         _any_yes(cfg, "NDS_CCTLCSR", "NDS_CCTL")
+-                        or (_int(cfg, "NDS_ICACHE_SIZE_KB") or 0) > 0
+-                        or (_int(cfg, "NDS_DCACHE_SIZE_KB") or 0) > 0,
+-        "PPI":          (_int(cfg, "NDS_PPI_SIZE_KB") or 0) > 0,
+-        "FIO":          (_int(cfg, "NDS_FIO_SIZE_KB") or 0) > 0
+-                        or is_yes(cfg, "NDS_FIO"),
+-    }
+-
+-
+-# (csr name, gate) in HYBRID_ANDES_CSR_LIST order, then the PMA group markers --
+-# mirrors andes_caps.hpp andes_gate_for() + supported_andes_csr_names().
+-_CSR_GATES = [
+-    ("mxstatus",       "ALWAYS"),
+-    ("mpft_ctl",       "POWERBRAKE"),
+-    ("mclk_ctl",       "ALWAYS"),
+-    ("milmb",          "ILM"),
+-    ("mdlmb",          "DLM"),
+-    ("mecc_code",      "ECC"),
+-    ("mhsp_ctl",       "STACKSAFE"),
+-    ("msp_bound",      "STACKSAFE"),
+-    ("msp_base",       "STACKSAFE"),
+-    # The PMNDS counter block: SPA existence mmsc_cfg.PMNDS (& misa[20]/[18]
+-    # for the U/S members). jvt is Zcmt's table-jump base, NOT implied by
+-    # classic CoDense. All were over-claimed once and faulted the PB drain
+-    # sweep live (0x7D1 + jvt on premium, 0x7CF on advanced/Sscofpmf).
+-    ("mcountermask_m", "PMNDS_UMODE"),
+-    ("uitb",           "CODENSE"),
+-    ("jvt",            "ZCMT"),
+-    ("ucode",          "DSP"),
+-    ("pmacfg",         "PMA"),
+-    ("pmaaddr",        "PMA"),
+-    # v4 M-ext CSRs, in HYBRID_M_EXT_CSR_LIST order (gdb mnemonics, matching
+-    # supported_andes_csr_names which iterates that list after the Andes block).
+-    ("menvcfg",        "UMODE"),
+-    ("mseccfg",        "EPMP"),
+-    ("mcounteren",     "UMODE"),
+-    ("mcountinhibit",  "PERF_MONITOR"),
+-    ("mhpmcounter3",   "PERF_MONITOR"),
+-    ("mhpmcounter4",   "PERF_MONITOR"),
+-    ("mhpmcounter5",   "PERF_MONITOR"),
+-    ("mhpmcounter6",   "PERF_MONITOR"),
+-    ("mhpmevent3",     "PERF_MONITOR"),
+-    ("mhpmevent4",     "PERF_MONITOR"),
+-    ("mhpmevent5",     "PERF_MONITOR"),
+-    ("mhpmevent6",     "PERF_MONITOR"),
+-    ("mcounterwen",    "PMNDS_UMODE"),
+-    ("mcounterinten",  "PMNDS"),
+-    ("mcountermask_s", "PMNDS_SMODE"),
+-    ("mcountermask_u", "PMNDS_UMODE"),
+-    ("mnscratch",      "SMRNMI"),
+-    ("mnepc",          "SMRNMI"),
+-    ("mncause",        "SMRNMI"),
+-    ("mnstatus",       "SMRNMI"),
+-    # mnvec: spec "IM Requirement: Required", RTL unconditional -- base Andes
+-    # NMI state, NOT part of Smrnmi (registration-audit under-claim fix).
+-    ("mnvec",          "ALWAYS"),
+-    ("mrnxvec",        "SMRNMI"),
+-    ("mdcause",        "ALWAYS"),
+-    ("mslideleg",      "SMODE"),
+-    ("msavestatus",    "EXCSLVL"),
+-    ("msaveepc1",      "EXCSLVL"),
+-    ("msavecause1",    "EXCSLVL"),
+-    ("msaveepc2",      "EXCSLVL"),
+-    ("msavecause2",    "EXCSLVL"),
+-    ("msavedcause1",   "EXCSLVL"),
+-    ("msavedcause2",   "EXCSLVL"),
+-    ("mtvt",           "CLIC"),
+-    ("mintthresh",     "CLIC"),
+-    ("mcirq_entry",    "CLIC"),
+-    ("mstateen0",      "SMSTATEEN"),
+-    ("mstateen1",      "SMSTATEEN"),
+-    ("mstateen2",      "SMSTATEEN"),
+-    ("mstateen3",      "SMSTATEEN"),
+-    ("mcctlbeginaddr", "CCTL"),
+-    ("mcctldata",      "CCTL"),
+-    ("mppib",          "PPI"),
+-    ("mfiob",          "FIO"),
+-    ("tselect",        "TRIGGER"),
+-    ("tdata1",         "TRIGGER"),
+-    ("tdata2",         "TRIGGER"),
+-    ("tcontrol",       "TRIGGER"),
+-    ("mcontext",       "TRIGGER"),
+-    ("uzobctl",        "UMODE"),
+-    ("ucctlbeginaddr", "UMODE"),
+-    ("sleepvalue",     "UMODE"),
+-    ("umisc_ctl",      "ALT_FP"),  # existence: BF16|ACE, not U-mode
+-]
+-
+-
+-def supported_andes_csrs(cfg: dict) -> list:
+-    g = gates(cfg)
+-    return [name for name, gate in _CSR_GATES if g[gate]]
+-
+-
+-def main(argv: list) -> int:
+-    if argv and argv[0] == "--check":
+-        if len(argv) < 2:
+-            print(__doc__)
+-            return 2
+-        got = supported_andes_csrs(parse_inc(argv[1]))
+-        want = argv[2:]
+-        if got != want:
+-            print(f"MISMATCH\n  got:  {got}\n  want: {want}", file=sys.stderr)
+-            return 1
+-        print("OK: " + " ".join(got))
+-        return 0
+-    if len(argv) != 1:
+-        print(__doc__)
+-        return 2
+-    print(" ".join(supported_andes_csrs(parse_inc(argv[0]))))
+-    return 0
+-
+-
+-if __name__ == "__main__":
+-    sys.exit(main(sys.argv[1:]))
+--- /home/nick/work/andesim/tests/andes_sim/test_andes_sim_caps_parity.sh	2026-07-02 14:01:44.333205150 +0800
++++ /dev/null	2026-06-23 12:17:08.168967066 +0800
+@@ -1,54 +0,0 @@
+-#!/usr/bin/env bash
+-# Andes-CSR capability parity (the flywheel / drift guard).
+-#
+-# The offline deriver (scripts/config_inc_to_andes_caps.py) computes, from a
+-# core's config.inc, which Andes CSRs it implements. The vsim
+-# engine compiles the SAME gate logic (src/hybrid/andes_caps*.hpp) and reports
+-# the list at runtime via `--describe` ("andes_csrs"). Fed the engine's OWN
+-# embedded build config.inc, the two must be byte-identical -- a disagreement
+-# means the resume/drain capability gate is wrong for that engine.
+-#
+-# Runs against EVERY built engine under $VSIM_BIN_DIR (each sim_* binary with
+-# a V<engine>/obj_sc/config.inc beside it) -- a single hardcoded engine left
+-# new engines with zero parity coverage. Uses the engine's build config.inc
+-# (the exact blob the binary embeds), so offline and online share one source.
+-# The --describe half is opportunistic: it needs the engine rebuilt with the
+-# S3 describe change (a prebuilt binary that omits "andes_csrs" is skipped).
+-set -uo pipefail
+-
+-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+-ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+-. "$SCRIPT_DIR/../lib/log.sh"
+-
+-DERIVE="$ROOT/scripts/config_inc_to_andes_caps.py"
+-[ -f "$DERIVE" ] || fail "missing deriver: $DERIVE"
+-
+-VSIM_BIN_DIR="${VSIM_BIN_DIR:-$ROOT/../vsim_andesim/build}"
+-
+-checked=0
+-for ENG in "$VSIM_BIN_DIR"/sim_*; do
+-  [ -x "$ENG" ] || continue
+-  name=$(basename "$ENG")            # sim_<engine>
+-  engine=${name#sim_}
+-  # The engine's embedded config.inc (copied next to its Verilated objects).
+-  CFG="$VSIM_BIN_DIR/V$engine/obj_sc/config.inc"
+-  [ -f "$CFG" ] || fail "$name present but its build config.inc not found at $CFG"
+-
+-  offline=$(python3 "$DERIVE" "$CFG") || fail "deriver failed on $CFG"
+-  [ -n "$offline" ] || fail "deriver produced an empty list for $CFG"
+-
+-  online=$("$ENG" --describe 2>/dev/null \
+-    | python3 -c 'import sys,json; print(" ".join(json.load(sys.stdin).get("andes_csrs", [])))' 2>/dev/null)
+-  if [ -z "$online" ]; then
+-    echo "[skip] $name --describe has no andes_csrs (rebuild vsim with the S3 change)"
+-    continue
+-  fi
+-
+-  [ "$online" = "$offline" ] || fail \
+-    "PARITY MISMATCH ($engine): --describe andes_csrs != offline deriver"$'\n'"  describe: $online"$'\n'"  offline:  $offline"
+-  echo "[ok] $engine: --describe == offline deriver"
+-  checked=$((checked + 1))
+-done
+-
+-[ "$checked" -gt 0 ] || { echo "[skip] no built engines under $VSIM_BIN_DIR"; ok "andes caps parity (skipped)"; exit 0; }
+-ok "flywheel: --describe == offline deriver on $checked engine(s)"

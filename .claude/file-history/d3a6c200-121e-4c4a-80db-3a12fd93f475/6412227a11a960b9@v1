@@ -1,0 +1,190 @@
+# ROADMAP: engine registration = complete CSR-test gate
+
+Goal (user): `andesim` registers a vsim engine, and registration PASSES only
+after every CSR the engine's config supports is completely tested.
+
+## Design principle: measure, don't model
+
+The engine is the ground truth for itself. We stop GUESSING which CSRs exist
+from config knobs or spec conditions -- that mapping lives only in the RTL and
+is fragile to hand-copy -- and instead ASK the vsim engine directly (a probe).
+Each source shrinks to its true minimal job:
+
+| source | role |
+|---|---|
+| **vsim probe** | THE truth: existent CSR set + reset values (measured on the reset hart) |
+| config.inc | identity only: `sha256` = registration key; + fallback for the un-probeable few |
+| spec inventory | the map: which addresses to probe, names, DS order, read-side-effect skip-list |
+| RTL `existent_csr` | optional cross-check for the read-side-effect CSRs the probe must skip |
+| QEMU | workload payload + independent `--verify` oracle -- NOT existence |
+
+Why not config alone: spec speaks architecture (`mmsc_cfg.PMNDS`), config speaks
+knobs (`NDS_*`), neither holds the bridge. Why not QEMU: it is a different
+implementation with its own (larger, coarser-than-a-config-hash) CSR set --
+using its drain to decide vsim transport over-claims and faults the DM sweep.
+
+## The invariant the gate enforces
+
+For a built engine (identity = engine name + `config.inc` hash), every
+`implemented` CSR (measured by the probe) must be in exactly one bucket:
+
+- **transported + tested** -- restored at resume, drained, `--verify`-compared,
+  AND has its own per-CSR round-trip test.
+- **named-excluded** -- not transported, with a named reason
+  (`EXCL_MODE|RV32|DEBUG|SIDEFX`, `CONST_RO`, `gate=off`, ...).
+
+Neither-bucket = silent state loss = FAIL. Transported without its own test = FAIL.
+
+Locked definitions:
+- "supported" = the `implemented` (probe-measured) set, not just transported.
+- "completely tested" for un-writable control CSRs = read-back round-trip
+  (read crt0 value -> stash -> re-read in ROI -> `bne` + `--verify`), NOT a
+  destructive blind write.
+
+## Discovery vs verification (only verification runs an ELF)
+
+- **Discovery = the probe.** Reset hart, checked `csrr` over the inventory. NO ELF.
+  Yields: existent set, reset values, over-claim + under-claim checks. One-time,
+  at registration.
+- **Verification = the generated fixtures.** Run ELFs to prove each transported
+  CSR round-trips. After discovery, transported set only.
+
+## What already exists (reuse, do not rebuild)
+
+- `tests/engines/<engine>-<hash>/csr_manifest.csv` -- the 232-row table.
+- `tests/engines/gen_manifest.py` -- three-way audit. NOTE: its `implemented`
+  comes from a hand-traced RTL param dict `P` (line 30) and its reset values
+  from an ELF-keyed baseline capture (line 119) -- both replaced by F3's probe.
+- `tests/engines/gen_fixtures.py` + `safe_write_policy.csv` -- write-survival
+  fixtures for the write-safe subset.
+- `tests/engines/test_registration_guard.sh` -- presence + hash gate.
+- `tests/engines/test_registration_fixtures.sh` -- safe-write fixtures pass.
+
+## Features (one per session, TDD, update Status)
+
+- [x] **F1 Under-claim hard gate.** DONE. `check_completeness.py` +
+  `test_registration_completeness.sh`. Real manifests clean (140 implemented
+  rows); injected under-claim caught; both engines pass. Turn the printed under-claim report into a
+  failing check. A script reads `csr_manifest.csv` and EXITS NONZERO if any row
+  is `implemented in {yes,partial}` AND `transported=no` AND its
+  `gate_or_disposition` is not a named `EXCL_*` / `gate=off` reason.
+  RED: a fixture manifest with one deliberate under-claim -> script fails;
+  a clean manifest -> passes.
+  Key files: `tests/engines/check_completeness.py` (new),
+  `tests/engines/test_registration_completeness.sh` (new, glob-picked by
+  `test_all.sh`), `tests/engines/README.md`. Deps: none (pure andesim).
+  Enforces on today's manifest now; F3 later makes the `implemented` data it
+  gates on empirical.
+
+- [x] **F2 Per-CSR test for every transported CSR.** DONE.
+  `check_test_coverage.py` + `test_registration_coverage.sh` is the gate (every
+  transported RW CSR must be write/readback/covered/verify-only). `gen_fixtures.py`
+  now emits TWO fixtures: `csr_survival_gen.S` (write) + `csr_readback_gen.S`
+  (read-back, memory-stash). Both fixtures pass hybrid `--verify` on BOTH engines
+  (premium 7 write + 11 readback; advanced 6 write + 13 readback).
+  Findings baked into the policy: (a) the readback fixture MUST be a separate ELF
+  from the write fixture -- `csrw mcounterinten` in the same lengthened ROI hangs
+  the run; (b) tdata1 (0x7A1) round-trips through resume but its DRAINED value
+  diverges vsim-vs-QEMU, so it is verify-only, not readback.
+  Original plan below:
+
+- [ ] **F2 (orig) Per-CSR test for every transported CSR.** Extend `gen_fixtures.py`:
+  write-safe CSRs keep the write-survival fixture; control/skip CSRs get a
+  read-back round-trip assertion (no destructive write). Add a `readback` action
+  tier to `safe_write_policy.csv`. Then assert: per-CSR-test count == transported
+  count (minus a named `--verify-only` allow-list), else FAIL.
+  RED: a transported CSR with no test entry -> coverage assert fails.
+  Key files: `tests/engines/gen_fixtures.py`, `tests/engines/safe_write_policy.csv`,
+  `tests/engines/test_registration_fixtures.sh`, generated `fixtures/*.S`.
+  Deps: none (independent of F1).
+
+- [x] **F3 Registration-time probe = primary existence + reset source (vsim-side).**
+  DONE + VALIDATED. Added `sim_<engine> --probe <addr-list> <spin.elf>` in the
+  vsim repo (`src/simulator.hpp` `probe_csrs()` + `src/main.cpp` free-fn wiring;
+  halts the reset hart, enables mstatus.FS/VS, checked-reads each address, emits
+  `0xADDR,yes|no,0xRESET`). Reproducible via `tests/engines/probe_engine.sh`.
+  `gen_manifest.py` (both engines) consumes it via `ANDESIM_PROBE_CSV`, with the
+  RTL equation kept as the fallback for read-side-effect CSRs the probe skips.
+  **Validation (premium):** probe vs the hand-traced manifest = 0 existence
+  mismatches, all 54 reset values identical, and the probe is MORE precise on
+  range CSRs (finds the exact absent pmpcfg/pmaaddr members "partial" hid). The
+  probe-driven regenerated manifest is BYTE-IDENTICAL to the committed one ->
+  transparent drop-in for hand-traced `P`. Notes: the probe is slow (~6 min for
+  362 CSRs on the cycle-accurate sim -- fine one-time at registration); mstatus's
+  own probed value is FS/VS-perturbed (a documented artifact, it is verify-
+  excluded). A clang ICE on the generic sc_main lambda forced the CSV-emit code
+  into free functions (`read_probe_list`/`emit_probe_csv`).
+  Original plan below:
+
+- [ ] **F3 (orig) Registration-time probe = primary existence + reset source (vsim-side).**
+  Add `sim_<engine> --probe`: on the freshly-reset halted hart, checked `csrr`
+  of every inventory address (skip the spec read-side-effect list); emit existent
+  set + reset values. Runs ONCE at registration, NO ELF. Then:
+  - `gen_manifest.py` consumes it for `implemented` + `reset_value`, replacing the
+    hand-traced `P` (line 30) and the ELF-keyed baseline (line 119);
+  - the probe computes both completeness checks with no ELF (over-claim = a claimed
+    CSR returns cmderr; under-claim = an existent transportable CSR not claimed);
+  - cache keyed by config hash (not ELF); the runtime liveness gate reuses it
+    instead of the per-ELF baseline capture.
+  Key files: vsim repo (`hybrid_vsim`) `--probe` sub-command;
+  `tests/engines/gen_manifest.py`; driver liveness-gate cache key;
+  `tests/engines/README.md`. Deps: cross-repo (vsim). Makes F1 self-truthing;
+  RTL `existent_csr` stays only as the skip-list cross-check.
+
+- [x] **F4 Wire gates + docs.** DONE for wiring + contract. The two new
+  `test_registration_*.sh` are auto-picked by the `tests/engines/test_*.sh` glob
+  in `scripts/test_all.sh` (verified). `tests/engines/README.md` updated with the
+  invariant + checks 4/5/7 + the read-back-vs-write rule. (`docs/USER_GUIDE.md`
+  section 4.4 already documents what `--verify` compares; not re-touched.)
+
+- [ ] **F5 DS220-ordered human restore table (optional view).** Render
+  `csr_manifest.csv` in DS220 order (Tables 166..184) to `csr_restore_table.md`
+  (`restore? / reason`). = existing `docs/ds220_restore_table_ROADMAP.md`.
+  Needs PyMuPDF (venv). Deps: manifest.
+
+- [~] **F6 Runtime transport from the manifest.** CORE DONE + vsim support done.
+  - `andes_caps_from_transport_set()` (vsim `andes_caps.hpp`): rebuilds the exact
+    caps from the manifest's transported set (the set is a union of complete
+    gate-groups). Unit-tested (`andes_caps.test.cpp` new case) -- PROVEN identical
+    to config-derived caps for both premium + advanced.
+  - vsim runtime: `--transport-csrs <addr-list>` -> `Simulator::set_transport_caps`
+    -> `active_caps()` returns it instead of `andes_caps_from_config()` at all 4
+    transport sites; config-caps kept as the fallback. Built; fixtures pass with
+    NO regression (fallback path unchanged), `--describe` unchanged.
+  REMAINING (the last mile -- a driver refactor + its own e2e cycle, deliberately
+  not rushed): (1) driver auto-wiring -- locate the registration by normalized
+  config hash, read the manifest's transported addresses, write a list file, and
+  append `--transport-csrs` to the accurate-leg command in `run_plan.cpp`; then
+  (2) delete `scripts/config_inc_to_andes_caps.py` + the parity guard (the mirror
+  is obsolete once the driver drives from the manifest). (2) is irreversible and
+  flips the transport default, so it must follow a full e2e re-validation.
+
+## Order / dependency
+
+F1 -> F2 -> F4 ; F3 hardens F1 (swap the data source under the gate);
+F5, F6 are independent add-ons. Start: **F1** (pure-andesim, TDD, one session).
+
+## Status
+Created 2026-07-03; design = measure-don't-model + probe-at-registration.
+- **F1 DONE** (under-claim hard gate). **F2 DONE** (coverage gate + split write/
+  readback fixtures, both engines pass hybrid `--verify`). **F4 DONE** (wiring +
+  `tests/engines/README.md` contract).
+- **F3 / F6 pending** -- vsim-side (probe sub-command; runtime-from-manifest),
+  cross-repo `hybrid_vsim`, needs a podman rebuild. **F5 pending** -- needs
+  PyMuPDF (not installed).
+
+### Resolved: recurring "stale registration" -> ROOT CAUSE was a build timestamp
+`test_registration_guard.sh` kept FAILING after every vsim rebuild. Root cause
+(found after an initial wrong guess that config.inc had no volatile content):
+**config.inc line 1 is `// created on <date>` -- a build timestamp** -- so
+hashing it RAW changes the identity on every rebuild even when the config is
+byte-identical otherwise. Every rebuild self-staled the registration.
+
+Proper fix (not a rename-whack-a-mole): the guard now hashes config.inc with the
+`^// created on ` line STRIPPED (`test_registration_guard.sh`), and the
+`engine.env` recompute instruction matches. The normalized hash is stable across
+rebuilds. Verified: CSR set (manifest cols 1-9) BYTE-IDENTICAL across rebuilds;
+cold-cache `--verify` re-proven on both rebuilt binaries (premium 147 / advanced
+148 fields, clean sweep); dirs re-registered to the stable hashes
+(`ax45mpv_premium-5bea8bdc`, `ax46mpv_advanced-a13f86a3`). Guard + all four
+engine tests green, and they STAY green across future rebuilds.
