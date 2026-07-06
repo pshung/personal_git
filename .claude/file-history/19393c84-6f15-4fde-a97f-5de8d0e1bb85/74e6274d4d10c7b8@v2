@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# v5 contract: QEMU seeds the L2C Control Register (0xE0500008) with its DS220
+# 11.8.7 reset value CEN=1 (L2 enabled by default). A fixture that NEVER writes
+# the register (handoff_roundtrip) must still drain CEN=1 -- proving a guest that
+# relies on the reset default is not silently handed a disabled L2 (CEN=0).
+#
+# Required environment (auto-detected):
+#   VSIM_QEMU, VSIM_PLUGIN, VSIM_ELF (FIXTURE=handoff_roundtrip)
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/../lib/paths.sh"
+
+FIXTURE="${FIXTURE:-handoff_roundtrip}"
+hybrid_resolve_paths
+
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+SHARED_SIZE=$((128 * 1024 * 1024))
+SHARED_MEM=$(mktemp -p /dev/shm vsim-plugin-l2c-rst-shared.XXXXXX)
+STATE_QEMU=$(mktemp)
+QEMU_LOG=$(mktemp)
+CHECK_SRC=$(mktemp --suffix=.c)
+CHECK_BIN=$(mktemp)
+trap 'rm -f "$SHARED_MEM" "$STATE_QEMU" "$QEMU_LOG" "$CHECK_SRC" "$CHECK_BIN"' EXIT
+truncate -s "$SHARED_SIZE" "$SHARED_MEM"
+
+set +e
+"$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHARED_MEM,size=$SHARED_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -semihosting-config enable=on,target=native \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_QEMU" >"$QEMU_LOG" 2>&1
+RC=$?
+set -e
+
+if [ "$RC" -ne 200 ]; then
+  echo "FAIL[plugin_l2c_reset_default]: expected QEMU exit=200 on drain, got $RC"
+  cat "$QEMU_LOG"; exit 1
+fi
+
+cat > "$CHECK_SRC" <<'EOF'
+#include "hybrid/state_abi.h"
+#include <stdio.h>
+int main(int argc, char **argv) {
+    FILE *f = fopen(argv[1], "rb");
+    if (!f) return 2;
+    struct hybrid_state_v1 s;
+    if (fread(&s, 1, sizeof(s), f) != sizeof(s)) return 3;
+    fclose(f);
+    if (!(s.flags & HYBRID_FLAG_L2C)) { fprintf(stderr, "HYBRID_FLAG_L2C not set\n"); return 5; }
+    unsigned long long ctrl = (unsigned long long) s.l2c.reg[HYBRID_L2C_OFF_CONTROL / 8];
+    if ((ctrl & 0x1u) != 0x1u) { fprintf(stderr, "CEN not set: l2c.ctrl=0x%llx\n", ctrl); return 6; }
+    printf("OK: reset default CEN=1, l2c.ctrl=0x%llx\n", ctrl);
+    return 0;
+}
+EOF
+cc -std=c11 -I "$REPO_ROOT/include" "$CHECK_SRC" -o "$CHECK_BIN"
+
+if "$CHECK_BIN" "$STATE_QEMU"; then
+  echo "PASS[plugin_l2c_reset_default]"
+else
+  echo "FAIL[plugin_l2c_reset_default]: L2C reset default CEN=1 not observed"
+  exit 1
+fi

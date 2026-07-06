@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# v5 contract: the QEMU plugin drains the L2C MMIO register window into
+# hybrid_state_v1. The l2c_drain fixture writes 0xA5 to the L2C Control Register
+# (0xE0500008) and then hits the ROI entry marker; the plugin must set
+# HYBRID_FLAG_L2C and capture 0xA5 at hybrid_l2c.reg[HYBRID_L2C_OFF_CONTROL/8].
+#
+# Required environment (auto-detected with sensible defaults):
+#   VSIM_QEMU    qemu-system-riscv64
+#   VSIM_PLUGIN  libhybrid_handoff.so
+#   VSIM_ELF     the l2c_drain fixture (FIXTURE=l2c_drain)
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/../lib/paths.sh"
+
+FIXTURE="${FIXTURE:-l2c_drain}"
+hybrid_resolve_paths
+
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+SHARED_SIZE=$((128 * 1024 * 1024))
+SHARED_MEM=$(mktemp -p /dev/shm vsim-plugin-l2c-shared.XXXXXX)
+STATE_QEMU=$(mktemp)
+QEMU_LOG=$(mktemp)
+CHECK_SRC=$(mktemp --suffix=.c)
+CHECK_BIN=$(mktemp)
+trap 'rm -f "$SHARED_MEM" "$STATE_QEMU" "$QEMU_LOG" "$CHECK_SRC" "$CHECK_BIN"' EXIT
+truncate -s "$SHARED_SIZE" "$SHARED_MEM"
+
+set +e
+"$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHARED_MEM,size=$SHARED_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -semihosting-config enable=on,target=native \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_QEMU" >"$QEMU_LOG" 2>&1
+RC=$?
+set -e
+
+if [ "$RC" -ne 200 ]; then
+  echo "FAIL[plugin_l2c_drain]: expected QEMU exit=200 on drain, got $RC"
+  echo "--- qemu log ---"; cat "$QEMU_LOG"
+  exit 1
+fi
+
+# Inspect the drained struct via a tiny C checker that shares the ABI header,
+# so the field offset stays robust to layout changes.
+cat > "$CHECK_SRC" <<'EOF'
+#include "hybrid/state_abi.h"
+#include <stdio.h>
+#include <stdlib.h>
+int main(int argc, char **argv) {
+    FILE *f = fopen(argv[1], "rb");
+    if (!f) { fprintf(stderr, "open %s failed\n", argv[1]); return 2; }
+    struct hybrid_state_v1 s;
+    size_t n = fread(&s, 1, sizeof(s), f);
+    fclose(f);
+    if (n != sizeof(s)) { fprintf(stderr, "short read %zu != %zu\n", n, sizeof(s)); return 3; }
+    if (s.magic != HYBRID_STATE_MAGIC) { fprintf(stderr, "bad magic\n"); return 4; }
+    if (!(s.flags & HYBRID_FLAG_L2C)) { fprintf(stderr, "HYBRID_FLAG_L2C not set\n"); return 5; }
+    unsigned long long ctrl = (unsigned long long) s.l2c.reg[HYBRID_L2C_OFF_CONTROL / 8];
+    unsigned long long want = strtoull(argv[2], NULL, 0);
+    if (ctrl != want) { fprintf(stderr, "l2c ctrl=0x%llx want=0x%llx\n", ctrl, want); return 6; }
+    printf("OK: HYBRID_FLAG_L2C set, l2c.ctrl=0x%llx\n", ctrl);
+    return 0;
+}
+EOF
+cc -std=c11 -I "$REPO_ROOT/include" "$CHECK_SRC" -o "$CHECK_BIN"
+
+if "$CHECK_BIN" "$STATE_QEMU" 0xA5; then
+  echo "PASS[plugin_l2c_drain]"
+else
+  echo "FAIL[plugin_l2c_drain]: L2C register window not drained correctly"
+  exit 1
+fi
