@@ -1,0 +1,1155 @@
+# Hybrid Simulator User Guide
+
+Audience: a new engineer who wants to RUN the Andes hybrid simulator,
+not study its internals. After this guide you can:
+
+1. Build every artifact from a fresh clone.
+2. Configure QEMU, vsim, and the orchestrator for a workload.
+3. Pick a switching mode (marker or PC) and run one handoff end-to-end
+   with a concrete worked example.
+
+For internals, read `docs/archive/hybrid_plan.md`. For per-mode drill-down,
+read `docs/switching_modes_tutorial.md`.
+
+---
+
+## 0. The one-paragraph mental model
+
+QEMU runs the boring parts at MHz. vsim (Verilator + SystemC) runs the
+small region-of-interest at cycle accuracy. They share RAM via an
+`mmap` file. A magic trigger (marker HINT or PC)
+hands control between them. One run is two legs:
+
+```
+   QEMU1  -- state.bin + shared mmap -->  vsim
+   (fast)                                 (cycle accurate)
+```
+
+The thing you choose per run is the TRIGGER that decides where each
+leg drains and the next leg resumes. That choice is the "switching
+mode".
+
+---
+
+## 0.5 Quick start with `./andesim`
+
+`./andesim` is the canonical end-user entry point (the C++ driver; it
+self-builds on first use). It drives `run` itself, orchestrating QEMU and
+vsim directly; building is done by `scripts/build_all.sh` (which delegates to
+`setup.sh`, `scripts/build_*.sh`). Sections 1-7 document those underlying
+scripts (`tests/e2e.sh`, `scripts/run_e2e.sh`) for when you need to bypass
+the driver.
+
+Four-command worked example - cold checkout to passing suite:
+
+```sh
+bash scripts/build_all.sh                             # qemu, vsim, plugin, fixtures
+./andesim list engines                                # discover the built engines
+./andesim run --mode hybrid --trigger marker --engine vsim:ax45mpv_premium \
+  tests/fixtures/rt_c_hello.elf                         # one marker-mode handoff
+JOBS=8 bash scripts/run_e2e.sh                          # the hybrid e2e suite (or scripts/test_all.sh for unit+contract+e2e)
+```
+
+Expected last line of `scripts/run_e2e.sh`:
+
+```
+summary: marker <N>p/0f/<S>s  pc <N>p/0f/<S>s  neg <N>p/0f/0s  total <N> passed, 0 failed, <S> skipped
+```
+
+Subcommand cheat sheet:
+
+| Command                                                          | What it does                                                        |
+|------------------------------------------------------------------|---------------------------------------------------------------------|
+| `./andesim list <models|engines>`                              | List the 3 models, or the discovered engines with their hardware params (XLEN/VLEN/DLEN/ELEN; `-` = not reported). |
+| `bash scripts/build_all.sh [TARGET] [--dry-run]`               | Build artifacts; targets: `all`, `plugin`, `fixtures`, `runtime` (qemu and vsim are external prebuilt binaries, not built here). |
+| `./andesim doctor`                                             | Read-only environment health check: artifacts, submodules, toolchain, runtime, discovered engines, and `/dev/shm` mmap tiers (with WSL2 advice). |
+| `./andesim run --mode fast|cycle|hybrid [--trigger marker|pc] [--engine ID] [--gdb [--gdb-port PORT]] <elf>` | Run one ELF on a model (hybrid = QEMU -> vsim handoff and REQUIRES `--trigger marker|pc` to delimit the ROI; --gdb pauses at startup for a debugger: fast opens QEMU's GDB stub on port 1234, cycle halts the hart and opens vsim's JTAG port (9104) then execs `$ICEMAN`, a GDB server (use a modern OpenOCD); --gdb not supported with hybrid). |
+| `bash scripts/run_e2e.sh` (env: `FILTER`, `MODE`, `JOBS`)        | Run the hybrid e2e suite directly (qemu+vsim round-trips). |
+| `bash scripts/test_all.sh [--dry-run] [unit\|contract\|e2e]`     | Run the full test surface: C++ unit tests + driver contracts + the e2e suite. |
+
+Run `./andesim <cmd> -h` for the full flag list of a subcommand (set
+`ANDESIM_DEV=1` to reveal developer-only flags and the `list fixtures`
+target). The rest of this guide (Sections 1-7) documents the
+underlying scripts and is useful when you need to bypass `./andesim`
+(custom env vars, single-leg debugging, alternative CPU YAML, etc.).
+
+---
+
+## 1. Build and environment setup
+
+### 1.1 Host prerequisites
+
+Install these on the host once:
+
+| Package          | Notes                                                |
+|------------------|------------------------------------------------------|
+| `git`            | clone the repo and its submodules                    |
+| C/C++ toolchain  | clang or gcc; needed by QEMU and the plugin          |
+| `cmake` >= 3.20  | vsim build                                           |
+| `ninja`          | vsim default generator                               |
+| `python3`        | orchestrator, plugin tests                           |
+| `glib-2.0` dev   | QEMU plugin link line                                |
+| `pkg-config`     | plugin build (glib-2.0)                              |
+| `podman`         | runs vsim builds inside `vsim-env:latest` container  |
+| Verilator        | auto-detected; set `VSIM_VERILATOR_EXECUTABLE` if needed |
+| QEMU             | prebuilt external binary; set `QEMU_BIN_DIR` (not built here) |
+| RISC-V toolchain | `riscv64-unknown-elf-{gcc,nm,objdump}` (Andes v5d)   |
+
+The Andes RISC-V toolchain is needed to build the fixtures and to
+resolve symbols for PC-mode. The harness scripts default to
+`/local/nick/SW_Release/build-ast540/.../bin/riscv64-unknown-elf-nm`;
+override with `NM=/your/path/to/nm` if you keep it elsewhere.
+
+### 1.2 Clone with submodules
+
+```sh
+git clone --recursive https://gitea.andestech.com/nick/hybrid_sim
+cd hybrid_sim
+```
+
+If you forgot `--recursive`:
+
+```sh
+git submodule update --init --recursive
+```
+
+Submodules under this repo:
+
+| Path             | What it is                                          |
+|------------------|-----------------------------------------------------|
+| `include/`     | the shared ABI (`andesim_abi` repo): `hybrid_state_v1` wire contract under `include/hybrid/` |
+
+vsim is no longer a submodule -- it is a prebuilt **external** binary, like QEMU.
+Build it in your own vsim (`hybrid_vsim`) checkout and point `VSIM_BIN_DIR`
+(`config.env`) at its `build/` dir; see 1.3.
+
+### 1.3 Per-host config (`config.env`)
+
+The repo ships a template `config.env.example` listing per-host paths
+that cannot live in the build system (notably the Andes RISC-V
+toolchain root, which `setup.sh` does NOT build).
+
+On the first `source ./setup.sh`, the template is copied to
+`./config.env` (gitignored) so your edits never touch git history. If
+the toolchain lives somewhere other than the default, edit
+`config.env`:
+
+```sh
+# config.env
+HYBRID_TOOLCHAIN=/local/nick/SW_Release/build-ast540/build-toolchain/linux/nds64le-elf-newlib-v5d
+HYBRID_TOOLCHAIN32=/local/nick/SW_Release/build-ast540/build-toolchain/linux/nds32le-elf-newlib-v5d
+```
+
+The variables today:
+
+| Variable            | What it points at                                                  |
+|---------------------|--------------------------------------------------------------------|
+| `HYBRID_TOOLCHAIN`  | rv64 toolchain root. `$HYBRID_TOOLCHAIN/bin/` must contain `riscv64-unknown-elf-{gcc,ld,nm,objdump,...}`. |
+| `HYBRID_TOOLCHAIN32`| rv32 toolchain root (a *separate* install), for building the rv32 runtime + fixtures. `bin/` must contain `riscv32-unknown-elf-{gcc,ar,...}`. Optional: leave unset if you only target rv64 (rv32 builds are skipped). |
+| `QEMU_BIN_DIR`      | External prebuilt QEMU build dir holding `qemu-system-riscv64` AND `qemu-system-riscv32` (this repo no longer builds QEMU). |
+| `VSIM_BIN_DIR`      | External prebuilt vsim build dir holding the `sim_*` binaries (this repo no longer builds vsim; the driver discovers cycle engines by scanning it). |
+
+How it propagates:
+
+- `setup.sh` sources `config.env`, validates `$HYBRID_TOOLCHAIN/bin/`
+  exists, and `export`s the variable so all child processes see it.
+- The fixture `Makefile` (`tests/fixtures/Makefile`) defaults
+  `TOOLCHAIN` to `$(HYBRID_TOOLCHAIN)` and aborts with a clear error if
+  the variable is missing.
+- The unified `e2e.sh` test harness loads `config.env` itself when run
+  without prior `source ./setup.sh`, then derives
+  `NM=$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-nm`.
+
+Override per-invocation without editing the file:
+
+```sh
+HYBRID_TOOLCHAIN=/opt/my-toolchain make -C tests/fixtures
+HYBRID_TOOLCHAIN=/opt/my-toolchain ./andesim run \
+  tests/fixtures/rt_c_v_matmul_free.elf --mode hybrid --trigger pc --engine vsim:ax45mpv_premium \
+  --pc-start vmatmul_kernel --pc-end 0x<post-jal>  # see docs/switching_modes_tutorial.md
+```
+
+### 1.4 Build everything
+
+One command builds all three artifacts and exports the env vars the
+test harness expects:
+
+```sh
+source ./setup.sh
+```
+
+`source` (not `bash`) is required so the script can prepend the build
+dirs to PATH and export `VSIM_QEMU`, `VSIM_PLUGIN`, `VSIM_BIN_DIR`,
+`QEMU_BIN_DIR`, `HYBRID_TOOLCHAIN` into the current shell. The steps it
+runs:
+
+```
+0/3 config     -> auto-copy config.env.example -> config.env (first run);
+                  source it; export HYBRID_TOOLCHAIN + QEMU_BIN_DIR + VSIM_BIN_DIR
+1/3 QEMU       -> located (external prebuilt): $QEMU_BIN_DIR/qemu-system-riscv64
+2/3 vsim       -> located (external prebuilt): $VSIM_BIN_DIR/sim_*
+3/3 plugin     -> qemu_plugin/libhybrid_handoff.so
+```
+
+Neither QEMU nor vsim is built here: build each in its own checkout and point
+`QEMU_BIN_DIR` / `VSIM_BIN_DIR` (in `config.env`) at the dirs holding
+`qemu-system-riscv64` / the `sim_*` binaries.
+
+To rebuild the one component this repo still builds:
+
+```sh
+make -C qemu_plugin            # plugins; vendored qemu-plugin.h, no QEMU source needed
+```
+
+(vsim is rebuilt in your external vsim checkout via its own `build_vsim.sh`.)
+
+To clean:
+
+```sh
+source ./setup.sh clean         # both
+source ./setup.sh clean vsim
+source ./setup.sh clean plugin
+```
+
+### 1.5 Build the test fixtures (RISC-V ELFs)
+
+Fixtures are small RISC-V programs that exercise specific transport
+paths. They are NOT built by `setup.sh`; build them once:
+
+```sh
+make -C tests/fixtures -j
+```
+
+One fixture at a time:
+
+```sh
+make -C tests/fixtures rt_c_v_matmul.elf
+```
+
+Output ELFs land next to the sources under
+`tests/fixtures/*.elf`. The fixtures depend on the Andes
+RISC-V GCC (newlib); all C fixtures link through the vplat runtime
+(section 5), so no semihosting library is involved. The toolchain path
+comes from `$HYBRID_TOOLCHAIN` (see section 1.3); to override for one
+invocation:
+
+```sh
+make -C tests/fixtures TOOLCHAIN=/opt/my-toolchain
+```
+
+### 1.6 Sanity check the build
+
+```sh
+# Artifacts present? (QEMU is external -- set via QEMU_BIN_DIR)
+ls "$QEMU_BIN_DIR/qemu-system-riscv64"
+ls "$VSIM_BIN_DIR"/sim_ax45mpv_premium
+ls qemu_plugin/libhybrid_handoff.so
+
+# Smallest possible end-to-end - one marker-mode handoff:
+FIXTURE=rt_c_v_matmul TRIGGER_MODE=marker TIMEOUT=120 \
+  bash tests/e2e.sh
+```
+
+Expected last line:
+
+```
+[rt_c_v_matmul PASS] 2-phase handoff complete (QEMU 1 drain -> vsim drain)
+```
+
+If you see `skip: ... not built`, redo `source ./setup.sh` and
+re-build fixtures (`make -C tests/fixtures`).
+
+---
+
+## 2. Configuring the simulator
+
+There are four configuration surfaces. Most users only touch the env
+vars in 2.1.
+
+### 2.1 Environment variables (the only ones you usually set)
+
+`setup.sh` exports these for you. Override only if your artifacts live
+somewhere non-default.
+
+| Variable        | Default                                          | Used by                  |
+|-----------------|--------------------------------------------------|--------------------------|
+| `HYBRID_TOOLCHAIN` | From `config.env` (sec 1.3); toolchain root  | Makefile, NM derivation  |
+| `VSIM_QEMU`     | `$QEMU_BIN_DIR/qemu-system-riscv64` (external)    | every harness            |
+| `VSIM_PLUGIN`   | `qemu_plugin/libhybrid_handoff.so`               | every harness            |
+| `VSIM_BIN`      | first `$VSIM_BIN_DIR/sim_*`                     | every harness            |
+| `VSIM_ELF`      | `tests/fixtures/$FIXTURE.elf`           | harness scripts          |
+| `NM`            | `$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-nm`   | PC-mode symbol resolve   |
+| `TIMEOUT`       | 60 s (120 for long runs)                         | per-leg `timeout` cap    |
+| `FIXTURE`       | `rt_shared_mem`                                  | which `.elf` to load     |
+| `TRIGGER_MODE`  | `marker`                                            | `marker` or `pc`            |
+| `JOBS`          | auto-cap on this 128-core host: set to 8         | parallel test runner     |
+| `HSIM_MMAP_DIR` | tier list (`/dev/shm`, then `~/.cache/andesim`) | pin one backing dir for `--mem-size` (disables the fallback) |
+
+Example: override the QEMU binary for one run:
+
+```sh
+VSIM_QEMU=/opt/qemu-9.0/qemu-system-riscv64 \
+  ./andesim run tests/fixtures/rt_c_v_matmul.elf --mode hybrid --trigger marker --engine vsim:ax45mpv_premium
+```
+
+### 2.2 The vsim CPU configuration YAML
+
+vsim is built in its own external checkout (the `hybrid_vsim` repo, pointed at by
+`VSIM_BIN_DIR`); the commands in this section run THERE, not in andesim. Its
+`config.yaml` selects which Andes core to verilate. The default is
+`ax45mpv_premium`:
+
+```yaml
+cpus:
+  ax45mpv_premium:
+    cpu_series: 45
+    rtl_package: ax45mpv_premium
+    cpp_wrapper: ax45mpv_premium_cpu_cluster_subsystem
+    config: data/configs/ax45mpv_premium.cfg
+    config_dir: andes_ip/kv_core/top/hdl
+    config_inc_filter: grep '^`define NDS_'
+    extra_verilator_flags: --threads 8 --unroll-count 256
+```
+
+Switch CPU by pointing CMake at a different YAML (in your vsim checkout):
+
+```sh
+cd <your vsim checkout>   # e.g. /home/nick/work/vsim_andesim
+cmake -S . -B build -G Ninja -DVSIM_CONFIG_FILE=my_other_cpu.yaml
+cmake --build build -j
+```
+
+`-DVSIM_ENABLE_HYBRID=ON` registers the e2e fixtures with CTest;
+`-DVSIM_NO_VERILATOR=ON` skips Verilator (use a prebuilt model).
+
+### 2.3 QEMU plugin args
+
+The plugin reads `arg=value` tokens after `-plugin <path>,`. They
+select WHICH switching mode QEMU1 runs in:
+
+| Plugin arg           | Effect                                                                 |
+|----------------------|------------------------------------------------------------------------|
+| `outfile=PATH`       | REQUIRED. Drained `hybrid_state_v1` is written here.                   |
+| `enter_pc=0xADDR`    | PC mode: drain when PC == ADDR. Bypasses the marker-insn matcher.         |
+| `exit_marker=1`      | Oracle exit drain (verification): arm on the EXIT marker `slti x0,x0,0x5A1`, drain right after it retires. The run never hands off -- it produces the reference state `--verify` compares against. Exclusive with the other mode args. |
+| `exit_pc=0xADDR`     | Oracle exit drain, pc form: arm when PC == ADDR instead of on the exit marker. |
+| `drain_pc=0xADDR`    | Oracle modifier: after arming, drain at the first hit of ADDR (the verifier passes vsim's drained pc here, so both sides sample the same architectural point -- vsim's DMI halt lands a few insns past the trigger). |
+
+If no mode arg is given, the default is marker-insn match (marker mode): the
+plugin matches `slti x0, x0, 0x5A0` at retire.
+
+Example invocation (marker mode, just the minimal arg):
+
+```
+-plugin libhybrid_handoff.so,outfile=/tmp/state.bin
+```
+
+### 2.4 vsim CLI flags
+
+`sim_ax45mpv_premium <elf> [flags]`. The hybrid-relevant subset:
+
+| Flag                          | Purpose                                                  |
+|-------------------------------|----------------------------------------------------------|
+| `--resume-from-qemu FILE`     | Read drained state, restore into hart, run from PC.     |
+| `--handoff-out FILE`          | Drain back into FILE when the exit trigger fires.       |
+| `--shared-mem-path FILE`      | mmap FILE as RAM (zero-copy share with QEMU).           |
+| `--shared-mem-size BYTES`     | Size of the shared region. Match QEMU `-m`.             |
+| `--shared-mem-base HEX`       | Guest physical address where file offset 0 lands.       |
+| `--hybrid-exit-pc 0xADDR`     | PC mode exit: drain when this PC retires.               |
+| `--drain-minimal`             | Exit drain reads back only mcycle/minstret; the driver sets it when `--verify` is off. |
+| `--no-reset-baseline`         | Disable the liveness gate (below): restore every transported register. |
+| `--jtag-port N`               | Open the JTAG bitbang port (ICEman or OpenOCD). The hart free-runs; the debugger halts it over the JTAG DTM on connect. The `./andesim run --mode cycle --gdb` path opens this port for ICEman (set `$ICEMAN`). |
+| `--log-level N`               | 0=trace .. 5=critical .. 6=off (default 2=info)         |
+
+The default for `--shared-mem-base` is `0x80000000` (the `virt` / `andes_ae350` RAM base). Most users never override it.
+
+**Liveness gate (reset baseline).** Every register moved through the Debug
+Module costs hundreds of simulated cycles, and most transported state still
+holds its reset value. So the resume skips any restore whose drained value
+equals the engine's own reset value -- a no-op write. The very first hybrid
+run of a given (engine build, ELF) pair drains that reset state once (a few
+extra seconds) and caches it under `$XDG_CACHE_HOME/andesim/` (fallback
+`~/.cache/andesim/`); later runs load the cache and typically cut the vsim
+leg by ~4x (hello: 50k -> 12k simulated cycles). The cache self-invalidates
+on engine rebuild or ELF change (mtime+size keyed); delete the directory to
+force a fresh capture. `--verify` works unchanged with the gate active;
+`--no-reset-baseline` restores the old transport-everything behavior.
+
+Run `$VSIM_BIN --help` for the full list (waveform/save/restore are
+license-gated and off by default).
+
+### 2.5 Requesting memory (`--mem-size` + `HSIM_MMAP_DIR`)
+
+By default every `./andesim` (and `./hsim.py`) invocation that needs a shared mmap allocates
+a 128 MiB sparse file under `/dev/shm` (tmpfs, RAM-backed). When your
+workload's memory footprint exceeds `/dev/shm` capacity (typically
+RAM/2 on Linux), two knobs let you redirect:
+
+| Knob              | Where             | What it does |
+|-------------------|-------------------|--------------|
+| `--mem-size SPEC` | flag on `run` (`--mmap-size` is the old alias) | request guest program memory (`SPEC` = `128M`, `1.5G`, `2G`, or raw bytes). Cap `2G` minus one 4 KiB V-transport page (the AE350 DRAM window). |
+| `HSIM_MMAP_DIR=/path` | env var | pin the backing directory (skips the tier list below). |
+
+Per-model semantics of `--mem-size`:
+
+| Model    | What it does |
+|----------|--------------|
+| `hybrid` | `--mem-size` is your **program** RAM (default `128M`). The driver maps one extra 4 KiB page on top for the V-register transport scratch (L26): the physical shared mmap = QEMU memory backend = vsim RAM window = `--mem-size + 4 KiB`, with the scratch parked in that top page, just above everything your program can address. You get your full `--mem-size`; the page is invisible. The driver rejects `> 2G - 4 KiB` **before** allocating, and rejects an ELF whose static image would extend into the reserved page (`raise --mem-size`). |
+| `fast`   | forwards a plain QEMU `-m`. Without the flag the argv is untouched -- QEMU as-is, its own 128 MiB default, no mmap involved. No `2G` cap here (that ceiling is the hybrid shared-mmap window, not fast's); QEMU itself validates the size and rejects only oversized values (`Cannot model more than 16GB RAM` on the AE350 machine). |
+| `cycle`  | validate-only: the cycle engine always models its full DRAM window, so there is nothing to size (the driver says so on stderr). |
+
+Backing-directory selection (`./andesim`): a two-tier list, first fit
+wins (fit = size + 256 MiB free):
+
+1. `/dev/shm` -- tmpfs, RAM speed. Skipped when absent or too small.
+2. `~/.cache/andesim` (honors `XDG_CACHE_HOME`) -- disk-backed; the
+   size ceiling becomes disk free space. Hot pages still sit in the
+   kernel page cache, so the cost vs tmpfs is background writeback only.
+
+We never switch **silently**: the status line always names the chosen
+dir, and a fallback adds the reason, e.g.
+`[hsim mmap] 2.0 GiB at /home/u/.cache/andesim (free: 2.1 TiB) (fallback: /dev/shm too small (1.2 GiB free))`.
+`HSIM_MMAP_DIR` pins a single dir with **no** fallback past it: rc=2
+with a hint if it can't hold the request. (The retired `./hsim.py`
+golden keeps the old pin-or-/dev/shm rule with no tier list.)
+
+Examples:
+
+```sh
+# Small request; /dev/shm fits, so tier 1 is chosen.
+./andesim run tests/fixtures/rt_c_hello.elf --mode hybrid --trigger marker --engine vsim:ax45mpv_premium --mem-size 256M
+#   [hsim mmap] 256.0 MiB at /dev/shm (free: 252.0 GiB)
+
+# 2 GiB request on a small-RAM box: falls through to the disk tier,
+# and the status line says so.
+./andesim run my.elf --mode hybrid --trigger marker --engine vsim:ax45mpv_premium --mem-size 2G
+#   [hsim mmap] 2.0 GiB at /home/u/.cache/andesim (free: 2.1 TiB) (fallback: /dev/shm too small (1.2 GiB free))
+
+# Pin a scratch filesystem instead (no fallback past the pin):
+HSIM_MMAP_DIR=/scratch/hsim \
+  ./andesim run my.elf --mode hybrid --trigger marker --engine vsim:ax45mpv_premium --mem-size 2G
+```
+
+If you pin `HSIM_MMAP_DIR=/tmp` and `/tmp` is mounted as tmpfs (Arch
+default), that does not lift the RAM ceiling; pick a directory on a
+non-tmpfs filesystem (`/var/tmp`, `/scratch`, etc.) -- or just let the
+tier list pick `~/.cache/andesim` for you.
+
+The hardcoded `mktemp -p /dev/shm` paths in the shell harnesses
+(`tests/e2e.sh`, `tests/drivers/*.sh`, `tests/plugin/*.sh`) all use
+128 MiB and are unaffected.
+
+### 2.5.1 Running on WSL2 and macOS
+
+The hybrid handoff needs both legs (QEMU and vsim) on **one Linux
+kernel**, with the mmap file on a filesystem local to that kernel.
+That rule decides what each OS needs:
+
+**Linux** -- native, nothing to do.
+
+**Windows (WSL2)** -- works as Linux; two caveats:
+
+- Keep the repo and the mmap dirs on the ext4 side (`~/...`), never
+  under `/mnt/c` (drvfs is slow and `MAP_SHARED` is not coherent there).
+- `/dev/shm` is capped by the WSL VM memory. Raise `memory=` in
+  `%UserProfile%\.wslconfig` if tier 1 is too small -- or just let the
+  tier list fall through to `~/.cache/andesim`.
+
+`./andesim doctor` checks both (see the `mmap tiers:` section and the
+WSL warnings at the end of its report).
+
+**macOS** -- run-only. vsim is a Linux binary, so `./andesim` re-execs
+the run inside a prebuilt Linux runtime image in the podman machine VM;
+the mmap lives inside that VM (the container's `/dev/shm`), never on a
+virtiofs mount. One-time setup:
+
+```sh
+brew install podman
+podman machine init --memory 4096   # the VM hosts /dev/shm (tier 1)
+podman machine start
+podman pull <runtime image>         # or load a CI-built andesim-runtime:latest
+./andesim run --mode hybrid --trigger marker --mem-size 256M my.elf
+```
+
+Knobs: `ANDESIM_IMAGE` (image name, default `andesim-runtime:latest`),
+`ANDESIM_SHM_SIZE` (container `/dev/shm`, default `3g`),
+`ANDESIM_CONTAINER_ENGINE` (podman/docker). Your current directory is
+bind-mounted at the same path, so relative ELF paths and output files
+work; builds (`scripts/build_all.sh`) stay Linux-only. The image is built on
+Linux from `Dockerfile.runtime` (it bakes a fully built repo at
+`/opt/hybrid_sim`); Apple Silicon runs the x86-64 image under emulation,
+so expect slower wall-clock than a Linux host.
+
+### 2.6 Orchestrator plan YAML (used by archive/replay)
+
+For checkpoint workflows you describe a multi-step plan in YAML and
+hand it to the orchestrator:
+
+```yaml
+session:
+  mem_size: 134217728            # 128 MB shared mmap
+  mmap_path: null                # null -> mktemp in /dev/shm
+  elf: tests/fixtures/rt_c_v_matmul.elf
+
+steps:
+  - model: qemu
+    trigger: { kind: marker }       # marker trigger; can also be { kind: pc, enter: 0x... }
+    on_exit: { archive_as: "snap/0" }
+```
+
+Run it:
+
+```sh
+python3 -m orchestrator.main run plan.yaml \
+  --project-root . --workdir /tmp/run --archive-root /tmp/archives
+```
+
+Replay:
+
+```sh
+python3 -m orchestrator.main replay-checkpoint /tmp/archives/snap/0 \
+  --resume-with vsim --project-root . --workdir /tmp/replay
+```
+
+---
+
+## 3. Switching modes - which trigger to use
+
+| Mode     | Profiles          | Switch boundary                                          | Cycle figure           |
+|----------|-------------------|----------------------------------------------------------|------------------------|
+| marker   | a kernel          | `slti x0,x0,0x5A0/1` insn match (markers in source)         | kernel cycles          |
+| PC       | a kernel          | PC equals a boundary: any symbol or `0x` address (both `--pc-start`/`--pc-end` required) | kernel cycles |
+
+Marker/PC delimit ONE kernel you choose. Both go through `./andesim run
+--mode hybrid --trigger marker|pc`. The cycle figure is the vsim `mcycle`
+delta.
+
+Decision flow:
+
+```
+Profiling ONE region you can name (a kernel)?
+  binary is yours to edit          -> marker (andesim_ROI_begin()/end() around it)
+  not editable, symbol/PC at ends  -> PC   (./andesim run --mode hybrid
+                                            --trigger pc --pc-start S --pc-end E)
+```
+
+**Hardware-config sync.** A hybrid run models ONE core on two engines, so
+the QEMU fast leg inherits the selected engine's hardware config. Two
+things flow from engine to QEMU, both derived from the engine's frozen
+`config.inc`:
+
+- **VLEN** comes from the engine's `--describe` (512 when the engine
+  reports none) and shows in the run banner as `vlen=N`.
+- **The ISA** (extensions: CoDense, Zfh, Zba/Zbb/Zbc/Zbs, `xandesv5isa`,
+  ...) comes from the engine's `--print-qemu-config`: the driver captures
+  that QEMU `-readconfig` cfg and hands it to the fast leg, so QEMU executes
+  the same extensions the engine models instead of a fixed `-cpu` string.
+  An engine built without the flag (an older binary) makes the driver fall
+  back to its default `-cpu` with no error. See `docs/qemu_match_ROADMAP.md`.
+
+An engine whose XLEN is not 64 (e.g. `vsim:d23`, rv32) cannot share
+architectural state with the rv64 fast leg and is rejected with a clear
+error.
+
+**Preview the commands (`--dry-run`).** Add `--dry-run` to **any** mode
+(`fast`, `cycle`, or `hybrid`) to print the exact engine command line(s) --
+fully resolved and shell-quoted, including any matched `-readconfig` and all
+paths -- and run nothing. `fast`/`cycle` print their single standalone command;
+`hybrid` prints both legs:
+
+```
+./andesim run --mode fast --dry-run prog.elf
+# [andesim] dry-run: 1 command(s), not executed
+# # command 1/1: standalone [qemu64]
+# qemu-system-riscv64 -machine andes_ae350 -cpu andes-ax46mpv ... -bios prog.elf
+
+./andesim run --mode hybrid --trigger marker --dry-run --engine vsim:<cfg> prog.elf
+# [andesim] dry-run: 2 command(s), not executed
+# # command 1/2: fast-leg [qemu64]
+# qemu-system-riscv64 ... -cpu andes-ax45mpv,vlen=512 ... -readconfig <tmp>/qemu.cfg
+# # command 2/2: accurate-leg [vsim:<cfg>]
+# sim_<cfg> prog.elf --resume-from-qemu <tmp>/state-0.bin --handoff-out ...
+```
+
+Supported VLEN range: 128 to 1024 bits. The handoff state file reserves
+128 bytes per vector register (`HYBRID_VLEN_BYTES_MAX`); an engine whose
+VLEN exceeds 1024 is refused with a clear error instead of silently
+truncating the V registers. A standalone fast run defaults to the
+vector-capable CPU `andes-ax46mpv` (rv64) / `andes-a46mpv` (rv32), so RVV
+binaries run out of the box at the cpu model's built-in VLEN; andesim itself
+passes no `vlen`. To pin an exact VLEN, add a `-cpu` through the passthrough
+tail, e.g. `andesim run --mode fast app.elf -- -cpu andes-ax46mpv,vlen=256`
+(the last `-cpu` wins).
+
+Where `--` args land depends on the mode. `fast`/`cycle` forward them to their
+single engine (qemu / vsim). `hybrid` has **two** legs (a QEMU fast-forward and
+a vsim measure leg) whose command lines the driver builds itself, so there is no
+single "the engine" to forward to -- `hybrid` therefore **rejects** `-- args`
+(rc=2) rather than silently dropping them or guessing a leg. For vsim options use
+the dedicated flags (`--kanata`/`--objdump`); to pin VLEN, pick the right
+`--engine` (each vsim engine has a fixed VLEN).
+
+**`cycle` output.** A `cycle` run prints just two things: the program's own
+output, then the cycle count as andesim's own one-line result --
+
+```
+$ ./andesim run --mode cycle --engine vsim:ax45mpv_premium hello.elf
+hello
+[andesim] 3573 cycles
+```
+
+vsim's startup banner (the `Copyright ... / Version :` lines) and its verbose
+`[info]` log are hidden so the result stands alone; real `[warn]`/`[error]`
+diagnostics still pass through, and the engine exit code is propagated. (`fast`
+is raw passthrough -- QEMU's output is shown verbatim, and QEMU prints no such
+banner or cycle line. `cycle --gdb` is interactive and is not filtered.)
+
+**Window boundary semantics.** Markers are HINT NOPs: the window is the
+span strictly between them. A pc boundary is real user code: the
+instruction at `--pc-start` executes
+INSIDE the measured window -- the fast leg stops just before it and vsim
+resumes at it, so no instruction is lost across the handoff. The
+instruction at `--pc-end` is where vsim drains. `--pc-start` and `--pc-end`
+must resolve to **different** addresses (compared numerically, so `main` and
+its literal `0x..` address count as equal): an equal pair is an empty ROI --
+vsim would drain the instant it resumes -- and is rejected up front with rc=2.
+
+> **Writing a kernel for cycle measurement (marker/PC modes):** keep the measured
+> kernel anchored inside the `slti x0,x0,0x5A0/1` span -- read its inputs and
+> write its outputs through memory inside the span, or wrap the kernel in a
+> `__attribute__((noinline))` function called between the markers. The
+> markers' `"memory"` clobber pins memory I/O but not register-only compute,
+> so a kernel that carries live vector values in registers across the
+> boundary may be hoisted/sunk out of the measured window. See
+> `tests/fixtures/runtime/rt_c_helpers.h`.
+
+---
+
+## 4. Walk-through: one handoff in each mode
+
+Each section is copy-pastable. They all share the same setup.
+
+### 4.0 Common setup (do once per shell)
+
+```sh
+cd /home/nick/work/hybrid_sim
+source ./setup.sh                         # builds + exports env vars
+make -C tests/fixtures -j        # builds .elf fixtures
+```
+
+Quick env check:
+
+```sh
+echo "$VSIM_QEMU"
+echo "$VSIM_PLUGIN"
+echo "$VSIM_BIN"
+ls tests/fixtures/rt_c_v_matmul.elf
+```
+
+### 4.1 marker mode - the default (kernel)
+
+Goal: run a vector fixture through QEMU1 -> vsim using the
+two ROI markers (`slti x0, x0, 0x5A0/0x5A1`) that the fixture already contains.
+
+```sh
+./andesim run tests/fixtures/rt_c_v_matmul.elf --mode hybrid --trigger marker --engine vsim:ax45mpv_premium
+```
+
+Expected output (stderr + stdout):
+
+```
+[andesim] model=hybrid engine=vsim:ax45mpv_premium vlen=<N> trigger=marker fixture=rt_c_v_matmul
+[marker window_cycles] <N>  (vsim mcycle=<V> - qemu mcycle=<Q>)
+PASS: --mode hybrid --trigger marker (rt_c_v_matmul)
+```
+
+The relayed output is just the program's own prints plus andesim's own lines:
+vsim's startup banner (the `Copyright ... / Version :` lines) is stripped from
+the vsim leg, the same as `cycle` mode, so the result stands alone. (vsim's
+`[info]` log never reaches here -- the leg's stderr is dropped at capture.)
+
+`./andesim run` orchestrates the two legs directly (no Python wrapper). Inside, the two legs are:
+
+```
+1) QEMU1 with -plugin libhybrid_handoff.so,outfile=$STATE
+        -> drain at slti x0,x0,0x5A0   -> exit 200
+2) sim_ax45mpv_premium $ELF \
+        --resume-from-qemu $STATE --handoff-out $STATE_V \
+        --shared-mem-path $SHM --shared-mem-size 128MB
+        -> ROI runs in vsim, drains at slti x0,x0,0x5A1   -> exit 200
+```
+
+Try a different fixture:
+
+```sh
+./andesim run tests/fixtures/rt_c_matmul.elf --mode hybrid --trigger marker --engine vsim:ax45mpv_premium
+```
+
+### 4.2 PC mode - markerless workload, explicit boundary PCs
+
+Same plumbing as marker mode, but the binary carries **no** trigger markers.
+The user picks the switch PCs explicitly via `--pc-start` and `--pc-end`,
+each a symbol name or `0x` address. Both args are required for `--mode hybrid --trigger pc --engine vsim:ax45mpv_premium`.
+
+Don't know where the hot region is? `build/hotloops` runs the binary
+fast and reports the hottest loops (function, source line, PC range) as
+an LLM-ready Markdown fact sheet. It auto-detects the QEMU binary,
+plugin, and CPU from your build. Each loop block carries a `measure:`
+field — a ready `--pc-start`/`--pc-end` pair that covers the enclosing
+function entry to `ret` — that pastes straight into the command above.
+`docs/andes_sim_gemm_tutorial.ipynb` walks that workflow end to end.
+
+```sh
+./build/hotloops --min-iters 10 my_kernel.elf
+```
+
+```sh
+# resolve the boundary PCs once (cheap, host-side; needs HYBRID_TOOLCHAIN)
+ELF=tests/fixtures/rt_c_v_matmul_free.elf
+START=vmatmul_kernel
+END=$(${HYBRID_TOOLCHAIN}/bin/riscv64-unknown-elf-objdump -d "$ELF" \
+        | awk '/<main>:/{flag=1} flag&&/jal[[:space:]]+.*<vmatmul_kernel>/{getline; print "0x"$1; exit}' \
+        | tr -d ':')
+
+./andesim run "$ELF" --mode hybrid --trigger pc --engine vsim:ax45mpv_premium --pc-start "$START" --pc-end "$END"
+```
+
+`rt_c_v_matmul_free.elf` is the **markerless twin** of the GEMM fixture,
+built `-DHYBRID_MARKERLESS` from the same source as the marked
+`rt_c_v_matmul`. Both triggers are one-shot (QEMU plugin `exit(200)` on
+first match; vsim drains on first match), so the measured window is
+**exactly one full `vmatmul_kernel` call** (16 outer rows + inner k-loop
++ vse32 stores). The cycle count should land near marker mode's ~22808.
+
+The mechanism is fully general - pc mode can target **any** symbol or raw
+address. `./andesim run --mode hybrid --trigger pc --engine vsim:ax45mpv_premium` resolves `--pc-start` / `--pc-end` directly (symbol name or `0x` address) without needing env vars.
+
+The underlying QEMU and vsim invocations (what the driver orchestrates):
+
+```sh
+# Resolve the boundaries (objdump-based; pick any two PCs in the ELF):
+OBJDUMP=$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-objdump
+NM=$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-nm
+ROI_START=$("$NM" tests/fixtures/rt_c_v_matmul_free.elf \
+              | awk '$3=="vmatmul_kernel"{print "0x"$1}')
+ROI_END=$("$OBJDUMP" -d tests/fixtures/rt_c_v_matmul_free.elf \
+              | awk '/<main>:/{flag=1} flag&&/jal[[:space:]]+.*<vmatmul_kernel>/{getline; print "0x"$1; exit}' \
+              | tr -d ':')
+echo "enter=$ROI_START  exit=$ROI_END"   # e.g. 0x10021c / 0x1002cc
+
+# QEMU1 leg
+"$VSIM_QEMU" \
+  -object memory-backend-file,id=mem,share=on,mem-path=/dev/shm/share,size=134217728 \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -bios tests/fixtures/rt_c_v_matmul_free.elf \
+  -plugin "$VSIM_PLUGIN,outfile=/tmp/q1.bin,enter_pc=$ROI_START"
+
+# vsim leg
+"$VSIM_BIN" tests/fixtures/rt_c_v_matmul_free.elf \
+  --resume-from-qemu /tmp/q1.bin \
+  --handoff-out /tmp/v.bin \
+  --shared-mem-path /dev/shm/share \
+  --shared-mem-size 134217728 \
+  --hybrid-exit-pc "$ROI_END"
+```
+
+The fixture binary differs from marker mode (markerless vs marked), and the
+QEMU1 plugin and vsim flags carry hex PCs (`enter_pc=` / `--hybrid-exit-pc`)
+instead of marker-trigger plumbing.
+
+### 4.3 Capturing a Kanata pipeline trace of the ROI
+
+When debugging a hot path on vsim, pass `--kanata FILE` to `./andesim run`
+in marker or pc mode. The resulting trace contains pipeline records only
+for the ROI region (between QEMU 1's drain and vsim's drain) -- vsim
+boot and DMI resume overhead are filtered out.
+
+```sh
+# marker mode: the ROI is the span between the two ROI markers (slti x0,x0,0x5A0/1)
+# markers already in the source. vsim auto-derives the window.
+./andesim run tests/fixtures/rt_c_v_matmul.elf \
+  --mode hybrid --trigger marker --engine vsim:ax45mpv_premium --kanata /tmp/roi.kanata
+
+# pc mode: the ROI bounds are whatever PCs you passed.
+./andesim run tests/fixtures/rt_c_v_matmul_free.elf \
+  --mode hybrid --trigger pc --engine vsim:ax45mpv_premium --pc-start vmatmul_kernel --pc-end 0x1002cc \
+  --kanata /tmp/roi.kanata
+```
+
+Add `--objdump FILE` so the kanata `L` records embed the disassembly
+text next to each PC. Generate the dump once with the toolchain
+`objdump -d`:
+
+```sh
+$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-objdump -d \
+  tests/fixtures/rt_c_v_matmul.elf > /tmp/roi.S
+./andesim run tests/fixtures/rt_c_v_matmul.elf \
+  --mode hybrid --trigger marker --engine vsim:ax45mpv_premium --kanata /tmp/roi.kanata --objdump /tmp/roi.S
+```
+
+Open `/tmp/roi.kanata` in [Konata](https://github.com/shioyadan/Konata)
+to view the pipeline.
+
+Constraints:
+
+- `--kanata` is only valid with `--mode hybrid --trigger marker` or `--mode hybrid --trigger pc` (the only triggers with a single ROI-exit PC); any other trigger is rejected with rc=2.
+- marker mode requires exactly one `slti x0,x0,0x5A1` (exit marker) in the
+  ELF. If the binary has more than one, vsim errors out with
+  `multiple ... markers in ELF -- use \`--mode hybrid --trigger pc\` with explicit \`--pc-end\``.
+  Switch to pc mode and pick the desired exit explicitly.
+- `--objdump` requires `--kanata`.
+
+How it works:
+
+- hsim forwards `KANATA_FILE` (and optionally `OBJDUMP_FILE`) to
+  `tests/e2e.sh`, which appends `--kanata FILE --kanata-roi`
+  (and `--objdump FILE`) to vsim's argv.
+- vsim's `--kanata-roi` flag defers the kanata enable until after
+  `--resume-from-qemu` loads the input state and `enable_hybrid_handoff`
+  scans the ELF, then derives a one-shot `LoopGate`:
+  - `start_pc` = the resumed PC (where vsim first fetches user code)
+  - `end_pc`   = `--hybrid-exit-pc` (pc mode) or the unique
+    `slti x0,x0,0x5A1` PC from CsrTrigger (marker mode)
+  - `skip_iters=0`, `record_iters=1` (open on first fetch of start_pc,
+    close on first retire of end_pc).
+
+### 4.4 Verifying a hybrid run against a QEMU oracle (`--verify`)
+
+With the QEMU2 handback removed, the code after your ROI never runs, so a
+hybrid run normally proves only that a cycle figure came out. `--verify`
+(default OFF) cross-checks the run's correctness:
+
+```sh
+./andesim run --mode hybrid --trigger marker --engine vsim:ax45mpv_premium --verify your_prog.elf
+# ...
+# [marker window_cycles] 46  (vsim mcycle=... - qemu mcycle=...)
+# [state-diff] PASS: 109 fields match (counters and passthrough CSRs excluded)
+# [verify] PASS: vsim drain matches the QEMU oracle
+```
+
+Performance note: without `--verify`, the vsim leg drains only `mcycle`/`minstret`
+(the cycle figure) and skips reading back the full architectural register file
+over the Debug Module. On a full drain the GPR and FPR readback ride
+Program-Buffer sweeps into the shared scratch page (like the vector-register
+sweep) -- ~6 halted-hart round-trips each instead of 31/32 per-register abstract
+commands -- and the Andes/M-ext CSR blocks ride a batched `csrr`+`sd` sweep the
+same way (3 CSRs per Program-Buffer execution), so what remains is the scalar
+M-mode CSRs, whose simulated debug cycles dominate hybrid wall-clock for a short
+ROI but never affect the cycle count. `--verify` needs every field for the diff,
+so it keeps the full drain; expect a `--verify` run to take noticeably longer
+than the same run without it.
+
+How it works: after the normal run, the same ELF re-runs on pure QEMU (the
+oracle) with the plugin draining at the ROI exit boundary, sampled at the
+exact pc where vsim halted. The pre-ROI path is QEMU in both runs, so the
+ROI inputs are identical -- any architectural divergence inside the ROI
+(RTL bug, state-restore bug, drain bug) shows up as a field mismatch and
+the run exits non-zero, listing each differing field:
+
+```
+[state-diff] x10: ref=0x3d got=0x0
+[state-diff] FAIL: 1 mismatch(es) (115 fields compared)
+```
+
+What is compared: pc, all GPRs, all FPRs (when FP state is live), the V
+CSRs and full vector registers (when V state is live), and the writable
+M-mode CSRs that round-trip through the handoff -- `mscratch` (L23) and
+`mepc`/`mcause`/`mtval`/`mie` (L24), restored at resume and re-read at
+drain. What is not:
+
+- `mcycle`/`minstret` -- the engines count differently by design;
+- `mip` -- restored and re-read, but its pending bits are hardware-driven
+  (the timer bit tracks elapsed time, which differs between QEMU's
+  functional clock and vsim's cycle clock), so a compare would
+  false-positive;
+- `mstatus`, `mtvec` -- passthrough: vsim restores the QEMU1 entry snapshot value; both sides hold the same bits by construction so comparing is trivially true but not useful;
+- `satp`, `medeleg`/`mideleg` -- S-mode CSRs, not implemented on the default M-only engine. The privilege level itself IS compared: both
+  sides drain the real one (L6), so a wrong-privilege resume shows up as
+  a priv mismatch.
+
+The handoff also carries the v3 Andes block (`mxstatus`, ILM/DLM bases, PMA, ...)
+and the **v4 M-ext block** (`HYBRID_M_EXT_CSR_LIST`): the writable M-mode CSRs
+across the whole AndeStar V5 SPA -- perf counters, NMI, CLIC, trap-save,
+state-enable, debug triggers, ePMP, CCTL, peripheral bases, U-mode Andes control
+(51 CSRs). Every one is **capability-gated by CSR address**: an engine restores,
+drains, and `--verify`-compares only the CSRs its config implements (reported via
+`--describe andes_csrs`), so a CSR the core lacks is a no-op rather than a DM
+hang. On the default `ax45mpv_premium` (M-only) that gates on the perf-monitor +
+trigger CSRs; the rest ride forward-looking for a CLIC / Smrnmi / Smstateen /
+M+U-capable engine. A few supported-but-engine-divergent CSRs are transported and
+restored but excluded from `--verify` (like `msp_bound`): the HW perf counters
+`mhpmcounter3-6`, `mdcause`, the trigger defaults `tdata1`/`tcontrol`, and the
+ILM/DLM base+enable CSRs `milmb`/`mdlmb` (their enable bit reads 1 on the vsim
+RTL but 0 on QEMU, which models no local memory). The
+complete per-CSR disposition for all 232 spec CSRs is in
+`docs/csr_coverage.ipynb`, guarded against drift by
+`tests/andes_csr/check_coverage.py`.
+
+Per-engine CSR validation is a registration requirement: every supported
+engine build carries its own CSR manifest + registration report under
+`tests/engines/` (contract: `tests/engines/README.md`). For a human-readable
+answer to "which CSRs does this engine restore, and under which condition --
+or why not", read the engine's `csr_restore_table.md` in the same directory
+(generated from the manifest by `tests/engines/render_restore_table.py`;
+`test_restore_table.sh` guards it against drift).
+`docs/engine_registration_tutorial.ipynb` walks the whole lifecycle --
+the three-way audit (spec x config.inc x RTL), registering a new engine or
+config, and removing one. `docs/csr_transport_bringup_tutorial.ipynb` is the
+companion reference: what the `/csr-transport-bringup` skill does (its 7-phase
+pipeline), every column of `csr_manifest.csv`, and each file a registration
+ships under `tests/engines/<engine>-<confighash>/`.
+
+Costs and limits: the oracle leg is one extra QEMU run of the whole
+program (MHz-class -- cheap next to the vsim leg). `--verify` works with
+`--trigger marker|pc`, assumes the single-shot ROI the hybrid run itself
+assumes, and requires `--mode hybrid` (the other models have nothing to
+cross-check).
+
+### 4.5 Debugging with GDB (`--gdb`, `--gdb-port`)
+
+Add `--gdb` to attach a debugger to a running simulation.
+
+**fast model** -- starts QEMU's built-in GDB stub and pauses at the entry point:
+```sh
+./andesim run --mode fast --gdb my.elf
+# In another terminal:
+gdb-multiarch -ex 'target remote :1234' my.elf
+```
+Default port: 1234. Override with `--gdb-port PORT`.
+
+**cycle model** -- resets and **halts** the hart (like QEMU's `-S`), opens vsim's
+JTAG bitbang port in the background, waits for it to come up, then execs `$ICEMAN`
+-- your JTAG debug server -- in the foreground:
+```sh
+export ICEMAN=/path/to/jtag-debug-server      # see note
+./andesim run --mode cycle --gdb --engine vsim:ax45mpv_premium my.elf
+# then point GDB at the server's gdb port (OpenOCD's default is 1111):
+gdb-multiarch -ex 'target remote :1111' my.elf
+```
+`--gdb-port PORT` sets vsim's JTAG bitbang port (default `9104`); GDB itself
+connects to the **server's own** gdb port, not this one. The hart starts halted,
+so the debugger attaches to a stopped core -- set breakpoints, then `continue`.
+
+`$ICEMAN` is whichever JTAG debug server you point it at; it must speak the
+OpenOCD `remote_bitbang` protocol to vsim's port. A current **OpenOCD (0.12+)**
+works -- a one-line `$ICEMAN` wrapper can just `exec openocd -f <cfg>`, where
+`<cfg>` selects `adapter driver remote_bitbang` at `remote_bitbang port 9104`,
+a generic `riscv` target, and a `gdb_port`. A full worked example is in
+`docs/andes_sim_demo.ipynb` ("7. Debug with GDB"). **Note:** Andes ICEman's
+*own* bundled OpenOCD 0.10 has a `remote_bitbang` bug that crashes against vsim's
+DTM, so point `$ICEMAN` at a modern OpenOCD rather than the bundled one.
+
+`--gdb` is not supported with `--mode hybrid` (the handoff pipeline cannot pause for interactive debugging).
+
+---
+
+## 5. One binary on every engine (the vplat runtime)
+
+A binary linked with a semihosting libgloss (e.g. `-lgloss_vh`) can print
+only where a QEMU intercepts the semihosting `ebreak` triple; vsim has no
+semihosting, so a syscall inside the ROI traps there -- the old Phase-2
+"no syscalls inside the ROI" rule. The **vplat runtime** removes the
+per-engine build split: it is a newlib stub layer
+(`runtime/vplat_syscalls.c`) that talks only to devices both
+engines model at the same addresses, so ONE ELF runs on `fast`, on `cycle`,
+and across a `hybrid` handoff, and a syscall inside the ROI works (it just
+adds its real cycles to the figure). Every in-tree C fixture links this
+runtime; nothing in the repo uses `-lgloss_vh` anymore.
+
+| Channel | Device | QEMU andes_ae350 | vsim |
+|---------|--------|------------------|------|
+| stdio (fd 0-2)   | UART2 16550, `THR` @ `0xf0300020`, `LSR` @ `0xf0300034` | `serial_mm_init` (serial0) | `src/platform/uart.hpp` |
+| exit code        | SimControl @ `0xe0080000` (u32 < 256 = exit code)       | `hw/misc/andes_sim_control.c` | `src/platform/sim_control.hpp` |
+| file io (fd > 2) | HTIF magicmem command @ `0xe0080010`                    | same device | same model |
+
+The runtime ships prebuilt as `libandesim_runtime.a`. Build it once
+(`scripts/build_all.sh runtime`, or any fixture build does it implicitly),
+then compile with two extra flags (same line for every engine; no `-mvh`,
+no `-lgloss_vh`):
+
+```sh
+"$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-gcc" -march=rv64gc -mabi=lp64d -O1 \
+  -B build/runtime -specs=andesim.specs your_prog.c -o your_prog.elf
+```
+
+`-B` points gcc at the built artifacts (use the absolute path to
+`<repo>/build/runtime` when compiling outside the repo);
+`-specs=andesim.specs` swaps the startfile to the runtime's `crt0.o`,
+adds `-T andesim.ld` (load base `0x00100000`), and rewrites the library
+list to `--start-group -landesim_runtime -lc -lgcc --end-group`, so no
+libgloss or semihosting can leak into the link.
+
+Without the gcc driver (a custom build system), link the pieces directly:
+
+```sh
+... -nostartfiles -nodefaultlibs -T build/runtime/andesim.ld \
+  build/runtime/crt0.o your_prog.o -L build/runtime \
+  -Wl,--start-group -landesim_runtime -lc -lgcc -Wl,--end-group
+```
+
+Sources live in `runtime/` (crt0.S boot, trap.S + handler.c trap
+diagnostics, vplat_syscalls.c newlib stubs). `crt0.o` is shipped next to
+the archive, not inside it: nothing references `_start`, so the linker
+would never extract it from a `.a`.
+
+### 5.1 rv32 and rv64
+
+The runtime builds for **both** widths from two toolchains (`HYBRID_TOOLCHAIN`
+= rv64, `HYBRID_TOOLCHAIN32` = rv32; section 1.3). `scripts/build_all.sh
+runtime` builds both when `HYBRID_TOOLCHAIN32` is set:
+
+- rv64 -> `build/runtime/` (link `-B build/runtime`, as above).
+- rv32 -> `build/runtime/rv32/` (link `-B build/runtime/rv32`).
+
+The rv32 link is the same shape with the rv32 compiler and `-march=rv32gc
+-mabi=ilp32d`:
+
+```sh
+"$HYBRID_TOOLCHAIN32/bin/riscv32-unknown-elf-gcc" -march=rv32gc -mabi=ilp32d -O1 \
+  -B build/runtime/rv32 -specs=andesim.specs your_prog.c -o your_prog.elf
+```
+
+**The driver follows the ELF's width.** `run` reads the ELF's class
+(rv32/rv64) and:
+
+- **fast** auto-selects `qemu-system-riscv32` or `qemu-system-riscv64` to match
+  the ELF -- no flag needed (an explicit `--engine qemu32`/`qemu64` overrides,
+  with a warning if it disagrees with the ELF).
+- **cycle** / **hybrid** reject an ELF whose width does not match the chosen
+  engine, up front, instead of a cryptic failure deep inside the engine:
+
+  ```
+  $ ./andesim run --mode cycle --engine vsim:ax45mpv_premium prog_rv32.elf
+  andesim run --mode cycle: ELF is rv32 but engine 'vsim:ax45mpv_premium' is rv64
+    -- pick a matching engine or an rv64 ELF
+  ```
+
+See `docs/andesim_runtime_tutorial.ipynb` for a step-by-step walkthrough
+of what the two flags do, what to avoid, and how to add ROI markers and RVV.
+
+Ready-made fixtures: `vplat_hello.elf` (stdio + exit), `vplat_exit41.elf`
+(exit-code propagation), `vplat_file.elf` (HTIF file io); they are built
+with exactly the two-flag command above. Per-feature smoke tests live in
+`tests/vplat/test_vplat_f1..f9.sh`.
+
+Notes:
+
+- **Exit codes** stay below 256; the write to `0xe0080000` terminates the
+  simulation and becomes the simulator process exit code on both engines
+  (magic commands `0x01234567/68/71` map to 0, `0x01234569/70` to 1).
+- **File io** is host-passthrough: paths resolve relative to the engine
+  process cwd; the QEMU device mirrors vsim's `sys_call.hpp` table
+  byte-for-byte (newlib->Linux `O_*` translation, `st_mode`/`st_size`-only
+  stat writeback).
+- **ROI markers are safe in vplat binaries.** The markers are RISC-V HINTs
+  (`slti x0, x0, 0x5A0/0x5A1` -- rd=x0 discards the result), so they execute
+  as NOPs on every engine and on silicon: one marker ELF runs standalone on
+  fast/cycle AND drives `--trigger marker` on hybrid. Get them from
+  `#include <andesim/ROI.h>` (`andesim_ROI_begin()/end()`; the header
+  rides the same `-B build/runtime` flag). For binaries you cannot edit,
+  delimit the ROI with PC symbols and `--trigger pc` instead (see
+  `tests/fixtures/vplat_hello.c`: `say_hello` / `vplat_roi_end`).
+- A `printf` inside the measured window now works (the UART is modeled and
+  its MMIO cost is real), but it still adds those UART cycles to the figure -
+  keep measured kernels I/O-free when you care about clean numbers.
+- `docs/andes_sim_tutorial.ipynb` sections 2, 3 and 4d run the same
+  `hello.elf` through all three models.
+
+---
+
+## 6. Running the full test suite
+
+After any change to the simulator or plugin, run the suite:
+
+```sh
+JOBS=8 bash scripts/run_e2e.sh
+```
+
+`JOBS=8` is the practical cap on this 128-core host (vsim Verilator
+processes are CPU-hungry; the default cap of 128 saturates the box and
+times out). Logs go to `/tmp/e2e-<RAND>/`; failed-test logs are
+streamed at the end.
+
+Run a subset:
+
+```sh
+FILTER=rt_c_v JOBS=8 bash scripts/run_e2e.sh        # only V-related fixtures
+MODE=marker     JOBS=8 bash scripts/run_e2e.sh         # skip the pc-mode iterations
+JOBS=1                     bash scripts/run_e2e.sh  # sequential for debugging
+LOG_DIR=/tmp/my-logs       bash scripts/run_e2e.sh
+VERIFY=1 JOBS=8            bash scripts/run_e2e.sh  # + oracle cross-check per test
+```
+
+Differential verification -- re-run on pure QEMU draining at the ROI exit,
+then compare the drains -- lives in the product path `./andesim run --mode
+hybrid --verify` (see Section 4.4). `tests/e2e.sh` itself is a self-contained
+handoff harness with no andesim dependency.
+
+For a per-mode handoff on the GEMM workload, drive `./andesim run`
+directly (`--mode hybrid --trigger marker|pc`); see Section 4 for the
+mode-by-mode commands.
+
+The e2e suite runs via `scripts/run_e2e.sh`, not CTest; the external vsim repo
+registers only the hybrid-layer doctest unit tests (there is no
+`switching-mode` CTest label).
+
+---
+
+## 7. Common failures and how to read them
+
+| Symptom                                                | Cause / fix                                                          |
+|--------------------------------------------------------|----------------------------------------------------------------------|
+| `skip: ... not built; run 'make' ...`                  | `source ./setup.sh` and `make -C tests/fixtures`            |
+| `QEMU 1 expected exit 200, got 0`                      | Trigger never fired. Wrong mode / wrong PC.     |
+| `QEMU 1 expected exit 200, got 124`                    | `timeout` killed the plugin. Increase `TIMEOUT` or tune the target.  |
+| `cannot resolve ROI start/end '<x>'`                   | PC-mode boundary `<x>` is neither a `0x` address nor a defined symbol. Fix `--pc-start`/`--pc-end` (or `ROI_START`/`ROI_END`), or use marker mode. |
+| Whole suite times out under `scripts/run_e2e.sh`               | Set `JOBS=8`. Default 128 saturates a 128-core host.                 |
+| `[FAIL] [N/M] ... -> /tmp/e2e-XXXX/...log`             | Open that log; it is the full stdout+stderr of the failing leg.      |
+
+---
+
+## 8. Where to go next
+
+- `docs/andes_sim_demo.ipynb` - 5-minute product demo: one `hello` ELF
+  on fast, cycle and hybrid, with ROI markers around a single `printf`
+  and a no-source-edit `--trigger pc` run on objdump-found addresses.
+- `docs/andes_sim_options_tutorial.ipynb` - the `andesim run` option
+  reference: every flag (`--mode`, `--engine`, `--trigger`/`--pc-*`,
+  `--mem-size`, `--dry-run`, `--verify`, `--gdb`, passthrough `--`) with
+  one live demo each, plus an error gallery (missing ELF, rv32/rv64
+  mismatch, omitted required flags) showing the exact message and fix.
+- `docs/andes_sim_gemm_tutorial.ipynb` - measure a real RVV GEMM kernel:
+  build + verify against plain C, read engine hardware params
+  (XLEN/VLEN/DLEN/ELEN), kernel cycles via markers, then the no-edit
+  path: `build/hotloops` detector -> `--trigger pc` on the hot function.
+- `docs/andes_sim_memory_tutorial.ipynb` - guest memory: a program that
+  needs 2 GiB faults under the default and passes with `--mem-size 2G`;
+  per-model semantics, the 2 GiB cap, backing-store tiers, doctor's
+  `mmap tiers:` readout, WSL2/macOS notes.
+- `docs/andes_sim_limitations.ipynb` - what the simulator CANNOT do today:
+  the narrow ROI envelope (trap-free, no paging; M/S/U privilege is
+  transported since L6 was resolved, but the ROI must hold one privilege
+  and the engine's RTL must implement it -- M-mode-only engines abort
+  loudly on an S/U handoff), the full L1-L21 list with live evidence
+  cells, and the commercial-readiness scorecard.
+- `docs/competition_landscape.ipynb` - where andesim sits against
+  Dromajo, ImperasDV (Synopsys) and gem5: a positioning map plus
+  capability/dimension tables across cosim, fast-forward, accuracy,
+  speed, cost, interrupts/exceptions, OS boot and RVVI support, plus a
+  "which one should I use" guide. andesim is the
+  only one pairing functional fast-forward with cycle-accuracy from the
+  real RTL; the others are functional golden models (Dromajo, ImperasDV)
+  or a cycle-approximate performance model (gem5).
+- `docs/archive/hybrid_plan.md` - architecture deep-dive (state ABI,
+  Debug Module transport, V-scratch trick, passthrough rationale).
+- `docs/switching_modes_tutorial.md` - one exercise per mode with
+  drill-down on the underlying CLI invocations.
+- `CLAUDE.md` - file-level pointers (key files, build commands,
+  fixture authoring rules).
+- `tests/fixtures/rt_c_v_matmul.c` - the RVV GEMM the switching modes
+  run; one source builds both the marked (marker mode) and markerless
+  (pc mode) variants.
+- `tests/fixtures/rt_c_v_regs.c` - reference fixture for V-regfile transport
+  (V regfile + V scalar CSRs + shared memory).
