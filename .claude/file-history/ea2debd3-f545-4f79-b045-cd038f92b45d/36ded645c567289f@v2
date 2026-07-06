@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Render a human-readable CSR restore table from an engine's csr_manifest.csv.
+
+Answers, per CSR, the registration owner's question: can this engine restore
+it, and under WHICH condition -- or why not / which condition is unmet.
+Three groups:
+  1. Restored at resume       (transported yes/partial): the condition IS met.
+  2. Implemented, NOT restored: the engine has it; a named policy reason says
+     why nothing is (or needs to be) restored.
+  3. Not implemented           : the build does not satisfy the existence
+     condition -- that unmet condition is the answer.
+
+Stdlib only. The manifest is the single input; the spec/RTL/probe provenance
+of each column is csr_manifest.csv's job (see tests/engines/README.md).
+
+Usage:
+  render_restore_table.py [manifest.csv ...]  # write csr_restore_table.md beside each
+  render_restore_table.py                     # default: every registered manifest
+"""
+from __future__ import annotations
+
+import csv
+import re
+import sys
+
+from reglib import manifest_paths
+
+# Plain-English reasons for the non-transported dispositions (group 2 and the
+# secondary note in group 3). Keys are the leading token of
+# gate_or_disposition, before any '[', '(' or ';' detail.
+REASONS = {
+    "CONST_RO": "read-only constant -- the engine derives it; nothing to restore",
+    "EXCL_RO": "read-only register -- nothing to restore",
+    "EXCL_MODE": "S-mode / Hypervisor CSR -- outside the M / M+U envelope",
+    "EXCL_SIDEFX": "read/write has side effects -- not plain state",
+    "EXCL_RV32": "RV32-only high-half shadow -- not present on RV64",
+    "EXCL_W1C_HW": "hardware-driven write-1-clear -- hardware owns the bits",
+    "EXCL_DEBUG": "Debug-mode CSR -- the handoff itself drives it",
+    "EXCL_NEXT": "U-mode N-extension trap state -- outside the trap-free ROI",
+    "EXCL_TRAP": "trap-cause latch -- only live after a trap; the ROI is trap-free",
+    "EXCL_INDIRECT": "indirect access window (miselect/mireg), not a real register",
+    "NEW": "transport planned, not carried yet",
+    "NEW_TRIG": "debug-trigger CSR -- transport planned (guarded), not carried yet",
+    "NEW_UDELTA": "U-mode Andes control -- transported only for the M+U envelope",
+    "TRANSPORT_NOW": "in the wire format, but this engine does not implement it",
+}
+
+
+def _token(disposition: str) -> str:
+    """Leading token of gate_or_disposition ('NEW[gate UMODE=off]' -> 'NEW')."""
+    return re.split(r"[\[(;]", disposition)[0].strip()
+
+
+def _detail(disposition: str) -> str:
+    """The rest, cleaned ('NEW[gate UMODE=off]' -> 'gate UMODE=off')."""
+    rest = disposition[len(_token(disposition)):].strip()
+    return rest.strip("[]();: ")
+
+
+def _reason(disposition: str) -> str:
+    tok = _token(disposition)
+    phrase = REASONS.get(tok, tok)
+    det = _detail(disposition)
+    return f"{phrase} ({det})" if det else phrase
+
+
+def _cell(value: str) -> str:
+    """Escape '|' so free-text values cannot split a markdown table row."""
+    return value.replace("|", r"\|")
+
+
+def render(rows: list[dict], engine: str, config_hash: str) -> str:
+    restored = [r for r in rows if r["transported"] in ("yes", "partial")]
+    impl_not = [r for r in rows
+                if r["transported"] == "no" and r["implemented"] in ("yes", "partial")]
+    not_impl = [r for r in rows
+                if r["transported"] == "no" and r["implemented"] == "no"]
+
+    out = [
+        f"# CSR restore table: {engine} (config {config_hash})",
+        "",
+        "Generated from csr_manifest.csv by render_restore_table.py -- do not",
+        "edit by hand; regenerate with:",
+        "`python3 tests/engines/render_restore_table.py` (all engines).",
+        "",
+        f"Summary: {len(rows)} spec CSRs -> {len(restored)} restored, "
+        f"{len(impl_not)} implemented but not restored, "
+        f"{len(not_impl)} not implemented on this build.",
+        "",
+        "## 1. Restored at resume",
+        "",
+        "The engine implements these CSRs (condition met) and the handoff",
+        "writes them into the hart at resume. `verified` says how --verify",
+        "treats the value afterwards.",
+        "",
+        "| CSR | addr | condition met | gate | verified |",
+        "|---|---|---|---|---|",
+    ]
+    for r in restored:
+        out.append(f"| {r['name']} | {r['addr']} | {_cell(r['exists_cond'])} "
+                   f"| {_cell(r['gate_or_disposition'])} | {_cell(r['verify'])} |")
+
+    out += [
+        "",
+        "## 2. Implemented, but NOT restored",
+        "",
+        "The engine has these CSRs, and a named policy reason says why there",
+        "is nothing to restore (or why restoring is excluded).",
+        "",
+        "| CSR | addr | why not restored |",
+        "|---|---|---|",
+    ]
+    for r in impl_not:
+        out.append(f"| {r['name']} | {r['addr']} "
+                   f"| {_cell(_reason(r['gate_or_disposition']))} |")
+
+    out += [
+        "",
+        "## 3. Not implemented on this build",
+        "",
+        "The build does not satisfy the existence condition, so there is no",
+        "CSR to restore. The `unmet condition` column is what a build would",
+        "need for the CSR to exist.",
+        "",
+        "| CSR | addr | unmet condition | disposition if it existed |",
+        "|---|---|---|---|",
+    ]
+    for r in not_impl:
+        out.append(f"| {r['name']} | {r['addr']} | {_cell(r['exists_cond'])} "
+                   f"| {_cell(_reason(r['gate_or_disposition']))} |")
+
+    out.append("")
+    return "\n".join(out)
+
+
+def main(argv: list[str]) -> int:
+    wrote = 0
+    for manifest in manifest_paths(argv):
+        regdir = manifest.rsplit("/", 1)[0]
+        # engine.env carries the identity next to every manifest.
+        env = {}
+        with open(f"{regdir}/engine.env") as f:
+            for line in f:
+                if "=" in line and not line.lstrip().startswith("#"):
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip()
+        with open(manifest, newline="") as f:
+            rows = list(csv.DictReader(f))
+        md = render(rows, engine=env["ENGINE"], config_hash=env["CONFIG_HASH"])
+        out_path = f"{regdir}/csr_restore_table.md"
+        with open(out_path, "w") as f:
+            f.write(md)
+        print(f"[restore-table] wrote {out_path} ({len(rows)} CSRs)")
+        wrote += 1
+    if not wrote:
+        print("[restore-table] no manifests found", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
