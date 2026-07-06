@@ -1,0 +1,379 @@
+# CSR transport pipeline: full walkthrough (probe -> classify -> gate -> validate -> register)
+
+This document traces the WHOLE story of how a CSR gets transported for a vsim
+engine. For every step it names the exact data source, the exact file, and the
+exact command. Written in simple English.
+
+The one question it answers first, because it keeps coming up:
+**"How does the probe know to read 0x004? Where does the CSR list come from?"**
+See the box in Step 1. Short answer: the list is the *spec catalog*, mined from
+the AndeStar V5 SPA PDF into `tests/andes_csr/csr_inventory.csv`.
+
+---
+
+## 0. The five ground-truth sources
+
+Nothing in this pipeline is invented. Every fact comes from one of five
+sources, and they each have ONE job. Mixing their jobs is where bugs come from.
+
+| # | Source | What it is | Its ONE job | Where it lives |
+|---|---|---|---|---|
+| S1 | **SPEC** | AndeStar V5 SPA PDF, Chapter 5 summary tables (Tables 5-12) | the CSR *catalog* -- every CSR any V5 core COULD have | `AndeStar_V5_SPA_UM164_V1.7.pdf` -> `tests/andes_csr/csr_inventory.csv` |
+| S2 | **CONFIG** | the build's feature knobs (`` `define _NDS_* ``) | the engine *identity* (a hash) + which features are on | `$VSIM_BIN_DIR/V<engine>/obj_sc/config.inc` |
+| S3 | **RTL** | the CSR decoder's `assign existent_csr = ...` boolean | the *bridge*: config knobs -> "this CSR exists" | build `kv_csr_dec.v` |
+| S4 | **PROBE** | `sim_<engine> --probe` on the live reset hart | the *measured truth*: exists? + reset value | the built engine binary |
+| S5 | **QEMU** | the functional oracle leg | independent `--verify` check of values -- **NOT** existence | `$QEMU_BIN_DIR/qemu-system-riscv64` |
+
+Key idea repeated throughout: **"measure, don't model."** We do not guess which
+CSRs an engine has from config knobs. We hand the engine the full spec catalog
+(S1) and let the engine itself answer yes/no (S4). S2/S3 are only there to
+explain and cross-check the answer.
+
+```
+ S1 SPEC PDF                       S2 config.inc          S3 kv_csr_dec.v
+ (catalog: 232 CSRs)               (feature knobs)        (existence equation)
+      |                                  |                       |
+      | extract_csr_inventory.py         | config_hash.sh        | (cross-check
+      v                                  v                        only)
+ csr_inventory.csv  ---------------->  engine identity            |
+      |                                  <engine>-<hash8>         |
+      | (minus EXCL_SIDEFX)                                       |
+      v                                                           |
+   PROBE  ----S4---->  implemented? + reset value  <--------------+
+      |
+      v
+  CLASSIFY  ---->  disposition per CSR (transport? or named EXCL_*?)
+      |
+      v
+    GATE  ---->  caps map: addr -> feature gate (vsim) + offline mirror
+      |
+      v
+  VALIDATE  ---->  the ladder: parity, coverage, under-claim, cold-cache --verify (sweep)
+      |
+      v
+  REGISTER  ---->  tests/engines/<engine>-<hash8>/  (manifest + report + fixtures + guard)
+```
+
+---
+
+## 1. PROBE -- "what CSRs does THIS engine really have?"
+
+### 1a. Where the probe list comes from (the 0x004 answer)
+
+> **The probe does NOT invent addresses. It reads them from the spec catalog.**
+>
+> `tests/engines/probe_engine.sh` builds its address list like this:
+> - start from every row in **`tests/andes_csr/csr_inventory.csv`**
+> - remove the rows classified `EXCL_SIDEFX` (reading them changes hart state)
+>
+> `csr_inventory.csv` is 232 CSRs mined from the **AndeStar V5 SPA PDF**
+> (Chapter 5, Tables 5-12) by `scripts/extract_csr_inventory.py`. It is the
+> ARCHITECTURE catalog -- every CSR any V5 core could have -- not what one
+> engine implements.
+>
+> `0x004` is line 204 of that file:
+> ```
+> 0x004,URW,uie,U-std,N Extension CSRs
+> ```
+> So the probe reads `0x004` (`uie`, the user interrupt-enable from the
+> N-extension) simply because the SPEC lists it. Whether *this* engine has it is
+> exactly what the probe is measuring. On `ax45mpv_premium` (M-only, no
+> N-extension) the checked read faults and the probe prints `0x004,no,`. That
+> `no` is a measured fact, not an assumption. If we had pre-filtered `0x004` out
+> of the list, we would be *guessing* the answer -- the exact modeling error the
+> probe exists to avoid.
+
+Provenance chain for the list:
+```
+AndeStar_V5_SPA_UM164_V1.7.pdf   (Chapter 5, Tables 5-12)
+        |  scripts/extract_csr_inventory.py   (offline, needs PyMuPDF)
+        v
+tests/andes_csr/csr_inventory.csv   (232 rows: addr, priv, name, mode, section)
+        |  probe_engine.sh: keep all rows EXCEPT decision==EXCL_SIDEFX
+        v
+probe address list  ->  sim_<engine> --probe
+```
+
+### 1b. How to run it
+
+```sh
+bash tests/engines/probe_engine.sh ax45mpv_premium
+```
+- one positional arg = the engine name (the binary suffix, so `ax45mpv_premium`,
+  NOT the registration dir `ax45mpv_premium-5bea8bdc`).
+- needs `$VSIM_BIN_DIR/sim_<engine>` to exist (build vsim first).
+- prints one line per CSR to stdout.
+
+### 1c. What it does under the hood (from `probe_engine.sh`)
+
+1. builds `tests/fixtures/spin.elf` -- a benign program at a *mapped* reset
+   vector (the hart free-runs a few instructions before the DMI halt lands; an
+   unmapped vector would bus-error).
+2. builds the probe address list (Step 1a).
+3. runs `sim_<engine> --probe <addrs.txt> spin.elf`, which **halts the reset
+   hart** and does a **checked read** of every address. A read that faults
+   (`cmderr`) means "not implemented".
+
+### 1d. Output
+
+```
+0xADDR,yes|no,0xRESET
+0x300,yes,0x0000000000001800     # mstatus exists, reset 0x1800
+0x004,no,                        # uie absent on this build
+```
+- `yes`/`no` = the measured existent set.
+- third field = the reset value drained from the fresh reset hart.
+
+### 1e. How it feeds the next steps
+
+```sh
+bash tests/engines/probe_engine.sh ax45mpv_premium > /tmp/probe.csv
+ANDESIM_PROBE_CSV=/tmp/probe.csv \
+  python3 tests/engines/ax45mpv_premium-5bea8bdc/gen_manifest.py \
+          tests/engines/ax45mpv_premium-5bea8bdc
+```
+The env var `ANDESIM_PROBE_CSV` tells `gen_manifest.py` to fill the
+`implemented` and `reset_value` columns from the MEASUREMENT (S4), instead of
+tracing the RTL equation (S3). The `EXCL_SIDEFX` CSRs that were removed from the
+probe list fall back to the RTL equation for their `implemented` value.
+
+---
+
+## 2. CLASSIFY -- "for each CSR, what do we intend to do with it?"
+
+Classification happens in two layers: architecture-wide first, then per-engine.
+
+### 2a. Architecture-wide disposition (spec level)
+
+```sh
+python3 scripts/classify_csr_coverage.py tests/andes_csr/csr_inventory.csv
+# writes tests/andes_csr/csr_coverage.csv  (adds a `decision` column)
+```
+This reads the spec catalog (S1) and gives every CSR ONE disposition, under the
+supported envelope (bare-metal, single-hart, M or M+U mode, trap-free ROI). The
+decision does not depend on any single engine yet -- it is the policy.
+
+Dispositions (from `classify_csr_coverage.py` docstring):
+
+| decision | meaning | transported? |
+|---|---|---|
+| `TRANSPORT_NOW` | already carried in `hybrid_state_v1` | yes |
+| `NEW` | writable M-mode plain state -- expansion target | pending |
+| `NEW_TRIG` | debug-trigger CSR (shares the Debug Module) | pending, guarded |
+| `NEW_UDELTA` | U-mode Andes control -- only in M+U | pending |
+| `CONST_RO` | read-only config/info -- engine derives it | no (nothing to move) |
+| `EXCL_RV32` | RV32 high-half shadow -- irrelevant on RV64 | no |
+| `EXCL_SIDEFX` | read/write has side effects -- not architectural state | no (also skipped by probe) |
+| `EXCL_W1C_HW` | write-1-clear, hardware-driven (like `mip`) | no |
+| `EXCL_INDIRECT` | `miselect`/`mireg` access mechanism, not a register | no |
+| `EXCL_NEXT` | U-mode N-extension trap state | no |
+| `EXCL_DEBUG` | Debug-mode CSR the handoff itself drives | no |
+| `EXCL_MODE` | S-mode / Hypervisor -- outside M / M+U envelope | no |
+| `EXCL_TRAP` | detailed trap-cause latch, live only after a trap | no |
+
+Example: `0x004,...,EXCL_NEXT` -- `uie` is U-mode N-extension trap state, so the
+policy never transports it, on any engine.
+
+### 2b. Per-engine manifest (join everything)
+
+```sh
+python3 tests/engines/<engine>-<hash>/gen_manifest.py <regdir>
+# writes <regdir>/csr_manifest.csv  (232 rows, one per spec CSR)
+```
+`gen_manifest.py` JOINS all sources into the per-engine truth table:
+
+| column | meaning | source |
+|---|---|---|
+| addr, name, access | identity + access mode | S1 spec inventory |
+| exists_cond | existence condition in spec words | S1 SPA IM Requirement / Table 13 |
+| implemented | does THIS engine have it | S4 probe (or S3 RTL for `EXCL_SIDEFX`) |
+| transported | restored + drained by the handoff | caps / `--describe andes_csrs` |
+| gate_or_disposition | why (gate name or `EXCL_*`) | caps map (S3) / coverage matrix (2a) |
+| reset_value | the engine's real reset value | S4 empirical baseline, never the spec column |
+| verify | compared or excluded (+ why) | driver `state_diff.cpp` |
+| safe_write | write mask/skip for fixtures | reviewed `safe_write_policy.csv` |
+
+The result (real numbers today):
+- `ax45mpv_premium`: 64 implemented, 40 transported (+2 partial).
+- `ax46mpv_advanced`: 72 implemented, 43 transported (+2 partial).
+
+---
+
+## 3. GATE -- "wire each transported CSR to its real existence condition"
+
+A "gate" is a boolean the sim computes: *does this engine implement this CSR?*
+Restoring or sweeping a CSR the core LACKS can **hang the DMI handshake**
+(observed on `ax45mpv_premium` for `ucode` with no DSP, `mecc_code` with no
+ECC). So transport must be gated by real existence.
+
+Three files, kept in lockstep:
+
+1. **`src/hybrid/andes_caps.hpp`** (vsim repo) -- maps a CSR *address* to an
+   `AndesGate` enum value (`ALWAYS`, `DSP`, `CODENSE`, `ZCMT`, `POWERBRAKE`,
+   `STACKSAFE`, `ECC`, `PMA`, `ILM`, `DLM`, `PERF_MONITOR`, `PMNDS`,
+   `PMNDS_UMODE`, `PMNDS_SMODE`, `ALT_FP`, ... plus the v4 M-ext gates).
+
+2. **`src/hybrid/andes_caps_config.hpp`** (vsim repo) -- the ONE place that binds
+   each gate to the compiled-in `_NDS_*` config macro (S2). A macro that is
+   absent reads as "off" (gate clear) -- never a compile error. Example bindings:
+   ```
+   PMNDS  = _NDS_PERFORMANCE_MONITOR_INT && !_NDS_SSCOFPMF_SUPPORT
+   PMA    = _NDS_PMA_ENTRIES > 0
+   ZCMT   = _NDS_ZCMT_SUPPORT_INT || _NDS_ZCE_SUPPORT_INT
+   ```
+
+3. **`scripts/config_inc_to_andes_caps.py`** (andesim repo) -- the OFFLINE mirror
+   of the same logic, in Python. Reads a `config.inc` and prints the same gated
+   list without running the engine.
+
+**The rule that matters:** the gate must encode the RTL's `existent_csr` term
+(S3), NOT a plausibly-related feature. Three real bugs came from getting this
+wrong:
+- `0x7D1` (`mcountermask_m`): was gated on `PERF_MONITOR`, is really `PMNDS_UMODE`.
+- `jvt` (`0x017`): was gated on `CODENSE`, is really `ZCMT`.
+- `0x7CF` (`mcounterinten`): was `PERF_MONITOR`, is really `PMNDS` (`perf && !Sscofpmf`).
+
+Each faulted the drain sweep until the gate was fixed to match the RTL.
+
+Runtime readout of the gated list:
+```sh
+$VSIM_BIN_DIR/sim_ax45mpv_premium --describe   # section "andes_csrs"
+```
+
+---
+
+## 4. VALIDATE -- "prove the caps table is right, both directions"
+
+Run bottom-up. Each rung catches what the one below cannot. The two failure
+directions:
+- **over-claim** = claim a CSR the RTL lacks. Silently masked by the tolerant
+  per-CSR path, but the batched drain SWEEP faults on it and names it.
+- **under-claim** = implemented but not transported and no named reason = silent
+  state loss. Caught by a script, not a human.
+
+| rung | tool | catches |
+|---|---|---|
+| 1 | caps unit test (`andes_caps.test.cpp`, vsim) | gate logic for this config shape |
+| 2 | parity guard `tests/andes_sim/test_andes_sim_caps_parity.sh` | offline mirror (S2->caps) != runtime `--describe` |
+| 3 | coverage guard `tests/andes_csr/check_coverage.py` | `csr_inventory.csv` != `csr_coverage.csv` != `state_abi.h` (the ABI) |
+| 4 | under-claim guard `tests/engines/check_completeness.py` | an implemented CSR that is neither transported nor named-`EXCL_*` |
+| 5 | cold-cache `--verify`, both trigger modes | **over-claim** -- the batched PB `csrr` sweep faults (`cmderr`) and names the CSR |
+| 6 | generated write-survival fixtures | a transported CSR that does not actually round-trip a written value |
+
+Why rung 5 is the real proof: the tolerant abstract path MASKS an over-claim (a
+faulting read mirrors as 0, QEMU drains 0 too, `--verify` falsely passes). Only
+the batched sweep is strict. The cold-cache run forces the reset-baseline
+capture, which is a DRAIN, so it exercises the sweep over the full claimed set.
+
+The commands (per engine):
+```sh
+rm -rf ~/.cache/andesim        # force a fresh baseline capture (cold cache)
+./andesim run --mode hybrid --trigger marker --engine vsim:ax45mpv_premium \
+  --verify tests/fixtures/rt_c_hello.elf
+# expect: [state-diff] PASS: 147 fields match  /  [verify] PASS
+
+TRIGGER_MODE=pc FIXTURE=rt_c_hello VSIM_BIN=$VSIM_BIN_DIR/sim_ax45mpv_premium \
+  bash tests/e2e.sh            # pc mode, same window
+```
+
+Two value-compare exceptions live in `driver/state_diff.cpp` (`andes_verify_excluded`):
+CSRs whose QEMU reset != engine reset for a value the program never writes
+(`mnvec`, `msp_bound`/`msp_base`, `milmb`/`mdlmb` EN bit, `mip`, trigger CSRs,
+...). These are transported but not compared, else they false-fail.
+
+---
+
+## 5. REGISTER -- "freeze it as a signed, complete record"
+
+### 5a. Identity = a hash of the build config
+
+```sh
+scripts/config_hash.sh $VSIM_BIN_DIR/Vax45mpv_premium/obj_sc/config.inc
+# -> first 8 hex of sha256 over config.inc, with the "// created on <date>"
+#    line stripped (so an identical rebuild keeps the same identity)
+```
+A rebuild with a different config = a DIFFERENT hash = a NEW registration. Stale
+artifacts can never be silently reused. (This is why the two live dirs are
+`ax45mpv_premium-5bea8bdc` and `ax46mpv_advanced-a13f86a3`; earlier commits show
+older hashes `ed1cb158` / `4d194785` before rebuilds.)
+
+### 5b. What ships per engine build (`tests/engines/<engine>-<hash8>/`)
+
+```
+tests/engines/ax45mpv_premium-5bea8bdc/
+|-- engine.env               # ENGINE, CONFIG_HASH, XLEN, VLEN, PRIV_LEVELS, QEMU_CPU
+|-- csr_manifest.csv         # 232 rows -- the per-engine truth table (Step 2b)
+|-- gen_manifest.py          # regenerates the manifest from probe/RTL/caps
+|-- registration_report.md   # the human report (the 5 required sections below)
+`-- fixtures/
+    |-- csr_survival_gen.S    # generated write-survival test (from safe_write_policy.csv)
+    `-- csr_readback_gen.S    # generated read-back round-trip test
+```
+
+`registration_report.md` must contain, per the contract in
+`tests/engines/README.md`:
+1. the three-way translation table for every gated CSR (spec <-> RTL term <-> config);
+2. the cold-cache `--verify` evidence (PASS line + compared-field count);
+3. the under-claim check result ("none" or the gaps);
+4. a DISCREPANCIES section (every spec-vs-engine disagreement, classified, with
+   quoted evidence) -- a validation result is only trustworthy if this exists,
+   even when it says "none";
+5. test-generation guidance (safe-write masks, write-ordering rules, run commands).
+
+### 5c. Guards that keep a registration honest
+
+- `tests/engines/test_registration_guard.sh` -- an unregistered engine fails loudly.
+- `tests/engines/test_registration_completeness.sh` -- both-direction completeness.
+- `tests/engines/test_registration_fixtures.sh` -- regenerate + rebuild + `--verify`
+  the generated fixtures.
+
+Status is REGISTERED only when all six contract checks pass. Both live engines
+are REGISTERED today.
+
+---
+
+## 6. Worked example: follow 0x004 (uie) end to end
+
+| step | what happens to 0x004 | source |
+|---|---|---|
+| catalog | listed as `0x004,URW,uie,U-std,N Extension CSRs` | SPA PDF -> `csr_inventory.csv` |
+| classify | `decision = EXCL_NEXT` (U-mode N-extension trap state) | `classify_csr_coverage.py` -> `csr_coverage.csv` |
+| probe list | it is NOT `EXCL_SIDEFX`, so it stays on the probe list | `probe_engine.sh` |
+| probe | checked read faults on M-only premium -> `0x004,no,` | `sim_ax45mpv_premium --probe` |
+| manifest | row: `implemented=no, transported=no, gate_or_disposition=EXCL_NEXT` | `gen_manifest.py` |
+| gate | no caps gate needed (not transported) | `andes_caps.hpp` |
+| validate | under-claim guard is happy: not implemented, so no obligation to transport | `check_completeness.py` |
+| register | recorded in `csr_manifest.csv` as a not-implemented, excluded CSR | registration dir |
+
+So `uie` is probed (because the spec lists it), measured absent, and correctly
+carried through the whole pipeline as "not implemented, excluded" -- with a
+machine-checked paper trail, not a guess.
+
+---
+
+## 7. Data-source cheat sheet
+
+| I want to know... | Look here | Kind |
+|---|---|---|
+| every CSR the architecture defines | `tests/andes_csr/csr_inventory.csv` | SPEC (mined from PDF) |
+| what we intend to do with each CSR (policy) | `tests/andes_csr/csr_coverage.csv` | classified matrix |
+| what THIS engine implements + reset values | `sim_<engine> --probe` (via `probe_engine.sh`) | measured |
+| what THIS engine transports + why | `tests/engines/<engine>-<hash>/csr_manifest.csv` | joined truth table |
+| which feature gates each CSR | `andes_caps.hpp` + `andes_caps_config.hpp` (vsim), mirror `config_inc_to_andes_caps.py` | gate logic |
+| what `--verify` compares vs excludes | `driver/state_diff.cpp` | verify policy |
+| the engine identity | `scripts/config_hash.sh <config.inc>` | sha256(config.inc) |
+| the human report | `tests/engines/<engine>-<hash>/registration_report.md` | report |
+
+---
+
+## 8. One-line mental model
+
+**probe** finds the truth (measure, don't model) ->
+**classify** decides intent (transport or named-exclude) ->
+**gate** encodes existence (RTL term, not a guess) ->
+**validate** proves it both ways (sweep catches over-claim, script catches under-claim) ->
+**register** signs it (config-hash identity + complete artifacts).
+
+The CSR list is never invented at any step. It starts as the SPA PDF catalog and
+is narrowed, one machine-checked decision at a time, to exactly the set this
+engine has and can safely move.
