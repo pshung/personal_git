@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Registration completeness gate (ROADMAP F1): the under-claim HARD check.
+
+Rule: in a registered engine's csr_manifest.csv, every IMPLEMENTED CSR must be
+either TRANSPORTED, or carry a named reason for not being transported --
+`CONST_RO` (a read-only constant, nothing to restore) or an `EXCL_*` class
+(mode/rv32/debug/sidefx/... a documented exclusion). An implemented,
+non-transported CSR with neither is an UNDER-CLAIM: its value is silently lost
+across the QEMU1 -> vsim handoff. That FAILS registration.
+
+Only `transported == no` is the hard fail. `transported == partial` (e.g. even
+pmpcfg, pmaaddr0-15) is an intentional, disposition-documented subset, not an
+under-claim. The `implemented` column is the engine's real existent set (today
+from gen_manifest.py's RTL eval; ROADMAP F3 makes it the live probe) -- this
+gate is only as trustworthy as that column, and self-truthing once F3 lands.
+
+Usage:
+  check_completeness.py [manifest.csv ...]   # check the given manifests
+  check_completeness.py                       # default: every registered manifest
+
+Exit 0 = clean; 1 = at least one under-claim (each printed with its evidence).
+"""
+from __future__ import annotations
+
+import csv
+import os
+import sys
+
+from reglib import HERE, manifest_paths
+
+
+def accepted_reason(disposition: str) -> bool:
+    """A named reason an IMPLEMENTED CSR may legitimately go untransported."""
+    d = disposition.strip()
+    return d.startswith("CONST_RO") or d.startswith("EXCL_")
+
+
+def scan(path: str) -> tuple[int, list[dict]]:
+    impl = 0
+    under: list[dict] = []
+    with open(path, newline="") as f:
+        for r in csv.DictReader(f):
+            if r["implemented"] not in ("yes", "partial"):
+                continue
+            impl += 1
+            if r["transported"] == "no" and not accepted_reason(r["gate_or_disposition"]):
+                under.append(r)
+    return impl, under
+
+
+def main(argv: list[str]) -> int:
+    paths = manifest_paths(argv)
+    if not paths:
+        print("[completeness] no manifests found")
+        return 0
+
+    total_impl = 0
+    fails = 0
+    for p in paths:
+        impl, under = scan(p)
+        total_impl += impl
+        rel = os.path.relpath(p, HERE)
+        for r in under:
+            print(
+                f"UNDER-CLAIM {r['addr']} {r['name']}: implemented={r['implemented']} "
+                f"transported=no disposition={r['gate_or_disposition']!r} -- implemented "
+                f"but not transported and no CONST_RO/EXCL_* reason  ({rel})"
+            )
+            fails += 1
+
+    if fails:
+        print(f"[completeness] FAIL: {fails} under-claim(s) across {len(paths)} manifest(s)")
+        return 1
+    print(
+        f"[completeness] all clean: {len(paths)} manifest(s), "
+        f"{total_impl} implemented CSR-rows, 0 under-claims"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Probe-by-default gate ("measure, don't model"): gen_manifest.py must MEASURE
+# the implemented set from the live engine, not silently model it from the RTL
+# equation.
+#  A. With no ANDESIM_PROBE_CSV, the generator auto-runs the probe and says so.
+#  B. A non-EXCL_SIDEFX CSR missing from the probe is an ERROR, not a silent
+#     RTL-eval fallback (the fallback is legal ONLY for the read-side-effect
+#     CSRs the probe must skip).
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+
+REGDIR=$(cd -- "$SCRIPT_DIR/ax45mpv_premium-"* && pwd)
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+mkdir -p "$TMP/reg"
+cp "$REGDIR/engine.env" "$REGDIR/rtl_params.json" "$TMP/reg/"
+
+# A. no env var -> the generator must run the probe itself and name its source.
+out=$(cd "$SCRIPT_DIR/../.." && python3 tests/engines/gen_manifest.py "$TMP/reg" 2>&1) \
+  || fail "generator failed without ANDESIM_PROBE_CSV: $out"
+echo "$out" | grep -q "implemented source: probe" \
+  || fail "generator did not measure via the probe (no 'implemented source: probe' line)"
+diff -q "$TMP/reg/csr_manifest.csv" "$REGDIR/csr_manifest.csv" >/dev/null \
+  || fail "probe-sourced manifest differs from the committed one"
+ok "A: probe is the default implemented/reset source"
+
+# B. a probe CSV missing a non-SIDEFX CSR (mstatus 0x300) must FAIL loudly.
+printf '0xF11,yes,0x31e\n' > "$TMP/one.csv"
+if out=$(cd "$SCRIPT_DIR/../.." && ANDESIM_PROBE_CSV="$TMP/one.csv" \
+         python3 tests/engines/gen_manifest.py "$TMP/reg" 2>&1); then
+  fail "generator accepted a probe CSV missing non-SIDEFX CSRs (silent RTL fallback)"
+fi
+echo "$out" | grep -qi "missing from probe" \
+  || fail "failure did not name the missing-from-probe cause: $out"
+ok "B: non-SIDEFX CSR missing from the probe fails loudly"
+ok "gen_manifest probe-default gate green"
