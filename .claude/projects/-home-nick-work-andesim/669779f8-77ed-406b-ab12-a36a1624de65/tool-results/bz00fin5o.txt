@@ -1,0 +1,652 @@
+=== final cmd_run.cpp ===
+// `andesim run --mode fast|cycle|hybrid [engine selection] ELF [-- engine args]`.
+//
+// The top selection axis. F7/F8 land the two standalone models, `fast` (QEMU)
+// and `cycle` (a cycle-accurate engine, from reset): each resolves its
+// engine, then hands off to transparent passthrough -- the ELF plus everything
+// after `--` becomes the engine's own command line, run with inherited stdio,
+// no timeout, and the exit code propagated, so a gdbstub / monitor /
+// semihosting console all behave as if the engine were invoked directly.
+// `hybrid` (F9) orchestrates a QEMU1 -> vsim handoff via run_plan and prints the
+// window-cycle figure (the vsim mcycle delta).
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
+
+#include "argv.hpp"
+#include "cli.hpp"
+#include "elf_syms.hpp"
+#include "engine_descriptor.hpp"
+#include "engine_registry.hpp"
+#include "hybrid.hpp"
+#include "hybrid/state_abi.h"  // HYBRID_V_SCRATCH_BYTES (L26/F3 overlap check)
+#include "models.hpp"
+#include "plan.hpp"
+#include "process.hpp"
+#include "repo_root.hpp"
+#include "run_passthrough.hpp"
+#include "run_plan.hpp"
+#include "shm.hpp"
+#include "state.hpp"
+#include "state_diff.hpp"
+#include "vsim_filter.hpp"
+
+namespace fs = std::filesystem;
+
+namespace andes_sim {
+namespace {
+
+// Resolve `path` to an absolute, EXISTING ELF. Returns the resolved string on
+// success; on failure prints an error tagged with `ctx` and returns "". The
+// existence check is here, at the one resolver fast/cycle/cycle-gdb share, so a
+// missing path fails with a clear "ELF not found" instead of being handed to the
+// engine (e.g. qemu's cryptic "Unable to find the RISC-V BIOS"). Mirrors the
+// up-front check run_hybrid already does.
+std::string abs_elf(const std::string& path, const std::string& ctx) {
+  std::error_code ec;
+  fs::path abs = fs::absolute(path, ec);
+  if (ec) {
+    std::fprintf(stderr, "andesim run %s: cannot resolve ELF '%s'\n",
+                 ctx.c_str(), path.c_str());
+    return "";
+  }
+  if (!fs::is_regular_file(abs, ec)) {
+    std::fprintf(stderr, "andesim run %s: ELF not found: %s\n", ctx.c_str(),
+                 path.c_str());
+    return "";
+  }
+  return abs.string();
+}
+
+// Validate the lone-ELF positional shape the standalone models require: print
+// the diagnostic and return 2 on a violation, else 0. Split out so `cycle`
+// can reject a missing/extra ELF BEFORE paying for engine discovery (which
+// spawns a --describe subprocess per Verilator build). `model` labels the error.
+int check_one_elf(const Cli& cli, const char* model) {
+  if (cli.positional.empty()) {
+    std::fprintf(stderr,
+                 "andesim run --mode %s: missing ELF (the workload to run; "
+                 "e.g. a tests/fixtures/<name>.elf)\n",
+                 model);
+    return 2;
+  }
+  if (cli.positional.size() > 1) {
+    std::fprintf(stderr,
+                 "andesim run --mode %s: unexpected argument '%s' "
+                 "(engine args go after --)\n",
+                 model, cli.positional[1].c_str());
+    return 2;
+  }
+  return 0;
+}
+
+// Reject an ELF whose class width (rv32/rv64) does not match the engine it would
+// run on -- a clear pre-flight error instead of a cryptic "not of ELFCLASSxx"
+// from deep inside the engine. Both directions. Returns "" when they agree, when
+// the ELF is unreadable/not-ELF (reported elsewhere), or when the engine
+// declares no xlen (cannot judge). Shared by cycle and hybrid: one wording.
+std::string elf_engine_arch_error(const std::string& elf,
+                                  const EngineDescriptor& eng) {
+  const int ex = elf_xlen(elf);
+  if (ex == 0 || eng.xlen == 0 || ex == eng.xlen) return "";
+  char buf[256];
+  std::snprintf(buf, sizeof(buf),
+                "ELF is rv%d but engine '%s' is rv%ld -- pick a matching engine "
+                "or an rv%d ELF",
+                ex, eng.id.c_str(), eng.xlen, ex);
+  return buf;
+}
+
+// Print the dry-run preview: the exact command(s) andesim WOULD spawn, each
+// shell-quoted and labeled, executing nothing. Shared by every --mode so the
+// preview format is identical; `labels[i]` annotates `argvs[i]` (e.g.
+// "fast-leg [qemu64]", "standalone [qemu64]"). Always returns 0 -- a dry run
+// reports the plan, it does not run it.
+int print_dry_run(const std::vector<std::vector<std::string>>& argvs,
+                  const std::vector<std::string>& labels) {
+  std::printf("[andesim] dry-run: %zu command(s), not executed\n", argvs.size());
+  for (size_t i = 0; i < argvs.size(); ++i) {
+    std::printf("# command %zu/%zu: %s\n", i + 1, argvs.size(),
+                labels[i].c_str());
+    std::printf("%s\n", render_argv(argvs[i]).c_str());
+  }
+  return 0;
+}
+
+// `run --mode cycle` presentation: spawn the engine, hiding its startup banner
+// and verbose [info] log (VsimFilter), relaying only the program's own output
+// and any real diagnostics, then restate the lifted cycle count as andesim's own
+// one-line result under the [andesim] prefix. The count is printed AFTER the run
+// (the engine logs it at exit), so it follows the program output. Returns the
+// engine exit code. Unlike fast's exec_passthrough, the parent stays alive to
+// filter -- fine, because cycle (without --gdb) is a batch run, not interactive.
+int run_cycle_clean(const std::vector<std::string>& argv) {
+  VsimFilter filter;
+  const int rc = run_line_filtered(
+      argv, [&filter](int stream, std::string_view line) {
+        std::FILE* dst = nullptr;
+        switch (filter.classify(stream, line)) {
+          case VsimFilter::Dest::kStdout: dst = stdout; break;
+          case VsimFilter::Dest::kStderr: dst = stderr; break;
+          case VsimFilter::Dest::kDrop: return;
+        }
+        std::fwrite(line.data(), 1, line.size(), dst);
+        std::fputc('\n', dst);
+      });
+  if (const std::optional<uint64_t> c = filter.cycles())
+    std::printf("[andesim] %llu cycles\n", static_cast<unsigned long long>(*c));
+  return rc;
+}
+
+// The standalone spine shared by `fast` and `cycle`: both take a single ELF,
+// then run the resolved engine standalone with `extra` (model flags the
+// framework forwards, e.g. fast's -m) followed by the post-`--` args verbatim.
+// `clean_output` picks how the engine's output is presented: fast inherits the
+// stdio transparently (exec_passthrough -- an interactive gdbstub / monitor /
+// semihosting console works unchanged); cycle filters out the engine's banner +
+// [info] noise and restates the cycle count (run_cycle_clean). Either way the
+// exit code propagates. The per-model engine + selection are resolved by the
+// caller; `model` here only labels the positional diagnostics.
+int run_standalone(const Cli& cli, const EngineDescriptor& eng,
+                   const char* model, const std::vector<std::string>& extra = {},
+                   bool clean_output = false) {
+  if (int rc = check_one_elf(cli, model)) return rc;
+  // QEMU's -bios flag searches its data directory for relative paths rather
+  // than the CWD; resolve to absolute so both QEMU and vsim find the ELF.
+  const std::string elf = abs_elf(cli.positional[0], "--mode " + std::string(model));
+  if (elf.empty()) return 2;
+  std::vector<std::string> args = extra;
+  args.insert(args.end(), cli.passthrough.begin(), cli.passthrough.end());
+  std::string err;
+  const std::vector<std::string> argv =
+      passthrough_argv(eng, "standalone", elf, args, err);
+  if (!err.empty()) {
+    std::fprintf(stderr, "andesim run: %s\n", err.c_str());
+    return 2;
+  }
+  // --dry-run: print the exact engine command and stop, spawning nothing -- the
+  // full qemu/vsim command (incl. -bios <elf> and any post-`--`).
+  if (cli.dry_run)
+    return print_dry_run({argv}, {std::string("standalone [") + eng.id + "]"});
+  return clean_output ? run_cycle_clean(argv) : exec_passthrough(argv);
+}
+
+// `run --mode fast`: QEMU alone, functional, transparent passthrough. Needs
+// only the built-in qemu descriptor, so it resolves that directly rather than
+// discover_engines(), which would spawn a --describe subprocess per Verilator
+// build only to discard them all here.
+int run_fast(const Cli& cli) {
+  // fast is QEMU-only; an explicit engine must name 'qemu64' (rv64) or 'qemu32'.
+  if (!cli.engine.empty() && cli.engine != kQemuId64 && cli.engine != kQemuId32) {
+    std::fprintf(stderr,
+                 "andesim run --mode fast: engine must be 'qemu64' or 'qemu32', "
+                 "got '%s'\n",
+                 cli.engine.c_str());
+    return 2;
+  }
+  // --mem-size forwards a plain `-m`; QEMU validates it (as-is, no mmap, no
+  // default injected). It precedes the post-`--` args, so a user's own -m wins.
+  std::string err;
+  std::vector<std::string> extra = qemu_m_args(cli.mem_size, err);
+  if (!err.empty()) {
+    std::fprintf(stderr, "andesim run --mode fast: %s\n", err.c_str());
+    return 2;
+  }
+  // --gdb: inject QEMU's built-in GDB stub and pause at startup.
+  if (cli.gdb) {
+    const std::string port = cli.gdb_port.empty() ? "1234" : cli.gdb_port;
+    extra.push_back("-gdb");
+    extra.push_back("tcp::" + port);
+    extra.push_back("-S");
+  }
+  // Pick rv32 vs rv64. An explicit --engine (qemu32/qemu64) wins; otherwise read
+  // the ELF's class so an rv32 program lands on qemu-system-riscv32 instead of
+  // the rv64 default. Warn (do not fail) if an explicit choice contradicts the
+  // ELF -- the override is the user's call.
+  const int elf_w = cli.positional.empty() ? 0 : elf_xlen(cli.positional[0]);
+  int xlen;
+  if (cli.engine == kQemuId32) xlen = 32;
+  else if (cli.engine == kQemuId64) xlen = 64;
+  else xlen = elf_w ? elf_w : 64;  // no explicit engine: follow the ELF (else rv64)
+  // Only an explicit engine can disagree with the ELF (when none is given, xlen
+  // == elf_w), so this guard already implies an explicit --engine.
+  if (elf_w && elf_w != xlen)
+    std::fprintf(stderr,
+                 "[andesim] --mode fast: --engine %s is rv%d but the ELF is rv%d "
+                 "(running as rv%d)\n",
+                 cli.engine.c_str(), xlen, elf_w, xlen);
+  return run_standalone(cli, builtin_qemu_arch(xlen), "fast", extra);
+}
+
+// Block until 127.0.0.1:`port` is LISTENing (or `timeout_ms` elapses). vsim opens
+// its --jtag-port only after it has reset and halted the hart, so the debugger we
+// exec next must not race ahead of it -- OpenOCD/ICEman do not retry the bitbang
+// connect, and a missed connect leaves the session dead. Non-intrusive: scans
+// /proc/net/tcp rather than connecting (a probe connection would land in vsim's
+// single debugger slot). Returns false on timeout.
+static bool wait_for_jtag_port(uint16_t port, int timeout_ms = 20000) {
+  constexpr int kPollMs = 50;
+  for (int waited = 0; waited <= timeout_ms; waited += kPollMs) {
+    if (std::FILE* f = std::fopen("/proc/net/tcp", "re")) {
+      char line[512];
+      while (std::fgets(line, sizeof line, f)) {
+        // cols: sl  local_address(IP:port hex)  rem_address  st  ...
+        // "%*8x:%x" skips the 8-hex-digit IPv4 and reads the local port; the
+        // 0A (TCP_LISTEN) filter also drops the non-hex header row.
+        unsigned lport = 0, st = 0;
+        if (std::sscanf(line, "%*s %*8x:%x %*s %x", &lport, &st) == 2
+            && st == 0x0A && lport == port) {
+          std::fclose(f);
+          return true;
+        }
+      }
+      std::fclose(f);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
+  }
+  return false;
+}
+
+// `run --mode cycle --gdb`: start vsim with --jtag-port 9104 in the background
+// (the hart free-runs; ICEman halts it over the JTAG DTM on connect), then exec
+// ICEman ($ICEMAN env var) with `-Z v5 -I virtual_dmi.cfg` in the foreground.
+int run_cycle_gdb(const Cli& cli, const EngineDescriptor& eng) {
+  const char* iceman = std::getenv("ICEMAN");
+  if (!iceman || !*iceman) {
+    std::fprintf(stderr,
+                 "andesim run --mode cycle --gdb: $ICEMAN not set "
+                 "(export ICEMAN=<path to ICEman binary>)\n");
+    return 2;
+  }
+  // Build vsim argv from the standalone template, appending user passthrough
+  // and the JTAG port flag.
+  const std::string elf = abs_elf(cli.positional[0], "--mode cycle --gdb");
+  if (elf.empty()) return 2;
+  const std::string jtag_port = cli.gdb_port.empty() ? "9104" : cli.gdb_port;
+  std::vector<std::string> vsim_pass = cli.passthrough;
+  vsim_pass.push_back("--jtag-port");
+  vsim_pass.push_back(jtag_port);
+  std::string err;
+  const std::vector<std::string> vsim_argv =
+      passthrough_argv(eng, "standalone", elf, vsim_pass, err);
+  if (!err.empty()) {
+    std::fprintf(stderr, "andesim run --mode cycle --gdb: %s\n", err.c_str());
+    return 2;
+  }
+  std::fprintf(stderr,
+               "[andesim] --gdb: vsim JTAG on port %s, exec ICEman\n",
+               jtag_port.c_str());
+  if (fork_background(vsim_argv) < 0) {
+    std::fprintf(stderr,
+                 "andesim run --mode cycle --gdb: failed to fork vsim\n");
+    return 1;
+  }
+  // vsim opens the JTAG port and the hart free-runs; ICEman halts it on connect.
+  // Wait for the port to be LISTENing before launching the debugger (it does not
+  // retry the bitbang connect). Numeric ports only; a non-numeric --gdb-port
+  // (atoi -> 0) skips the wait and lets the engine reject it. Best-effort: warn
+  // but launch anyway if it never appears.
+  if (const int pnum = std::atoi(jtag_port.c_str());
+      pnum > 0 && !wait_for_jtag_port(static_cast<uint16_t>(pnum)))
+    std::fprintf(stderr,
+                 "[andesim] --gdb: warning: vsim JTAG port %s not LISTENing "
+                 "after 20s; launching the debugger anyway\n",
+                 jtag_port.c_str());
+  // -I virtual_dmi.cfg selects ICEman's remote_bitbang interface (host
+  // localhost, port 9104) instead of its default real-hardware adapter; without
+  // it ICEman finds no adapter and exits. The cfg is found relative to the cwd
+  // (repo root) in interface/; it pins port 9104, matching --jtag-port's default.
+  return exec_passthrough({iceman, "-Z", "v5", "-I", "virtual_dmi.cfg"});
+}
+
+// `run --mode cycle`: one cycle-accurate engine alone, from reset (no QEMU,
+// no --resume-from-qemu), transparent passthrough -- cycles surface in the
+// engine's own output. Unlike fast, this must discover the Verilator build(s)
+// to resolve the engine (explicit --engine, else the sole one).
+int run_accurate(const Cli& cli) {
+  // Reject a missing/extra ELF before discovery so a CLI typo does not spawn a
+  // --describe subprocess per Verilator build only to fail on the argument.
+  if (int rc = check_one_elf(cli, "cycle")) return rc;
+  // --mem-size is validated but has nothing to size: the cycle engine always
+  // models its full DRAM window. Say so instead of silently ignoring it.
+  if (!cli.mem_size.empty()) {
+    std::string se;
+    if (parse_size(cli.mem_size, se); !se.empty()) {
+      std::fprintf(stderr, "andesim run --mode cycle: --mem-size: %s\n",
+                   se.c_str());
+      return 2;
+    }
+    std::fprintf(stderr,
+                 "[andesim] --mem-size: the cycle engine models its full "
+                 "DRAM window; nothing to size\n");
+  }
+  Discovery disc = discover_engines();
+  std::string err;
+  const EngineDescriptor* eng =
+      resolve_accurate_engine(disc.engines, cli.engine, err);
+  if (!eng) {
+    std::fprintf(stderr, "andesim run --mode cycle: %s\n", err.c_str());
+    // Surface why an expected engine may be absent (failed --describe, etc.).
+    for (const std::string& w : disc.warnings)
+      std::fprintf(stderr, "andesim: skipped engine: %s\n", w.c_str());
+    return 2;
+  }
+  // The ELF must match the engine's width: an rv32 ELF on an rv64 engine (or
+  // vice versa) cannot run. Catch it here with a clear message instead of the
+  // engine's cryptic "not of ELFCLASSxx". check_one_elf above guaranteed a lone
+  // positional.
+  if (std::string e = elf_engine_arch_error(cli.positional[0], *eng); !e.empty()) {
+    std::fprintf(stderr, "andesim run --mode cycle: %s\n", e.c_str());
+    return 2;
+  }
+  // --dry-run previews the standalone command and spawns nothing, so it takes
+  // precedence over the interactive --gdb path (a dry run launches no debugger).
+  if (cli.gdb && !cli.dry_run) return run_cycle_gdb(cli, *eng);
+  // clean_output: hide vsim's banner + [info] log, restate the cycle count under
+  // [andesim] (fast keeps raw passthrough -- QEMU has no such banner and its
+  // monitor/gdbstub are interactive).
+  return run_standalone(cli, *eng, "cycle", /*extra=*/{}, /*clean_output=*/true);
+}
+
+// `run --mode hybrid`: orchestrate a QEMU1 fast-forward -> vsim measure+drain
+// handoff (no QEMU2). The trigger (marker|pc) delimits the ROI; the cycle
+// figure is the vsim mcycle minus QEMU1's drained mcycle. Replaces the Python
+// driver's tests/e2e.sh delegation with a single window-cycle line.
+int run_hybrid(const Cli& cli) {
+  // Single diagnostic sink for the early-validation returns: prefix + exit 2.
+  auto fail = [](const std::string& msg) {
+    std::fprintf(stderr, "andesim run --mode hybrid: %s\n", msg.c_str());
+    return 2;
+  };
+
+  if (int rc = check_one_elf(cli, "hybrid")) return rc;
+
+  // Resolve to an absolute, existing ELF through the shared resolver -- the same
+  // check and "ELF not found" message fast/cycle get (abs_elf already printed on
+  // failure). pc-trigger resolution below then reads the ELF's .symtab.
+  const std::string elf_path = abs_elf(cli.positional[0], "--mode hybrid");
+  if (elf_path.empty()) return 2;
+  const fs::path elf{elf_path};  // for .stem() in the banner / PASS lines
+
+  // Validate everything cheap BEFORE the expensive engine discovery, so a CLI
+  // mistake fails fast without spawning a --describe per Verilator build.
+  std::string err;
+  const Trigger trig = hybrid_trigger(cli, elf_path, err);
+  if (!err.empty()) return fail(err);
+
+  // hybrid_trigger has already guaranteed trig.kind is marker|pc (the only
+  // hybrid triggers; unknown returned an error above) -- exactly the entry
+  // boundary --verify needs the oracle to arm on.
+  std::vector<std::string> vsim_extras = vsim_extra_args(cli, trig.kind, err);
+  if (!err.empty()) return fail(err);
+
+  long long mem = 128LL * 1024 * 1024;  // shared mmap; --mem-size overrides
+  if (!cli.mem_size.empty()) {
+    std::string se;
+    mem = parse_size(cli.mem_size, se);
+    if (!se.empty()) return fail("--mem-size: " + se);
+    // Early cap: QEMU's AE350 DRAM window is 2 GiB and the backend doubles as
+    // guest RAM here. The physical mmap reserves one V-scratch page above the
+    // program's RAM (L26/F2), so the usable --mem-size is 2 GiB minus that
+    // page. Failing now beats allocating a huge mmap file first and letting
+    // QEMU die late.
+    if (mem > max_program_mem_bytes())
+      return fail("--mem-size " + cli.mem_size +
+                  " exceeds the AE350 DRAM window (2G minus the V-scratch "
+                  "reservation)");
+  }
+
+  // L26/F3: refuse a run whose static image would extend into the reserved
+  // V-transport scratch page. Scheme D parks the scratch in the TOP page of the
+  // physical mmap; a PT_LOAD segment reaching there means the ELF was linked for
+  // more RAM than --mem-size grants, and QEMU would load it straight onto the
+  // scratch -> silent corruption. Derive the page's start from
+  // physical_mmap_bytes (the same sizing the mmap uses) rather than a bare
+  // `mem`, so the threshold tracks the reservation shape instead of relying on
+  // the +page/-page adjustments cancelling. ram_base is the fixed andes_ae350
+  // DRAM base (0; see L10). Skipped when the ELF cannot be read -- downstream
+  // reports it.
+  {
+    std::string e;
+    const uint64_t top = elf_load_top(elf_path, e);
+    const uint64_t scratch_gpa =
+        static_cast<uint64_t>(physical_mmap_bytes(mem)) - HYBRID_V_SCRATCH_BYTES;
+    if (e.empty() && top > scratch_gpa) {
+      char msg[256];
+      std::snprintf(msg, sizeof(msg),
+                    "ELF static image ends at 0x%llx, overlapping the reserved "
+                    "V-transport scratch page at 0x%llx (ram_base + --mem-size)"
+                    "; raise --mem-size or shrink the image",
+                    static_cast<unsigned long long>(top),
+                    static_cast<unsigned long long>(scratch_gpa));
+      return fail(msg);
+    }
+  }
+
+  // qemu is the built-in fast leg; resolve the accurate (vsim) leg by --engine
+  // or the sole cycle-accurate engine (reusing the F8 selector).
+  Discovery disc = discover_engines();
+  const EngineDescriptor* acc =
+      resolve_accurate_engine(disc.engines, cli.engine, err);
+  if (!acc) {
+    std::fprintf(stderr, "andesim run --mode hybrid: %s\n", err.c_str());
+    for (const std::string& w : disc.warnings)
+      std::fprintf(stderr, "andesim: skipped engine: %s\n", w.c_str());
+    return 2;
+  }
+
+  // ISA sync: both legs must agree on the base ISA width (rv32 engines
+  // cannot share architectural state with the rv64 fast leg).
+  if (std::string hw = hybrid_hw_check(*acc); !hw.empty()) return fail(hw);
+  // ...and the ELF must match that engine width too (same guard as cycle).
+  if (std::string e = elf_engine_arch_error(elf_path, *acc); !e.empty())
+    return fail(e);
+
+  Plan plan;
+  plan.elf = elf_path;
+  plan.mem_size = mem;
+  Step qemu_step{kQemuId64, "fast-leg", trig};
+  Step vsim_step{acc->id, "accurate-leg", trig};
+  vsim_step.extra_args = std::move(vsim_extras);  // kanata, validated
+  // #1: with no --verify the driver consumes only the vsim mcycle delta, so ask
+  // the accurate leg to drain just the counters and skip the full register-file
+  // readback (~190 DM abstract commands). --verify keeps the full drain so the
+  // oracle diff sees every field. Driver policy lives here next to the rest of
+  // the verify reasoning, not in vsim_extra_args (user-forwarded flags only).
+  if (!cli.verify)
+    vsim_step.extra_args.push_back("--drain-minimal");
+  plan.steps = {qemu_step, vsim_step};
+
+  // Banner to stderr so the window-cycle result stands alone on stdout.
+  // vlen is the synced value the fast leg inherits from the engine.
+  std::fprintf(stderr,
+               "[andesim] model=hybrid engine=%s vlen=%ld trigger=%s fixture=%s\n",
+               acc->id.c_str(), synced_vlen(acc->vlen), trig.kind.c_str(),
+               elf.stem().string().c_str());
+
+  PlanOptions opts;
+  opts.dry_run = cli.dry_run;
+  const PlanResult r = run_plan(plan, disc.engines, opts);
+  if (!r.ok()) {
+    std::fprintf(stderr, "andesim run --mode hybrid: %s\n", r.error.c_str());
+    return 1;
+  }
+  // --dry-run: print the exact per-leg commands run_plan assembled -- the QEMU
+  // fast leg (incl. the staged -readconfig from the engine's --print-qemu-config)
+  // then the vsim accurate leg -- and stop. Nothing was spawned.
+  if (cli.dry_run) {
+    std::vector<std::string> labels;
+    labels.reserve(plan.steps.size());
+    for (const Step& s : plan.steps)
+      labels.push_back(s.role + " [" + s.engine_id + "]");
+    return print_dry_run(r.argvs, labels);
+  }
+  // Relay each leg's stdout: the program's own prints (QEMU1 phase-1 output,
+  // then anything the ROI wrote on vsim) belong to the user. The vsim
+  // (accurate) leg's output is prefixed by vsim's startup banner (Copyright /
+  // Version) -- strip it so only real program output shows, the same as `cycle`
+  // does; its [info] log is already absent (the leg's stderr was dropped at
+  // capture). The QEMU leg has no banner, so it relays verbatim.
+  for (size_t i = 0; i < r.phases.size(); ++i) {
+    const std::string& out = r.phases[i].out;
+    if (out.empty()) continue;
+    if (i < plan.steps.size() && plan.steps[i].role == "accurate-leg") {
+      const std::string shown = strip_vsim_banner(out);
+      std::fwrite(shown.data(), 1, shown.size(), stdout);
+    } else {
+      std::fwrite(out.data(), 1, out.size(), stdout);
+    }
+  }
+  // phases[0] = QEMU1 drain, [1] = vsim drain; the kernel/window figure is the
+  // vsim mcycle delta.
+  {
+    const unsigned long long q_mc = r.phases[0].mcycle;
+    const unsigned long long v_mc = r.phases[1].mcycle;
+    std::printf("[%s window_cycles] %llu  (vsim mcycle=%llu - qemu mcycle=%llu)\n",
+                trig.kind.c_str(), v_mc - q_mc, v_mc, q_mc);
+  }
+
+  // v6 incompatibility surface: the QEMU1 drain's write-mask records which
+  // config CSRs the program actually wrote; any of them this engine does not
+  // implement would TRAP on its silicon (the program would never reach the
+  // ROI), yet the hybrid restore silently skipped it. Warn -- the figure may
+  // not represent this engine running this program.
+  {
+    const std::string w = unsupported_written_warning(
+        r.phases[0].st, acc->andes_csrs, acc->id);
+    if (!w.empty()) std::fputs(w.c_str(), stderr);
+  }
+
+  // --verify (verify_oracle F4, default off): re-run the ELF on pure QEMU
+  // with the plugin draining at the ROI exit boundary, sampling at vsim's
+  // halt pc, and diff the two drains in-process. The oracle plan gets its
+  // own fresh mmap: reusing the main run's would boot the oracle on the
+  // hybrid run's leftover memory. Its stdout is dropped -- the program's
+  // output was already relayed from the main run.
+  if (cli.verify) {
+    char pcbuf[32];
+    std::snprintf(pcbuf, sizeof(pcbuf), "0x%llx",
+                  static_cast<unsigned long long>(r.phases[1].st.pc));
+    Trigger vtrig;
+    vtrig.kind = "verify-" + trig.kind;
+    if (trig.kind == "pc") vtrig.params["exit_pc"] = trig.params.at("exit_pc");
+    vtrig.params["drain_pc"] = pcbuf;
+
+    Plan vplan;
+    vplan.elf = elf_path;
+    vplan.mem_size = mem;
+    vplan.steps = {Step{kQemuId64, "fast-leg", vtrig}};
+
+    std::fprintf(stderr,
+                 "[andesim] verify: oracle leg (pure QEMU drains at the ROI "
+                 "exit, pc=%s)\n",
+                 pcbuf);
+    const PlanResult vr = run_plan(vplan, disc.engines);
+    if (!vr.ok()) {
+      std::fprintf(stderr, "andesim run --verify: %s\n", vr.error.c_str());
+      return 1;
+    }
+    // Pass the cycle engine's supported Andes-CSR list so verify skips CSRs the
+    // engine does not implement (it never restored/re-read them; comparing
+    // would false-diff). Mirrors the resume/drain gating in vsim.
+    const DiffReport d =
+        diff_states(vr.phases[0].st, r.phases[1].st, acc->andes_csrs);
+    print_diff_report(d);
+    if (!d.ok()) {
+      std::fprintf(stderr,
+                   "andesim run --verify: vsim drain diverges from the "
+                   "QEMU oracle\n");
+      return 1;
+    }
+    std::printf("[verify] PASS: vsim drain matches the QEMU oracle\n");
+  }
+
+  std::printf("PASS: --mode hybrid --trigger %s (%s)\n", trig.kind.c_str(),
+              elf.stem().string().c_str());
+  return 0;
+}
+
+}  // namespace
+
+int cmd_run(const Cli& cli) {
+  if (cli.model.empty()) {
+    std::fprintf(stderr,
+                 "andesim run: --mode fast|cycle|hybrid is required "
+                 "(pick the composition; see 'andesim run --help')\n");
+    return 2;
+  }
+  if (!find_model(cli.model)) {
+    std::fprintf(stderr,
+                 "andesim run: unknown model '%s' (want fast|cycle|hybrid)\n",
+                 cli.model.c_str());
+    return 2;
+  }
+  if (!cli.gdb_port.empty() && !cli.gdb) {
+    std::fprintf(stderr, "andesim run: --gdb-port requires --gdb\n");
+    return 2;
+  }
+  // --gdb is an interactive debugging aid; the hybrid handoff runs QEMU1 then
+  // vsim sequentially in a pipeline and cannot pause for a debugger to attach.
+  if (cli.gdb && cli.model == "hybrid") {
+    std::fprintf(stderr,
+                 "andesim run: --gdb is not supported with --mode hybrid\n");
+    return 2;
+  }
+  // --verify re-runs the workload against a QEMU oracle -- only the hybrid
+  // composition has a second engine to check.
+  if (cli.verify && cli.model != "hybrid") {
+    std::fprintf(stderr,
+                 "andesim run: --verify requires --mode hybrid (the %s "
+                 "model has nothing to cross-check)\n",
+                 cli.model.c_str());
+    return 2;
+  }
+  // Post-`--` args are forwarded verbatim to the engine -- but hybrid has TWO
+  // legs (a QEMU fast-forward + a vsim measure leg) whose command lines the
+  // handoff builds itself, so there is no single "the engine" to forward to.
+  // Reject rather than silently drop (the old behavior) or guess a leg. vsim
+  // options have dedicated flags (--kanata/--objdump); fast/cycle still forward.
+  if (!cli.passthrough.empty() && cli.model == "hybrid") {
+    std::fprintf(stderr,
+                 "andesim run: --mode hybrid takes no `-- <args>` (the handoff "
+                 "builds both legs' command lines; use --kanata/--objdump for "
+                 "vsim options, or --mode fast|cycle to forward to one engine)\n");
+    return 2;
+  }
+  // --trigger / --pc-start / --pc-end delimit the hybrid ROI window. --trigger
+  // is hybrid-only; --pc-start/--pc-end belong to --trigger pc specifically. Any
+  // other mode/trigger would SILENTLY drop them and hand back a figure for the
+  // wrong window (fast/cycle: the whole program; hybrid+marker: the marker
+  // window), so reject instead of measuring something the user did not ask for.
+  if (!cli.trigger.empty() && cli.model != "hybrid") {
+    std::fprintf(stderr,
+                 "andesim run: --trigger applies only to --mode hybrid "
+                 "(the ROI delimiter); fast/cycle run the whole program\n");
+    return 2;
+  }
+  if (!cli.pc_end.empty() && cli.trigger != "pc") {
+    std::fprintf(stderr,
+                 "andesim run: --pc-end applies only to --mode hybrid "
+                 "--trigger pc\n");
+    return 2;
+  }
+  if (!cli.pc_start.empty() && cli.trigger != "pc") {
+    std::fprintf(stderr,
+                 "andesim run: --pc-start applies only to --mode hybrid "
+                 "--trigger pc\n");
+    return 2;
+  }
+  if (cli.model == "fast") return run_fast(cli);
+  if (cli.model == "cycle") return run_accurate(cli);
+  return run_hybrid(cli);  // model validated above; only hybrid remains
+}
+
+}  // namespace andes_sim
