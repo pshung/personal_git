@@ -1,0 +1,270 @@
+// StateDrain halts the hart via the Debug Module and populates a
+// hybrid_state_v1 with the architectural register file. Reuses
+// ResumeDriver's DM register constants and DmiBus interface.
+
+#pragma once
+
+#include "hybrid/abstract_command.hpp"
+#include "hybrid/andes_caps.hpp"
+#include "hybrid/dmi_poll.hpp"
+#include "hybrid/resume_driver.hpp"
+#include "hybrid/state_abi.h"
+#include "hybrid/v_regfile_xfer.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <span>
+
+namespace hybrid
+{
+
+class StateDrain
+{
+public:
+  using RD = ResumeDriver;
+
+  // scratch_gpa: the GUEST address of the V-register transport page (L26:
+  // the mmap's top page, v_scratch_gpa(ram_base, ram_size)). Defaults to the
+  // unset sentinel; only the V dump sweep consults it, and it throws there if
+  // a V drain is reached with the GPA unset (no silent dump to a bogus
+  // address). The simulator passes the real value from platform.main_memory.
+  // caps: which Andes custom CSRs the TARGET core implements (from its
+  // config.inc, supplied by the sim binary). Defaults to all() so existing
+  // call sites are unchanged. Gates the Andes re-read below: reading an
+  // unimplemented CSR can stall the DM, same as restoring one.
+  explicit StateDrain(DmiBus& bus, uint64_t scratch_gpa = kVScratchGpaUnset,
+                      AndesCaps caps = AndesCaps::all())
+      : bus_{bus}, scratch_gpa_{scratch_gpa}, caps_{caps}
+  {}
+
+  // v5: declare whether the target engine has an L2 cache controller, and its
+  // MMIO register base (dual of ResumeDriver::set_l2c). Off by default so an
+  // engine without an L2C reads nothing back -- a load from an absent region
+  // would fault the Program Buffer. The simulator calls this from its engine
+  // config (has_shared_cache + NDS_L2C_REG_BASE).
+  void set_l2c(bool present, uint64_t base)
+  {
+    l2c_present_ = present;
+    l2c_base_    = base;
+  }
+
+  // Drain x1..x31 + PC. FP/CSR/V slots remain zero; merge them in via
+  // drain_with_passthrough when the QEMU 1 snapshot is available.
+  auto drain() -> hybrid_state_v1
+  {
+    hybrid_state_v1 state{};
+    state.magic   = HYBRID_STATE_MAGIC;
+    state.version = HYBRID_STATE_VERSION;
+    state.flags   = HYBRID_FLAG_RV64;
+    halt_and_capture_pc_priv(state);
+
+    for (uint16_t i = 1; i < 32; ++i)
+      state.gpr[i] = read_register_64(bus_, regno_gpr(i), "StateDrain GPR");
+
+    return state;
+  }
+
+  // Returns the input snapshot with x1..x31 and PC overwritten by a fresh
+  // DM read. When HYBRID_FLAG_FP is set, also freshly reads f0..f31 + fcsr
+  // (L20) so post-vsim FP modifications are captured (otherwise the stale
+  // QEMU 1 snapshot leaks into the drained state). When HYBRID_FLAG_V is set, also
+  // freshly reads the six V CSRs (vstart/vxsat/vxrm/vcsr/vtype/vl); vlenb
+  // and vreg remain pass-through (read-only / too large for DM).
+  // mcycle/minstret are always refreshed (F-T2.4): the vsim phase's
+  // contribution would otherwise be discarded as the passthrough preserves
+  // QEMU1's pre-handoff value.
+  auto drain_with_passthrough(const hybrid_state_v1& input) -> hybrid_state_v1
+  {
+    auto state = input;
+    halt_and_capture_pc_priv(state);  // L6: pc + privilege at the exit halt
+
+    // GPRs/FPRs: one abstract register read each. Abstract-only by design,
+    // like the resume side -- the Program Buffer is reserved for state the
+    // abstract command space cannot reach (the V regfile, the CSR sweep,
+    // L2C MMIO).
+    for (uint16_t i = 1; i < 32; ++i)
+      state.gpr[i] = read_register_64(bus_, regno_gpr(i), "StateDrain GPR");
+
+    if (input.flags & HYBRID_FLAG_FP) {
+      for (uint16_t i = 0; i < 32; ++i)
+        state.fpr[i] = read_register_64(bus_, regno_fpr(i), "StateDrain FPR");
+      // L20: fcsr (frm + sticky fflags) accumulated by the vsim phase.
+      state.fcsr = read_register_64(bus_, regno_csr(RD::kCsrFcsr));
+    }
+
+    if (input.flags & HYBRID_FLAG_V) {
+      state.vstart = read_register_64(bus_, regno_csr(RD::kCsrVstart));
+      state.vxsat  = read_register_64(bus_, regno_csr(RD::kCsrVxsat));
+      state.vxrm   = read_register_64(bus_, regno_csr(RD::kCsrVxrm));
+      state.vcsr   = read_register_64(bus_, regno_csr(RD::kCsrVcsr));
+      state.vtype  = read_register_64(bus_, regno_csr(RD::kCsrVtype));
+      state.vl     = read_register_64(bus_, regno_csr(RD::kCsrVl));
+    }
+
+    // L23: mscratch round-trips now (ResumeDriver restores it), so re-read it
+    // from the hart -- otherwise an in-ROI write to the software scratch CSR is
+    // dropped and the stale QEMU1 value passes through into the drained state.
+    state.mscratch = read_register_64(bus_, regno_csr(RD::kCsrMscratch));
+
+    // L24: the writable M-mode trap/interrupt CSRs round-trip too (ResumeDriver
+    // restores them), so re-read them -- an in-ROI write must reach the drained
+    // state instead of the stale QEMU1 passthrough value.
+    state.mepc   = read_register_64(bus_, regno_csr(RD::kCsrMepc));
+    state.mcause = read_register_64(bus_, regno_csr(RD::kCsrMcause));
+    state.mtval  = read_register_64(bus_, regno_csr(RD::kCsrMtval));
+    state.mie    = read_register_64(bus_, regno_csr(RD::kCsrMie));
+    state.mip    = read_register_64(bus_, regno_csr(RD::kCsrMip));
+
+    state.mcycle   = read_register_64(bus_, regno_csr(RD::kCsrMcycle));
+    state.minstret = read_register_64(bus_, regno_csr(RD::kCsrMinstret));
+
+    // Andes V5 + M-ext CSR block (v3/v4): re-read the transported CSRs so an
+    // in-ROI write reaches the drained state instead of the stale QEMU1
+    // passthrough (same round-trip as mscratch). One caps-gated abstract read
+    // per CSR. See drain_andes_m_ext.
+    drain_andes_m_ext(state);
+
+    // v5: re-read the writable L2C config registers (the ones ResumeDriver
+    // restored) so the --verify oracle sees the round-tripped values instead of
+    // the stale QEMU1 passthrough. The ROI is trap-free and does not touch L2C
+    // config, so these must match the producer. Clobbers x5/x6 -- safe here, the
+    // GPRs are already captured above and the hart is terminal. See drain_l2c.
+    drain_l2c(state);
+
+    // V data regfile: dump v0..v31 to the shared scratch region via the
+    // Program Buffer LAST -- after every architectural read above -- so the
+    // sweep's clobbers (vtype/vl/vstart, x5/x6/x7) and its counter increments
+    // cannot corrupt the values already captured. The simulator's
+    // read_v_from_scratch then lifts the scratch bytes into state.vreg[].
+    // Stride is HYBRID_VLEN_BYTES_MAX (the wire-format per-register span).
+    if (input.flags & HYBRID_FLAG_V)
+      dump_v_to_scratch(input.vlenb);
+
+    return state;
+  }
+
+  // #1 (drain-minimal): refresh only mcycle/minstret from the hart and pass
+  // every other field through from the QEMU1 snapshot. Used when --verify is
+  // off: the driver then consumes only the vsim mcycle delta, so the full
+  // register-file readback drain_with_passthrough performs (~190 DMI abstract
+  // commands -- f0..f31, the V dump sweep, the Andes/M-ext blocks, ...) is pure
+  // wasted wall-clock. The hart is left halted, identical to the full drain, so
+  // the caller's file-write + exit path is unchanged.
+  auto drain_counters_only(const hybrid_state_v1& input) -> hybrid_state_v1
+  {
+    halt("StateDrain halt (minimal)");
+
+    auto state     = input;
+    state.mcycle   = read_register_64(bus_, regno_csr(RD::kCsrMcycle),
+                                      "StateDrain mcycle");
+    state.minstret = read_register_64(bus_, regno_csr(RD::kCsrMinstret),
+                                      "StateDrain minstret");
+    return state;
+  }
+
+private:
+  // Debug-Module halt-and-wait, shared by drain() and drain_counters_only():
+  // dmactive must transition 0->1 in its own write before haltreq is honored
+  // (RISC-V Debug Spec), then wait for allhalted. `ctx` labels the poll.
+  void halt(const char* ctx)
+  {
+    bus_.write(RD::kDmcontrol, RD::kDmcontrolDmactive);
+    bus_.write(RD::kDmcontrol, RD::kDmcontrolDmactive | RD::kDmcontrolHaltreq);
+    poll_until_set(bus_, RD::kDmstatus, RD::kDmstatusAllhalted, ctx);
+  }
+
+  // Halt the hart and capture the two control fields every drain path needs:
+  // privilege (dcsr.prv, L6) and PC (dpc). Header fields and the register
+  // blocks are filled by the caller, so drain() and drain_with_passthrough
+  // share one halt + prologue.
+  void halt_and_capture_pc_priv(hybrid_state_v1& state)
+  {
+    halt("StateDrain halt");
+    state.priv = read_register_64(bus_, regno_csr(RD::kCsrDcsr),
+                                  "StateDrain DCSR") & 0x3u;
+    state.pc = read_register_64(bus_, regno_csr(RD::kCsrDpc), "StateDrain DPC");
+  }
+
+  // Andes V5 + M-ext CSR drain: one caps-gated abstract read per CSR into
+  // state. Abstract-only by design, same caps gate + canonical order as the
+  // ResumeDriver restore.
+  void drain_andes_m_ext(hybrid_state_v1& state)
+  {
+    const bool andes = state.flags & HYBRID_FLAG_ANDES;
+    const bool mext  = state.flags & HYBRID_FLAG_M_EXT;
+    if (!andes && !mext) return;
+
+    if (andes) {
+#define X(field, addr, name) \
+  if (caps_.supports_csr(addr)) \
+    state.andes.field = read_register_64(bus_, regno_csr(addr));
+      HYBRID_ANDES_CSR_LIST(X)
+#undef X
+      for (int i = 0; i < HYBRID_PMA_CFG_NUM; ++i)
+        if (caps_.supports_csr(HYBRID_PMA_CFG0_CSR + 2 * i))
+          state.andes.pmacfg[i] =
+            read_register_64(bus_, regno_csr(HYBRID_PMA_CFG0_CSR + 2 * i));
+      for (int i = 0; i < HYBRID_PMA_ADDR_NUM; ++i)
+        if (caps_.supports_csr(HYBRID_PMA_ADDR0_CSR + i))
+          state.andes.pmaaddr[i] =
+            read_register_64(bus_, regno_csr(HYBRID_PMA_ADDR0_CSR + i));
+    }
+    if (mext) {
+#define X(field, addr, name) \
+  if (caps_.supports_csr(addr)) \
+    state.m_ext.field = read_register_64(bus_, regno_csr(addr));
+      HYBRID_M_EXT_CSR_LIST(X)
+#undef X
+    }
+  }
+
+  // V data dump sweep: vse8.v v0..v31 from the regfile into the scratch page.
+  // L26: guards on the configured scratch GPA so a V drain never stores to a
+  // bogus address (mirror of ResumeDriver's reload-sweep guard).
+  void dump_v_to_scratch(uint64_t vlenb)
+  {
+    if (scratch_gpa_ == kVScratchGpaUnset)
+      throw std::runtime_error(
+        "StateDrain: V state present but scratch GPA unset");
+    pb_v_data_sweep(bus_, scratch_gpa_, vlenb, /*load=*/false);
+  }
+
+  // v5: re-read the writable L2C config registers via Program-Buffer word loads,
+  // the dual of ResumeDriver::restore_l2c. Reads back ONLY the registers the
+  // resume side restored -- Control, HPM Control, Way Allocation Masks -- so the
+  // --verify oracle compares round-tripped values. Hard-gated on the engine
+  // having an L2C (a load from an absent region faults the Program Buffer).
+  void drain_l2c(hybrid_state_v1& state)
+  {
+    if (!(state.flags & HYBRID_FLAG_L2C)) return;
+    if (!l2c_present_) return;
+
+    state.l2c.reg[HYBRID_L2C_OFF_CONTROL / 8]  = pb_load_l2c_reg(HYBRID_L2C_OFF_CONTROL);
+    state.l2c.reg[HYBRID_L2C_OFF_HPM_CTL0 / 8] = pb_load_l2c_reg(HYBRID_L2C_OFF_HPM_CTL0);
+    for (uint32_t i = 0; i < HYBRID_L2C_WAYMASK_NUM; ++i) {
+      const uint32_t off = HYBRID_L2C_OFF_WAYMASK0 + i * 8u;
+      state.l2c.reg[off / 8] = pb_load_l2c_reg(off);
+    }
+  }
+
+  // One L2C register read-back: stage the MMIO address in x6, execute
+  // `lwu x5, 0(x6)` in the Program Buffer, then read x5. lwu (zero-extend) so a
+  // 32-bit register value does not sign-pollute the drained u64. Word access
+  // per DS220 11.8.3 (< 8 bytes).
+  auto pb_load_l2c_reg(uint32_t offset) -> uint64_t
+  {
+    write_register_abstract(bus_, regno_gpr(6), l2c_base_ + offset);
+    const std::array<uint32_t, 1> pb = { encode_lwu(5, 6, 0) };
+    exec_progbuf(bus_, std::span<const uint32_t>{pb});
+    return read_register_64(bus_, regno_gpr(5), "StateDrain L2C reg");
+  }
+
+  DmiBus& bus_;
+  uint64_t scratch_gpa_ = kVScratchGpaUnset;  // L26: V transport page GPA
+  AndesCaps caps_ = AndesCaps::all();         // target core's Andes-CSR support
+  bool l2c_present_     = false;              // v5: engine has an L2C (set_l2c)
+  uint64_t l2c_base_    = 0;                  // v5: L2C MMIO register base
+};
+
+}  // namespace hybrid
