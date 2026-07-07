@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# v6 contract: the QEMU plugin tracks which mask-governed CSRs the guest WROTE
+# and drains that as write_mask[] under HYBRID_FLAG_WRITE_MASK. The wm_drain
+# fixture writes mxstatus + mcache_ctl (read-modify-write-same), and only READS
+# mmisc_ctl, so:
+#   - HYBRID_FLAG_WRITE_MASK set
+#   - mxstatus + mcache_ctl bits SET
+#   - mmisc_ctl bit CLEAR (a csrr must not count as a write)
+#   - ucode bit SET unconditionally (DSP ops update it without a CSR insn)
+#
+# Required environment (auto-detected):
+#   VSIM_QEMU, VSIM_PLUGIN, VSIM_ELF (FIXTURE=wm_drain)
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+. "$SCRIPT_DIR/../lib/paths.sh"
+
+FIXTURE="${FIXTURE:-wm_drain}"
+hybrid_resolve_paths
+
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+SHARED_SIZE=$((128 * 1024 * 1024))
+SHARED_MEM=$(mktemp -p /dev/shm vsim-plugin-wm-shared.XXXXXX)
+STATE_QEMU=$(mktemp)
+QEMU_LOG=$(mktemp)
+CHECK_SRC=$(mktemp --suffix=.c)
+CHECK_BIN=$(mktemp)
+trap 'rm -f "$SHARED_MEM" "$STATE_QEMU" "$QEMU_LOG" "$CHECK_SRC" "$CHECK_BIN"' EXIT
+truncate -s "$SHARED_SIZE" "$SHARED_MEM"
+
+set +e
+"$VSIM_QEMU" \
+  -object "memory-backend-file,id=mem,share=on,mem-path=$SHARED_MEM,size=$SHARED_SIZE" \
+  -machine andes_ae350,memory-backend=mem \
+  -cpu andes-ax45mpv,vlen=512 \
+  -nographic \
+  -semihosting-config enable=on,target=native \
+  -bios "$VSIM_ELF" \
+  -plugin "$VSIM_PLUGIN,outfile=$STATE_QEMU" >"$QEMU_LOG" 2>&1
+RC=$?
+set -e
+
+if [ "$RC" -ne 200 ]; then
+  echo "FAIL[plugin_write_mask]: expected QEMU exit=200 on drain, got $RC"
+  cat "$QEMU_LOG"; exit 1
+fi
+
+cat > "$CHECK_SRC" <<'EOF'
+#include "hybrid/write_mask.h"
+#include <stdio.h>
+int main(int argc, char **argv) {
+    (void) argc;
+    FILE *f = fopen(argv[1], "rb");
+    if (!f) return 2;
+    struct hybrid_state_v1 s;
+    if (fread(&s, 1, sizeof(s), f) != sizeof(s)) { fprintf(stderr, "short read\n"); return 3; }
+    fclose(f);
+    if (s.magic != HYBRID_STATE_MAGIC) { fprintf(stderr, "bad magic\n"); return 4; }
+    if (!(s.flags & HYBRID_FLAG_WRITE_MASK)) { fprintf(stderr, "HYBRID_FLAG_WRITE_MASK not set\n"); return 5; }
+    int mxstatus = hybrid_wm_test(s.write_mask, HYBRID_WM_ANDES_BASE + HYBRID_WM_ANDES_IDX_mxstatus);
+    int mcache   = hybrid_wm_test(s.write_mask, HYBRID_WM_MCACHE_CTL);
+    int mmisc    = hybrid_wm_test(s.write_mask, HYBRID_WM_MMISC_CTL);
+    int ucode    = hybrid_wm_test(s.write_mask, HYBRID_WM_ANDES_BASE + HYBRID_WM_ANDES_IDX_ucode);
+    if (!mxstatus) { fprintf(stderr, "mxstatus bit clear (csrw not tracked)\n"); return 6; }
+    if (!mcache)   { fprintf(stderr, "mcache_ctl bit clear (csrw not tracked)\n"); return 7; }
+    if (mmisc)     { fprintf(stderr, "mmisc_ctl bit SET (csrr wrongly counted as write)\n"); return 8; }
+    if (!ucode)    { fprintf(stderr, "ucode bit clear (must be transport-always)\n"); return 9; }
+    printf("OK: mask=%016llx %016llx (mxstatus+mcache_ctl set, mmisc_ctl clear, ucode always)\n",
+           (unsigned long long) s.write_mask[1], (unsigned long long) s.write_mask[0]);
+    return 0;
+}
+EOF
+cc -std=c11 -I "$REPO_ROOT/include" "$CHECK_SRC" -o "$CHECK_BIN"
+
+if "$CHECK_BIN" "$STATE_QEMU"; then
+  echo "PASS[plugin_write_mask]"
+else
+  echo "FAIL[plugin_write_mask]: write-mask not drained correctly"
+  exit 1
+fi

@@ -1,0 +1,153 @@
+// v6: CSR write-mask -- the wire contract for "which config CSRs did the
+// producer's guest actually WRITE before the drain".
+//
+// Policy: a mask-governed CSR is restored (and verify-compared) only when its
+// bit is set. An untouched CSR is NOT transported: its drained value is merely
+// the producer's (QEMU's) reset default, which can legitimately differ from
+// the consuming engine's RTL reset value (msp_bound all-ones vs 0, milmb.IEN
+// 0 vs 1, ...). Leaving it unrestored keeps the engine at ITS OWN reset value
+// -- exactly what real silicon of that engine would hold for a CSR the program
+// never touched. This makes reset-value divergence between the functional
+// producer and any current or future cycle engine harmless by construction,
+// with no per-engine data flowing into the producer.
+//
+// Mask-governed set (boot-static config CSRs only):
+//   - the v3 Andes scalar block (HYBRID_ANDES_CSR_LIST)
+//   - PMA (pmacfg[2] + pmaaddr[16])
+//   - the v4 M-ext block (HYBRID_M_EXT_CSR_LIST)
+//   - mcache_ctl / mmisc_ctl
+// Never mask-governed (transported as before): GPRs/FPRs/V data, mstatus,
+// dpc/dcsr, mcycle/minstret, fcsr (FP ops write it without a CSR insn), the
+// trap-writable CSRs mepc/mcause/mtval/mip/mie (hardware writes them without
+// a CSR insn, so a write-mask cannot see those writes), mtvec/mscratch, and
+// PMP (the S/U mirror is a hard correctness requirement, never gated).
+//
+// ucode caveat: the DSP sticky-overflow flag (ucode.OV) is set by DSP
+// instructions, not by csrrw, so instruction-level tracking cannot see it.
+// Producers must set the ucode slot UNCONDITIONALLY (transport-always, like
+// fcsr) until a producer tracks DSP ops.
+//
+// HYBRID_FLAG_WRITE_MASK gates validity: when clear, consumers fall back to
+// restore-everything -- the pre-v6 behavior.
+//
+// Slot order is WIRE FORMAT -- append only, never renumber.
+
+#ifndef HYBRID_WRITE_MASK_H
+#define HYBRID_WRITE_MASK_H
+
+#include "hybrid/state_abi.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#ifndef __cplusplus
+#  ifndef static_assert
+#    define static_assert _Static_assert
+#  endif
+#endif
+
+// Parallel index enums generated from the SAME X-macros that fix the struct
+// layout, so slot numbering can never drift from field order.
+enum {
+#define HYBRID_WM_IDX(field, addr, name) HYBRID_WM_ANDES_IDX_##field,
+  HYBRID_ANDES_CSR_LIST(HYBRID_WM_IDX)
+#undef HYBRID_WM_IDX
+  HYBRID_WM_ANDES_COUNT
+};
+enum {
+#define HYBRID_WM_IDX(field, addr, name) HYBRID_WM_M_EXT_IDX_##field,
+  HYBRID_M_EXT_CSR_LIST(HYBRID_WM_IDX)
+#undef HYBRID_WM_IDX
+  HYBRID_WM_M_EXT_COUNT
+};
+
+#define HYBRID_WM_ANDES_BASE   0
+#define HYBRID_WM_PMACFG_BASE  (HYBRID_WM_ANDES_BASE + HYBRID_WM_ANDES_COUNT)
+#define HYBRID_WM_PMAADDR_BASE (HYBRID_WM_PMACFG_BASE + HYBRID_PMA_CFG_NUM)
+#define HYBRID_WM_M_EXT_BASE   (HYBRID_WM_PMAADDR_BASE + HYBRID_PMA_ADDR_NUM)
+#define HYBRID_WM_MCACHE_CTL   (HYBRID_WM_M_EXT_BASE + HYBRID_WM_M_EXT_COUNT)
+#define HYBRID_WM_MMISC_CTL    (HYBRID_WM_MCACHE_CTL + 1)
+#define HYBRID_WM_SLOT_COUNT   (HYBRID_WM_MMISC_CTL + 1)
+
+static_assert(HYBRID_WM_SLOT_COUNT <= 128,
+              "write_mask[2] holds 128 slots; grow the array (version bump) "
+              "before adding more mask-governed CSRs");
+
+static inline void hybrid_wm_set(uint64_t mask[2], unsigned slot)
+{
+  mask[slot >> 6] |= (uint64_t)1 << (slot & 63u);
+}
+
+static inline int hybrid_wm_test(const uint64_t mask[2], unsigned slot)
+{
+  return (int)((mask[slot >> 6] >> (slot & 63u)) & 1u);
+}
+
+// Decode a 32-bit RISC-V instruction word: does it WRITE a CSR? Zicsr forms
+// only, all on the SYSTEM opcode (no compressed CSR instruction exists, so a
+// 4-byte check upstream is exact):
+//   csrrw/csrrwi  (funct3 001/101): always write, even rd=x0 / uimm=0.
+//   csrrs/csrrc   (funct3 010/011): write only when rs1 != x0 (`csrr rd, csr`
+//                                   is csrrs rd, csr, x0 -- a pure read).
+//   csrrsi/csrrci (funct3 110/111): write only when uimm[4:0] != 0.
+// Returns 1 and stores the CSR address from imm[31:20]; 0 for anything else.
+static inline int hybrid_wm_insn_csr_write(uint32_t insn, uint16_t *csr)
+{
+  if ((insn & 0x7Fu) != 0x73u) return 0;         /* SYSTEM opcode */
+  const uint32_t funct3 = (insn >> 12) & 0x7u;
+  const uint32_t rs1    = (insn >> 15) & 0x1Fu;  /* rs1 or uimm[4:0] */
+  switch (funct3) {
+    case 1: case 5:                              /* csrrw / csrrwi */
+      break;
+    case 2: case 3:                              /* csrrs / csrrc  */
+    case 6: case 7:                              /* csrrsi / csrrci */
+      if (rs1 == 0) return 0;
+      break;
+    default:                                     /* ecall/ebreak/xret/wfi/... */
+      return 0;
+  }
+  *csr = (uint16_t)(insn >> 20);
+  return 1;
+}
+
+// CSR address -> mask slot; -1 when the CSR is not mask-governed.
+static inline int hybrid_wm_slot_for_csr(uint16_t csr)
+{
+  switch (csr) {
+#define HYBRID_WM_CASE(field, addr, name) \
+    case addr: return HYBRID_WM_ANDES_BASE + HYBRID_WM_ANDES_IDX_##field;
+  HYBRID_ANDES_CSR_LIST(HYBRID_WM_CASE)
+#undef HYBRID_WM_CASE
+#define HYBRID_WM_CASE(field, addr, name) \
+    case addr: return HYBRID_WM_M_EXT_BASE + HYBRID_WM_M_EXT_IDX_##field;
+  HYBRID_M_EXT_CSR_LIST(HYBRID_WM_CASE)
+#undef HYBRID_WM_CASE
+    case 0x7CA: return HYBRID_WM_MCACHE_CTL;
+    case 0x7D0: return HYBRID_WM_MMISC_CTL;
+    case HYBRID_PMA_CFG0_CSR:     return HYBRID_WM_PMACFG_BASE + 0;
+    case HYBRID_PMA_CFG0_CSR + 2: return HYBRID_WM_PMACFG_BASE + 1;
+    default:
+      if (csr >= HYBRID_PMA_ADDR0_CSR
+          && csr < HYBRID_PMA_ADDR0_CSR + HYBRID_PMA_ADDR_NUM)
+        return HYBRID_WM_PMAADDR_BASE + (csr - HYBRID_PMA_ADDR0_CSR);
+      return -1;
+  }
+}
+
+// Combined translate-time filter for producers: the mask slot this
+// instruction writes, or -1. The CSR address is a static field of the
+// encoding, so the whole decision happens at translation time -- instructions
+// outside the governed set cost nothing at execution time.
+static inline int hybrid_wm_slot_for_insn(uint32_t insn)
+{
+  uint16_t csr;
+  if (!hybrid_wm_insn_csr_write(insn, &csr)) return -1;
+  return hybrid_wm_slot_for_csr(csr);
+}
+
+#ifdef __cplusplus
+}  // extern "C"
+#endif
+
+#endif  // HYBRID_WRITE_MASK_H
