@@ -1,0 +1,265 @@
+# Hybrid State Transport: the 10 Problems, Explained
+
+## Background (read this first)
+
+A hybrid run uses TWO simulators for ONE program:
+
+```
+  QEMU (fast, no timing)          vsim (slow, cycle-accurate)
+  boot + setup code       ---->   the measured region (ROI)
+                        "handoff"
+```
+
+At the handoff we must make vsim's CPU look EXACTLY like QEMU's CPU at
+that moment. This copy has two steps:
+
+- **drain**: read all state out of QEMU into a file (`hybrid_state_v1`).
+- **restore**: write that file into the vsim hart through the Debug
+  Module, then let it run.
+
+Two kinds of state travel:
+
+- **CSR**: a register inside the CPU (mstatus, mcache_ctl, ...).
+  Written by the `csrw` instruction.
+- **MMIO**: a register inside a device, reached by a memory address
+  (the L2 cache controller at 0xE0500000, ...). Written by a normal
+  store instruction.
+
+Everything below is a way this copy can silently go wrong.
+
+---
+
+## 1. [MMIO + CSR] QEMU and the engine wake up with different values
+
+**What happens.** Most registers are never touched by the program; they
+just keep their power-on ("reset") value. QEMU and the real RTL do not
+always agree on that power-on value. The drain reads a value out of
+QEMU, but it cannot know whether the program PUT it there or it is just
+QEMU's default. So restore may overwrite the engine's correct default
+with QEMU's wrong one.
+
+**Step-by-step example (L2C CEN, the case we hit).**
+1. Real chip: after reset, L2C Control bit CEN = 1 (L2 cache ON).
+2. QEMU models the L2C block as plain RAM, so it reads 0.
+3. The program trusts the hardware default and never writes it.
+4. Drain reads CEN=0. Restore writes CEN=0 into vsim.
+5. vsim runs the ROI with L2 OFF. Cycle count is several times too
+   big. No error is printed anywhere.
+
+CSR example: `mnvec`. QEMU resets it to 0; the Andes RTL resets it to
+the hart's reset vector. (We know engine reset values only one way: the
+`--probe` reads the freshly-reset hart; results are in each engine's
+`csr_manifest.csv`. Never trust memory or hearsay -- `msp_bound` was
+long quoted as "RTL resets 0", and the probe showed that was wrong.)
+
+**Fix.** Two halves. (a) Values fixed by the IP spec: make QEMU boot
+with the correct value -- we seed CEN=1 into the RAM stub at machine
+init. (b) Values that differ per engine: do not copy untouched
+registers at all -- see problem 2.
+
+---
+
+## 2. [MMIO + CSR] The file carries values, but not "who wrote them"
+
+**What happens.** The drained file is just numbers. The same number can
+mean two different things:
+
+- (a) the program never touched the register (number = QEMU default);
+- (b) the program deliberately wrote that number.
+
+The right action is different: for (a) do NOT restore (let the engine
+keep its own default); for (b) DO restore. But the consumer cannot tell
+(a) from (b) by looking at the value.
+
+**Example.** `mcache_ctl = 0` can mean "program disabled the caches on
+purpose" or "program never touched it". Same bytes in the file.
+
+**Fix (v6 write-mask).** Record the fact at the source, where it is
+still known. The QEMU plugin decodes every CSR-write instruction at
+translation time and sets one bit per register: "the guest wrote this".
+Restore and verify then act only on registers whose bit is set. Cost is
+near zero: only real CSR-write instructions get a callback, and those
+run a handful of times during boot.
+
+---
+
+## 3. [MMIO vs CSR] A wrong CSR write is forgiven; a wrong MMIO write crashes
+
+**What happens.** Restore pushes values into the halted hart through
+the Debug Module. The failure mode differs by kind:
+
+- CSR: writing a CSR this engine does not implement raises a small
+  error flag (cmderr). We clear it and continue. Harmless.
+- MMIO: storing to an address where this engine has NO device is a bus
+  error. The Program Buffer faults and the whole resume aborts.
+
+**Example.** Every current engine is built `NDS_L2C_CACHE_SIZE_KB=0`
+(no L2C device). A `sw` to 0xE0500008 on such an engine does not get
+ignored -- it faults.
+
+**Fix.** CSRs may use "try and forgive" (tolerant write + capability
+list). MMIO must ask FIRST: "does this engine physically have the
+device?" -- a hard gate read from the engine's build config
+(`Simulator::l2c_present()`), no store issued when absent.
+
+---
+
+## 4. [MMIO] Some registers DO something when written
+
+**What happens.** "Restore" means "write the drained values back". But
+some registers are not storage -- they are buttons. Writing them
+triggers an action, so writing back the drained value re-triggers the
+action at ROI entry.
+
+**Examples.**
+- L2C CCTL Command register: writing 0x12 STARTS a full L2 flush.
+  Blindly restoring it would run a cache flush inside the measured
+  window -- wrong cycles.
+- W1C error bits ("write 1 to clear"): writing the drained value back
+  ERASES the error state instead of restoring it.
+- Read-only Configuration register: the write is ignored anyway.
+
+**Fix.** Capture the WHOLE window into the file (for the record and
+for verify), but write back only a whitelist of plain-storage config:
+Control, HPM Control, Way Allocation Masks.
+
+---
+
+## 5. [MMIO + CSR] Some values change by themselves
+
+**What happens.** Timers tick and counters count, driven by hardware,
+not by the program. QEMU advances by instructions, vsim by cycles, so
+these values can NEVER match between the two sides -- even when the
+transport is perfect. If `--verify` compared them, every single run
+would fail with a false alarm.
+
+**Examples.** `mip` timer-pending bit, `mcycle`/`minstret`,
+`mhpmcounter3-6`, L2C `INITSTATUS[14]`.
+
+**Fix.** Verify skips these fields (or masks single bits, like
+INITSTATUS inside the L2C Control compare). This is physics, not a bug.
+
+---
+
+## 6. [MMIO + CSR] Each register class has its own legal access method
+
+**What happens.** There is no universal "write register" operation.
+Hardware imposes rules, and breaking them gives UNPREDICTABLE results
+or faults.
+
+**Examples.**
+- L2C spec (DS220 11.8.3): accesses must be smaller than 8 bytes. So
+  the transport must use `sw`/`lwu` (32-bit), never `sd`/`ld` (64-bit).
+- `vl`/`vtype` cannot be written directly at all; only the `vsetvl`
+  instruction sets them (and it also clears vstart, forcing a strict
+  restore ORDER).
+- CSRs restore one-at-a-time: in a batched script, one faulting CSR
+  kills the whole batch halfway, leaving the hart half-restored.
+
+**Fix.** One dedicated path per class: Program-Buffer word stores for
+L2C, `vsetvl` staging for V config, per-CSR abstract commands for CSRs.
+
+---
+
+## 7. [MMIO + CSR] Many engines, one QEMU
+
+**What happens.** Hybrid pairs the SAME QEMU with different vsim
+engines (premium, ax46, future cores). Engines differ in which
+registers even exist (HSP? CLIC? L2C?). If we hardcode one engine's
+details into QEMU, every other engine silently gets the wrong behavior.
+
+**Example.** `msp_bound` exists on ax46 (HSP) but not on premium.
+A future engine adds CLIC CSRs that today's engines lack.
+
+**Fix.** Engine knowledge lives on the CONSUMER side, measured per
+engine: `--probe` reads the freshly-reset hart once and records which
+CSRs exist and their reset values (`csr_manifest.csv` -- "measure,
+don't model"). Restore/drain/verify consult that manifest. QEMU keeps
+only family-level constants (`-cpu andes-ax66`, `vlen=512`).
+
+---
+
+## 8. [CSR] The hardware may silently refuse the write (WARL)
+
+**What happens.** RISC-V lets a field accept only values it supports
+("WARL": write any, read legal). You write X; the hardware keeps Y. The
+Debug Module reports success, but the value is not there. Restore
+"worked" and still did nothing.
+
+**Examples.**
+- `dcsr.prv` on an M-only engine is pinned to 3. Restoring a state
+  whose privilege is U(0) does not take -- the ROI would run in the
+  WRONG privilege mode.
+- `mnvec` is WARL-held at the reset vector; a restore write of 0 is
+  discarded.
+
+**Fix.** For fields where it matters, write THEN read back and compare.
+A `dcsr.prv` mismatch aborts the run with "this engine cannot run S/U
+-- pick an S/U-capable engine". Fields that are only cosmetic go on the
+verify exclusion list.
+
+---
+
+## 9. [CSR, MMIO reads too] The damage may already be done before the handoff
+
+**What happens.** Transport copies state AT the boundary. But the boot
+code already RAN on QEMU. If it READ a config register and took a
+branch, and QEMU's config differs from the engine's, the wrong branch
+already executed. No state copy can undo a branch.
+
+**Step-by-step example.**
+1. BSP boot code reads `mmsc_cfg.PPMA` ("do I have programmable PMA?").
+2. The engine has PPMA=1, but QEMU's CPU model says 0.
+3. The boot code SKIPS the PMA setup -- on QEMU, where it ran.
+4. The drained state has unprogrammed PMA. vsim faithfully restores
+   it. The ROI runs with memory attributes the real chip would never
+   have.
+
+MMIO variant: reading the L2C Configuration register's SIZE field
+returns 0 from QEMU's RAM stub.
+
+**Fix.** This is the one class transport can NEVER fix. The fix is
+making QEMU's visible config match the engine family: the driver picks
+`-cpu` per engine and passes properties (`vlen=512` is the existing
+precedent). Add a property when a real case appears.
+
+---
+
+## 10. [MMIO] Devices that exist on only one side
+
+**What happens.** QEMU models the whole AE350 platform (PLIC, PIT,
+WDT, RTC, GPIO, DMAC...). vsim models only a handful (see its
+`platform/memory_map.h`): RAM, the local memories (ILM/DLM), UART1/2,
+SimControl, the debug module, SMU, and the AIA interrupt files --
+no PLIC, no timers, no GPIO. Code inside the ROI that touches a
+QEMU-only device runs fine in the functional phase and BUS-FAULTS in
+the cycle phase.
+
+**Example.** Reading the PIT timer inside the ROI.
+
+**Fix.** A contract, not code: ROI code must not touch single-sided
+devices. Inside the ROI, use only dual-modeled devices (UART2 printf,
+SimControl exit). Their configuration cannot be transported either --
+device state lives inside each simulator.
+
+---
+
+## Quick reference
+
+| # | Kind | Problem in one line | Fix in one line |
+|---|------|---------------------|-----------------|
+| 1 | both | power-on defaults differ | seed QEMU (spec constants) / write-mask (engine differences) |
+| 2 | both | value does not say who wrote it | write-mask records writes at the source |
+| 3 | contrast | absent CSR forgives, absent MMIO faults | tolerant writes vs hard presence gate |
+| 4 | MMIO | some registers are buttons, not storage | capture all, restore whitelist only |
+| 5 | both | timers/counters never match | verify skips/masks them |
+| 6 | both | each class has one legal access method | dedicated path per class |
+| 7 | both | engines differ; QEMU serves them all | probe + manifest on consumer side |
+| 8 | CSR | WARL: write "succeeds", value refused | read back and check, or exclude |
+| 9 | CSR+ | wrong branch already ran on QEMU | match QEMU config via -cpu/properties |
+| 10 | MMIO | device exists on one side only | ROI contract: do not touch |
+
+**One sentence:** CSRs travel with "caps + write-mask + tolerant
+write"; MMIO travels with "full capture + whitelist restore + presence
+gate"; verify masks hardware-driven values; engine knowledge stays in
+the driver/consumer, QEMU keeps only spec constants.
