@@ -1,0 +1,110 @@
+# Hybrid State Transport: Problem Checklist (MMIO + CSR)
+
+The 10 problem classes we must solve when transporting MMIO / CSR state
+between QEMU (functional producer) and a vsim engine (cycle consumer),
+each with one example and the current solution.
+
+## 1. [MMIO + CSR] Reset default divergence
+
+An untouched register drains the PRODUCER's default, not the engine's
+reset value.
+
+- Example: L2C `CEN` -- QEMU's RAM stub reads 0, real HW resets to 1.
+  `msp_bound` -- QEMU resets all-ones, RTL resets 0.
+- Solution: spec/IP-level constants -> seed QEMU (`CEN=1` at machine
+  init). Engine-level differences -> v6 write-mask.
+
+## 2. [MMIO + CSR] Wire carries values, not write history
+
+"Never written" and "explicitly wrote the default value" look identical
+in the drained file.
+
+- Example: program writes `mcache_ctl=0` (disable caches) vs never
+  touching it -- same drained bytes on a caches-off QEMU default.
+- Solution: write-mask records the FACT at the source (translate-time
+  CSR-write decode in the plugin); consumers never guess.
+
+## 3. [MMIO vs CSR] Restore safety differs: CSR tolerant vs MMIO faulting
+
+A CSR write to an unimplemented CSR is a tolerant no-op (cmderr
+cleared); a Program-Buffer store to an absent MMIO region FAULTS.
+
+- Example: `sw` to 0xE0500008 on an engine built with
+  `NDS_L2C_CACHE_SIZE_KB=0` -> PB fault.
+- Solution: CSRs use tolerant writes + caps gating; MMIO restore is
+  HARD-gated on hardware presence (`Simulator::l2c_present()`).
+
+## 4. [MMIO] Side-effecting registers must never be written back
+
+Restore is not "write everything back".
+
+- Example: L2C CCTL Command register -- writing it RE-ISSUES a cache
+  flush/invalidate; W1C error registers clear state on write.
+- Solution: capture the FULL window for the record; restore only the
+  boot-static writable whitelist (Control, HPM Control, Way Masks).
+
+## 5. [MMIO + CSR] Hardware-driven values cannot be verified
+
+Functional and cycle clocks legitimately diverge.
+
+- Example: `mip` timer bit, `mcycle`/`minstret`, `mhpmcounter3-6`,
+  L2C `INITSTATUS[14]`.
+- Solution: verify exclusion list / bit masks -- not transport bugs.
+
+## 6. [MMIO + CSR] Access rules differ per register class
+
+Each class has one legal transport method.
+
+- Example: L2C requires <8-byte accesses (DS220 11.8.3) -> `sw`/`lwu`,
+  never `sd`/`ld`; `vtype`/`vl` are only restorable via `vsetvl`
+  (Tier B); CSR restore is one abstract command per CSR (a batched
+  csrrw sweep cannot tolerate a mid-batch fault).
+- Solution: dedicated path per class (PB word store, abstract per-CSR,
+  vsetvl staging).
+
+## 7. [MMIO + CSR] Engine capability variance; QEMU must stay engine-agnostic
+
+Never bake one engine's knowledge into QEMU -- hybrid pairs QEMU with
+DIFFERENT engines.
+
+- Example: M-only `ax45mpv_premium` lacks S-mode CSRs and HSP; a future
+  engine adds CLIC/Smstateen.
+- Solution: caps/manifest gates live on the CONSUMER side (probe:
+  "measure, don't model"); the driver owns the pairing (`-cpu
+  andes-ax66`, `vlen=512`). QEMU keeps only spec constants.
+
+## 8. [CSR] WARL pinning / legalization divergence
+
+A restore write may not take; the two sides may legalize differently.
+
+- Example: `dcsr.prv` WARL-pinned to 3 on an M-only engine; `mnvec`
+  held at the reset vector by the RTL.
+- Solution: write-then-read-back verification (prv mismatch aborts with
+  a pick-an-S/U-engine error) or verify exclusion.
+
+## 9. [CSR, MMIO reads too] QEMU-phase read-path infidelity
+
+The guest READS config on QEMU and takes a branch; if QEMU's config
+differs from the engine's, the wrong path already executed -- NO
+transport policy can fix this.
+
+- Example: BSP reads `mmsc_cfg.PPMA` to decide whether to program PMA.
+  MMIO variant: reading the L2C Configuration Register's SIZE field
+  (read-only, derived by HW) returns 0 from QEMU's RAM stub.
+- Solution: `-cpu` family pairing + per-knob properties (`vlen=512` is
+  the precedent); add knobs as needed.
+
+## 10. [MMIO] Devices that exist on only one side
+
+MMIO regions vsim does not model fault when touched in the ROI.
+
+- Example: PLIC, PIT, WDT, RTC, GPIO... absent from vsim's memory map.
+- Solution: ROI contract -- do not touch them; inside the ROI use only
+  dual-modeled devices (UART2, SimControl/HTIF).
+
+## One-line summary
+
+CSRs travel via "caps + write-mask + tolerant write"; MMIO travels via
+"full-window capture + whitelist restore + hardware-presence gate";
+verify masks hardware-driven values; engine knowledge stays in the
+consumer/driver, QEMU keeps only spec constants.
