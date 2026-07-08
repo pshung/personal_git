@@ -1,0 +1,799 @@
+======== DIFF HEAD..andesim: qemu_plugin/hybrid_handoff.c ========
+diff --git a/qemu_plugin/hybrid_handoff.c b/qemu_plugin/hybrid_handoff.c
+index a5df87e..c20a800 100644
+--- a/qemu_plugin/hybrid_handoff.c
++++ b/qemu_plugin/hybrid_handoff.c
+@@ -7,6 +7,7 @@
+ #include "hybrid/reg_names.h"
+ #include "hybrid/state_abi.h"
+ #include "hybrid/v_drain_policy.h"
++#include "hybrid/write_mask.h"
+ 
+ #include <qemu-plugin.h>
+ 
+@@ -29,6 +30,7 @@ typedef struct {
+     struct qemu_plugin_register *fpr[32];
+     struct qemu_plugin_register *fcsr;  // L20: frm[7:5] | fflags[4:0]
+     struct qemu_plugin_register *pc;
++    struct qemu_plugin_register *priv;  // L6: gdbstub virtual feature
+ 
+     // M-mode CSRs as exposed by QEMU's gdbstub csr feature.
+     struct qemu_plugin_register *mstatus;
+@@ -51,6 +53,22 @@ typedef struct {
+     struct qemu_plugin_register *mcache_ctl;
+     struct qemu_plugin_register *mmisc_ctl;
+ 
++    // Andes V5 CSR block (v3). HYBRID_ANDES_CSR_LIST is the shared source of
++    // truth; a NULL handle (non-Andes stub) drains 0 -> tolerant no-op.
++#define HYBRID_ANDES_FIELD(field, addr, name) \
++    struct qemu_plugin_register *andes_##field;
++    HYBRID_ANDES_CSR_LIST(HYBRID_ANDES_FIELD)
++#undef HYBRID_ANDES_FIELD
++    struct qemu_plugin_register *pmacfg[HYBRID_PMA_CFG_NUM];
++    struct qemu_plugin_register *pmaaddr[HYBRID_PMA_ADDR_NUM];
++
++    // M-ext CSR block (v4). Same shared X-macro; a NULL handle (the stub's
++    // gdbstub does not advertise this CSR for the paired cpu) drains 0.
++#define HYBRID_M_EXT_FIELD(field, addr, name) \
++    struct qemu_plugin_register *m_ext_##field;
++    HYBRID_M_EXT_CSR_LIST(HYBRID_M_EXT_FIELD)
++#undef HYBRID_M_EXT_FIELD
++
+     struct qemu_plugin_register *pmpcfg[HYBRID_PMP_CFG_NUM];
+     struct qemu_plugin_register *pmpaddr[HYBRID_PMP_ADDR_NUM];
+ 
+@@ -99,20 +117,25 @@ static int      exit_pc_mode;
+ static int      exit_marker_mode;
+ static uint64_t drain_pc_arg;
+ static int      drain_pc_set;
++// v5: L2C MMIO register base. DS220 24.2 maps the AE350 L2C block at 0xE0500000;
++// overridable via `l2c_base=0x...` for a platform with a relocated block.
++static uint64_t l2c_base_arg = 0xE0500000ull;
+ static volatile int oracle_armed;
+ 
+-// Drain-at-exit mode (F14): when drain_at_exit_mode is set (plugin arg
+-// `drain_at_exit=1`), the plugin registers a per-insn exec callback that
+-// bumps `atexit_insn_count`, and a `qemu_plugin_register_atexit_cb` that
+-// drains state on natural program exit (e.g. semihosting EXIT). The
+-// atexit callback overrides s.minstret with the plugin counter so the
+-// caller gets a true retired-insn count
+-// independent of QEMU's PMU semantics (which can return host ticks on
+-// system-mode without `-icount`). `drained_already` suppresses the
+-// atexit path if another trigger (marker/PC) drained first.
+-static int      drain_at_exit_mode;
+-static volatile int drained_already;
+-static uint64_t atexit_insn_count;
++// v6: which mask-governed config CSRs the guest has WRITTEN so far
++// (hybrid/write_mask.h slot numbering). Marked by per-insn exec callbacks that
++// are registered ONLY on instructions whose translate-time decode says "writes
++// a governed CSR" -- steady-state code carries no instrumentation. Single-hart
++// flow (like the rest of the handoff); atomics keep a future SMP guest safe.
++static uint64_t csr_write_mask[2];
++
++static void on_csr_write(unsigned int vcpu_idx, void *udata)
++{
++    (void) vcpu_idx;
++    const unsigned slot = (unsigned) (uintptr_t) udata;
++    __atomic_fetch_or(&csr_write_mask[slot >> 6],
++                      (uint64_t) 1 << (slot & 63u), __ATOMIC_RELAXED);
++}
+ 
+ static struct qemu_plugin_register *find_reg(GArray *regs, const char *name)
+ {
+@@ -140,6 +163,7 @@ static void resolve_handles(VcpuRegs *v)
+     }
+     v->fcsr = find_reg(regs, "fcsr");
+     v->pc = find_reg(regs, "pc");
++    v->priv = find_reg(regs, "priv");
+ 
+     v->mstatus  = find_reg(regs, "mstatus");
+     v->mepc     = find_reg(regs, "mepc");
+@@ -159,6 +183,26 @@ static void resolve_handles(VcpuRegs *v)
+     v->mmisc_ctl  = find_reg(regs, "mmisc_ctl");
+ 
+     char buf[16];
++
++    // Andes V5 CSR block (v3): resolve by gdb mnemonic from the shared X-macro.
++#define HYBRID_ANDES_FIELD(field, addr, name) v->andes_##field = find_reg(regs, name);
++    HYBRID_ANDES_CSR_LIST(HYBRID_ANDES_FIELD)
++#undef HYBRID_ANDES_FIELD
++
++    // M-ext CSR block (v4): resolve by gdb mnemonic (NULL if the stub does not
++    // advertise it for the paired cpu).
++#define HYBRID_M_EXT_FIELD(field, addr, name) v->m_ext_##field = find_reg(regs, name);
++    HYBRID_M_EXT_CSR_LIST(HYBRID_M_EXT_FIELD)
++#undef HYBRID_M_EXT_FIELD
++    for (int i = 0; i < HYBRID_PMA_CFG_NUM; i++) {
++        // RV64 packs 8 PMA entries per cfg CSR, so only even cfg CSRs exist.
++        g_snprintf(buf, sizeof(buf), "pmacfg%d", 2 * i);
++        v->pmacfg[i] = find_reg(regs, buf);
++    }
++    for (int i = 0; i < HYBRID_PMA_ADDR_NUM; i++) {
++        g_snprintf(buf, sizeof(buf), "pmaaddr%d", i);
++        v->pmaaddr[i] = find_reg(regs, buf);
++    }
+     for (int i = 0; i < HYBRID_PMP_CFG_NUM; i++) {
+         g_snprintf(buf, sizeof(buf), "pmpcfg%d", i);
+         v->pmpcfg[i] = find_reg(regs, buf);
+@@ -207,16 +251,25 @@ static size_t read_reg_bytes(struct qemu_plugin_register *h,
+     return n;
+ }
+ 
+-// Atomic on POSIX: write to .tmp, fsync, rename.
++// Atomic on POSIX: write to a mkstemp-reserved tmp file, fsync, rename.
++// mkstemp guarantees uniqueness via a 6-char random suffix + atomic
++// O_EXCL-style inode reservation, so concurrent plugin instances cannot
++// collide even under aggressive PID reuse (B13). The tmp lives in the
++// same directory as `path` so the rename is intra-filesystem.
+ static int write_state_atomic(const struct hybrid_state_v1 *s, const char *path)
+ {
+     char tmp[PATH_MAX];
+-    g_snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int) getpid());
+-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
++    int n = g_snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path);
++    if (n < 0 || (size_t) n >= sizeof(tmp)) {
++        fprintf(stderr, "hybrid_handoff: tmp path too long\n");
++        return -1;
++    }
++    int fd = g_mkstemp(tmp);
+     if (fd < 0) {
+-        perror("hybrid_handoff: open tmp");
++        perror("hybrid_handoff: g_mkstemp");
+         return -1;
+     }
++    // g_mkstemp creates the file 0600; no further chmod needed.
+     ssize_t want = (ssize_t) sizeof(*s);
+     ssize_t got = write(fd, s, sizeof(*s));
+     if (got != want) {
+@@ -235,23 +288,25 @@ static int write_state_atomic(const struct hybrid_state_v1 *s, const char *path)
+     return 0;
+ }
+ 
+-// Drain CPU state to outfile_path. pc is computed by the caller (from a
+-// HandoffSite for trigger paths, or 0 for the atexit path which lacks an
+-// insn context). If minstret_override is non-zero, it replaces QEMU's PMU
+-// minstret in the state file (used by drain_at_exit mode to record a
+-// plugin-counted retired-insn total). Does NOT call exit -- caller
+-// decides exit(200) (normal trigger) vs _exit(200) (inside atexit chain).
+-static void drain_state_to_file(unsigned int vcpu_idx, uint64_t pc,
+-                                uint64_t minstret_override)
++// Drain CPU state into `*s`. pc is computed by the caller (from a
++// HandoffSite for trigger paths). If minstret_override is non-zero, it
++// replaces QEMU's PMU minstret.
++static void drain_state_into(unsigned int vcpu_idx, uint64_t pc,
++                             uint64_t minstret_override,
++                             struct hybrid_state_v1 *sp)
+ {
+     VcpuRegs *v = qemu_plugin_scoreboard_find(vcpu_state, vcpu_idx);
+     resolve_handles(v);
++    memset(sp, 0, sizeof(*sp));
+     struct hybrid_state_v1 s = {0};
+     s.magic   = HYBRID_STATE_MAGIC;
+     s.version = HYBRID_STATE_VERSION;
+     s.flags   = HYBRID_FLAG_RV64;
+     s.hart_id = vcpu_idx;
+-    s.priv    = 3;
++    // L6: real privilege at the boundary; M-mode fallback only when the
++    // stub doesn't advertise the gdbstub virtual feature (a missing handle
++    // reads as 0 = U, which would silently demote the hart).
++    s.priv    = v->priv ? (read_reg64(v->priv) & 0x3) : 3;
+     s.pc      = pc;
+     for (int i = 0; i < 32; i++) s.gpr[i] = read_reg64(v->gpr[i]);
+ 
+@@ -285,6 +340,38 @@ static void drain_state_to_file(unsigned int vcpu_idx, uint64_t pc,
+     s.mcache_ctl = read_reg64(v->mcache_ctl);
+     s.mmisc_ctl  = read_reg64(v->mmisc_ctl);
+ 
++    // Andes V5 CSR block (v3): drain every transported Andes CSR. Set
++    // HYBRID_FLAG_ANDES if the stub advertised at least one (mirrors has_fp/
++    // has_v); otherwise the block stays zero and consumers skip it. A NULL
++    // handle on a non-Andes stub reads back as 0 -> tolerant.
++    int has_andes = 0;
++#define HYBRID_ANDES_FIELD(field, addr, name)  \
++    s.andes.field = read_reg64(v->andes_##field); \
++    if (v->andes_##field) has_andes = 1;
++    HYBRID_ANDES_CSR_LIST(HYBRID_ANDES_FIELD)
++#undef HYBRID_ANDES_FIELD
++    for (int i = 0; i < HYBRID_PMA_CFG_NUM; i++) {
++        s.andes.pmacfg[i] = read_reg64(v->pmacfg[i]);
++        if (v->pmacfg[i]) has_andes = 1;
++    }
++    for (int i = 0; i < HYBRID_PMA_ADDR_NUM; i++) {
++        s.andes.pmaaddr[i] = read_reg64(v->pmaaddr[i]);
++        if (v->pmaaddr[i]) has_andes = 1;
++    }
++    if (has_andes) s.flags |= HYBRID_FLAG_ANDES;
++
++    // M-ext CSR block (v4): drain every transported M-mode CSR the stub
++    // advertised. Set HYBRID_FLAG_M_EXT if at least one resolved; a NULL handle
++    // reads 0. The vsim caps gate decides which of these the cycle engine
++    // actually restores, so draining an absent-on-vsim CSR here is harmless.
++    int has_m_ext = 0;
++#define HYBRID_M_EXT_FIELD(field, addr, name)  \
++    s.m_ext.field = read_reg64(v->m_ext_##field); \
++    if (v->m_ext_##field) has_m_ext = 1;
++    HYBRID_M_EXT_CSR_LIST(HYBRID_M_EXT_FIELD)
++#undef HYBRID_M_EXT_FIELD
++    if (has_m_ext) s.flags |= HYBRID_FLAG_M_EXT;
++
+     for (int i = 0; i < HYBRID_PMP_CFG_NUM; i++)
+         s.pmpcfg[i] = read_reg64(v->pmpcfg[i]);
+     for (int i = 0; i < HYBRID_PMP_ADDR_NUM; i++)
+@@ -334,73 +421,100 @@ static void drain_state_to_file(unsigned int vcpu_idx, uint64_t pc,
+                                   (size_t) s.vlenb);
+     }
+ 
+-    if (write_state_atomic(&s, outfile_path) != 0) {
++    // v6: which mask-governed CSRs the guest actually wrote (translate-time
++    // decode + exec callbacks above). ucode rides transport-always: DSP
++    // instructions update its sticky OV flag without any CSR instruction, so
++    // instruction-level tracking cannot see those writes (like fcsr's fflags).
++    s.write_mask[0] = __atomic_load_n(&csr_write_mask[0], __ATOMIC_RELAXED);
++    s.write_mask[1] = __atomic_load_n(&csr_write_mask[1], __ATOMIC_RELAXED);
++    hybrid_wm_set(s.write_mask, HYBRID_WM_ANDES_BASE + HYBRID_WM_ANDES_IDX_ucode);
++    s.flags |= HYBRID_FLAG_WRITE_MASK;
++
++    // v5: L2C MMIO register window (DS220 11.8.5 Table 112, offsets
++    // 0x0000..0x0527). Read the whole documented block from the L2C base by
++    // PHYSICAL address (paging is off in the M-mode boot flow, so VA==PA anyway).
++    // QEMU's AE350 machine maps L2C as a device region; if the read fails (a
++    // machine without an L2C), the flag stays clear and consumers skip the
++    // block. Little-endian native host, so the raw bytes land directly in
++    // s.l2c.reg[]. The vsim side gates restore on its OWN L2C presence, so
++    // setting the flag whenever QEMU can read the region is correct.
++    {
++        g_autoptr(GByteArray) l2c = g_byte_array_new();
++        enum qemu_plugin_hwaddr_operation_result r =
++            qemu_plugin_read_memory_hwaddr(l2c_base_arg, l2c,
++                                           HYBRID_L2C_REG_WINDOW_BYTES);
++        if (r == QEMU_PLUGIN_HWADDR_OPERATION_OK
++            && l2c->len == HYBRID_L2C_REG_WINDOW_BYTES) {
++            memcpy(s.l2c.reg, l2c->data, HYBRID_L2C_REG_WINDOW_BYTES);
++            s.flags |= HYBRID_FLAG_L2C;
++        }
++    }
++
++    *sp = s;
++}
++
++// Drain CPU state to `path`. Does NOT call exit -- the caller decides
++// exit(200).
++static void drain_state_to_file(unsigned int vcpu_idx, uint64_t pc,
++                                uint64_t minstret_override, const char *path)
++{
++    struct hybrid_state_v1 s;
++    drain_state_into(vcpu_idx, pc, minstret_override, &s);
++    if (write_state_atomic(&s, path) != 0) {
+         fprintf(stderr, "hybrid_handoff: failed to write state file\n");
+         exit(2);
+     }
+     fprintf(stderr,
+-            "hybrid_handoff: drained state to %s (pc=%#" PRIx64 "), exiting\n",
+-            outfile_path, s.pc);
++            "hybrid_handoff: drained state to %s (pc=%#" PRIx64 ")\n",
++            path, s.pc);
+ }
+ 
+-static void on_handoff(unsigned int vcpu_idx, void *udata)
++// Shared drain tail: capture the (pre-execution) state, report `resume_pc`
++// as the vsim resume point, and exit 200.
++static void handoff_drain(unsigned int vcpu_idx, uint64_t resume_pc)
+ {
+-    const HandoffSite *site = (const HandoffSite *) udata;
+-    if (site->kind != HYBRID_HANDOFF_ENTER) return;
+-    // F14: suppress the atexit drain path now that we have a real trigger.
+-    drained_already = 1;
+-    // PC via translation-time vaddr+size; reading the gdbstub PC inside the
+-    // exec callback can lag the actual current insn when V instructions
+-    // retire just before the trigger (TCG defers PC writes for performance).
+-    drain_state_to_file(vcpu_idx, compute_handoff_pc(site), 0);
++    drain_state_to_file(vcpu_idx, resume_pc, 0, outfile_path);
+     // 200 == kExitHandoffToQemu in verilator/src/hybrid/exit_codes.hpp.
+     // Distinguishes drain from workload completion (0) so the orchestrator
+     // can decide the next spawn.
+     exit(200);
+ }
+ 
+-// F14: per-insn tick. Increments a global counter every retired insn so the
+-// drain-at-exit path can report a true retired-insn total (independent of
+-// QEMU's PMU semantics).
+-static void on_count_tick(unsigned int vcpu_idx, void *udata)
++// Marker sites. The marker is an architectural NOP, so the pre-execution
++// state equals the post-retire state and the window resumes AFTER it
++// (vaddr+size, computed at translation time; reading the gdbstub PC inside
++// the exec callback can lag the actual current insn when V instructions
++// retire just before the trigger -- TCG defers PC writes for performance).
++static void on_handoff(unsigned int vcpu_idx, void *udata)
+ {
+-    (void) vcpu_idx;
+-    (void) udata;
+-    atexit_insn_count++;
++    const HandoffSite *site = (const HandoffSite *) udata;
++    if (site->kind != HYBRID_HANDOFF_ENTER) return;
++    handoff_drain(vcpu_idx, compute_handoff_pc(site));
+ }
+ 
+-// F14: atexit drain. Fires when QEMU exits naturally (e.g. guest semihosting
+-// EXIT). The semihosting EXIT runs on the vCPU thread, so current_cpu is
+-// still set and qemu_plugin_read_register works. If any other trigger
+-// already drained, return immediately (drained_already guards against
+-// double drain). Inside an atexit handler, exit() is UB per C11 7.22.4.4;
+-// use _exit() to skip the rest of the atexit chain.
+-static void on_atexit(qemu_plugin_id_t id, void *udata)
++// pc boundary sites. Exec callbacks fire BEFORE the insn
++// executes, and the boundary insn is real user code (unlike a marker NOP):
++// the drained state must resume AT the boundary so the insn executes inside
++// the vsim window rather than on neither leg. (Skipping it corrupts the
++// window's architectural state -- e.g. a skipped vsetivli leaves vtype.vill
++// set and the first vector op of the window faults.)
++static void on_handoff_boundary(unsigned int vcpu_idx, void *udata)
+ {
+-    (void) id;
+-    (void) udata;
+-    if (drained_already) return;
+-    if (!drain_at_exit_mode) return;
+-    // pc=0 is a positive marker that the atexit path drained (no trigger).
+-    drain_state_to_file(0, 0, atexit_insn_count);
+-    fflush(stderr);
+-    _exit(200);
++    const HandoffSite *site = (const HandoffSite *) udata;
++    if (site->kind != HYBRID_HANDOFF_ENTER) return;
++    handoff_drain(vcpu_idx, site->vaddr);
+ }
+ 
+ // Per-insn tick for oracle exit-drain mode. udata is this insn's HandoffSite.
+ // When armed (the exit boundary's own tick ran), this tick fires before its
+ // insn executes, so a drain here records the post-retire state of the
+-// boundary insn with pc = the dynamically-next insn's vaddr. drain_pc (when
+-// set) delays the drain to the first post-arm tick at that pc, so both legs
+-// sample the same architectural point despite vsim's variable halt slack.
++// boundary insn with pc = the dynamically-next insn's vaddr.
+ static void on_oracle_tick(unsigned int vcpu_idx, void *udata)
+ {
+     const HandoffSite *site = (const HandoffSite *) udata;
+     if (oracle_armed
+         && (!drain_pc_set || site->vaddr == drain_pc_arg)) {
+-        drain_state_to_file(vcpu_idx, site->vaddr, 0);
+-        // 200 == kExitHandoffToQemu; distinguishes drain from workload exit.
+-        exit(200);
++        handoff_drain(vcpu_idx, site->vaddr);
+     }
+     if (exit_pc_mode ? (site->vaddr == exit_pc_arg)
+                      : (site->kind == HYBRID_HANDOFF_EXIT)) {
+@@ -416,12 +530,21 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
+     for (size_t i = 0; i < n; i++) {
+         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+ 
+-        // F14 count tick: registered FIRST so the count is incremented
+-        // before any trigger callback can call exit(200). NO_REGS keeps
+-        // the per-insn cost minimal (a single uint64 add).
+-        if (drain_at_exit_mode) {
+-            qemu_plugin_register_vcpu_insn_exec_cb(
+-                insn, on_count_tick, QEMU_PLUGIN_CB_NO_REGS, NULL);
++        // v6: CSR write-mask tracking, active in every trigger mode (the mode
++        // branches below `continue`). Decoded once at translation; only an
++        // instruction that writes a mask-governed CSR gets an exec callback
++        // (the CSR address is a static field of the encoding), so this costs
++        // nothing at execution time outside boot-style CSR setup code. No
++        // compressed CSR instruction exists, so the size==4 gate is exact.
++        if (qemu_plugin_insn_size(insn) == 4) {
++            uint32_t w = 0;
++            if (qemu_plugin_insn_data(insn, &w, sizeof(w)) == sizeof(w)) {
++                const int slot = hybrid_wm_slot_for_insn(w);
++                if (slot >= 0)
++                    qemu_plugin_register_vcpu_insn_exec_cb(
++                        insn, on_csr_write, QEMU_PLUGIN_CB_NO_REGS,
++                        (void *) (uintptr_t) slot);
++            }
+         }
+ 
+         // Oracle exit-drain mode: exclusive with every other mode (enforced
+@@ -443,16 +566,16 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
+         }
+ 
+         if (pc_mode) {
+-            // PC-trigger mode: vaddr-only match. qemu_plugin_insn_size lets
+-            // a future fixture park enter_pc on a compressed insn -- next-PC
+-            // is computed from the API-reported size, not assumed to be 4.
++            // PC-trigger mode: vaddr-only match; the drain resumes AT the
++            // boundary (on_handoff_boundary), so the insn size is recorded
++            // only for completeness.
+             if (qemu_plugin_insn_vaddr(insn) != enter_pc_arg) continue;
+             HandoffSite *site = g_new0(HandoffSite, 1);
+             site->kind  = HYBRID_HANDOFF_ENTER;
+             site->vaddr = qemu_plugin_insn_vaddr(insn);
+             site->size  = (uint32_t) qemu_plugin_insn_size(insn);
+             qemu_plugin_register_vcpu_insn_exec_cb(
+-                insn, on_handoff, QEMU_PLUGIN_CB_R_REGS, site);
++                insn, on_handoff_boundary, QEMU_PLUGIN_CB_R_REGS, site);
+             continue;
+         }
+ 
+@@ -524,18 +647,15 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
+             }
+             drain_pc_arg = (uint64_t) v;
+             drain_pc_set = 1;
+-        } else if (g_strcmp0(tok[0], "drain_at_exit") == 0 && tok[1]) {
+-            // F14: any non-zero value enables. "1" is the canonical form
+-            // callers emit; other ints (incl. negatives parsed as huge unsigned)
+-            // also enable -- the flag is a binary switch, not a count.
++        } else if (g_strcmp0(tok[0], "l2c_base") == 0 && tok[1]) {
+             char *endp = NULL;
+             unsigned long long v = g_ascii_strtoull(tok[1], &endp, 0);
+             if (!endp || *endp != '\0') {
+-                fprintf(stderr, "hybrid_handoff: invalid drain_at_exit=%s\n",
++                fprintf(stderr, "hybrid_handoff: invalid l2c_base=%s\n",
+                         tok[1]);
+                 return -1;
+             }
+-            drain_at_exit_mode = (v != 0);
++            l2c_base_arg = (uint64_t) v;
+         } else {
+             fprintf(stderr, "hybrid_handoff: unknown option: %s\n", argv[i]);
+             return -1;
+@@ -550,10 +670,6 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
+                 "hybrid_handoff: PC-mode enter=0x%" PRIx64 "\n",
+                 enter_pc_arg);
+     }
+-    if (drain_at_exit_mode) {
+-        fputs("hybrid_handoff: drain-at-exit mode enabled\n", stderr);
+-        qemu_plugin_register_atexit_cb(id, on_atexit, NULL);
+-    }
+     if (exit_marker_mode || exit_pc_mode) {
+         if ((exit_marker_mode && exit_pc_mode) || pc_mode) {
+             fputs("hybrid_handoff: oracle exit drain (exit_marker/exit_pc) "
+======== DIFF HEAD..andesim: scripts/run_e2e.sh ========
+diff --git a/scripts/run_e2e.sh b/scripts/run_e2e.sh
+index 6085aa6..7db16d5 100755
+--- a/scripts/run_e2e.sh
++++ b/scripts/run_e2e.sh
+@@ -10,7 +10,7 @@
+ #   FILTER       regex; only run tests whose name matches
+ #   MODE         marker | pc | both  (default: both) - drives TRIGGER_MODE
+ #                for round-trip fixtures. Negative drivers run once
+-#                regardless because they assert harness failure
++#                regardless because they assert orchestrator failure
+ #                modes orthogonal to the trigger mechanism.
+ #   JOBS         parallel job slots (default: min($(nproc),
+ #                free(/dev/shm)/256MB)). Each Tier-2 slot uses a 128 MB
+@@ -64,8 +64,11 @@ export VSIM_QEMU VSIM_PLUGIN VSIM_BIN
+ REQUIRED_ELFS=(
+   handoff_roundtrip rt_pc_jump rt_sign_bits rt_abi_aliases rt_long_roi
+   rt_all_gprs rt_mem_loadstore rt_unaligned_lh rt_csr_survival rt_shared_mem
++  rt_priv_smode rt_priv_umode
+   rt_c_hello rt_c_printf rt_c_matmul rt_c_fcsr rt_c_v_regs rt_c_v_csrs
+   rt_c_v_matmul rt_c_v_fill
++  # CSR-less spin loop fixture.
++  icount_spin
+ )
+ need_build=0
+ for f in "${REQUIRED_ELFS[@]}"; do
+@@ -90,6 +93,8 @@ RT_TESTS=(
+   "rt_mem_loadstore|FIXTURE=rt_mem_loadstore"
+   "rt_unaligned_lh|FIXTURE=rt_unaligned_lh"
+   "rt_csr_survival|FIXTURE=rt_csr_survival"
++  "rt_m_ext_counters|FIXTURE=rt_m_ext_counters"
++  "rt_m_ext_trigcause|FIXTURE=rt_m_ext_trigcause"
+   "rt_shared_mem|FIXTURE=rt_shared_mem"
+   "rt_c_hello|FIXTURE=rt_c_hello"
+   "rt_c_printf|FIXTURE=rt_c_printf"
+@@ -106,6 +111,19 @@ NEG_TESTS=(
+   "rt_corrupt_state|bash $HARNESS/drivers/rt_corrupt_state.sh"
+ )
+ 
++# Heavyweight round-trip fixtures, run SEQUENTIALLY after the parallel
++# pool drains. The L6 privilege fixtures need an S/U-capable engine pair
++# (the default ax45mpv_premium RTL is M-mode-only,
++# NDS_NUM_PRIVILEGE_LEVELS=1), and the only built RV64 one is
++# ax66_makatau -- whose Verilator binary runs 32 threads. Two of those in
++# the parallel pool saturate the box and time out BOTH themselves and the
++# lighter default-engine tests, so they get the machine to themselves.
++# Same entry format as RT_TESTS; both trigger modes still apply.
++SERIAL_RT_TESTS=(
++  "rt_priv_smode|FIXTURE=rt_priv_smode CHECK_PRIV=1 TIMEOUT=300 VSIM_BIN=$VSIM_BUILD/sim_ax66_makatau QEMU_CPU=andes-ax66,vlen=128"
++  "rt_priv_umode|FIXTURE=rt_priv_umode CHECK_PRIV=0 TIMEOUT=300 VSIM_BIN=$VSIM_BUILD/sim_ax66_makatau QEMU_CPU=andes-ax66,vlen=128"
++)
++
+ MODE="${MODE:-both}"
+ case "$MODE" in
+   marker|pc|both) ;;
+@@ -196,7 +214,21 @@ for entry in "${NEG_TESTS[@]}"; do
+   WORKPLAN+=("neg|$neg_name|$neg_cmd")
+ done
+ 
+-TOTAL=${#WORKPLAN[@]}
++# Serial phase: same (mode, name, cmd) tuples, executed one at a time
++# after the parallel pool drains (see SERIAL_RT_TESTS above for why).
++declare -a SERIAL_PLAN=()
++for tm in marker pc; do
++  [[ "$MODE" != "both" && "$MODE" != "$tm" ]] && continue
++  for entry in "${SERIAL_RT_TESTS[@]}"; do
++    rt_name="${entry%%|*}"
++    env_prefix="${entry#*|}"
++    [[ -n "$FILTER" && ! "$rt_name" =~ ^$FILTER$ ]] && continue
++    cmd="TRIGGER_MODE=$tm $env_prefix bash $HARNESS/e2e.sh"
++    SERIAL_PLAN+=("$tm|$rt_name|$cmd")
++  done
++done
++
++TOTAL=$(( ${#WORKPLAN[@]} + ${#SERIAL_PLAN[@]} ))
+ step "logs: $LOG_DIR  jobs: $JOBS  mode: $MODE  tests: $TOTAL"
+ 
+ # FIFO-based bounded job pool. Each child reads one token from $SEM_FIFO
+@@ -229,6 +261,16 @@ done
+ wait
+ exec 8>&-
+ 
++# Serial phase: each heavyweight test gets the machine to itself.
++for w in "${SERIAL_PLAN[@]}"; do
++  i=$((i+1))
++  w_mode="${w%%|*}"
++  w_rest="${w#*|}"
++  w_name="${w_rest%%|*}"
++  w_cmd="${w_rest#*|}"
++  run_one "$w_mode" "$w_name" "$w_cmd" "$i" "$TOTAL"
++done
++
+ declare -A MODE_PASS=([marker]=0 [pc]=0 [neg]=0)
+ declare -A MODE_FAIL=([marker]=0 [pc]=0 [neg]=0)
+ declare -A MODE_SKIP=([marker]=0 [pc]=0 [neg]=0)
+@@ -244,7 +286,7 @@ done < "$RESULTS_FILE"
+ 
+ # Stream failed-test logs in workplan order so the user sees a
+ # deterministic post-run failure dump.
+-for w in "${WORKPLAN[@]}"; do
++for w in "${WORKPLAN[@]}" "${SERIAL_PLAN[@]}"; do
+   w_mode="${w%%|*}"
+   w_rest="${w#*|}"
+   w_name="${w_rest%%|*}"
+======== DIFF HEAD..andesim: tests/fixtures/Makefile ========
+diff --git a/tests/fixtures/Makefile b/tests/fixtures/Makefile
+index 1a28d84..1bafb0d 100644
+--- a/tests/fixtures/Makefile
++++ b/tests/fixtures/Makefile
+@@ -6,12 +6,13 @@
+ # to bypass the env var.
+ 
+ TOOLCHAIN ?= $(HYBRID_TOOLCHAIN)
+-ifeq ($(strip $(TOOLCHAIN)),)
+-$(error HYBRID_TOOLCHAIN is not set. Run `source ./setup.sh` from the repo root, or pass `TOOLCHAIN=/path/to/toolchain` on the command line)
+-endif
+-CC        := $(TOOLCHAIN)/bin/riscv64-unknown-elf-gcc
+-LD        := $(TOOLCHAIN)/bin/riscv64-unknown-elf-ld
+-OBJDUMP   := $(TOOLCHAIN)/bin/riscv64-unknown-elf-objdump
++# rv64 tools. The toolchain check is deferred to use-time (recursive `=` +
++# $(error)), so a pure-rv32 `make rv32` -- which uses CC32/LD32 below -- needs
++# only HYBRID_TOOLCHAIN32, not HYBRID_TOOLCHAIN.
++rv64_tc   = $(if $(strip $(TOOLCHAIN)),$(TOOLCHAIN),$(error HYBRID_TOOLCHAIN is not set. Run `source ./setup.sh` from the repo root, or pass TOOLCHAIN=/path/to/toolchain))
++CC        = $(rv64_tc)/bin/riscv64-unknown-elf-gcc
++LD        = $(rv64_tc)/bin/riscv64-unknown-elf-ld
++OBJDUMP   = $(rv64_tc)/bin/riscv64-unknown-elf-objdump
+ 
+ # Runtime sources live at the repo root (runtime/) -- they are the
+ # user-facing andesim runtime; fixtures are just one consumer. The linker
+@@ -25,14 +26,16 @@ CFLAGS  := -march=rv64gc -mabi=lp64d -nostdlib -static -Wall
+ LDFLAGS := -T $(LDSCRIPT) -nostdlib -static
+ 
+ # All fixtures share andesim.ld (load base 0x00100000, andes_ae350 DRAM).
+-RT_FIXTURES := rt_all_gprs rt_abi_aliases rt_sign_bits rt_pc_jump \
++RT_FIXTURES := rt_all_gprs rt_all_fprs rt_abi_aliases rt_sign_bits rt_pc_jump \
+                rt_long_roi rt_mem_loadstore rt_unaligned_lh \
+-               rt_shared_mem rt_csr_survival
++               rt_shared_mem rt_csr_survival rt_m_ext_counters \
++               rt_m_ext_trigcause rt_priv_smode rt_priv_umode
+ 
+ # Attack / breakage programs: each demonstrates a bug in the hybrid handoff.
+ # NOT part of the standard 'all' target (they are expected to misbehave).
+ # Build individually: make break_vscratch.elf   (etc.)
+-BREAK_FIXTURES := break_vscratch break_vscratch_top break_verify_diverge
++BREAK_FIXTURES := break_vscratch break_vscratch_top break_mcycle_write \
++                  break_verify_diverge
+ 
+ # C-level fixtures: standard newlib stdio (printf, fputs, ...) linked
+ # through the shipped vplat runtime (libandesim_runtime.a) with the
+@@ -51,6 +54,10 @@ RT_C_VPLAT_FIXTURES := vplat_hello vplat_exit41 vplat_file
+ 
+ RUNTIME_SRCS    := $(RUNTIME_DIR)/crt0.S $(RUNTIME_DIR)/trap.S \
+                    $(RUNTIME_DIR)/handler.c
++# Prereqs of the runtime grouped target(s) -- shared by the rv64 and rv32 rules.
++RUNTIME_DEPS    := $(RUNTIME_SRCS) $(RUNTIME_DIR)/vplat_syscalls.c \
++                   $(RUNTIME_DIR)/andesim.ld $(RUNTIME_DIR)/andesim.specs \
++                   $(RUNTIME_DIR)/ROI.h
+ VPLAT_RT_DIR := ../../build/runtime
+ VPLAT_RT     := $(VPLAT_RT_DIR)/libandesim_runtime.a $(VPLAT_RT_DIR)/crt0.o \
+                 $(VPLAT_RT_DIR)/andesim.ld $(VPLAT_RT_DIR)/andesim.specs \
+@@ -61,21 +68,47 @@ VPLAT_CFLAGS := -march=rv64gc -mabi=lp64d -O1 -Wall
+ # The crt0 already sets mstatus.VS to Initial, so V insns don't trap.
+ VPLAT_V_CFLAGS := -march=rv64gcv -mabi=lp64d -O1 -Wall
+ 
+-.PHONY: all clean dump
+-
+-all: spin.elf handoff_exit.elf handoff_roundtrip.elf \
++# --- rv32 fixtures (docs/rv32_ROADMAP.md F3) ---------------------------------
++# A small rv32 set for the arch-match path; the bulk of the fixtures stay rv64.
++# Built via `make rv32` (NOT part of `all`), only when HYBRID_TOOLCHAIN32 is set.
++# rv32_c_hello reuses rt_c_hello.c (markers are arch-neutral HINTs); rv32_spin
++# reuses spin.S. The rv32 runtime comes from build/runtime/rv32 (ARCH=rv32).
++TOOLCHAIN32    ?= $(HYBRID_TOOLCHAIN32)
++CC32           := $(TOOLCHAIN32)/bin/riscv32-unknown-elf-gcc
++LD32           := $(TOOLCHAIN32)/bin/riscv32-unknown-elf-ld
++CFLAGS32       := -march=rv32gc -mabi=ilp32d -nostdlib -static -Wall
++VPLAT_CFLAGS32 := -march=rv32gc -mabi=ilp32d -O1 -Wall
++VPLAT_RT32_DIR := ../../build/runtime/rv32
++VPLAT_RT32     := $(VPLAT_RT32_DIR)/libandesim_runtime.a $(VPLAT_RT32_DIR)/crt0.o \
++                  $(VPLAT_RT32_DIR)/andesim.ld $(VPLAT_RT32_DIR)/andesim.specs \
++                  $(VPLAT_RT32_DIR)/include/andesim/ROI.h
++
++.PHONY: all clean dump rv32
++
++all: spin.elf icount_spin.elf handoff.elf handoff_exit.elf handoff_roundtrip.elf \
++     l2c_drain.elf \
+      $(RT_FIXTURES:%=%.elf) $(RT_C_FIXTURES:%=%.elf) \
+      $(RT_C_V_FIXTURES:%=%.elf) rt_c_v_matmul_free.elf \
+      $(RT_C_VPLAT_FIXTURES:%=%.elf)
+ 
+-# Note: handoff_exit.elf, spin.elf are legacy (referenced only by
+-# EXCLUDE_FROM_ALL handoff_smoke.cpp). They still build for completeness
+-# but are not in active CTest. All targets now share andesim.ld at 0x00100000.
++# Note: handoff.elf, handoff_exit.elf, spin.elf are referenced only by the
++# EXCLUDE_FROM_ALL handoff_smoke.cpp target; they still build here for
++# completeness. All targets share andesim.ld at 0x00100000.
+ 
+ spin.elf: spin.S $(LDSCRIPT)
+ 	$(CC) $(CFLAGS) -c spin.S -o spin.o
+ 	$(LD) $(LDFLAGS) spin.o -o $@
+ 
++# CSR-less spin for F5 plugin-icount e2e. Linked at 0x00100000 (andesim.ld)
++# so andes_ae350's MROM at 0x80000000 stays clear when loaded via -bios.
++icount_spin.elf: icount_spin.S $(LDSCRIPT)
++	$(CC) $(CFLAGS) -c icount_spin.S -o icount_spin.o
++	$(LD) $(LDFLAGS) icount_spin.o -o $@
++
++handoff.elf: handoff.S $(LDSCRIPT)
++	$(CC) $(CFLAGS) -c handoff.S -o handoff.o
++	$(LD) $(LDFLAGS) handoff.o -o $@
++
+ handoff_exit.elf: handoff_exit.S $(LDSCRIPT)
+ 	$(CC) $(CFLAGS) -c handoff_exit.S -o handoff_exit.o
+ 	$(LD) $(LDFLAGS) handoff_exit.o -o $@
+@@ -84,6 +117,16 @@ handoff_roundtrip.elf: handoff_roundtrip.S $(LDSCRIPT) semihost_exit.inc
+ 	$(CC) $(CFLAGS) -c handoff_roundtrip.S -o handoff_roundtrip.o
+ 	$(LD) $(LDFLAGS) handoff_roundtrip.o -o $@
+ 
++# v5: L2C-drain fixture -- writes the L2C Control Register, then drains (marker).
++l2c_drain.elf: l2c_drain.S $(LDSCRIPT) semihost_exit.inc
++	$(CC) $(CFLAGS) -c l2c_drain.S -o l2c_drain.o
++	$(LD) $(LDFLAGS) l2c_drain.o -o $@
++
++# v6: write-mask fixture -- writes mxstatus/mcache_ctl, reads mmisc_ctl, drains.
++wm_drain.elf: wm_drain.S $(LDSCRIPT) semihost_exit.inc
++	$(CC) $(CFLAGS) -c wm_drain.S -o wm_drain.o
++	$(LD) $(LDFLAGS) wm_drain.o -o $@
++
+ $(RT_FIXTURES:%=%.elf): %.elf: %.S $(LDSCRIPT) semihost_exit.inc
+ 	$(CC) $(CFLAGS) -c $< -o $*.o
+ 	$(LD) $(LDFLAGS) $*.o -o $@
+@@ -112,9 +155,7 @@ $(RT_C_VPLAT_FIXTURES:%=%.elf): %.elf: %.c $(VPLAT_RT)
+ 	$(CC) $(VPLAT_CFLAGS) -B $(VPLAT_RT_DIR) -specs=andesim.specs $< -o $@
+ 
+ # One sub-make produces all five artifacts (grouped target, make >= 4.3).
+-$(VPLAT_RT) &: $(RUNTIME_SRCS) $(RUNTIME_DIR)/vplat_syscalls.c \
+-               $(RUNTIME_DIR)/andesim.ld $(RUNTIME_DIR)/andesim.specs \
+-               $(RUNTIME_DIR)/ROI.h
++$(VPLAT_RT) &: $(RUNTIME_DEPS)
+ 	$(MAKE) -C $(RUNTIME_DIR)
+ 
+ # Markerless GEMM twin (gemm_modes.md F2). Explicit rule, NOT in
+@@ -125,14 +166,31 @@ rt_c_v_matmul_free.elf: rt_c_v_matmul.c $(VPLAT_RT) $(HELPERS_DIR)/rt_c_helpers.
+ 	$(CC) $(VPLAT_V_CFLAGS) -DHYBRID_MARKERLESS -I$(HELPERS_DIR) \
+ 	  -B $(VPLAT_RT_DIR) -specs=andesim.specs rt_c_v_matmul.c -o $@
+ 
+-dump: spin.elf handoff_exit.elf
++# rv32 fixtures: one bare-asm (no runtime) + one C (links the rv32 runtime).
++rv32: rv32_spin.elf rv32_c_hello.elf
++
++rv32_spin.elf: spin.S $(LDSCRIPT)
++	$(CC32) $(CFLAGS32) -c spin.S -o rv32_spin.o
++	$(LD32) -T $(LDSCRIPT) -nostdlib -static rv32_spin.o -o $@
++
++rv32_c_hello.elf: rt_c_hello.c $(VPLAT_RT32) $(HELPERS_DIR)/rt_c_helpers.h
++	$(CC32) $(VPLAT_CFLAGS32) -I$(HELPERS_DIR) \
++	  -B $(VPLAT_RT32_DIR) -specs=andesim.specs rt_c_hello.c -o $@
++
++# rv32 runtime (grouped target): the runtime Makefile with ARCH=rv32.
++$(VPLAT_RT32) &: $(RUNTIME_DEPS)
++	$(MAKE) -C $(RUNTIME_DIR) ARCH=rv32 HYBRID_TOOLCHAIN32=$(TOOLCHAIN32)
++
++dump: spin.elf handoff.elf handoff_exit.elf
+ 	$(OBJDUMP) -d spin.elf
++	$(OBJDUMP) -d handoff.elf
+ 	$(OBJDUMP) -d handoff_exit.elf
+ 
+ clean:
+-	rm -f spin.o spin.elf handoff_exit.o handoff_exit.elf \
++	rm -f spin.o spin.elf handoff.o handoff.elf handoff_exit.o handoff_exit.elf \
+ 	      handoff_roundtrip.o handoff_roundtrip.elf \
+ 	      $(RT_FIXTURES:%=%.o) $(RT_FIXTURES:%=%.elf) \
+-	      $(BREAK_FIXTURES:%=%.o) $(BREAK_FIXTURES:%=%.elf) \
+ 	      $(RT_C_FIXTURES:%=%.elf) $(RT_C_V_FIXTURES:%=%.elf) \
+-	      rt_c_v_matmul_free.elf $(RT_C_VPLAT_FIXTURES:%=%.elf)
++	      rt_c_v_matmul_free.elf $(RT_C_VPLAT_FIXTURES:%=%.elf) \
++	      $(BREAK_FIXTURES:%=%.o) $(BREAK_FIXTURES:%=%.elf) \
++	      rv32_spin.o rv32_spin.elf rv32_c_hello.elf
+======== DIFF HEAD..andesim: tests/e2e.sh ========
+diff --git a/tests/e2e.sh b/tests/e2e.sh
+index 92239c2..8e7fce8 100755
+--- a/tests/e2e.sh
++++ b/tests/e2e.sh
+@@ -19,7 +19,15 @@
+ #   TIMEOUT         vsim leg timeout in seconds (default 60).
+ #   CHECK_MCYCLE_MONOTONIC=1   assert mcycle/minstret strictly increased
+ #                              between QEMU 1's drain and vsim's drain.
++#   CHECK_PRIV=<0|1|3>         assert both drained state files carry this
++#                              privilege (L6: 0=U, 1=S, 3=M).
+ #   VSIM_BIN, VSIM_QEMU, VSIM_PLUGIN, VSIM_ELF, NM  override built paths.
++#   QEMU_CPU        -cpu argument for both QEMU legs (default
++#                   andes-ax45mpv,vlen=512, pairing the default vsim
++#                   engine). Override together with VSIM_BIN to run a
++#                   fixture on another engine, e.g. the S/U-capable
++#                   ax66_makatau for the rt_priv_* fixtures (the default
++#                   ax45mpv_premium RTL is M-mode-only).
+ 
+ set -euo pipefail
+ 
+@@ -30,6 +38,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ FIXTURE="${FIXTURE:?FIXTURE env var is required (e.g. FIXTURE=rt_c_hello)}"
+ TIMEOUT="${TIMEOUT:-60}"
+ TRIGGER_MODE="${TRIGGER_MODE:-marker}"
++QEMU_CPU="${QEMU_CPU:-andes-ax45mpv,vlen=512}"
+ 
+ hybrid_resolve_paths
+ 
+@@ -68,8 +77,19 @@ case "$TRIGGER_MODE" in
+     ;;
+ esac
+ 
+-# 128 MB matches the QEMU virt machine default; vsim uses the same size.
+-SHARED_SIZE=$((128 * 1024 * 1024))
++# 128 MB program RAM matches the QEMU virt machine default. L26/F2: the
++# physical mmap reserves one V-scratch page (HYBRID_V_SCRATCH_BYTES =
++# 32 * HYBRID_VLEN_BYTES_MAX) ABOVE the program's RAM, so the V-transport
++# scratch (vsim parks it at the mmap top page) sits past anything the program
++# can address. Mirrors the andesim driver (shm.cpp physical_mmap_bytes).
++# Read HYBRID_VLEN_BYTES_MAX from the shared ABI so this tracks the header
++# (the ceiling moved 64 -> 128 once already) instead of hardcoding it.
++VLEN_BYTES_MAX=$(awk '/^#define HYBRID_VLEN_BYTES_MAX/ {print $3}' \
++  "$SCRIPT_DIR/../include/hybrid/state_abi.h")
++[ -n "$VLEN_BYTES_MAX" ] || { echo "e2e: cannot read HYBRID_VLEN_BYTES_MAX from state_abi.h" >&2; exit 1; }
++PROGRAM_SIZE=$((128 * 1024 * 1024))
++V_SCRATCH_BYTES=$((32 * VLEN_BYTES_MAX))
++SHARED_SIZE=$((PROGRAM_SIZE + V_SCRATCH_BYTES))
+ SHARED_MEM=$(mktemp -p /dev/shm vsim-e2e-shared.XXXXXX)
+ STATE_QEMU=$(mktemp)
+ STATE_VSIM=$(mktemp)
+@@ -100,7 +120,7 @@ set +e
+ "$VSIM_QEMU" \
+   -object "memory-backend-file,id=mem,share=on,mem-path=$SHARED_MEM,size=$SHARED_SIZE" \
+   -machine andes_ae350,memory-backend=mem \
+-  -cpu andes-ax45mpv,vlen=512 \
++  -cpu "$QEMU_CPU" \
+   -nographic \
+   -semihosting-config enable=on,target=native \
+   -bios "$VSIM_ELF" \
+@@ -153,6 +173,16 @@ if [ -s "$STATE_VSIM" ] && [ -s "$STATE_QEMU" ]; then
+   V_MCYCLE=$(read_u64_le  624 "$STATE_VSIM")
+   V_MINST=$(read_u64_le   632 "$STATE_VSIM")
+   echo "[$FIXTURE kernel_cycles] $((V_MCYCLE - Q1_MCYCLE))  (vsim mcycle=$V_MCYCLE - qemu1 mcycle=$Q1_MCYCLE)"
++  # L6: privilege survives the handoff. priv@24 locked by state_abi_check.h.
++  if [ -n "${CHECK_PRIV:-}" ]; then
++    Q1_PRIV=$(read_u64_le 24 "$STATE_QEMU")
++    V_PRIV=$(read_u64_le  24 "$STATE_VSIM")
++    echo "[$FIXTURE priv] qemu1=$Q1_PRIV vsim=$V_PRIV expected=$CHECK_PRIV"
++    if [ "$Q1_PRIV" != "$CHECK_PRIV" ] || [ "$V_PRIV" != "$CHECK_PRIV" ]; then
++      echo "FAIL[$FIXTURE]: drained priv mismatch (expected $CHECK_PRIV)"
++      exit 1
++    fi
++  fi
+   if [ "${CHECK_MCYCLE_MONOTONIC:-0}" = "1" ]; then
+     echo "[$FIXTURE mcycle/minstret] qemu1: mcycle=$Q1_MCYCLE minstret=$Q1_MINST"
+     echo "[$FIXTURE mcycle/minstret] vsim:  mcycle=$V_MCYCLE minstret=$V_MINST"
