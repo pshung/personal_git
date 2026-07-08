@@ -1,0 +1,713 @@
+########## driver/cli.cpp ##########
+diff --git a/driver/cli.cpp b/driver/cli.cpp
+index add0198..2f0d42f 100644
+--- a/driver/cli.cpp
++++ b/driver/cli.cpp
+@@ -53,6 +53,14 @@ Cli parse_cli(const std::vector<std::string>& args) {
+       c.dry_run = true;
+       continue;
+     }
++    if (a == "--verify") {
++      c.verify = true;
++      continue;
++    }
++    if (a == "--gdb") {
++      c.gdb = true;
++      continue;
++    }
+ 
+     const struct {
+       const char* flag;
+@@ -65,7 +73,8 @@ Cli parse_cli(const std::vector<std::string>& args) {
+                 {"--mem-size", &c.mem_size},
+                 {"--mmap-size", &c.mem_size},  // retired spelling, same knob
+                 {"--kanata", &c.kanata},
+-                {"--objdump", &c.objdump}};
++                {"--objdump", &c.objdump},
++                {"--gdb-port", &c.gdb_port}};
+     bool consumed = false;
+     for (const auto& o : opts) {
+       int r = match_opt(args, i, o.flag, *o.out);
+########## driver/cli.hpp ##########
+diff --git a/driver/cli.hpp b/driver/cli.hpp
+index a201ce8..80a1029 100644
+--- a/driver/cli.hpp
++++ b/driver/cli.hpp
+@@ -34,6 +34,9 @@ struct Cli {
+   std::vector<std::string> passthrough;   // verbatim, everything after `--`
+   bool help = false;                      // -h / --help (before `--`)
+   bool dry_run = false;                   // --dry-run (build, run, test, ...)
++  bool verify = false;                    // --verify (run --mode hybrid)
++  bool gdb = false;                       // --gdb (fast: QEMU gdbstub; cycle: vsim JTAG + ICEman)
++  std::string gdb_port;                   // --gdb-port (fast: default 1234; cycle: default 9104)
+   bool has_passthrough = false;           // a `--` boundary was present
+   std::string error;                      // non-empty => parse failed
+ };
+########## driver/cli_test.cpp ##########
+diff --git a/driver/cli_test.cpp b/driver/cli_test.cpp
+index 76cadf9..3a1f804 100644
+--- a/driver/cli_test.cpp
++++ b/driver/cli_test.cpp
+@@ -85,6 +85,17 @@ int main() {
+     CHECK(c.positional.size() == 1 && c.positional[0] == "fixtures");
+   }
+ 
++  // Hybrid pc-trigger boundaries (symbol + 0x address), space-separated form.
++  {
++    Cli c = parse_cli({"run", "--mode", "hybrid", "--trigger", "pc",
++                       "--pc-start", "main", "--pc-end", "0x80001234",
++                       "prog.elf"});
++    CHECK(c.error.empty());
++    CHECK(c.pc_start == "main");
++    CHECK(c.pc_end == "0x80001234");
++    CHECK(c.positional.size() == 1 && c.positional[0] == "prog.elf");
++  }
++
+   // Hybrid mem size; mixes space and =forms.
+   // --mmap-size is the retired spelling, kept as a hidden alias of --mem-size.
+   {
+@@ -124,6 +135,43 @@ int main() {
+     CHECK(c.mem_size == "2G");
+   }
+ 
++  // Absent hybrid flags stay empty -- cmd_run supplies the real defaults.
++  {
++    Cli c = parse_cli({"run", "--mode", "hybrid", "prog.elf"});
++    CHECK(c.error.empty());
++    CHECK(c.pc_start.empty());
++    CHECK(c.mem_size.empty());
++  }
++
++  // kanata/objdump pass-through flags parse like the rest (space + =form).
++  {
++    Cli c = parse_cli({"run", "--mode", "hybrid", "--kanata", "k.txt",
++                       "--objdump=o.txt", "prog.elf"});
++    CHECK(c.error.empty());
++    CHECK(c.kanata == "k.txt");
++    CHECK(c.objdump == "o.txt");
++  }
++
++  // --verify is a boolean (oracle differential verification), default off.
++  {
++    Cli c = parse_cli({"run", "--mode", "hybrid", "--verify", "prog.elf"});
++    CHECK(c.error.empty());
++    CHECK(c.verify);
++    CHECK(c.positional.size() == 1 && c.positional[0] == "prog.elf");
++    Cli d = parse_cli({"run", "--mode", "hybrid", "prog.elf"});
++    CHECK(!d.verify);
++  }
++
++  // --gdb is a boolean, default off; valid on fast and cycle.
++  {
++    Cli c = parse_cli({"run", "--mode", "fast", "--gdb", "prog.elf"});
++    CHECK(c.error.empty());
++    CHECK(c.gdb);
++    CHECK(c.positional.size() == 1 && c.positional[0] == "prog.elf");
++    Cli d = parse_cli({"run", "--mode", "cycle", "prog.elf"});
++    CHECK(!d.gdb);
++  }
++
+   // Unknown option before `--` is an error.
+   {
+     Cli c = parse_cli({"run", "--bogus"});
+########## driver/cmd_run.cpp ##########
+diff --git a/driver/cmd_run.cpp b/driver/cmd_run.cpp
+index bd6e0bd..a7bc784 100644
+--- a/driver/cmd_run.cpp
++++ b/driver/cmd_run.cpp
+@@ -8,22 +8,35 @@
+ // semihosting console all behave as if the engine were invoked directly.
+ // `hybrid` (F9) orchestrates a QEMU1 -> vsim handoff via run_plan and prints the
+ // window-cycle figure (the vsim mcycle delta).
++#include <algorithm>
++#include <chrono>
++#include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <filesystem>
++#include <optional>
+ #include <string>
++#include <string_view>
++#include <thread>
+ #include <vector>
+ 
+ #include "argv.hpp"
+ #include "cli.hpp"
++#include "elf_syms.hpp"
+ #include "engine_descriptor.hpp"
+ #include "engine_registry.hpp"
+ #include "hybrid.hpp"
++#include "hybrid/state_abi.h"  // HYBRID_V_SCRATCH_BYTES (L26/F3 overlap check)
+ #include "models.hpp"
+ #include "plan.hpp"
+ #include "process.hpp"
++#include "repo_root.hpp"
+ #include "run_passthrough.hpp"
+ #include "run_plan.hpp"
+ #include "shm.hpp"
++#include "state.hpp"
++#include "state_diff.hpp"
++#include "vsim_filter.hpp"
+ 
+ namespace fs = std::filesystem;
+ 
+@@ -32,9 +45,10 @@ namespace {
+ 
+ // Resolve `path` to an absolute, EXISTING ELF. Returns the resolved string on
+ // success; on failure prints an error tagged with `ctx` and returns "". The
+-// existence check is here, at the shared resolver, so a missing path fails
+-// with a clear "ELF not found" instead of being handed to the engine (e.g.
+-// qemu's cryptic "Unable to find the RISC-V BIOS").
++// existence check is here, at the one resolver fast/cycle/cycle-gdb share, so a
++// missing path fails with a clear "ELF not found" instead of being handed to the
++// engine (e.g. qemu's cryptic "Unable to find the RISC-V BIOS"). Mirrors the
++// up-front check run_hybrid already does.
+ std::string abs_elf(const std::string& path, const std::string& ctx) {
+   std::error_code ec;
+   fs::path abs = fs::absolute(path, ec);
+@@ -52,7 +66,9 @@ std::string abs_elf(const std::string& path, const std::string& ctx) {
+ }
+ 
+ // Validate the lone-ELF positional shape the standalone models require: print
+-// the diagnostic and return 2 on a violation, else 0. `model` labels the error.
++// the diagnostic and return 2 on a violation, else 0. Split out so `cycle`
++// can reject a missing/extra ELF BEFORE paying for engine discovery (which
++// spawns a --describe subprocess per Verilator build). `model` labels the error.
+ int check_one_elf(const Cli& cli, const char* model) {
+   if (cli.positional.empty()) {
+     std::fprintf(stderr,
+@@ -71,6 +87,23 @@ int check_one_elf(const Cli& cli, const char* model) {
+   return 0;
+ }
+ 
++// Reject an ELF whose class width (rv32/rv64) does not match the engine it would
++// run on -- a clear pre-flight error instead of a cryptic "not of ELFCLASSxx"
++// from deep inside the engine. Both directions. Returns "" when they agree, when
++// the ELF is unreadable/not-ELF (reported elsewhere), or when the engine
++// declares no xlen (cannot judge). Shared by cycle and hybrid: one wording.
++std::string elf_engine_arch_error(const std::string& elf,
++                                  const EngineDescriptor& eng) {
++  const int ex = elf_xlen(elf);
++  if (ex == 0 || eng.xlen == 0 || ex == eng.xlen) return "";
++  char buf[256];
++  std::snprintf(buf, sizeof(buf),
++                "ELF is rv%d but engine '%s' is rv%ld -- pick a matching engine "
++                "or an rv%d ELF",
++                ex, eng.id.c_str(), eng.xlen, ex);
++  return buf;
++}
++
+ // Print the dry-run preview: the exact command(s) andesim WOULD spawn, each
+ // shell-quoted and labeled, executing nothing. Shared by every --mode so the
+ // preview format is identical; `labels[i]` annotates `argvs[i]` (e.g.
+@@ -87,21 +120,48 @@ int print_dry_run(const std::vector<std::vector<std::string>>& argvs,
+   return 0;
+ }
+ 
+-// The standalone spine: take a single ELF, then run the resolved engine
+-// standalone with the post-`--` args appended verbatim (exec_passthrough --
+-// inherit stdio, no timeout, propagate the exit code, so an interactive
+-// gdbstub / monitor / semihosting console works unchanged). The per-model
+-// engine + selection are resolved by the caller; `model` here only labels
+-// the positional diagnostics.
++// `run --mode cycle` presentation: spawn the engine, hiding its startup banner
++// and verbose [info] log (VsimFilter), relaying only the program's own output
++// and any real diagnostics, then restate the lifted cycle count as andesim's own
++// one-line result under the [andesim] prefix. The count is printed AFTER the run
++// (the engine logs it at exit), so it follows the program output. Returns the
++// engine exit code. Unlike fast's exec_passthrough, the parent stays alive to
++// filter -- fine, because cycle (without --gdb) is a batch run, not interactive.
++int run_cycle_clean(const std::vector<std::string>& argv) {
++  VsimFilter filter;
++  const int rc = run_line_filtered(
++      argv, [&filter](int stream, std::string_view line) {
++        std::FILE* dst = nullptr;
++        switch (filter.classify(stream, line)) {
++          case VsimFilter::Dest::kStdout: dst = stdout; break;
++          case VsimFilter::Dest::kStderr: dst = stderr; break;
++          case VsimFilter::Dest::kDrop: return;
++        }
++        std::fwrite(line.data(), 1, line.size(), dst);
++        std::fputc('\n', dst);
++      });
++  if (const std::optional<uint64_t> c = filter.cycles())
++    std::printf("[andesim] %llu cycles\n", static_cast<unsigned long long>(*c));
++  return rc;
++}
++
++// The standalone spine shared by `fast` and `cycle`: both take a single ELF,
++// then run the resolved engine standalone with `extra` (model flags the
++// framework forwards, e.g. fast's -m) followed by the post-`--` args verbatim.
++// `clean_output` picks how the engine's output is presented: fast inherits the
++// stdio transparently (exec_passthrough -- an interactive gdbstub / monitor /
++// semihosting console works unchanged); cycle filters out the engine's banner +
++// [info] noise and restates the cycle count (run_cycle_clean). Either way the
++// exit code propagates. The per-model engine + selection are resolved by the
++// caller; `model` here only labels the positional diagnostics.
+ int run_standalone(const Cli& cli, const EngineDescriptor& eng,
+-                   const char* model, const std::vector<std::string>& extra = {}) {
++                   const char* model, const std::vector<std::string>& extra = {},
++                   bool clean_output = false) {
+   if (int rc = check_one_elf(cli, model)) return rc;
+   // QEMU's -bios flag searches its data directory for relative paths rather
+-  // than the CWD; resolve to absolute so the engine finds the ELF.
++  // than the CWD; resolve to absolute so both QEMU and vsim find the ELF.
+   const std::string elf = abs_elf(cli.positional[0], "--mode " + std::string(model));
+   if (elf.empty()) return 2;
+-  // `extra` (framework flags, e.g. fast's -m) precedes the post-`--` args, so a
+-  // user's own flag after `--` wins.
+   std::vector<std::string> args = extra;
+   args.insert(args.end(), cli.passthrough.begin(), cli.passthrough.end());
+   std::string err;
+@@ -115,7 +175,7 @@ int run_standalone(const Cli& cli, const EngineDescriptor& eng,
+   // full qemu/vsim command (incl. -bios <elf> and any post-`--`).
+   if (cli.dry_run)
+     return print_dry_run({argv}, {std::string("standalone [") + eng.id + "]"});
+-  return exec_passthrough(argv);
++  return clean_output ? run_cycle_clean(argv) : exec_passthrough(argv);
+ }
+ 
+ // `run --mode fast`: QEMU alone, functional, transparent passthrough. Needs
+@@ -123,10 +183,11 @@ int run_standalone(const Cli& cli, const EngineDescriptor& eng,
+ // discover_engines(), which would spawn a --describe subprocess per Verilator
+ // build only to discard them all here.
+ int run_fast(const Cli& cli) {
+-  // fast is QEMU-only; an explicit engine must name it.
+-  if (!cli.engine.empty() && cli.engine != kQemuId) {
++  // fast is QEMU-only; an explicit engine must name 'qemu64' (rv64) or 'qemu32'.
++  if (!cli.engine.empty() && cli.engine != kQemuId64 && cli.engine != kQemuId32) {
+     std::fprintf(stderr,
+-                 "andesim run --mode fast: engine must be 'qemu', got '%s'\n",
++                 "andesim run --mode fast: engine must be 'qemu64' or 'qemu32', "
++                 "got '%s'\n",
+                  cli.engine.c_str());
+     return 2;
+   }
+@@ -138,16 +199,120 @@ int run_fast(const Cli& cli) {
+     std::fprintf(stderr, "andesim run --mode fast: %s\n", err.c_str());
+     return 2;
+   }
+-  return run_standalone(cli, builtin_qemu(), "fast", extra);
++  // --gdb: inject QEMU's built-in GDB stub and pause at startup.
++  if (cli.gdb) {
++    const std::string port = cli.gdb_port.empty() ? "1234" : cli.gdb_port;
++    extra.push_back("-gdb");
++    extra.push_back("tcp::" + port);
++    extra.push_back("-S");
++  }
++  // Pick rv32 vs rv64. An explicit --engine (qemu32/qemu64) wins; otherwise read
++  // the ELF's class so an rv32 program lands on qemu-system-riscv32 instead of
++  // the rv64 default. Warn (do not fail) if an explicit choice contradicts the
++  // ELF -- the override is the user's call.
++  const int elf_w = cli.positional.empty() ? 0 : elf_xlen(cli.positional[0]);
++  int xlen;
++  if (cli.engine == kQemuId32) xlen = 32;
++  else if (cli.engine == kQemuId64) xlen = 64;
++  else xlen = elf_w ? elf_w : 64;  // no explicit engine: follow the ELF (else rv64)
++  // Only an explicit engine can disagree with the ELF (when none is given, xlen
++  // == elf_w), so this guard already implies an explicit --engine.
++  if (elf_w && elf_w != xlen)
++    std::fprintf(stderr,
++                 "[andesim] --mode fast: --engine %s is rv%d but the ELF is rv%d "
++                 "(running as rv%d)\n",
++                 cli.engine.c_str(), xlen, elf_w, xlen);
++  return run_standalone(cli, builtin_qemu_arch(xlen), "fast", extra);
++}
++
++// Block until 127.0.0.1:`port` is LISTENing (or `timeout_ms` elapses). vsim opens
++// its --jtag-port only after it has reset and halted the hart, so the debugger we
++// exec next must not race ahead of it -- OpenOCD/ICEman do not retry the bitbang
++// connect, and a missed connect leaves the session dead. Non-intrusive: scans
++// /proc/net/tcp rather than connecting (a probe connection would land in vsim's
++// single debugger slot). Returns false on timeout.
++static bool wait_for_jtag_port(uint16_t port, int timeout_ms = 20000) {
++  constexpr int kPollMs = 50;
++  for (int waited = 0; waited <= timeout_ms; waited += kPollMs) {
++    if (std::FILE* f = std::fopen("/proc/net/tcp", "re")) {
++      char line[512];
++      while (std::fgets(line, sizeof line, f)) {
++        // cols: sl  local_address(IP:port hex)  rem_address  st  ...
++        // "%*8x:%x" skips the 8-hex-digit IPv4 and reads the local port; the
++        // 0A (TCP_LISTEN) filter also drops the non-hex header row.
++        unsigned lport = 0, st = 0;
++        if (std::sscanf(line, "%*s %*8x:%x %*s %x", &lport, &st) == 2
++            && st == 0x0A && lport == port) {
++          std::fclose(f);
++          return true;
++        }
++      }
++      std::fclose(f);
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
++  }
++  return false;
++}
++
++// `run --mode cycle --gdb`: start vsim with --jtag-port 9104 in the background
++// (the hart free-runs; ICEman halts it over the JTAG DTM on connect), then exec
++// ICEman ($ICEMAN env var) with `-Z v5 -I virtual_dmi.cfg` in the foreground.
++int run_cycle_gdb(const Cli& cli, const EngineDescriptor& eng) {
++  const char* iceman = std::getenv("ICEMAN");
++  if (!iceman || !*iceman) {
++    std::fprintf(stderr,
++                 "andesim run --mode cycle --gdb: $ICEMAN not set "
++                 "(export ICEMAN=<path to ICEman binary>)\n");
++    return 2;
++  }
++  // Build vsim argv from the standalone template, appending user passthrough
++  // and the JTAG port flag.
++  const std::string elf = abs_elf(cli.positional[0], "--mode cycle --gdb");
++  if (elf.empty()) return 2;
++  const std::string jtag_port = cli.gdb_port.empty() ? "9104" : cli.gdb_port;
++  std::vector<std::string> vsim_pass = cli.passthrough;
++  vsim_pass.push_back("--jtag-port");
++  vsim_pass.push_back(jtag_port);
++  std::string err;
++  const std::vector<std::string> vsim_argv =
++      passthrough_argv(eng, "standalone", elf, vsim_pass, err);
++  if (!err.empty()) {
++    std::fprintf(stderr, "andesim run --mode cycle --gdb: %s\n", err.c_str());
++    return 2;
++  }
++  std::fprintf(stderr,
++               "[andesim] --gdb: vsim JTAG on port %s, exec ICEman\n",
++               jtag_port.c_str());
++  if (fork_background(vsim_argv) < 0) {
++    std::fprintf(stderr,
++                 "andesim run --mode cycle --gdb: failed to fork vsim\n");
++    return 1;
++  }
++  // vsim opens the JTAG port and the hart free-runs; ICEman halts it on connect.
++  // Wait for the port to be LISTENing before launching the debugger (it does not
++  // retry the bitbang connect). Numeric ports only; a non-numeric --gdb-port
++  // (atoi -> 0) skips the wait and lets the engine reject it. Best-effort: warn
++  // but launch anyway if it never appears.
++  if (const int pnum = std::atoi(jtag_port.c_str());
++      pnum > 0 && !wait_for_jtag_port(static_cast<uint16_t>(pnum)))
++    std::fprintf(stderr,
++                 "[andesim] --gdb: warning: vsim JTAG port %s not LISTENing "
++                 "after 20s; launching the debugger anyway\n",
++                 jtag_port.c_str());
++  // -I virtual_dmi.cfg selects ICEman's remote_bitbang interface (host
++  // localhost, port 9104) instead of its default real-hardware adapter; without
++  // it ICEman finds no adapter and exits. The cfg is found relative to the cwd
++  // (repo root) in interface/; it pins port 9104, matching --jtag-port's default.
++  return exec_passthrough({iceman, "-Z", "v5", "-I", "virtual_dmi.cfg"});
+ }
+ 
+ // `run --mode cycle`: one cycle-accurate engine alone, from reset (no QEMU,
+ // no --resume-from-qemu), transparent passthrough -- cycles surface in the
+-// engine's own output. Unlike fast, this must discover the vsim build(s) to
+-// resolve the engine (explicit --engine, else the sole one).
++// engine's own output. Unlike fast, this must discover the Verilator build(s)
++// to resolve the engine (explicit --engine, else the sole one).
+ int run_accurate(const Cli& cli) {
+   // Reject a missing/extra ELF before discovery so a CLI typo does not spawn a
+-  // --describe subprocess per vsim build only to fail on the argument.
++  // --describe subprocess per Verilator build only to fail on the argument.
+   if (int rc = check_one_elf(cli, "cycle")) return rc;
+   // --mem-size is validated but has nothing to size: the cycle engine always
+   // models its full DRAM window. Say so instead of silently ignoring it.
+@@ -173,7 +338,21 @@ int run_accurate(const Cli& cli) {
+       std::fprintf(stderr, "andesim: skipped engine: %s\n", w.c_str());
+     return 2;
+   }
+-  return run_standalone(cli, *eng, "cycle");
++  // The ELF must match the engine's width: an rv32 ELF on an rv64 engine (or
++  // vice versa) cannot run. Catch it here with a clear message instead of the
++  // engine's cryptic "not of ELFCLASSxx". check_one_elf above guaranteed a lone
++  // positional.
++  if (std::string e = elf_engine_arch_error(cli.positional[0], *eng); !e.empty()) {
++    std::fprintf(stderr, "andesim run --mode cycle: %s\n", e.c_str());
++    return 2;
++  }
++  // --dry-run previews the standalone command and spawns nothing, so it takes
++  // precedence over the interactive --gdb path (a dry run launches no debugger).
++  if (cli.gdb && !cli.dry_run) return run_cycle_gdb(cli, *eng);
++  // clean_output: hide vsim's banner + [info] log, restate the cycle count under
++  // [andesim] (fast keeps raw passthrough -- QEMU has no such banner and its
++  // monitor/gdbstub are interactive).
++  return run_standalone(cli, *eng, "cycle", /*extra=*/{}, /*clean_output=*/true);
+ }
+ 
+ // `run --mode hybrid`: orchestrate a QEMU1 fast-forward -> vsim measure+drain
+@@ -202,6 +381,9 @@ int run_hybrid(const Cli& cli) {
+   const Trigger trig = hybrid_trigger(cli, elf_path, err);
+   if (!err.empty()) return fail(err);
+ 
++  // hybrid_trigger has already guaranteed trig.kind is marker|pc (the only
++  // hybrid triggers; unknown returned an error above) -- exactly the entry
++  // boundary --verify needs the oracle to arm on.
+   std::vector<std::string> vsim_extras = vsim_extra_args(cli, trig.kind, err);
+   if (!err.empty()) return fail(err);
+ 
+@@ -210,12 +392,42 @@ int run_hybrid(const Cli& cli) {
+     std::string se;
+     mem = parse_size(cli.mem_size, se);
+     if (!se.empty()) return fail("--mem-size: " + se);
+-    // Early cap: QEMU's AE350 DRAM window is 2 GiB and the mmap backend doubles
+-    // as guest RAM here. Failing now beats allocating a huge mmap file first and
+-    // letting QEMU die late.
+-    if (mem > 2LL * 1024 * 1024 * 1024)
++    // Early cap: QEMU's AE350 DRAM window is 2 GiB and the backend doubles as
++    // guest RAM here. The physical mmap reserves one V-scratch page above the
++    // program's RAM (L26/F2), so the usable --mem-size is 2 GiB minus that
++    // page. Failing now beats allocating a huge mmap file first and letting
++    // QEMU die late.
++    if (mem > max_program_mem_bytes())
+       return fail("--mem-size " + cli.mem_size +
+-                  " exceeds the AE350 DRAM window (2G)");
++                  " exceeds the AE350 DRAM window (2G minus the V-scratch "
++                  "reservation)");
++  }
++
++  // L26/F3: refuse a run whose static image would extend into the reserved
++  // V-transport scratch page. Scheme D parks the scratch in the TOP page of the
++  // physical mmap; a PT_LOAD segment reaching there means the ELF was linked for
++  // more RAM than --mem-size grants, and QEMU would load it straight onto the
++  // scratch -> silent corruption. Derive the page's start from
++  // physical_mmap_bytes (the same sizing the mmap uses) rather than a bare
++  // `mem`, so the threshold tracks the reservation shape instead of relying on
++  // the +page/-page adjustments cancelling. ram_base is the fixed andes_ae350
++  // DRAM base (0; see L10). Skipped when the ELF cannot be read -- downstream
++  // reports it.
++  {
++    std::string e;
++    const uint64_t top = elf_load_top(elf_path, e);
++    const uint64_t scratch_gpa =
++        static_cast<uint64_t>(physical_mmap_bytes(mem)) - HYBRID_V_SCRATCH_BYTES;
++    if (e.empty() && top > scratch_gpa) {
++      char msg[256];
++      std::snprintf(msg, sizeof(msg),
++                    "ELF static image ends at 0x%llx, overlapping the reserved "
++                    "V-transport scratch page at 0x%llx (ram_base + --mem-size)"
++                    "; raise --mem-size or shrink the image",
++                    static_cast<unsigned long long>(top),
++                    static_cast<unsigned long long>(scratch_gpa));
++      return fail(msg);
++    }
+   }
+ 
+   // qemu is the built-in fast leg; resolve the accurate (vsim) leg by --engine
+@@ -233,13 +445,23 @@ int run_hybrid(const Cli& cli) {
+   // ISA sync: both legs must agree on the base ISA width (rv32 engines
+   // cannot share architectural state with the rv64 fast leg).
+   if (std::string hw = hybrid_hw_check(*acc); !hw.empty()) return fail(hw);
++  // ...and the ELF must match that engine width too (same guard as cycle).
++  if (std::string e = elf_engine_arch_error(elf_path, *acc); !e.empty())
++    return fail(e);
+ 
+   Plan plan;
+   plan.elf = elf_path;
+   plan.mem_size = mem;
+-  Step qemu_step{kQemuId, "fast-leg", trig};
++  Step qemu_step{kQemuId64, "fast-leg", trig};
+   Step vsim_step{acc->id, "accurate-leg", trig};
+   vsim_step.extra_args = std::move(vsim_extras);  // kanata, validated
++  // #1: with no --verify the driver consumes only the vsim mcycle delta, so ask
++  // the accurate leg to drain just the counters and skip the full register-file
++  // readback (~190 DM abstract commands). --verify keeps the full drain so the
++  // oracle diff sees every field. Driver policy lives here next to the rest of
++  // the verify reasoning, not in vsim_extra_args (user-forwarded flags only).
++  if (!cli.verify)
++    vsim_step.extra_args.push_back("--drain-minimal");
+########## driver/process.cpp ##########
+diff --git a/driver/process.cpp b/driver/process.cpp
+index 42ac0be..fc65b71 100644
+--- a/driver/process.cpp
++++ b/driver/process.cpp
+@@ -39,6 +39,35 @@ int wait_for_exit_code(pid_t pid) {
+   return -1;
+ }
+ 
++// fork + (optional chdir) + (optional stdin from /dev/null) + exec.
++// When `wait` is true (the default) waits for the child and returns its exit
++// code, 128+signal if signalled, or -1 on failure. When `wait` is false
++// returns the child pid immediately without waiting (caller owns the child).
++// Backs run_inherit (build: stdin closed, chdir), exec_passthrough (run
++// fast/cycle: stdin inherited, no chdir), and fork_background (no wait).
++int spawn_inherit(const std::vector<std::string>& argv, const std::string& cwd,
++                  bool stdin_from_devnull, bool wait = true) {
++  if (argv.empty()) return -1;
++
++  pid_t pid = fork();
++  if (pid < 0) return -1;
++
++  if (pid == 0) {  // child
++    if (!cwd.empty() && chdir(cwd.c_str()) != 0) _exit(127);
++    if (stdin_from_devnull) {
++      int devnull = open("/dev/null", O_RDONLY);
++      if (devnull >= 0) {
++        dup2(devnull, STDIN_FILENO);
++        if (devnull > 2) close(devnull);
++      }
++    }
++    exec_or_die(argv);
++  }
++
++  if (!wait) return static_cast<int>(pid);
++  return wait_for_exit_code(pid);
++}
++
+ }  // namespace
+ 
+ RunResult run_process(const std::vector<std::string>& argv, int timeout_ms) {
+@@ -121,13 +150,99 @@ RunResult run_process(const std::vector<std::string>& argv, int timeout_ms) {
+   return r;
+ }
+ 
++int run_inherit(const std::vector<std::string>& argv, const std::string& cwd) {
++  return spawn_inherit(argv, cwd, /*stdin_from_devnull=*/true);
++}
++
+ int exec_passthrough(const std::vector<std::string>& argv) {
++  return spawn_inherit(argv, /*cwd=*/"", /*stdin_from_devnull=*/false);
++}
++
++int fork_background(const std::vector<std::string>& argv) {
++  return spawn_inherit(argv, /*cwd=*/"", /*stdin_from_devnull=*/false, /*wait=*/false);
++}
++
++namespace {
++
++// Drain everything readable on `fd` into `buf`, delivering each completed
++// '\n'-terminated line (newline stripped) to on_line. Returns false at EOF /
++// error so the caller stops polling that stream.
++bool pump_stream(int fd, int stream, std::string& buf,
++                 const std::function<void(int, std::string_view)>& on_line) {
++  char rb[4096];
++  const ssize_t n = read(fd, rb, sizeof rb);
++  if (n == 0) return false;          // EOF: child closed this stream
++  if (n < 0) return errno == EINTR;  // transient -> keep; real error -> stop
++  buf.append(rb, static_cast<size_t>(n));
++  size_t nl;
++  while ((nl = buf.find('\n')) != std::string::npos) {
++    on_line(stream, std::string_view(buf.data(), nl));
++    buf.erase(0, nl + 1);
++  }
++  return true;
++}
++
++}  // namespace
++
++int run_line_filtered(
++    const std::vector<std::string>& argv,
++    const std::function<void(int, std::string_view)>& on_line) {
+   if (argv.empty()) return -1;
+ 
++  int out_fds[2], err_fds[2];
++  if (pipe(out_fds) != 0) return -1;
++  if (pipe(err_fds) != 0) {
++    close(out_fds[0]);
++    close(out_fds[1]);
++    return -1;
++  }
++
+   pid_t pid = fork();
+-  if (pid < 0) return -1;
+-  if (pid == 0) exec_or_die(argv);  // child: inherit all three std streams
++  if (pid < 0) {
++    close(out_fds[0]);
++    close(out_fds[1]);
++    close(err_fds[0]);
++    close(err_fds[1]);
++    return -1;
++  }
++
++  if (pid == 0) {  // child: stdout/stderr to the pipes, stdin inherited
++    close(out_fds[0]);
++    close(err_fds[0]);
++    dup2(out_fds[1], STDOUT_FILENO);
++    dup2(err_fds[1], STDERR_FILENO);
++    if (out_fds[1] > 2) close(out_fds[1]);
++    if (err_fds[1] > 2) close(err_fds[1]);
++    exec_or_die(argv);
++  }
++
++  // parent: poll both pipes, line-buffer each, until both hit EOF. No timeout --
++  // matches exec_passthrough (a cycle run can be arbitrarily long). The stream id
++  // is index+1 (0 -> stdout=1, 1 -> stderr=2); a closed stream's fd is set to -1,
++  // which poll() ignores (revents 0).
++  close(out_fds[1]);
++  close(err_fds[1]);
++  const int fd[2] = {out_fds[0], err_fds[0]};
++  std::string buf[2];
++  bool open_[2] = {true, true};
++
++  struct pollfd pfd[2] = {{fd[0], POLLIN, 0}, {fd[1], POLLIN, 0}};
++  while (open_[0] || open_[1]) {
++    for (int i = 0; i < 2; ++i) pfd[i].fd = open_[i] ? fd[i] : -1;
++    if (poll(pfd, 2, -1) < 0) {
++      if (errno == EINTR) continue;
++      break;
++    }
++    for (int i = 0; i < 2; ++i)
++      if (open_[i] && (pfd[i].revents & (POLLIN | POLLHUP | POLLERR)))
++        if (!pump_stream(fd[i], i + 1, buf[i], on_line)) open_[i] = false;
++  }
++  // Flush any final line that arrived without a trailing newline.
++  for (int i = 0; i < 2; ++i)
++    if (!buf[i].empty()) on_line(i + 1, buf[i]);
+ 
++  close(fd[0]);
++  close(fd[1]);
+   return wait_for_exit_code(pid);
+ }
+ 
+########## driver/process.hpp ##########
+diff --git a/driver/process.hpp b/driver/process.hpp
+index 20a275a..ad97d74 100644
+--- a/driver/process.hpp
++++ b/driver/process.hpp
+@@ -7,7 +7,9 @@
+ #ifndef ANDESIM_PROCESS_HPP
+ #define ANDESIM_PROCESS_HPP
+ 
++#include <functional>
+ #include <string>
++#include <string_view>
+ #include <vector>
+ 
+ namespace andes_sim {
+@@ -24,14 +26,39 @@ struct RunResult {
+ // timeout_ms it is SIGKILLed and timed_out is set.
+ RunResult run_process(const std::vector<std::string>& argv, int timeout_ms);
+ 
++// Run argv to completion with the child INHERITING this process's stdout and
++// stderr (its output streams straight to the terminal) and stdin from
++// /dev/null; chdir to `cwd` first if non-empty. No capture, no timeout. Returns
++// the child's exit code, 128+signal if it was signalled, or -1 on spawn
++// failure. Used by `build` to delegate to setup.sh / build_*.sh / make.
++int run_inherit(const std::vector<std::string>& argv, const std::string& cwd);
++
+ // Run argv to completion with the child INHERITING all three std streams
+ // (stdin, stdout, stderr) -- the transparent-passthrough mechanism behind
+-// `run --mode fast`: the engine reads/writes the terminal directly, so an
+-// interactive gdbstub or semihosting console works unchanged. No chdir,
++// `run --mode fast|cycle`: the engine reads/writes the terminal directly,
++// so an interactive gdbstub or semihosting console works unchanged. No chdir,
+ // no capture, no timeout. Returns the child's exit code, 128+signal if it was
+ // signalled, or -1 on spawn failure / empty argv.
+ int exec_passthrough(const std::vector<std::string>& argv);
+ 
++// Fork a child that execs argv with inherited stdio and return immediately
++// without waiting. Used by `run --mode cycle --gdb` to launch vsim in the
++// background before exec-ing ICEman in the foreground. Returns the child pid
++// on success, -1 on empty argv or fork failure.
++int fork_background(const std::vector<std::string>& argv);
++
++// Run argv with BOTH stdout and stderr captured (separate pipes) and stdin
++// inherited, streaming each complete line to `on_line(stream, line)` as it
++// arrives -- stream is 1 (stdout) or 2 (stderr), line excludes the trailing
++// newline. The callback owns presentation (it decides what to write to the real
++// streams), so this is the filtered counterpart to exec_passthrough: same "run
++// to completion, no timeout, propagate exit code" contract, but the parent sees
++// every line. A final unterminated line is delivered too. Returns the child's
++// exit code, 128+signal if signalled, or -1 on spawn failure / empty argv.
++int run_line_filtered(
++    const std::vector<std::string>& argv,
++    const std::function<void(int stream, std::string_view line)>& on_line);
++
+ }  // namespace andes_sim
+ 
+ #endif  // ANDESIM_PROCESS_HPP
