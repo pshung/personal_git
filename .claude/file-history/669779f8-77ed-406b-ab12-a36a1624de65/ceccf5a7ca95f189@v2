@@ -1,0 +1,97 @@
+export const meta = {
+  name: 'vsim-series-v2',
+  description: 'Build the fine-grained 50-commit prototype-first review series for vsim_andesim',
+  phases: [
+    { title: 'Build series', detail: 'one agent per commit, sequential, minimal->complete' },
+    { title: 'Verify', detail: 'tree parity + full unit-test pass' },
+  ],
+}
+
+const SCRATCH = '/tmp/claude-1002/-home-nick-work-andesim/669779f8-77ed-406b-ab12-a36a1624de65/scratchpad'
+const SPEC = SCRATCH + '/vsim_series_v2.json'
+const WT = SCRATCH + '/wt/vsim'
+const REPO = '/home/nick/work/vsim_andesim'
+const IDS = Array.from({length: 50}, (_, i) => 'v' + String(i + 1).padStart(3, '0'))
+
+const RES = {
+  type: 'object', required: ['status', 'summary'],
+  properties: {
+    status: { type: 'string', enum: ['committed', 'blocked'] },
+    sha: { type: 'string' },
+    summary: { type: 'string' },
+    deviations: { type: 'array', items: { type: 'string' } },
+    validation_notes: { type: 'string' },
+  },
+}
+
+const POLICY = `You build ONE commit of a fine-grained, prototype-first review series for the vsim_andesim repo. The series re-synthesizes 46 messy commits into 50 clean ones. The organizing rule: each functionality is built up in TWO steps -- a MINIMAL prototype commit (smallest real slice, e.g. transport only f0) with its test, then a COMPLETION commit (the rest, f1..f31) with its test. Some commits are single (atomic). Your commit's spec entry has a "slice" field: minimal | completion | single.
+
+WORKSPACE
+- Work ONLY in worktree ${WT} (branch review/vsim-series). NEVER modify ${REPO}'s main checkout or other worktrees; read-only git against ${REPO} is fine ('git -C ${WT} show <sha>' reaches all history).
+- NEVER 'git push'. Only branch review/vsim-series.
+- Start: 'git -C ${WT} status --short' clean. End: EXACTLY ONE new commit, clean status.
+
+SPEC
+- Read ${SPEC}. Find your entry by id. Also read top-level abi_pins, legacy_never_add, expected_delta_vs_old_tip. Substitute ${SCRATCH} for any SCRATCH in the text; abi/vN checkouts live at ${SCRATCH}/abi/v2..v6.
+
+SLICE SEMANTICS (critical -- this is what makes the series reviewable)
+- slice=minimal: the code genuinely does ONLY the small slice. E.g. for "GPR restore, min (x1)", the restore writes ONLY x1 (not a loop over x1..x31); the test checks ONLY x1. You author a genuinely reduced version of the final file -- NOT the final file. For X-macro CSR blocks, the minimal commit HAND-CODES the one named CSR (e.g. mxstatus), and the completion commit swaps in the HYBRID_*_CSR_LIST loop.
+- slice=completion: expand the previous minimal slice to the full final form (the loop / full list / all registers) and extend the test to cover all. After a completion commit, the touched file should match its final form MINUS features that land in still-later commits.
+- slice=single: author the file to final form minus later-feature parts, per construct.
+- The construct field tells you exactly what reduced/full content to write and how to derive it from the final file ('git -C ${WT} show qemu-isa-match:<path>'). Historical commits are reference only; the final file has the fixed form.
+
+BUILD-ORDER FACTS you must honor (ABI symbols/macros only exist after their pin commit):
+- hybrid_andes_csr + HYBRID_ANDES_CSR_LIST: only after the v3 pin. hybrid_m_ext_csr + HYBRID_M_EXT_CSR_LIST: only after v4. hybrid_l2c: only after v5. write_mask.h: only after v6. Do NOT reference a macro/struct that its pin has not introduced yet -- defer that branch to the commit the spec assigns it to.
+- andes_caps.hpp is CREATED partway through: earlier commits that reference it in FINAL must STRIP the include + the caps_ member and reduced call sites, adding them at the caps commit. Follow the construct.
+- Tolerant CSR writes evolve: plain write, then caps-gated, then baseline-gated, then write-mask-gated. Each later commit rewraps the same call sites -- do only what YOUR commit's construct says.
+- HybridConfig.cmake: every commit that ADDS a tests/hybrid/*.test.cpp must also register it there (per construct).
+- NEVER introduce a legacy_never_add item (dead consts, regno_vector, pcs_of_kind/empty, trigger() accessor, --hybrid-enter-pc, any PB register/CSR sweep, stale csrwi-0x7C0 / 'CSR sweep' wording). Write correct wording from day one.
+
+VALIDATION (must pass before committing)
+- Run every validate item in your spec entry. Header-only unit tests compile+run from the worktree:
+    g++ -std=c++20 -I ${SCRATCH}/abi/vN -I ${REPO}/external/doctest/doctest -I ${WT}/src <test file> -o /tmp/claude-1002/vtest_${'$'}{RANDOM} && that binary
+  where vN is the ABI pin in effect at your commit (spec 'abi' field / abi_pins). SystemC-linked tests (shared_mem_smoke/offset, memory_map) may be skipped with a note.
+- If validation cannot pass, DO NOT commit broken: fix construction, or return status=blocked with precise detail.
+
+GITLINK: to (re)pin external/andesim_abi: git -C ${WT} update-index --add --cacheinfo 160000,<full sha>,external/andesim_abi
+
+COMMIT MESSAGE: first line = spec subject verbatim. Blank line. Body = 2-6 full sentences from body_points (what + why; note "minimal: only <slice>" or "completes <feature>" so a reviewer sees the step). End with exactly:
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+REPORT: status/sha (git rev-parse --short HEAD)/summary + EVERY deviation.`
+
+phase('Build series')
+const done = []
+for (const id of IDS) {
+  const r = await agent(
+    POLICY + `\n\nYOUR COMMIT: ${id}\n\nCommits already in the series (oldest first): ${JSON.stringify(done)}\n\nBuild ${id} now.`,
+    { label: id, phase: 'Build series', schema: RES }
+  )
+  if (!r || r.status !== 'committed' || !r.sha) {
+    log(`ABORTED at ${id}: ${r ? r.summary : 'agent died'}`)
+    return { status: 'aborted', at: id, reason: r, done }
+  }
+  done.push({ id, sha: r.sha, dev: (r.deviations || []).join('; ').slice(0, 200) })
+  log(`${id} -> ${r.sha}`)
+}
+
+phase('Verify')
+const VER = {
+  type: 'object', required: ['verdict', 'issues'],
+  properties: {
+    verdict: { type: 'string', enum: ['clean', 'issues-found'] },
+    issues: { type: 'array', items: { type: 'string' } },
+    delta_report: { type: 'string' },
+    test_report: { type: 'string' },
+  },
+}
+const v = await agent(`Verify the finished 50-commit series on branch review/vsim-series in worktree ${WT} (repo ${REPO}; never push; do not touch other checkouts).
+
+1. TREE PARITY: 'git -C ${WT} diff qemu-isa-match HEAD --name-status'. Read ${SPEC} expected_delta_vs_old_tip. Every D on the deleted list, every M/A on the edited list; external/andesim_abi gitlink IDENTICAL at v6. For each edited file, read the diff and confirm ONLY sanctioned legacy removals/text fixes; quote anything else.
+2. FULL TESTS: compile+run EVERY tests/hybrid/*.test.cpp at the tip with g++ -std=c++20 -I ${SCRATCH}/abi/v6 -I ${REPO}/external/doctest/doctest -I ${WT}/src (skip SystemC-linked with a note). All pass.
+3. SERIES QUALITY + PROTOTYPE-FIRST: 'git -C ${WT} log --reverse --oneline 03dfe23..HEAD'. Confirm the minimal->completion pattern reads cleanly (each minimal commit precedes its completion; a reviewer can follow each functionality). Flag: any message/diff contradiction, any add-then-delete churn, any commit whose minimal slice actually contains the full implementation (defeats the prototype-first intent), any off-topic file touch.
+Return the structured verdict; be exhaustive.`,
+  { label: 'verify', phase: 'Verify', schema: VER })
+
+return { status: 'complete', done, verify: v }

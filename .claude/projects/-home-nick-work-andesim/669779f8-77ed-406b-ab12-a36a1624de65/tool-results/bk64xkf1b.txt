@@ -1,0 +1,754 @@
+   1 #pragma once
+   2 
+   3 #include "cpu_config.hpp"
+   4 #include "hybrid/andes_caps_config.hpp" // after cpu_config.hpp: needs _NDS_* macros
+   5 #include "hybrid/csr_trigger.hpp"
+   6 #include "hybrid/exit_codes.hpp"
+   7 #include "hybrid/handoff_controller.hpp"
+   8 #include "hybrid/v_regfile_xfer.hpp"
+   9 #include "hybrid/reset_baseline.hpp"
+  10 #include "hybrid/resume_driver.hpp"
+  11 #include "hybrid/state_loader.hpp"
+  12 #include "hybrid/systemc_dmi_bus.hpp"
+  13 #include "platform/memory_map.h"
+  14 #include "platform/platform.hpp"
+  15 #include "pybind11.hpp"
+  16 #include "simulator_context.hpp"
+  17 #include "simulator_trace.hpp"
+  18 #include "utils/axi.hpp"
+  19 #include "utils/axi_to_tlm_bridge.hpp"
+  20 #include "utils/elf_loader.hpp"
+  21 #include "utils/sizeconvert.hpp"
+  22 
+  23 #include <LIEF/ELF.hpp>
+  24 #include <systemc>
+  25 #include <tlm>
+  26 
+  27 #include <chrono>
+  28 #include <csignal>
+  29 #include <cstdint>
+  30 #include <cstdlib>
+  31 
+  32 #include <experimental/scope>
+  33 #include <fstream>
+  34 #include <memory>
+  35 #include <optional>
+  36 #include <span>
+  37 #include <string>
+  38 
+  39 template<typename CPU>
+  40 class Simulator : sc_core::sc_module
+  41 {
+  42   using PLATFORM = Platform<platform_config<CPU>>;
+  43   static constexpr bool is_axi = (CPU::SYSTEM_BUS_TYPE == BusTypes::AXI);
+  44   static constexpr auto bus_width = PLATFORM::data_width;
+  45 
+  46   // Helper: create an AXI→TLM bridge, bind clock, connect initiator BFM
+  47   auto make_axi_to_tlm(const char* name, auto& bfm_socket)
+  48     -> std::unique_ptr<axi_to_tlm_bridge<bus_width>>
+  49   {
+  50     auto bridge = std::make_unique<axi_to_tlm_bridge<bus_width>>(name);
+  51     bridge->pe.clk_i.bind(platform.clk);
+  52     bfm_socket.bind(bridge->axi_tsck);
+  53     return bridge;
+  54   }
+  55 
+  56   // Helper: create a TLM→AXI bridge, bind clock, connect target BFM
+  57   auto make_tlm_to_axi(const char* name, auto& bfm_socket)
+  58     -> std::unique_ptr<tlm_to_axi_bridge<bus_width>>
+  59   {
+  60     auto bridge = std::make_unique<tlm_to_axi_bridge<bus_width>>(name);
+  61     bridge->pe.clk_i.bind(platform.clk);
+  62     bridge->axi_isck.bind(bfm_socket);
+  63     return bridge;
+  64   }
+  65 
+  66 public:
+  67   CPU cpu;
+  68   PLATFORM platform;
+  69 
+  70   // AXI bridges (only used when is_axi == true, null otherwise)
+  71   std::unique_ptr<axi_to_tlm_bridge<bus_width>> mem_bridge;
+  72   std::unique_ptr<axi_to_tlm_bridge<bus_width>> mmio_bridge;
+  73   std::unique_ptr<tlm_to_axi_bridge<bus_width>> hvm_bridge;
+  74   std::unique_ptr<tlm_to_axi_bridge<bus_width>> slv_bridge;
+  75 
+  76   // sys bus (64-bit slave port on CPU, needs width adapter to 256-bit
+  77   // interconnect)
+  78   static constexpr std::size_t sys_bus_width = 64;
+  79   std::unique_ptr<socket_width_adapter<bus_width, sys_bus_width>> sys_adapter;
+  80   std::unique_ptr<tlm_to_axi_bridge<sys_bus_width>> sys_bridge;
+  81 
+  82 #if _NDS_IOCP_NUM > 0
+  83   // iocp_master connects directly to CPU, not through the interconnect.
+  84   // It needs to speak the CPU's bus protocol.
+  85   using IocpInitiatorType = std::
+  86     conditional_t<is_axi, AxiPeInitiator<bus_width>, AhbPeInitiator<bus_width>>;
+  87   IocpInitiatorType iocp_master;
+  88 #endif // _NDS_IOCP_NUM
+  89 
+  90 private:
+  91   // debug
+  92   jtag_dtm& dtm;
+  93   bool dtm_debug = false;
+  94   TraceController<CPU> trace_;
+  95 
+  96   // Hybrid handoff (vsim->QEMU). Order matters: dmi_bus_ is referenced by
+  97   // handoff_, so it must be declared first.
+  98   std::unique_ptr<hybrid::SystemCDmiBus<PLATFORM::dmi_addr_width,
+  99                                         PLATFORM::dmi_data_width>>
+ 100     hybrid_dmi_bus_;
+ 101   std::optional<hybrid::HandoffController<hybrid::CsrTrigger>>
+ 102     hybrid_handoff_;
+ 103   std::string hybrid_state_path_;
+ 104   std::optional<hybrid_state_v1> hybrid_input_state_;
+ 105 
+ 106   using xlen_t = std::conditional_t<CPU::NDS_XLEN <= 32, uint32_t, uint64_t>;
+ 107 
+ 108 public:
+ 109   ContextManager<CPU> context_config;
+ 110 
+ 111   Simulator(const sc_core::sc_module_name& name,
+ 112             std::span<uint8_t> ram_buffer = {},
+ 113             MemoryRegion ram_region = {RAM_BASE, RAM_END},
+ 114             MemoryRegion ram_alias_region = {RAM_ALIAS_BASE, RAM_ALIAS_END})
+ 115       : sc_core::sc_module{name},
+ 116         platform("platform", ram_buffer, ram_region, ram_alias_region),
+ 117         dtm(platform.dtm)
+ 118   {
+ 119     cpu.bind(platform.clk, platform.resetn, platform.reset_vector,
+ 120              platform.dmi_signals, platform.wfi_signal, platform.int_trigger);
+ 121 
+ 122     // --- CPU memory BFM → interconnect ---
+ 123     if constexpr (is_axi) {
+ 124       mem_bridge = make_axi_to_tlm("mem_bridge", cpu.mem_bfm.isckt);
+ 125       platform.interconnect.bind_initiator(mem_bridge->tlm_isck);
+ 126     } else {
+ 127       platform.interconnect.bind_initiator(cpu.mem_bfm.isckt);
+ 128     }
+ 129 
+ 130     // --- CPU MMIO BFM → interconnect ---
+ 131     if constexpr (requires { cpu.mmio_bfm; }) {
+ 132       if constexpr (is_axi) {
+ 133         mmio_bridge = make_axi_to_tlm("mmio_bridge", cpu.mmio_bfm.isckt);
+ 134         platform.interconnect.bind_initiator(mmio_bridge->tlm_isck);
+ 135       } else {
+ 136         platform.interconnect.bind_initiator(cpu.mmio_bfm.isckt);
+ 137       }
+ 138     }
+ 139 
+ 140     // --- CPU HVM subordinate port ---
+ 141     if constexpr (requires { cpu.hvm_bfm; }) {
+ 142       if constexpr (is_axi) {
+ 143         hvm_bridge = make_tlm_to_axi("hvm_bridge", cpu.hvm_bfm.tsckt);
+ 144         platform.interconnect.bind_target(
+ 145           hvm_bridge->tlm_tsck,
+ 146           {CPU::NDS_HVM_BASE,
+ 147            CPU::NDS_HVM_BASE + CPU::NDS_HVM_SIZE_KB * 0x1000 - 1});
+ 148       } else {
+ 149         platform.interconnect.bind_target(
+ 150           cpu.hvm_bfm.tsckt,
+ 151           {CPU::NDS_HVM_BASE,
+ 152            CPU::NDS_HVM_BASE + CPU::NDS_HVM_SIZE_KB * 0x1000 - 1});
+ 153       }
+ 154       platform.custom_master.hvm_base = CPU::NDS_HVM_BASE;
+ 155     }
+ 156 
+ 157     // --- CPU slave port ---
+ 158     if constexpr (requires { cpu.slv_bfm; }) {
+ 159       if constexpr (is_axi) {
+ 160         slv_bridge = make_tlm_to_axi("slv_bridge", cpu.slv_bfm.tsckt);
+ 161         platform.interconnect.bind_target(slv_bridge->tlm_tsck,
+ 162                                           {HART0_ILM_BASE, HART0_DLM_END});
+ 163       } else {
+ 164         platform.interconnect.bind_target(cpu.slv_bfm.tsckt,
+ 165                                           {HART0_ILM_BASE, HART0_DLM_END});
+ 166       }
+ 167       platform.custom_master.ilm_base = HART0_ILM_BASE;
+ 168       platform.custom_master.dlm_base = HART0_DLM_BASE;
+ 169     }
+ 170 
+ 171     // --- CPU sys bus (slave port, 64-bit) → interconnect ---
+ 172     if constexpr (requires { cpu.sys_bfm; }) {
+ 173       sys_adapter =
+ 174         std::make_unique<socket_width_adapter<bus_width, sys_bus_width>>(
+ 175           "sys_adapter");
+ 176       sys_bridge =
+ 177         std::make_unique<tlm_to_axi_bridge<sys_bus_width>>("sys_bridge");
+ 178       sys_bridge->pe.clk_i.bind(platform.clk);
+ 179       sys_bridge->axi_isck.bind(cpu.sys_bfm.tsckt);
+ 180       sys_adapter->isck.bind(sys_bridge->tlm_tsck);
+ 181       platform.interconnect.bind_target(sys_adapter->tsck,
+ 182                                         {MLIF_BASE, SLIF_END});
+ 183     }
+ 184 
+ 185 #if _NDS_IOCP_NUM > 0
+ 186     iocp_master.protocol_engine.clk_i.bind(platform.clk);
+ 187     iocp_master.socket.bind(cpu.iocp_bfm.tsckt);
+ 188 #endif // _NDS_IOCP_NUM
+ 189   }
+ 190 
+ 191   ~Simulator() { trace_.close(); }
+ 192 
+ 193   void init_debug_port(const uint16_t port = 9104)
+ 194   {
+ 195     dtm_debug = true;
+ 196     dtm.init_port(port);
+ 197     spdlog::info("waiting for debugger connection");
+ 198   }
+ 199 
+ 200   // Caller invariant: the CPU must already be out of reset.
+ 201   //
+ 202   // baseline_cache (LG3): path to this (engine build, ELF)'s reset-state
+ 203   // baseline; empty disables the liveness gate (transport-everything). On a
+ 204   // cache miss the baseline is captured HERE: the hart is freshly reset and
+ 205   // the capture drain halts it exactly where resume() would, so the drained
+ 206   // values ARE what the gate must compare restores against. Capture runs
+ 207   // BEFORE the scratch stagings below -- its drain sweeps dump reset
+ 208   // registers through the same scratch page the stagings fill.
+ 209   void apply_resume_from_qemu(const std::string& path,
+ 210                               const std::string& baseline_cache = {})
+ 211   {
+ 212     hybrid::SystemCDmiBus<PLATFORM::dmi_addr_width, PLATFORM::dmi_data_width>
+ 213       bus{platform.dmi, platform.clk.period()};
+ 214     hybrid_input_state_ = hybrid::load_state(path);
+ 215 
+ 216     std::optional<hybrid_state_v1> baseline{};
+ 217     bool baseline_captured = false;
+ 218     if (!baseline_cache.empty()) {
+ 219       baseline = hybrid::try_load_reset_baseline(baseline_cache);
+ 220       // Stale-shape insurance: a cache whose flags/vlenb no longer cover the
+ 221       // incoming state was captured under a different engine/QEMU pairing.
+ 222       if (baseline
+ 223           && ((baseline->flags & hybrid_input_state_->flags)
+ 224                 != hybrid_input_state_->flags
+ 225               || baseline->vlenb != hybrid_input_state_->vlenb))
+ 226         baseline.reset();
+ 227       if (!baseline) {
+ 228         baseline = capture_reset_baseline(bus, *hybrid_input_state_);
+ 229         baseline_captured = true;
+ 230         if (!hybrid::save_reset_baseline(baseline_cache, *baseline))
+ 231           spdlog::warn("hybrid: cannot save reset baseline to {}",
+ 232                        baseline_cache);
+ 233       }
+ 234       spdlog::info("hybrid: reset baseline {} ({})",
+ 235                    baseline_captured
+ 236                      ? "captured -- one-time cost per engine build + ELF"
+ 237                      : "cache hit",
+ 238                    baseline_cache);
+ 239     }
+ 240 
+ 241     // Stage V-register bytes into the fixed scratch region of RAM BEFORE
+ 242     // resume: ResumeDriver's Program-Buffer reload sweep issues vle8.v from
+ 243     // this region to repopulate v0..v31, so the bytes must be in place first.
+ 244     // Best-effort: mismatched RAM layouts throw, which is louder than silently
+ 245     // dropping V state.
+ 246     if ((hybrid_input_state_->flags & HYBRID_FLAG_V) != 0u) {
+ 247       hybrid::stage_v_to_scratch(*hybrid_input_state_,
+ 248                                  platform.main_memory.data);
+ 249     }
+ 250     // GPR/FPR/CSR transport is Abstract-Command-only in BOTH directions (never
+ 251     // Program Buffer): a csrrw to a caps-supported but read-only / WARL-illegal
+ 252     // CSR raises cmderr, and the abstract path's per-CSR clear_cmderr tolerates
+ 253     // that single failure and moves on -- a batched PB sweep could not. The
+ 254     // Program Buffer carries only what abstract commands cannot reach: the V
+ 255     // data sweep, the Tier-B vsetvl, and the L2C MMIO window.
+ 256     const auto caps = active_caps();
+ 257     hybrid::ResumeDriver driver(bus, v_scratch_gpa(), caps);
+ 258     driver.set_l2c(l2c_present(), l2c_base());  // v5: restore L2C config if present
+ 259     // LG3: on a capture run the capture drain's V dump sweep clobbered
+ 260     // vtype/vl/vstart, so the vsetvl elision is only valid on cache hits.
+ 261     if (baseline)
+ 262       driver.set_reset_baseline(*baseline,
+ 263                                 /*v_cfg_at_reset=*/!baseline_captured);
+ 264     std::size_t andes_mext_csrs = 0;
+ 265     hybrid::for_each_transport_csr(*hybrid_input_state_, caps,
+ 266       [&](uint16_t, const uint64_t&) { ++andes_mext_csrs; });
+ 267     const auto resume_t0 = sc_core::sc_time_stamp();
+ 268     const auto wall_t0 = std::chrono::steady_clock::now();
+ 269     driver.resume(*hybrid_input_state_);
+ 270     const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+ 271       std::chrono::steady_clock::now() - wall_t0).count();
+ 272     const auto resume_cycles = static_cast<uint64_t>(
+ 273       (sc_core::sc_time_stamp() - resume_t0) / platform.clk.period());
+ 274     spdlog::info("hybrid: resume={} cycles ({} ms wall), restore path="
+ 275                  "abstract, andes+m-ext csrs={}",
+ 276                  resume_cycles, wall_ms, andes_mext_csrs);
+ 277     if (baseline)
+ 278       spdlog::info("hybrid: liveness gate elided {} register restores",
+ 279                    driver.baseline_skip_count());
+ 280   }
+ 281 
+ 282   // F3: standalone CSR existence + reset-value probe. Halts the freshly-reset
+ 283   // hart via DMI and checked-reads each address -- cmderr (an unimplemented
+ 284   // CSR) surfaces as nullopt. No QEMU state, no run(): the read values ARE the
+ 285   // architectural reset state. Emitted by `--probe`, consumed by andesim's
+ 286   // gen_manifest.py to MEASURE the implemented set + reset values instead of
+ 287   // hand-tracing RTL params. The caller must load a (spin) ELF first so the
+ 288   // reset vector is mapped -- the hart fetches a couple instructions from it
+ 289   // before the DMI halt takes effect (same window capture_reset_baseline uses).
+ 290   auto probe_csrs(const std::vector<uint16_t>& addrs)
+ 291     -> std::vector<std::pair<uint16_t, std::optional<uint64_t>>>
+ 292   {
+ 293     using RD = hybrid::ResumeDriver;
+ 294     hybrid::SystemCDmiBus<PLATFORM::dmi_addr_width, PLATFORM::dmi_data_width>
+ 295       bus{platform.dmi, platform.clk.period()};
+ 296     bus.write(RD::kDmcontrol, RD::kDmcontrolDmactive);
+ 297     bus.write(RD::kDmcontrol, RD::kDmcontrolDmactive | RD::kDmcontrolHaltreq);
+ 298     hybrid::poll_until_set(bus, RD::kDmstatus, RD::kDmstatusAllhalted,
+ 299                            "csr-probe halt");
+ 300     // At reset mstatus.FS/VS are Off, so FP/V CSR reads raise illegal-insn
+ 301     // (cmderr) and would mis-probe as absent. Enable them (WARL no-op on an
+ 302     // engine without FP/V), exactly like capture_reset_baseline before its
+ 303     // FP/V reads. mstatus's own probed value is thus FS/VS-perturbed -- a known
+ 304     // artifact (mstatus is a base always-transported, verify-excluded CSR).
+ 305     {
+ 306       const uint64_t mstatus = hybrid::read_register_64(
+ 307         bus, hybrid::regno_csr(RD::kCsrMstatus), "csr-probe mstatus");
+ 308       uint64_t enable = mstatus;
+ 309       if ((enable & RD::kMstatusFsMask) == 0) enable |= RD::kMstatusFsInitial;
+ 310       if ((enable & RD::kMstatusVsMask) == 0) enable |= RD::kMstatusVsInitial;
+ 311       if (enable != mstatus)
+ 312         hybrid::write_register_abstract(
+ 313           bus, hybrid::regno_csr(RD::kCsrMstatus), enable);
+ 314     }
+ 315     std::vector<std::pair<uint16_t, std::optional<uint64_t>>> out;
+ 316     out.reserve(addrs.size());
+ 317     for (const uint16_t a: addrs)
+ 318       out.emplace_back(a, hybrid::read_register_64_checked(
+ 319                             bus, hybrid::regno_csr(a), "csr-probe"));
+ 320     return out;
+ 321   }
+ 322 
+ 323   // Enables the vsim->QEMU handoff drain. After this is set, run() watches
+ 324   // committed PCs and on retire of a `csrw 0x7C0, *` exit-trigger drains
+ 325   // architectural state to `state_out_path` and returns kExitHandoffToQemu.
+ 326   //
+ 327   // When `exit_pc` is set, the trigger is populated by `add_pc_hit` (PC
+ 328   // mode) and the ELF scan is skipped: the binary need not contain a magic
+ 329   // csrwi marker. CSR mode and PC mode are mutually exclusive on a single
+ 330   // run -- callers pass exactly one form.
+ 331   void enable_hybrid_handoff(const std::string& elf_path,
+ 332                              const std::string& state_out_path,
+ 333                              std::optional<uint64_t> exit_pc = std::nullopt,
+ 334                              bool drain_minimal = false)
+ 335   {
+ 336     hybrid::CsrTrigger trigger;
+ 337     if (exit_pc) {
+ 338       trigger.add_pc_hit(*exit_pc, HYBRID_HANDOFF_EXIT);
+ 339       spdlog::info("hybrid: PC-trigger mode, exit_pc=0x{:x}", *exit_pc);
+ 340     } else {
+ 341       auto elf = LIEF::ELF::Parser::parse(elf_path);
+ 342       if (!elf)
+ 343         throw std::runtime_error(
+ 344           "enable_hybrid_handoff: failed to parse " + elf_path);
+ 345       for (const auto& seg: elf->segments()) {
+ 346         if (seg.type() != LIEF::ELF::SEGMENT_TYPES::PT_LOAD) continue;
+ 347         if ((static_cast<unsigned>(seg.flags()) & 1u) == 0u) continue;  // PF_X
+ 348         const auto content = seg.content();
+ 349         const std::span<const uint8_t> bytes{content.data(), content.size()};
+ 350         trigger.scan_buffer(bytes, seg.virtual_address());
+ 351       }
+ 352     }
+ 353 
+ 354     hybrid_dmi_bus_ = std::make_unique<
+ 355       hybrid::SystemCDmiBus<PLATFORM::dmi_addr_width,
+ 356                             PLATFORM::dmi_data_width>>(platform.dmi,
+ 357                                                        platform.clk.period());
+ 358     hybrid_handoff_.emplace(std::move(trigger), *hybrid_dmi_bus_,
+ 359                             v_scratch_gpa(), active_caps());
+ 360     if (hybrid_input_state_)
+ 361       hybrid_handoff_->set_passthrough_input(*hybrid_input_state_);
+ 362     hybrid_handoff_->set_minimal_drain(drain_minimal);
+ 363     hybrid_handoff_->set_l2c(l2c_present(), l2c_base());  // v5: exit drain re-reads L2C
+ 364 
+ 365     hybrid_state_path_ = state_out_path;
+ 366   }
+ 367 
+ 368   // F6: override the config-derived caps with a manifest-driven transport set
+ 369   // (from --transport-csrs). When set, active_caps() returns this instead of
+ 370   // andes_caps_from_config() -- the runtime transport is then driven by the
+ 371   // registered manifest, not by re-modelling config macros.
+ 372   void set_transport_caps(const hybrid::AndesCaps& c) { transport_caps_ = c; }
+ 373 
+ 374 private:
+ 375   std::optional<hybrid::AndesCaps> transport_caps_{};
+ 376   auto active_caps() const -> hybrid::AndesCaps
+ 377   {
+ 378     return transport_caps_ ? *transport_caps_ : hybrid::andes_caps_from_config();
+ 379   }
+ 380 
+ 381   // v5: L2C MMIO transport gate, derived from the build's Verilog config macros
+ 382   // (_NDS_*, supplied via cpu_config.hpp -- same source as andes_caps_from_
+ 383   // config). Present only when this engine is built with an L2 cache controller
+ 384   // AND its register base is known. Gated on _NDS_L2C_CACHE_SIZE_KB, not the
+ 385   // cluster's has_shared_cache, because that flag also covers L3 (ax46/ax66).
+ 386   // A store to an absent L2C region would fault the Program Buffer, so this
+ 387   // stays off on every current engine (_NDS_L2C_CACHE_SIZE_KB == 0).
+ 388   static constexpr bool l2c_present()
+ 389   {
+ 390 #if defined(_NDS_L2C_CACHE_SIZE_KB) && defined(_NDS_L2C_REG_BASE)
+ 391     return (_NDS_L2C_CACHE_SIZE_KB) > 0;
+ 392 #else
+ 393     return false;
+ 394 #endif
+ 395   }
+ 396   static constexpr uint64_t l2c_base()
+ 397   {
+ 398 #if defined(_NDS_L2C_REG_BASE)
+ 399     return static_cast<uint64_t>(_NDS_L2C_REG_BASE);
+ 400 #else
+ 401     return 0;
+ 402 #endif
+ 403   }
+ 404 
+ 405   // L26: the GUEST address of the V-register transport page -- the top page of
+ 406   // the mapped RAM span. The driver maps one page above --mem-size (scheme D),
+ 407   // so this sits just past the program's declared RAM and never collides with
+ 408   // its data/stack. Single source of truth handed to ResumeDriver/StateDrain.
+ 409   auto v_scratch_gpa() const -> uint64_t
+ 410   {
+ 411     return hybrid::v_scratch_gpa(platform.main_memory.region.base_address,
+ 412                                  platform.main_memory.data.size());
+ 413   }
+ 414 
+ 415   // LG3: drain the freshly reset, just-halted hart into a baseline the
+ 416   // liveness gate compares restores against. The probe carries the incoming
+ 417   // state's flags/vlenb so drain_with_passthrough reads exactly the blocks
+ 418   // the gate will compare (it is flag-driven); every probe field it does not
+ 419   // re-read stays zero, matching what an absent block compares against.
+ 420   auto capture_reset_baseline(
+ 421     hybrid::SystemCDmiBus<PLATFORM::dmi_addr_width,
+ 422                           PLATFORM::dmi_data_width>& bus,
+ 423     const hybrid_state_v1& input) -> hybrid_state_v1
+ 424   {
+ 425     hybrid::StateDrain drain(bus, v_scratch_gpa(),
+ 426                              active_caps());
+ 427     // At reset mstatus.FS/VS are Off, so the capture's vse8 sweep (and the
+ 428     // FPR/V CSR abstract reads) would raise illegal instruction (cmderr=3).
+ 429     // Halt and enable them first, exactly like resume() does before its FPR/V
+ 430     // writes. Safe to clobber: mstatus is never re-read by a drain nor gated
+ 431     // by the baseline, and resume() rewrites it whenever the FP/V flags are
+ 432     // set -- the only case this branch runs.
+ 433     if (input.flags & (HYBRID_FLAG_FP | HYBRID_FLAG_V)) {
+ 434       using RD = hybrid::ResumeDriver;
+ 435       bus.write(RD::kDmcontrol, RD::kDmcontrolDmactive);
+ 436       bus.write(RD::kDmcontrol,
+ 437                 RD::kDmcontrolDmactive | RD::kDmcontrolHaltreq);
+ 438       hybrid::poll_until_set(bus, RD::kDmstatus, RD::kDmstatusAllhalted,
+ 439                              "reset-baseline capture halt");
+ 440       const uint64_t mstatus = hybrid::read_register_64(
+ 441         bus, hybrid::regno_csr(RD::kCsrMstatus), "reset-baseline mstatus");
+ 442       uint64_t enable = mstatus;
+ 443       if ((input.flags & HYBRID_FLAG_FP)
+ 444           && (enable & RD::kMstatusFsMask) == 0)
+ 445         enable |= RD::kMstatusFsInitial;
+ 446       if ((input.flags & HYBRID_FLAG_V)
+ 447           && (enable & RD::kMstatusVsMask) == 0)
+ 448         enable |= RD::kMstatusVsInitial;
+ 449       if (enable != mstatus)
+ 450         hybrid::write_register_abstract(
+ 451           bus, hybrid::regno_csr(RD::kCsrMstatus), enable);
+ 452     }
+ 453     hybrid_state_v1 probe{};
+ 454     probe.magic = HYBRID_STATE_MAGIC;
+ 455     probe.version = HYBRID_STATE_VERSION;
+ 456     probe.flags = input.flags;
+ 457     probe.vlenb = input.vlenb;
+ 458     auto baseline = drain.drain_with_passthrough(probe);
+ 459     lift_scratch_blocks(baseline);
+ 460     return baseline;
+ 461   }
+ 462 
+ 463   // Lift the scratch-page transport into `state` (dual of the resume
+ 464   // staging): the V dump sweep bytes back into state.vreg[] -- so the drained
+ 465   // state carries vsim's actual V values, not QEMU 1's stale snapshot. The V
+ 466   // regfile is the only state that rides the scratch page; GPRs, FPRs, and
+ 467   // every CSR drain via abstract reads directly into the state. Shared by the
+ 468   // exit drain and the reset-baseline capture.
+ 469   void lift_scratch_blocks(hybrid_state_v1& state)
+ 470   {
+ 471     const std::span<const uint8_t> ram{platform.main_memory.data.data(),
+ 472                                        platform.main_memory.data.size()};
+ 473     if ((state.flags & HYBRID_FLAG_V) != 0u)
+ 474       hybrid::read_v_from_scratch(state, ram);
+ 475   }
+ 476 
+ 477 public:
+ 478 
+ 479   void restore_context(const std::string& dir)
+ 480   {
+ 481     context_config.dir = dir;
+ 482     context_config.restore(platform, cpu);
+ 483   }
+ 484 
+ 485   void save_context(const std::string& dir)
+ 486   {
+ 487     context_config.dir = dir;
+ 488     context_config.save(platform, cpu);
+ 489   }
+ 490 
+ 491   // skip_memory_load: parse the ELF and set the reset vector, but leave
+ 492   // platform.main_memory untouched. Used in tier-2 hybrid resume where
+ 493   // QEMU 1's -kernel already populated the shared mmap; re-loading would
+ 494   // zero-fill the .bss tail of each PT_LOAD and destroy phase-1 writes
+ 495   // to static buffers. The reset vector is still set so the hart has a
+ 496   // valid fetch target during the post-reset cycles that precede the DMI
+ 497   // halt+DPC-write resume sequence.
+ 498   void load_elf(const std::string& path, bool skip_memory_load = false)
+ 499   {
+ 500     const auto elf = LIEF::ELF::Parser::parse(path);
+ 501     if (!elf) {
+ 502       spdlog::critical("Check if it's a valid ELF file path : {}", path);
+ 503       exit(1);
+ 504     }
+ 505 
+ 506     if (!skip_memory_load)
+ 507       read_elf_into_memory(
+ 508         *elf,
+ 509         static_cast<xlen_t>(platform.main_memory.region.base_address),
+ 510         platform.main_memory.data);
+ 511     for (auto& rv: platform.reset_vector)
+ 512       rv.write(elf->entrypoint());
+ 513   }
+ 514 
+ 515   void set_reset_vector(size_t hart, uint64_t addr)
+ 516   {
+ 517     if (hart >= platform.reset_vector.size()) {
+ 518       spdlog::critical("hart {} out of range (max {})", hart,
+ 519                        platform.reset_vector.size() - 1);
+ 520       std::exit(EXIT_FAILURE);
+ 521     }
+ 522     platform.reset_vector[hart].write(addr);
+ 523   }
+ 524 
+ 525   void load_image(const std::string& path, MEM_TYPE type)
+ 526   {
+ 527     switch (type) {
+ 528     case MEM_TYPE::ILM:
+ 529       if constexpr (requires { cpu.set_ilm({}); }) {
+ 530         read_binary_file(path, [this](const auto& data) { cpu.set_ilm(data); });
+ 531       } else {
+ 532         throw std::runtime_error(
+ 533           "CPU does not support ILM - cannot load ILM ROM image");
+ 534       }
+ 535       break;
+ 536 
+ 537     case MEM_TYPE::DLM:
+ 538       if constexpr (requires { cpu.set_dlm({}); }) {
+ 539         read_binary_file(path, [this](const auto& data) { cpu.set_dlm(data); });
+ 540       } else {
+ 541         throw std::runtime_error(
+ 542           "CPU does not support DLM - cannot load DLM ROM image");
+ 543       }
+ 544       break;
+ 545 
+ 546     case MEM_TYPE::RAM:
+ 547       read_binary_file(path, [this](const auto& data) {
+ 548         if (data.size() > platform.main_memory.data.size())
+ 549           throw std::runtime_error("RAM image size exceeds main memory size");
+ 550         std::copy(data.begin(), data.end(), platform.main_memory.data.begin());
+ 551       });
+ 552       break;
+ 553 
+ 554     default:
+ 555       throw std::runtime_error("Unknown memory type");
+ 556     }
+ 557   }
+ 558 
+ 559   void reset()
+ 560   {
+ 561     static constexpr int core_num = CPU::NDS_NHART;
+ 562     static constexpr int reset_val = (1 << core_num) - 1;
+ 563 
+ 564     platform.resetn.write(0);
+ 565     auto saved = context_config;
+ 566     context_config = {};
+ 567     this->run(1);
+ 568     context_config = saved;
+ 569 
+ 570     for (size_t i = 0; i < platform.reset_vector.size(); ++i)
+ 571       spdlog::info("hart {} reset vector: {:#x}", i,
+ 572                    (uint64_t) platform.reset_vector[i].read());
+ 573 
+ 574     platform.resetn.write(reset_val);
+ 575 
+ 576     if (context_config.continue_from)
+ 577       restore_context(context_config.dir);
+ 578   }
+ 579 
+ 580   int run(const uint64_t max_cycles = std::numeric_limits<uint64_t>::max())
+ 581   {
+ 582     auto sa = memzeroed<struct sigaction>();
+ 583     sa.sa_handler = sigint_handler;
+ 584     sigemptyset(&sa.sa_mask);
+ 585 
+ 586     auto oact = memzeroed<struct sigaction>();
+ 587     if (sigaction(SIGINT, &sa, &oact) == -1)
+ 588       perror("sigaction");
+ 589 
+ 590     const auto restore_sigint = std::experimental::scope_exit{[&] {
+ 591       if (sigaction(SIGINT, &oact, nullptr) == -1)
+ 592         perror("sigaction");
+ 593     }};
+ 594 
+ 595     // wait for debugger connections
+ 596     while (dtm_debug && !dtm.is_connected()) {
+ 597       dtm.try_accept_socket();
+ 598       if (ctrlc != 0) {
+ 599         return 130;
+ 600       }
+ 601       sleep(1);
+ 602     }
+ 603 
+ 604     [[maybe_unused]]
+ 605     bool ctx_resuming = context_config.continue_from;
+ 606     [[maybe_unused]]
+ 607     bool ctx_triggered = false;
+ 608 
+ 609     for (auto n = uint64_t{0}; n < max_cycles; ++n) {
+ 610 
+ 611       if (ctx_resuming) [[unlikely]] {
+ 612         // Pull up PLIC interrupt signal at the first cycle of the resume
+ 613         platform.int_trigger.write(1);
+ 614         ctx_resuming = false;
+ 615         ctx_triggered = true;
+ 616       }
+ 617 
+ 618       sc_core::sc_start(platform.clk.period());
+ 619 
+ 620       trace_.on_cycle(cpu);
+ 621 
+ 622       if (hybrid_handoff_) [[unlikely]] {
+ 623         if (auto code = check_hybrid_handoff(); code) return *code;
+ 624       }
+ 625 
+ 626       if (context_config.save_on_wfi && platform.wfi_signal.read() == true)
+ 627         [[unlikely]]
+ 628       {
+ 629         context_config.save(platform, cpu);
+ 630         spdlog::info("User save context");
+ 631         return 0;
+ 632       }
+ 633 
+ 634       if (ctrlc != 0) {
+ 635         ctrlc = 0;
+ 636         spdlog::info("Ctrl+C PC: {:x}", get_current_pc());
+ 637         trace_.log_committed_pcs(cpu);
+ 638         return 130;
+ 639       }
+ 640 
+ 641       if (ctx_triggered) [[unlikely]] {
+ 642         // Pull down the interrupt signal after 1 cycle
+ 643         platform.int_trigger.write(0);
+ 644         ctx_triggered = false;
+ 645       }
+ 646 
+ 647       if (platform.sim_control.exits >= 0) {
+ 648         spdlog::info("sim_control: got exit {}, stopping",
+ 649                      platform.sim_control.exits);
+ 650         spdlog::info("Exit PC: {:x}", get_current_pc());
+ 651         trace_.log_committed_pcs(cpu);
+ 652         return platform.sim_control.exits;
+ 653       }
+ 654 
+ 655       if (this->cpu.contextp()->gotFinish())
+ 656         return 0;
+ 657 
+ 658       spdlog::trace("PC: {:x}", get_current_pc());
+ 659     }
+ 660     return 0;
+ 661   }
+ 662 
+ 663   uint64_t get_current_pc()
+ 664   {
+ 665     if constexpr (requires { cpu.get_current_pc(); }) {
+ 666       return cpu.get_current_pc();
+ 667     }
+ 668     return std::numeric_limits<uint64_t>::max();
+ 669   }
+ 670 
+ 671   auto check_hybrid_handoff() -> std::optional<int>
+ 672   {
+ 673     if constexpr (!requires { cpu.get_committed_pc(); }) {
+ 674       return std::nullopt;
+ 675     } else {
+ 676       const auto committed = cpu.get_committed_pc();
+ 677       if (committed.empty()) return std::nullopt;
+ 678       for (const auto pc: committed[0]) {
+ 679         auto state = hybrid_handoff_->on_retire(pc);
+ 680         if (state) {
+ 681           // V-register merge: pull the V dump sweep's scratch bytes into the
+ 682           // drained state (see lift_scratch_blocks).
+ 683           lift_scratch_blocks(*state);
+ 684           spdlog::info("hybrid handoff: drained at pc=0x{:x}, writing {}",
+ 685                        pc, hybrid_state_path_);
+ 686           std::ofstream f(hybrid_state_path_, std::ios::binary);
+ 687           f.write(reinterpret_cast<const char*>(&*state), sizeof(*state));
+ 688           return hybrid::kExitHandoffToQemu;
+ 689         }
+ 690       }
+ 691       return std::nullopt;
+ 692     }
+ 693   }
+ 694 
+ 695   void enable_waveform(const std::string& waveform_filename)
+ 696   {
+ 697     trace_.enable_waveform(cpu, waveform_filename);
+ 698   }
+ 699 
+ 700   void enable_pc_trace(const std::string& filename)
+ 701   {
+ 702     trace_.enable_pc_trace(filename);
+ 703   }
+ 704 
+ 705   void disable_pc_trace() { trace_.disable_pc_trace(); }
+ 706 
+ 707   void enable_kanata(const std::string& filename,
+ 708                      const std::string& objdump_file = "")
+ 709   {
+ 710     trace_.enable_kanata(cpu, filename, objdump_file);
+ 711   }
+ 712 
+ 713   void enable_clarity(const std::string& filename,
+ 714                       const std::string& objdump_file = "")
+ 715   {
+ 716     trace_.enable_clarity(cpu, filename, objdump_file);
+ 717   }
+ 718 
+ 719   void disable_pipeview() { trace_.disable_pipeview(); }
+ 720 
+ 721   void dump_cycle_pcs() { trace_.dump_cycle_pcs(cpu); }
+ 722 
+ 723   auto get_cycles() -> std::uint64_t { return trace_.get_cycles(platform.clk); }
+ 724 
+ 725   auto get_exits() { return platform.sim_control.exits; }
+ 726 
+ 727   void log_committed_pcs() { trace_.log_committed_pcs(cpu); }
+ 728 
+ 729   void set_mem_latency(const uint32_t latency)
+ 730   {
+ 731     platform.main_memory.latency = latency;
+ 732   }
+ 733 
+ 734   void close_trace() { trace_.close(); }
+ 735 
+ 736 #if ENABLE_PYBIND11
+ 737   static void bind_pybind11(pybind11::module_& m, const char* name)
+ 738   {
+ 739     namespace py = pybind11;
+ 740     auto c = py::class_<Simulator<CPU>>(m, name);
+ 741     c.def(py::init([](const char* name) { return new Simulator<CPU>(name); }));
+ 742     c.def("init_debug_port", &Simulator<CPU>::init_debug_port);
+ 743     c.def("load_elf", &Simulator<CPU>::load_elf);
+ 744     c.def("get_cycles", &Simulator<CPU>::get_cycles);
+ 745     c.def("reset", &Simulator<CPU>::reset);
+ 746     c.def("set_mem_latency", &Simulator<CPU>::set_mem_latency);
+ 747     c.def("get_exits", &Simulator<CPU>::get_exits);
+ 748     c.def("run", &Simulator<CPU>::run, "",
+ 749           py::arg("max_cycles") = std::numeric_limits<uint64_t>::max());
+ 750     c.def_readonly("cpu", &Simulator<CPU>::cpu,
+ 751                    py::return_value_policy::reference);
+ 752   }
+ 753 #endif
+ 754 };
