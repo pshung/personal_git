@@ -1,0 +1,1136 @@
+===== resume_driver.test.cpp L2C diff FINAL vs current =====
+3a4,29
+> //
+> // GPR transport complete: the driver restores GPRs x1..x31 and DPC. These
+> // cases pin the halt/resume handshake, the x1..x31 program (one COMMAND per
+> // register, x0 skipped), the DPC write, that M-mode CSRs/PMP are NOT programmed
+> // via DM abstract at this stage, and the header guard.
+> //
+> // FP restore, complete: under HYBRID_FLAG_FP the driver first writes mstatus
+> // (force FS = Initial so the abstract FPR writes are accepted even when the
+> // drained field is Off), then programs f0..f31 via abstract commands and
+> // restores fcsr (frm + sticky fflags, L20) under the same FS gate. With FP
+> // clear the driver issues no FPR or fcsr write. B17 pins the cmderr
+> // diagnostic side channel; B9 pins that every abstract write busy-polls
+> // abstractcs before the next caller inspects cmderr.
+> //
+> // Base M-mode CSR restore, complete: after the GPRs/DPC the driver restores
+> // mtvec + mscratch (L23), the writable trap/interrupt CSRs mepc/mcause/mtval/
+> // mie/mip (L24), and the Andes cache-setup CSRs mcache_ctl/mmisc_ctl -- all via
+> // the tolerant CSR path (write + clear cmderr, no PB fallback) -- plus mcycle/
+> // minstret (F-T2.4) so the vsim phase keeps counting from QEMU1's drain.
+> //
+> // V scalar CSR restore, complete: under HYBRID_FLAG_V the driver restores the
+> // V configuration after the data sweep -- Tier B (vtype+vl via a vsetvl x0,x5,x6
+> // in the Program Buffer, operands staged in x5/x6) then Tier A (vstart after the
+> // vsetvl that resets it, vxsat, vxrm, vcsr via abstract commands with PB
+> // fallback). All V-CSR writes precede the GPR loop that overwrites the x5/x6/x7
+> // scratch. B4 forces mstatus.VS != Off even when the drained field is Off.
+10d35
+< #include "hybrid/v_regfile_xfer.hpp"
+16d40
+< #include <deque>
+37c61,62
+< // driver. Tests pass this distinctive stand-in and assert the sweep uses it.
+---
+> // driver. The V-sweep tests pass this distinctive stand-in and assert the
+> // sweep uses it.
+56,59c81,84
+<   // Test-controlled response values for reads.
+<   uint32_t dmstatus_value = 0;       // bit 9: allhalted, bit 17: allresumeack
+<   uint32_t abstractcs_value = 0;     // fallback when queue is empty
+<   std::deque<uint32_t> abstractcs_queue; // queued reads drain first
+---
+>   // bit 9: allhalted, bit 17: allresumeack. Answering both lets the poll
+>   // loops finish on their first read. abstractcs reads return 0 (busy clear,
+>   // no cmderr), so each abstract write completes immediately.
+>   uint32_t dmstatus_value = 0;
+62,64c87,88
+<   // cmderr (cleared by the W1C abstractcs write the driver issues on its PB
+<   // fallback). Models real hardware and -- unlike positional queueing -- is
+<   // robust to however many unrelated abstract ops precede the targeted write.
+---
+>   // cmderr (cleared only by the W1C abstractcs write the driver issues).
+>   // Models a hart that NACKs a particular abstract CSR access.
+74,77c98,101
+<   // into regfile[regno]; abstract read-COMMANDs load it back so read-modify-
+<   // write-verify sequences observe their own writes. Regnos in warl_ignore
+<   // model WARL fields the hart pins (the write is recorded but discarded),
+<   // e.g. dcsr.prv on a core without S/U modes.
+---
+>   // into regfile[regno]; abstract read-COMMANDs load it back so a read-modify-
+>   // write-verify sequence (dcsr.prv) observes its own writes. Regnos in
+>   // warl_ignore model WARL fields the hart pins (the write is recorded but
+>   // discarded), e.g. dcsr.prv on an M-only core.
+89c113
+<       const auto regno    = static_cast<uint16_t>(value & 0xFFFFu);
+---
+>       const auto regno    = static_cast<uint16_t>(value & 0xffffu);
+95c119
+<       const auto regno    = static_cast<uint16_t>(value & 0xFFFFu);
+---
+>       const auto regno    = static_cast<uint16_t>(value & 0xffffu);
+118,128c142,144
+<     if (reg == kData0)   return pending_data0_;
+<     if (reg == kData1)   return pending_data1_;
+<     if (reg == kAbstractcs) {
+<       if (cmderr_sticky_) return kCmderrMask;
+<       if (!abstractcs_queue.empty()) {
+<         auto v = abstractcs_queue.front();
+<         abstractcs_queue.pop_front();
+<         return v;
+<       }
+<       return abstractcs_value;
+<     }
+---
+>     if (reg == kData0) return pending_data0_;
+>     if (reg == kData1) return pending_data1_;
+>     if (reg == kAbstractcs && cmderr_sticky_) return kCmderrMask;
+141c157
+< auto rv64_state(uint64_t pc, uint64_t x10) -> hybrid_state_v1
+---
+> auto rv64_state(uint64_t pc, uint64_t x1) -> hybrid_state_v1
+149c165
+<   s.gpr[10] = x10;
+---
+>   s.gpr[1] = x1;
+163,170d178
+< auto count_writes_to(const std::vector<DmiOp>& ops, uint8_t reg) -> std::size_t
+< {
+<   std::size_t n = 0;
+<   for (const auto& op : ops)
+<     if (op.kind == DmiOp::Kind::Write && op.reg == reg) ++n;
+<   return n;
+< }
+< 
+176d183
+<   // dmstatus answers halted+resumeack so poll loops finish on the first read.
+179,180c186,187
+<   hybrid::ResumeDriver driver(bus, kScratch);
+<   driver.resume(rv64_state(/*pc=*/0x80001000, /*x10=*/0xdeadbeef));
+---
+>   hybrid::ResumeDriver driver(bus);
+>   driver.resume(rv64_state(/*pc=*/0x80001000, /*x1=*/0xdeadbeef));
+207c214
+<   hybrid::ResumeDriver driver(bus, kScratch);
+---
+>   hybrid::ResumeDriver driver(bus);
+216a224,225
+>   // The first 31 COMMAND writes program x1..x31 in order, one abstract write
+>   // per register (the value rides the DATA0/DATA1 written just before each).
+223a233
+>   // x0 is never programmed.
+236c246
+<   hybrid::ResumeDriver driver(bus, kScratch);
+---
+>   hybrid::ResumeDriver driver(bus);
+239,240c249,250
+<   // Look for the COMMAND write that targets CSR DPC (regno=0x7B1).
+<   std::vector<std::size_t> dpc_cmd_indices;
+---
+>   // Look for the COMMAND write that targets CSR DPC (regno = 0x7B1).
+>   std::optional<std::size_t> dpc_cmd_idx;
+245c255,256
+<       dpc_cmd_indices.push_back(i);
+---
+>       dpc_cmd_idx = i;
+>       break;
+248c259
+<   REQUIRE(dpc_cmd_indices.size() == 1);
+---
+>   REQUIRE(dpc_cmd_idx.has_value());
+251,255c262,264
+<   const auto cmd_idx = dpc_cmd_indices[0];
+<   REQUIRE(cmd_idx >= 2);
+<   const auto& d0 = bus.ops[cmd_idx - 2];
+<   const auto& d1 = bus.ops[cmd_idx - 1];
+<   CHECK(d0.kind == DmiOp::Kind::Write);
+---
+>   REQUIRE(*dpc_cmd_idx >= 2);
+>   const auto& d0 = bus.ops[*dpc_cmd_idx - 2];
+>   const auto& d1 = bus.ops[*dpc_cmd_idx - 1];
+258d266
+<   CHECK(d1.kind == DmiOp::Kind::Write);
+268c276
+<   hybrid::ResumeDriver driver(bus, kScratch);
+---
+>   hybrid::ResumeDriver driver(bus);
+285c293
+<   hybrid::ResumeDriver driver(bus, kScratch);
+---
+>   hybrid::ResumeDriver driver(bus);
+308c316
+<   hybrid::ResumeDriver driver(bus, kScratch);
+---
+>   hybrid::ResumeDriver driver(bus);
+321c329
+<   hybrid::ResumeDriver driver(bus, kScratch);
+---
+>   hybrid::ResumeDriver driver(bus);
+325c333
+<   CHECK(count_writes_to(bus.ops, kCommand) >= 32u);
+---
+>   CHECK(find_write(bus.ops, kCommand).size() >= 32u);
+358c366
+<   hybrid::ResumeDriver driver(bus, kScratch);
+---
+>   hybrid::ResumeDriver driver(bus);
+374a383,399
+> namespace {
+> 
+> // COMMAND index of the first abstract write targeting regno, if any.
+> auto first_cmd_idx(const std::vector<DmiOp>& ops, uint16_t regno)
+>   -> std::optional<std::size_t>
+> {
+>   for (std::size_t i = 0; i < ops.size(); ++i) {
+>     const auto& op = ops[i];
+>     if (op.kind == DmiOp::Kind::Write && op.reg == kCommand
+>         && (op.value & 0xffffu) == regno)
+>       return i;
+>   }
+>   return std::nullopt;
+> }
+> 
+> }  // namespace
+> 
+381c406
+<   s.flags  |= HYBRID_FLAG_FP;
+---
+>   s.flags |= HYBRID_FLAG_FP;
+385c410
+<   hybrid::ResumeDriver driver(bus, kScratch);
+---
+>   hybrid::ResumeDriver driver(bus);
+393c418
+< TEST_CASE("resume with HYBRID_FLAG_FP: mstatus written before FPR Abstract Commands")
+---
+> TEST_CASE("mstatus (FS enable) is written before the FPR abstract command")
+399,401c424,426
+<   s.flags  |= HYBRID_FLAG_FP;
+<   s.mstatus = 0x6000ULL;
+<   s.fpr[0]  = 0xdeadbeefcafef00dULL;
+---
+>   s.flags |= HYBRID_FLAG_FP;
+>   s.mstatus = 0x2000ULL;
+>   s.fpr[0] = 0xabcd;
+403c428
+<   hybrid::ResumeDriver driver(bus, kScratch);
+---
+>   hybrid::ResumeDriver driver(bus);
+406,419c431,435
+<   std::optional<std::size_t> mstatus_cmd_idx;
+<   std::optional<std::size_t> f0_cmd_idx;
+<   for (std::size_t i = 0; i < bus.ops.size(); ++i) {
+<     const auto& op = bus.ops[i];
+<     if (op.kind != DmiOp::Kind::Write || op.reg != kCommand) continue;
+<     const auto regno = static_cast<uint16_t>(op.value & 0xFFFFu);
+<     if (!mstatus_cmd_idx && regno == hybrid::regno_csr(0x300))
+<       mstatus_cmd_idx = i;
+<     if (!f0_cmd_idx && regno == hybrid::regno_fpr(0))
+<       f0_cmd_idx = i;
+<   }
+<   REQUIRE(mstatus_cmd_idx.has_value());
+<   REQUIRE(f0_cmd_idx.has_value());
+<   CHECK(*mstatus_cmd_idx < *f0_cmd_idx);
+---
+>   const auto mstatus_idx = first_cmd_idx(bus.ops, hybrid::regno_csr(0x300));
+>   const auto fpr_idx     = first_cmd_idx(bus.ops, hybrid::regno_fpr(0));
+>   REQUIRE(mstatus_idx);
+>   REQUIRE(fpr_idx);
+>   CHECK(*mstatus_idx < *fpr_idx);
+422c438
+< TEST_CASE("resume with HYBRID_FLAG_FP: FPR writes carry the state value via DATA0/DATA1")
+---
+> TEST_CASE("FPR write carries its state value via DATA0/DATA1 before the COMMAND")
+426a443
+>   constexpr uint64_t f0 = 0xCAFEF00D'12345678ULL;
+428,430c445,447
+<   s.flags  |= HYBRID_FLAG_FP;
+<   s.mstatus = 0x6000ULL;
+<   s.fpr[7]  = 0x0123456789ABCDEFULL;
+---
+>   s.flags |= HYBRID_FLAG_FP;
+>   s.mstatus = 0x2000ULL;
+>   s.fpr[0] = f0;
+432c449
+<   hybrid::ResumeDriver driver(bus, kScratch);
+---
+>   hybrid::ResumeDriver driver(bus);
+435,448c452,456
+<   std::optional<std::size_t> f7_cmd_idx;
+<   for (std::size_t i = 0; i < bus.ops.size(); ++i) {
+<     const auto& op = bus.ops[i];
+<     if (op.kind == DmiOp::Kind::Write && op.reg == kCommand
+<         && (op.value & 0xFFFFu) == hybrid::regno_fpr(7)) {
+<       f7_cmd_idx = i;
+<       break;
+<     }
+<   }
+<   REQUIRE(f7_cmd_idx.has_value());
+<   REQUIRE(*f7_cmd_idx >= 2);
+<   const auto& d0 = bus.ops[*f7_cmd_idx - 2];
+<   const auto& d1 = bus.ops[*f7_cmd_idx - 1];
+<   CHECK(d0.kind == DmiOp::Kind::Write);
+---
+>   const auto fpr_cmd = first_cmd_idx(bus.ops, hybrid::regno_fpr(0));
+>   REQUIRE(fpr_cmd);
+>   REQUIRE(*fpr_cmd >= 2);
+>   const auto& d0 = bus.ops[*fpr_cmd - 2];
+>   const auto& d1 = bus.ops[*fpr_cmd - 1];
+450,451c458
+<   CHECK(d0.value == uint32_t(s.fpr[7] & 0xFFFFFFFFu));
+<   CHECK(d1.kind == DmiOp::Kind::Write);
+---
+>   CHECK(d0.value == uint32_t(f0 & 0xffffffffu));
+453c460,499
+<   CHECK(d1.value == uint32_t(s.fpr[7] >> 32));
+---
+>   CHECK(d1.value == uint32_t((f0 >> 32) & 0xffffffffu));
+> }
+> 
+> TEST_CASE("B4: drained mstatus.FS = Off still writes mstatus with FS forced Initial")
+> {
+>   RecordingBus bus;
+>   bus.dmstatus_value = (1u << 9) | (1u << 17);
+> 
+>   auto s = rv64_state(0x80001000, 0);
+>   s.flags |= HYBRID_FLAG_FP;
+>   s.mstatus = 0x0ULL;  // FS = Off in the drained state
+>   s.fpr[0] = 0x1;
+> 
+>   hybrid::ResumeDriver driver(bus);
+>   driver.resume(s);
+> 
+>   // mstatus (0x300) is still programmed, and DATA0 carries FS = Initial even
+>   // though the drained field was Off -- otherwise the FPR write would NACK.
+>   const auto mstatus_cmd = first_cmd_idx(bus.ops, hybrid::regno_csr(0x300));
+>   REQUIRE(mstatus_cmd);
+>   REQUIRE(*mstatus_cmd >= 2);
+>   const auto& d0 = bus.ops[*mstatus_cmd - 2];
+>   CHECK(d0.reg == kData0);
+>   CHECK((d0.value & 0x6000u) == 0x2000u);  // FS = Initial forced
+> }
+> 
+> TEST_CASE("resume without HYBRID_FLAG_FP: no FPR Abstract Commands issued")
+> {
+>   RecordingBus bus;
+>   bus.dmstatus_value = (1u << 9) | (1u << 17);
+> 
+>   auto s = rv64_state(0x80001000, 0);
+>   for (int i = 0; i < 32; ++i) s.fpr[i] = 0xf000000000000000ULL + i;
+> 
+>   hybrid::ResumeDriver driver(bus);
+>   driver.resume(s);
+> 
+>   const auto ns = cmd_regnos(bus.ops);
+>   for (uint16_t i = 0; i < 32; ++i)
+>     CHECK_FALSE(contains_regno(ns, hybrid::regno_fpr(i)));
+463c509
+<   s.flags  |= HYBRID_FLAG_FP;
+---
+>   s.flags |= HYBRID_FLAG_FP;
+465c511
+<   s.fcsr    = 0x21;  // frm=RTZ(1) << 5 | fflags=NX
+---
+>   s.fcsr = 0x21;  // frm=RTZ(1) << 5 | fflags=NX
+467c513
+<   hybrid::ResumeDriver driver(bus, kScratch);
+---
+>   hybrid::ResumeDriver driver(bus);
+470,482c516,520
+<   std::optional<std::size_t> mstatus_cmd_idx, fcsr_cmd_idx;
+<   for (std::size_t i = 0; i < bus.ops.size(); ++i) {
+<     const auto& op = bus.ops[i];
+<     if (op.kind != DmiOp::Kind::Write || op.reg != kCommand) continue;
+<     const auto regno = static_cast<uint16_t>(op.value & 0xFFFFu);
+<     if (!mstatus_cmd_idx && regno == hybrid::regno_csr(0x300))
+<       mstatus_cmd_idx = i;
+<     if (!fcsr_cmd_idx && regno == hybrid::regno_csr(0x003))
+<       fcsr_cmd_idx = i;
+<   }
+<   REQUIRE(mstatus_cmd_idx.has_value());
+<   REQUIRE(fcsr_cmd_idx.has_value());
+<   CHECK(*mstatus_cmd_idx < *fcsr_cmd_idx);
+---
+>   const auto mstatus_idx = first_cmd_idx(bus.ops, hybrid::regno_csr(0x300));
+>   const auto fcsr_idx    = first_cmd_idx(bus.ops, hybrid::regno_csr(0x003));
+>   REQUIRE(mstatus_idx);
+>   REQUIRE(fcsr_idx);
+>   CHECK(*mstatus_idx < *fcsr_idx);
+485,488c523,525
+<   REQUIRE(*fcsr_cmd_idx >= 2);
+<   const auto& d0 = bus.ops[*fcsr_cmd_idx - 2];
+<   const auto& d1 = bus.ops[*fcsr_cmd_idx - 1];
+<   CHECK(d0.kind == DmiOp::Kind::Write);
+---
+>   REQUIRE(*fcsr_idx >= 2);
+>   const auto& d0 = bus.ops[*fcsr_idx - 2];
+>   const auto& d1 = bus.ops[*fcsr_idx - 1];
+491d527
+<   CHECK(d1.kind == DmiOp::Kind::Write);
+504c540
+<   hybrid::ResumeDriver driver(bus, kScratch);
+---
+>   hybrid::ResumeDriver driver(bus);
+519c555
+<   hybrid::ResumeDriver driver(bus, kScratch);
+---
+>   hybrid::ResumeDriver driver(bus);
+559c595
+<   hybrid::ResumeDriver driver(bus, kScratch);
+---
+>   hybrid::ResumeDriver driver(bus);
+600c636
+<   hybrid::ResumeDriver driver(bus, kScratch);
+---
+>   hybrid::ResumeDriver driver(bus);
+757c793,798
+< TEST_CASE("resume without HYBRID_FLAG_FP: no FPR Abstract Commands issued")
+---
+> // v4 M-ext completion: the whole HYBRID_M_EXT_CSR_LIST block restores via one
+> // caps-gated abstract write per CSR, exactly like the Andes V5 block.
+> TEST_CASE("CSR restore is Abstract-Command-only: every Andes+M-ext CSR gets "
+>           "its own abstract write, never a Program-Buffer batch (a PB batch "
+>           "could not tolerate a cmderr on one CSR without corrupting the "
+>           "rest of the batch)")
+763c804,812
+<   for (int i = 0; i < 32; ++i) s.fpr[i] = 0xf000000000000000ULL + i;
+---
+>   s.flags |= HYBRID_FLAG_ANDES | HYBRID_FLAG_M_EXT;
+>   s.vlenb = 0;  // no V/FPR/GPR PB traffic: isolate the CSR restore path
+>   uint64_t v = 0xA00000000ULL;
+> #define X(field, addr, name) s.andes.field = v++;
+>   HYBRID_ANDES_CSR_LIST(X)
+> #undef X
+> #define X(field, addr, name) s.m_ext.field = v++;
+>   HYBRID_M_EXT_CSR_LIST(X)
+> #undef X
+765c814
+<   hybrid::ResumeDriver driver(bus, kScratch);
+---
+>   hybrid::ResumeDriver driver(bus, kScratch);  // caps default all()
+767a817,870
+>   // Expected supported addr list, canonical order (single source of truth).
+>   std::vector<uint16_t> addrs;
+>   hybrid::for_each_transport_csr(s, hybrid::AndesCaps::all(),
+>     [&](uint16_t addr, const uint64_t&) { addrs.push_back(addr); });
+>   REQUIRE(!addrs.empty());
+> 
+>   // (a) every supported CSR got its own abstract write-COMMAND.
+>   const auto ns = cmd_regnos(bus.ops);
+>   for (uint16_t a : addrs) CHECK(contains_regno(ns, hybrid::regno_csr(a)));
+> 
+>   // (b) no Program-Buffer execution occurred at all -- with no V/FPR/GPR
+>   // block-load active, the only possible PB user would have been a CSR sweep.
+>   for (const auto& op : bus.ops)
+>     CHECK_FALSE((op.kind == DmiOp::Kind::Write && op.reg == kCommand
+>                  && op.value == hybrid::kExecProgbufCmd));
+> }
+> 
+> TEST_CASE("resume restores mtvec + mcycle/minstret via abstract commands")
+> {
+>   RecordingBus bus;
+>   bus.dmstatus_value = (1u << 9) | (1u << 17);
+> 
+>   auto s = rv64_state(0x80001000, 0);
+>   s.mtvec    = 0x80000100ULL;
+>   s.mcycle   = 0x1111222233334444ULL;
+>   s.minstret = 0x5555666677778888ULL;
+> 
+>   hybrid::ResumeDriver driver(bus);
+>   driver.resume(s);
+> 
+>   // mtvec rides the tolerant CSR path; mcycle/minstret are restored (F-T2.4)
+>   // so the vsim phase keeps counting from QEMU1's drain.
+>   const auto ns = cmd_regnos(bus.ops);
+>   CHECK(contains_regno(ns, hybrid::regno_csr(0x305)));  // mtvec
+>   CHECK(contains_regno(ns, hybrid::regno_csr(0xB00)));  // mcycle
+>   CHECK(contains_regno(ns, hybrid::regno_csr(0xB02)));  // minstret
+> }
+> 
+> TEST_CASE("resume restores GPRs and FPRs via abstract writes only -- no "
+>           "Program Buffer execution")
+> {
+>   RecordingBus bus;
+>   bus.dmstatus_value = (1u << 9) | (1u << 17);
+> 
+>   auto s = rv64_state(0x80001000, 0);
+>   s.flags |= HYBRID_FLAG_FP;
+>   s.mstatus = 0x6000ULL;  // FS = Dirty: FPRs writable
+>   for (uint16_t i = 1; i < 32; ++i) s.gpr[i] = 0xB0000000ULL + i;
+>   for (int i = 0; i < 32; ++i)      s.fpr[i] = 0xF0000000ULL + i;
+> 
+>   hybrid::ResumeDriver driver(bus);
+>   driver.resume(s);
+> 
+>   // Every GPR and FPR arrives via its own abstract register write...
+768a872,873
+>   for (uint16_t i = 1; i < 32; ++i)
+>     CHECK(contains_regno(ns, hybrid::regno_gpr(i)));
+770c875,1059
+<     CHECK_FALSE(contains_regno(ns, hybrid::regno_fpr(i)));
+---
+>     CHECK(contains_regno(ns, hybrid::regno_fpr(i)));
+> 
+>   // ...and nothing rides the Program Buffer: with no abstract failure to
+>   // trigger the write_csr_abstract_or_pb fallback, no exec-progbuf COMMAND
+>   // is issued at all.
+>   for (const auto& op : bus.ops)
+>     CHECK_FALSE((op.kind == DmiOp::Kind::Write && op.reg == kCommand
+>                  && op.value == hybrid::kExecProgbufCmd));
+> }
+> 
+> TEST_CASE("B17: cleared cmderr surfaces via diagnostic side-channel")
+> {
+>   // clear_cmderr_if_set() swallows any sticky cmderr left by an earlier
+>   // per-register abstract failure so the resume can still proceed. Without a
+>   // side channel that swallow is invisible. Pin the contract: when a tolerant
+>   // CSR write fails, the driver records the last observed non-zero cmderr and
+>   // a non-zero clear count.
+>   RecordingBus bus;
+>   bus.dmstatus_value = (1u << 9) | (1u << 17);
+>   // Force the mtvec abstract write to fail. mtvec goes through
+>   // write_csr_tolerant which intentionally does NOT take the PB fallback; it
+>   // just clears cmderr at the end. So the failure is only visible via the
+>   // side channel.
+>   bus.fail_csr_write = 0x305;  // CSR mtvec
+> 
+>   hybrid::ResumeDriver driver(bus);
+>   driver.resume(rv64_state(0x80001000, 0));
+> 
+>   CHECK(driver.cmderr_clear_count() > 0u);
+>   CHECK(driver.last_observed_cmderr() != 0u);
+> }
+> 
+> TEST_CASE("B9: write_csr_abstract_or_pb busy-poll precedes cmderr inspection")
+> {
+>   // Every abstract register write (write_register_abstract) busy-polls
+>   // abstractcs before returning, so by the time any caller inspects cmderr
+>   // the busy bit is already clear. Pin that contract: between each kCommand
+>   // write and the next, the recorded ops must include at least one
+>   // kAbstractcs read (the busy poll). A refactor that drops the chained poll
+>   // regresses this test.
+>   RecordingBus bus;
+>   bus.dmstatus_value = (1u << 9) | (1u << 17);
+> 
+>   hybrid::ResumeDriver driver(bus);
+>   driver.resume(rv64_state(0x80001000, 0xdeadbeef));
+> 
+>   bool saw_cmd = false;
+>   std::size_t reads_since_cmd = 0;
+>   bool all_cmds_had_abstractcs_poll = true;
+>   for (const auto& op : bus.ops) {
+>     if (op.kind == DmiOp::Kind::Write && op.reg == kCommand) {
+>       if (saw_cmd && reads_since_cmd == 0)
+>         all_cmds_had_abstractcs_poll = false;
+>       saw_cmd = true;
+>       reads_since_cmd = 0;
+>     } else if (saw_cmd && op.kind == DmiOp::Kind::Read
+>                && op.reg == kAbstractcs) {
+>       ++reads_since_cmd;
+>     }
+>   }
+>   CHECK(all_cmds_had_abstractcs_poll);
+>   // The final kCommand write must also be followed by an abstractcs read.
+>   CHECK(reads_since_cmd > 0u);
+> }
+> 
+> TEST_CASE("L6: S-mode resume writes dcsr.prv = state.priv before resumereq")
+> {
+>   RecordingBus bus;
+>   bus.dmstatus_value = (1u << 9) | (1u << 17);
+> 
+>   auto s = rv64_state(0x80001000, 0);
+>   s.priv = 1;  // S-mode at the drain boundary
+> 
+>   hybrid::ResumeDriver driver(bus);
+>   driver.resume(s);
+> 
+>   // Exactly one write-COMMAND must target dcsr (0x7B0). The driver
+>   // read-modify-writes dcsr; the recording bus answers 0 for the read, so
+>   // the DATA0 staged two ops earlier is exactly the prv field.
+>   std::vector<std::size_t> idx;
+>   for (std::size_t i = 0; i < bus.ops.size(); ++i) {
+>     const auto& op = bus.ops[i];
+>     if (op.kind == DmiOp::Kind::Write && op.reg == kCommand
+>         && (op.value & 0xffffu) == kCsrDcsr
+>         && ((op.value >> 16) & 1u) != 0u) {
+>       idx.push_back(i);
+>     }
+>   }
+>   REQUIRE(idx.size() == 1);
+>   REQUIRE(idx[0] >= 2);
+>   const auto& d0 = bus.ops[idx[0] - 2];
+>   CHECK(d0.kind == DmiOp::Kind::Write);
+>   CHECK(d0.reg == kData0);
+>   CHECK((d0.value & 0x3u) == 1u);
+> 
+>   // The dcsr write must land before resumereq (bit 30 of dmcontrol).
+>   std::size_t resume_idx = bus.ops.size();
+>   for (std::size_t i = 0; i < bus.ops.size(); ++i) {
+>     const auto& op = bus.ops[i];
+>     if (op.kind == DmiOp::Kind::Write && op.reg == kDmcontrol
+>         && ((op.value >> 30) & 1u) != 0u) {
+>       resume_idx = i;
+>       break;
+>     }
+>   }
+>   CHECK(idx[0] < resume_idx);
+> }
+> 
+> TEST_CASE("L6: resume rejects reserved or out-of-range privilege values")
+> {
+>   RecordingBus bus;
+>   bus.dmstatus_value = (1u << 9) | (1u << 17);
+>   hybrid::ResumeDriver driver(bus);
+> 
+>   auto s = rv64_state(0x80001000, 0);
+>   s.priv = 2;  // reserved encoding (H-mode slot)
+>   CHECK_THROWS_AS(driver.resume(s), std::runtime_error);
+> 
+>   s.priv = 4;  // out of the 2-bit prv field entirely
+>   CHECK_THROWS_AS(driver.resume(s), std::runtime_error);
+> 
+>   // No abstract command may have been issued for a rejected state.
+>   std::size_t cmds = 0;
+>   for (const auto& op : bus.ops)
+>     if (op.kind == DmiOp::Kind::Write && op.reg == kCommand) ++cmds;
+>   CHECK(cmds == 0u);
+> }
+> 
+> TEST_CASE("L6: resume aborts loudly when the hart pins dcsr.prv (no S/U)")
+> {
+>   // An M-only core (e.g. NDS_NUM_PRIVILEGE_LEVELS=1 RTL) WARL-pins
+>   // dcsr.prv to 3. Silently resuming would measure the ROI in the wrong
+>   // privilege; the driver must verify its write took and throw instead.
+>   RecordingBus bus;
+>   bus.dmstatus_value = (1u << 9) | (1u << 17);
+>   bus.regfile[hybrid::regno_csr(kCsrDcsr)] = 0x40000003ULL;  // reset: prv=M
+>   bus.warl_ignore.insert(hybrid::regno_csr(kCsrDcsr));
+> 
+>   auto s = rv64_state(0x80001000, 0);
+>   s.priv = 1;
+> 
+>   hybrid::ResumeDriver driver(bus);
+>   CHECK_THROWS_AS(driver.resume(s), std::runtime_error);
+> }
+> 
+> TEST_CASE("L6/L2: S/U resume mirrors the producer's PMP block, addr before cfg")
+> {
+>   // With PMP implemented and no matching entry, every S/U access faults
+>   // (priv spec v1.10) -- an S/U ROI cannot even fetch its first insn on the
+>   // vsim side unless the producer's PMP block is mirrored in.
+>   RecordingBus bus;
+>   bus.dmstatus_value = (1u << 9) | (1u << 17);
+> 
+>   auto s = rv64_state(0x80001000, 0);
+>   s.priv = 0;  // U-mode
+>   for (int i = 0; i < HYBRID_PMP_ADDR_NUM; ++i) s.pmpaddr[i] = 0xb000 + i;
+>   s.pmpcfg[0] = 0x1f;  // entry 0: NAPOT, RWX
+> 
+>   hybrid::ResumeDriver driver(bus);
+>   driver.resume(s);
+> 
+>   std::vector<uint16_t> regnos;
+>   for (const auto& op : bus.ops)
+>     if (op.kind == DmiOp::Kind::Write && op.reg == kCommand
+>         && ((op.value >> 16) & 1u) != 0u)
+>       regnos.push_back(static_cast<uint16_t>(op.value & 0xffffu));
+> 
+>   // All 64 pmpaddr CSRs (0x3B0..0x3EF) and the 8 even pmpcfg CSRs
+>   // (0x3A0,0x3A2,..,0x3AE -- odd ones do not exist on RV64) are written.
+>   std::size_t first_cfg = regnos.size(), last_addr = 0;
+>   std::size_t n_addr = 0, n_cfg = 0, n_odd_cfg = 0;
+>   for (std::size_t i = 0; i < regnos.size(); ++i) {
+>     const auto r = regnos[i];
+>     if (r >= 0x3B0 && r <= 0x3EF) { ++n_addr; last_addr = i; }
+>     if (r >= 0x3A0 && r <= 0x3AF) {
+>       if ((r & 1u) != 0u) ++n_odd_cfg;
+>       else { ++n_cfg; if (i < first_cfg) first_cfg = i; }
+>     }
+>   }
+>   CHECK(n_addr == 64u);
+>   CHECK(n_cfg == 8u);
+>   CHECK(n_odd_cfg == 0u);
+>   // cfg activates the entries, so every addr write must precede every cfg
+>   // write (a cfg-locked entry would discard the addr that follows it).
+>   CHECK(last_addr < first_cfg);
+932a1222,1265
+> TEST_CASE("B4: resume with HYBRID_FLAG_V and drained VS=Off still writes "
+>           "mstatus with VS != Off so V-CSR abstract writes are accepted")
+> {
+>   RecordingBus bus;
+>   bus.dmstatus_value = (1u << 9) | (1u << 17);
+> 
+>   auto s = rv64_state(0x80001000, 0);
+>   s.flags  |= HYBRID_FLAG_V;
+>   s.mstatus = 0;                  // VS = 00 (Off)
+> 
+>   hybrid::ResumeDriver driver(bus, kScratch);
+>   driver.resume(s);
+> 
+>   std::optional<uint32_t> mstatus_low32;
+>   for (std::size_t i = 0; i < bus.ops.size(); ++i) {
+>     const auto& op = bus.ops[i];
+>     if (op.kind == DmiOp::Kind::Write && op.reg == kCommand
+>         && (op.value & 0xFFFFu) == hybrid::regno_csr(0x300)
+>         && ((op.value >> 16) & 1u)) {
+>       REQUIRE(i >= 2);
+>       mstatus_low32 = bus.ops[i - 2].value;
+>       break;
+>     }
+>   }
+>   REQUIRE(mstatus_low32.has_value());
+>   CHECK((*mstatus_low32 & 0x600u) != 0u);
+> }
+> 
+> namespace {
+> 
+> // True when `insn` appears in any Program-Buffer slot of the recorded ops.
+> auto pb_has_insn(const std::vector<DmiOp>& ops, uint32_t insn) -> bool
+> {
+>   for (const auto& op : ops)
+>     if (op.kind == DmiOp::Kind::Write
+>         && op.reg >= hybrid::kProgbuf0
+>         && op.reg <= hybrid::kProgbuf0 + hybrid::kProgbufMaxInsns
+>         && op.value == insn)
+>       return true;
+>   return false;
+> }
+> 
+> }  // namespace
+> 
+1023,1114d1355
+< TEST_CASE("resume restores GPRs and FPRs via abstract writes only -- no PB "
+<           "load-sweep, even when the V region leaves scratch room")
+< {
+<   RecordingBus bus;
+<   bus.dmstatus_value = (1u << 9) | (1u << 17);  // halted + resumeack
+<   bus.abstractcs_value = 8u << 24;              // progbufsize = 8 (this DM)
+< 
+<   auto s = rv64_state(0x80001000, 0);
+<   s.flags  |= HYBRID_FLAG_FP;
+<   s.mstatus = 0x6000ULL;  // FS = Dirty: FPRs writable
+<   for (uint16_t i = 1; i < 32; ++i) s.gpr[i] = 0xB0000000ULL + i;
+<   for (int i = 0; i < 32; ++i)      s.fpr[i] = 0xF0000000ULL + i;
+<   s.vlenb = 64;
+< 
+<   hybrid::ResumeDriver driver(bus, kScratch);
+<   driver.resume(s);
+< 
+<   // Every GPR and FPR arrives via its own abstract register write...
+<   const auto ns = cmd_regnos(bus.ops);
+<   for (uint16_t i = 1; i < 32; ++i)
+<     CHECK(contains_regno(ns, hybrid::regno_gpr(i)));
+<   for (uint16_t i = 0; i < 32; ++i)
+<     CHECK(contains_regno(ns, hybrid::regno_fpr(i)));
+< 
+<   // ...and no load instruction rides the Program Buffer (LOAD opcode 0x03 /
+<   // LOAD-FP 0x07 with a memory-load funct3 would be a scratch-page sweep; the
+<   // only legitimate PB use in this non-V state is none at all).
+<   for (const auto& op : bus.ops)
+<     CHECK_FALSE((op.kind == DmiOp::Kind::Write && op.reg == kCommand
+<                  && op.value == hybrid::kExecProgbufCmd));
+< }
+< 
+< TEST_CASE("B4: resume with HYBRID_FLAG_FP and drained FS=Off still writes "
+<           "mstatus with FS != Off so FPR abstract writes are accepted")
+< {
+<   RecordingBus bus;
+<   bus.dmstatus_value = (1u << 9) | (1u << 17);
+< 
+<   auto s = rv64_state(0x80001000, 0);
+<   s.flags  |= HYBRID_FLAG_FP;
+<   s.mstatus = 0;                  // FS = 00 (Off)
+< 
+<   hybrid::ResumeDriver driver(bus, kScratch);
+<   driver.resume(s);
+< 
+<   // Find the abstract write that targets mstatus (regno = 0x300) and verify
+<   // FS (bits 14:13) was forced non-zero. The drained mstatus has FS=Off but
+<   // the hart needs FS != Off to accept abstract FPR writes; the gate must
+<   // OR in FS=Initial without altering the wire-format state.mstatus.
+<   std::optional<uint32_t> mstatus_low32;
+<   for (std::size_t i = 0; i < bus.ops.size(); ++i) {
+<     const auto& op = bus.ops[i];
+<     if (op.kind == DmiOp::Kind::Write && op.reg == kCommand
+<         && (op.value & 0xFFFFu) == hybrid::regno_csr(0x300)
+<         && ((op.value >> 16) & 1u)) {
+<       REQUIRE(i >= 2);
+<       mstatus_low32 = bus.ops[i - 2].value;
+<       break;
+<     }
+<   }
+<   REQUIRE(mstatus_low32.has_value());
+<   CHECK((*mstatus_low32 & 0x6000u) != 0u);
+< }
+< 
+< TEST_CASE("B4: resume with HYBRID_FLAG_V and drained VS=Off still writes "
+<           "mstatus with VS != Off so V-CSR abstract writes are accepted")
+< {
+<   RecordingBus bus;
+<   bus.dmstatus_value = (1u << 9) | (1u << 17);
+< 
+<   auto s = rv64_state(0x80001000, 0);
+<   s.flags  |= HYBRID_FLAG_V;
+<   s.mstatus = 0;                  // VS = 00 (Off)
+< 
+<   hybrid::ResumeDriver driver(bus, kScratch);
+<   driver.resume(s);
+< 
+<   std::optional<uint32_t> mstatus_low32;
+<   for (std::size_t i = 0; i < bus.ops.size(); ++i) {
+<     const auto& op = bus.ops[i];
+<     if (op.kind == DmiOp::Kind::Write && op.reg == kCommand
+<         && (op.value & 0xFFFFu) == hybrid::regno_csr(0x300)
+<         && ((op.value >> 16) & 1u)) {
+<       REQUIRE(i >= 2);
+<       mstatus_low32 = bus.ops[i - 2].value;
+<       break;
+<     }
+<   }
+<   REQUIRE(mstatus_low32.has_value());
+<   CHECK((*mstatus_low32 & 0x600u) != 0u);
+< }
+< 
+1117,1121c1358,1360
+<   // B1 regression: exec_progbuf used to return bool and four call sites
+<   // silently dropped the result. The very first PB exec inside resume() for a
+<   // V-state is the pb_v_data_sweep vsetvl (program_buffer.hpp:164); arming
+<   // fail_next_pb_exec makes that exec raise sticky cmderr, and the throw must
+<   // propagate through pb_v_data_sweep -> ResumeDriver::resume.
+---
+>   // The first PB exec inside resume() for a V-state is the pb_v_data_sweep
+>   // vsetvl; arming fail_next_pb_exec makes that exec raise sticky cmderr, and
+>   // the throw must propagate through pb_v_data_sweep -> ResumeDriver::resume.
+1129,1328d1367
+<   s.vl    = 8;
+<   s.vtype = 0xC1;
+< 
+<   hybrid::ResumeDriver driver(bus, kScratch);
+<   CHECK_THROWS_AS(driver.resume(s), std::runtime_error);
+< }
+< 
+< TEST_CASE("resume without HYBRID_FLAG_V: no vsetvl PB instruction issued")
+< {
+<   RecordingBus bus;
+<   bus.dmstatus_value = (1u << 9) | (1u << 17);
+< 
+<   hybrid::ResumeDriver driver(bus, kScratch);
+<   driver.resume(rv64_state(0x80001000, 0));  // no HYBRID_FLAG_V
+< 
+<   const uint32_t expected_vsetvl = hybrid::encode_vsetvl(0, 5, 6);
+<   bool found_vsetvl_pb = false;
+<   for (const auto& op : bus.ops)
+<     if (op.kind == DmiOp::Kind::Write && op.reg == hybrid::kProgbuf0
+<         && op.value == expected_vsetvl)
+<       found_vsetvl_pb = true;
+<   CHECK_FALSE(found_vsetvl_pb);
+< }
+< 
+< TEST_CASE("B17: cleared cmderr surfaces via diagnostic side-channel")
+< {
+<   // The restore tail's clear_cmderr_if_set() swallows any sticky cmderr
+<   // from earlier per-register failures so the resume can proceed. Without
+<   // a side channel, a partially-broken restore is invisible. Pin the
+<   // contract: when a CSR write fails (sticky cmderr -> PB fallback path
+<   // also clears it... but with no PB fallback for tolerant CSRs, the
+<   // tail-clear is the surviving signal), the driver records the last
+<   // observed non-zero cmderr in last_observed_cmderr() / records a
+<   // non-zero clear count.
+<   RecordingBus bus;
+<   bus.dmstatus_value = (1u << 9) | (1u << 17);
+<   // Force the mtvec abstract write to fail. mtvec goes through
+<   // write_csr_tolerant which intentionally does NOT take the PB
+<   // fallback; it just clears cmderr at the end. So the failure
+<   // is only visible via the side channel.
+<   bus.fail_csr_write = 0x305;  // CSR mtvec
+< 
+<   hybrid::ResumeDriver driver(bus, kScratch);
+<   driver.resume(rv64_state(0x80001000, 0));
+< 
+<   CHECK(driver.cmderr_clear_count() > 0u);
+<   CHECK(driver.last_observed_cmderr() != 0u);
+< }
+< 
+< TEST_CASE("B9: write_csr_abstract_or_pb busy-poll precedes cmderr inspection")
+< {
+<   // The B9 audit claimed write_csr_abstract_or_pb reads abstractcs without
+<   // first polling busy. In fact write_64bit_register -> write_register_abstract
+<   // calls poll_until_clear(busy) before returning, so by the time the cmderr
+<   // check runs, busy is already clear. This test pins that contract: between
+<   // every kCommand write and the next kAbstractcs read, the recorded ops
+<   // must include at least one kAbstractcs read (the busy poll). If a future
+<   // refactor regresses by removing the chained poll, this test fails.
+<   RecordingBus bus;
+<   bus.dmstatus_value = (1u << 9) | (1u << 17);
+< 
+<   hybrid::ResumeDriver driver(bus, kScratch);
+<   driver.resume(rv64_state(0x80001000, 0xdeadbeef));
+< 
+<   // Walk ops; between each kCommand write and the very next kAbstractcs
+<   // read by an unrelated caller, there must be at least one kAbstractcs
+<   // read (the busy poll from write_register_abstract).
+<   bool saw_cmd = false;
+<   std::size_t reads_since_cmd = 0;
+<   bool all_cmds_had_abstractcs_poll = true;
+<   for (const auto& op : bus.ops) {
+<     if (op.kind == DmiOp::Kind::Write && op.reg == kCommand) {
+<       if (saw_cmd && reads_since_cmd == 0)
+<         all_cmds_had_abstractcs_poll = false;
+<       saw_cmd = true;
+<       reads_since_cmd = 0;
+<     } else if (saw_cmd && op.kind == DmiOp::Kind::Read
+<                && op.reg == kAbstractcs) {
+<       ++reads_since_cmd;
+<     }
+<   }
+<   CHECK(all_cmds_had_abstractcs_poll);
+<   // The final kCommand write must also be followed by an abstractcs read.
+<   CHECK(reads_since_cmd > 0u);
+< }
+< 
+< TEST_CASE("L6: S-mode resume writes dcsr.prv = state.priv before resumereq")
+< {
+<   RecordingBus bus;
+<   bus.dmstatus_value = (1u << 9) | (1u << 17);
+< 
+<   auto s = rv64_state(0x80001000, 0);
+<   s.priv = 1;  // S-mode at the drain boundary
+< 
+<   hybrid::ResumeDriver driver(bus, kScratch);
+<   driver.resume(s);
+< 
+<   // Exactly one write-COMMAND must target dcsr (0x7B0). The driver
+<   // read-modify-writes dcsr; the recording bus answers 0 for the read, so
+<   // the DATA0 staged two ops earlier is exactly the prv field.
+<   std::vector<std::size_t> idx;
+<   for (std::size_t i = 0; i < bus.ops.size(); ++i) {
+<     const auto& op = bus.ops[i];
+<     if (op.kind == DmiOp::Kind::Write && op.reg == kCommand
+<         && (op.value & 0xffffu) == kCsrDcsr
+<         && ((op.value >> 16) & 1u) != 0u) {
+<       idx.push_back(i);
+<     }
+<   }
+<   REQUIRE(idx.size() == 1);
+<   REQUIRE(idx[0] >= 2);
+<   const auto& d0 = bus.ops[idx[0] - 2];
+<   CHECK(d0.kind == DmiOp::Kind::Write);
+<   CHECK(d0.reg == kData0);
+<   CHECK((d0.value & 0x3u) == 1u);
+< 
+<   // The dcsr write must land before resumereq (bit 30 of dmcontrol).
+<   std::size_t resume_idx = bus.ops.size();
+<   for (std::size_t i = 0; i < bus.ops.size(); ++i) {
+<     const auto& op = bus.ops[i];
+<     if (op.kind == DmiOp::Kind::Write && op.reg == kDmcontrol
+<         && ((op.value >> 30) & 1u) != 0u) {
+<       resume_idx = i;
+<       break;
+<     }
+<   }
+<   CHECK(idx[0] < resume_idx);
+< }
+< 
+< TEST_CASE("L6: resume rejects reserved or out-of-range privilege values")
+< {
+<   RecordingBus bus;
+<   bus.dmstatus_value = (1u << 9) | (1u << 17);
+<   hybrid::ResumeDriver driver(bus, kScratch);
+< 
+<   auto s = rv64_state(0x80001000, 0);
+<   s.priv = 2;  // reserved encoding (H-mode slot)
+<   CHECK_THROWS_AS(driver.resume(s), std::runtime_error);
+< 
+<   s.priv = 4;  // out of the 2-bit prv field entirely
+<   CHECK_THROWS_AS(driver.resume(s), std::runtime_error);
+< 
+<   // No abstract command may have been issued for a rejected state.
+<   CHECK(count_writes_to(bus.ops, kCommand) == 0u);
+< }
+< 
+< TEST_CASE("L6/L2: S/U resume mirrors the producer's PMP block, addr before cfg")
+< {
+<   // With PMP implemented and no matching entry, every S/U access faults
+<   // (priv spec v1.10) -- an S/U ROI cannot even fetch its first insn on the
+<   // vsim side unless the producer's PMP block is mirrored in.
+<   RecordingBus bus;
+<   bus.dmstatus_value = (1u << 9) | (1u << 17);
+< 
+<   auto s = rv64_state(0x80001000, 0);
+<   s.priv = 0;  // U-mode
+<   for (int i = 0; i < HYBRID_PMP_ADDR_NUM; ++i) s.pmpaddr[i] = 0xb000 + i;
+<   s.pmpcfg[0] = 0x1f;  // entry 0: NAPOT, RWX
+< 
+<   hybrid::ResumeDriver driver(bus, kScratch);
+<   driver.resume(s);
+< 
+<   std::vector<uint16_t> regnos;
+<   for (const auto& op : bus.ops)
+<     if (op.kind == DmiOp::Kind::Write && op.reg == kCommand
+<         && ((op.value >> 16) & 1u) != 0u)
+<       regnos.push_back(static_cast<uint16_t>(op.value & 0xffffu));
+< 
+<   // All 64 pmpaddr CSRs (0x3B0..0x3EF) and the 8 even pmpcfg CSRs
+<   // (0x3A0,0x3A2,..,0x3AE -- odd ones do not exist on RV64) are written.
+<   std::size_t first_cfg = regnos.size(), last_addr = 0;
+<   std::size_t n_addr = 0, n_cfg = 0, n_odd_cfg = 0;
+<   for (std::size_t i = 0; i < regnos.size(); ++i) {
+<     const auto r = regnos[i];
+<     if (r >= 0x3B0 && r <= 0x3EF) { ++n_addr; last_addr = i; }
+<     if (r >= 0x3A0 && r <= 0x3AF) {
+<       if ((r & 1u) != 0u) ++n_odd_cfg;
+<       else { ++n_cfg; if (i < first_cfg) first_cfg = i; }
+<     }
+<   }
+<   CHECK(n_addr == 64u);
+<   CHECK(n_cfg == 8u);
+<   CHECK(n_odd_cfg == 0u);
+<   // cfg activates the entries, so every addr write must precede every cfg
+<   // write (a cfg-locked entry would discard the addr that follows it).
+<   CHECK(last_addr < first_cfg);
+< }
+< 
+< TEST_CASE("L6: resume aborts loudly when the hart pins dcsr.prv (no S/U)")
+< {
+<   // An M-only core (e.g. NDS_NUM_PRIVILEGE_LEVELS=1 RTL) WARL-pins
+<   // dcsr.prv to 3. Silently resuming would measure the ROI in the wrong
+<   // privilege; the driver must verify its write took and throw instead.
+<   RecordingBus bus;
+<   bus.dmstatus_value = (1u << 9) | (1u << 17);
+<   bus.regfile[hybrid::regno_csr(kCsrDcsr)] = 0x40000003ULL;  // reset: prv=M
+<   bus.warl_ignore.insert(hybrid::regno_csr(kCsrDcsr));
+< 
+<   auto s = rv64_state(0x80001000, 0);
+<   s.priv = 1;
+1356,1359c1395
+< TEST_CASE("CSR restore is Abstract-Command-only: every Andes+M-ext CSR gets "
+<           "its own abstract write, never a Program-Buffer batch (a PB batch "
+<           "could not tolerate a cmderr on one CSR without corrupting the "
+<           "rest of the batch)")
+---
+> TEST_CASE("resume without HYBRID_FLAG_V: no vsetvl PB instruction issued")
+1362,1383c1398
+<   bus.dmstatus_value   = (1u << 9) | (1u << 17);
+<   bus.abstractcs_value = 8u << 24;  // progbufsize=8: a batch would fit here
+< 
+<   auto s = rv64_state(0x80001000, 0);
+<   s.flags |= HYBRID_FLAG_ANDES | HYBRID_FLAG_M_EXT;
+<   s.vlenb = 0;  // no V/FPR/GPR PB traffic: isolate the CSR restore path
+<   uint64_t v = 0xA00000000ULL;
+< #define X(field, addr, name) s.andes.field = v++;
+<   HYBRID_ANDES_CSR_LIST(X)
+< #undef X
+< #define X(field, addr, name) s.m_ext.field = v++;
+<   HYBRID_M_EXT_CSR_LIST(X)
+< #undef X
+< 
+<   hybrid::ResumeDriver driver(bus, kScratch);  // caps default all()
+<   driver.resume(s);
+< 
+<   // Expected supported addr list, canonical order (single source of truth).
+<   std::vector<uint16_t> addrs;
+<   hybrid::for_each_transport_csr(s, hybrid::AndesCaps::all(),
+<     [&](uint16_t addr, const uint64_t&) { addrs.push_back(addr); });
+<   REQUIRE(!addrs.empty());
+---
+>   bus.dmstatus_value = (1u << 9) | (1u << 17);
+1385,1387c1400,1401
+<   // (a) every supported CSR got its own abstract write-COMMAND.
+<   const auto ns = cmd_regnos(bus.ops);
+<   for (uint16_t a : addrs) CHECK(contains_regno(ns, hybrid::regno_csr(a)));
+---
+>   hybrid::ResumeDriver driver(bus, kScratch);
+>   driver.resume(rv64_state(0x80001000, 0));  // no HYBRID_FLAG_V
+1389,1393c1403
+<   // (b) no Program-Buffer execution occurred at all -- with no V/FPR/GPR
+<   // block-load active, the only possible PB user would have been a CSR sweep.
+<   for (const auto& op : bus.ops)
+<     CHECK_FALSE((op.kind == DmiOp::Kind::Write && op.reg == kCommand
+<                  && op.value == hybrid::kExecProgbufCmd));
+---
+>   CHECK_FALSE(pb_has_insn(bus.ops, hybrid::encode_vsetvl(0, 5, 6)));
+1615c1625
+< // ---- v5: L2C MMIO config restore ------------------------------------------
+---
+> // ---- v5: L2C MMIO config restore (minimal: Control register) --------------
+1619c1629,1631
+< // Program Buffer, so an engine without one must issue nothing.
+---
+> // Program Buffer, so an engine without one must issue nothing. This prototype
+> // restores ONLY the Control register; HPM Control + the Way Allocation Masks
+> // land at the completion commit.
+1631c1643
+< TEST_CASE("resume restores writable L2C config regs via PB sw when flag + engine present")
+---
+> TEST_CASE("resume restores the L2C Control reg via PB sw when flag + engine present")
+1644,1645c1656
+<   // Each config-register store is `sw x5, 0(x6)` in the Program Buffer.
+<   // Control + HPM Control + Way Allocation Masks = the writable config set.
+---
+>   // The prototype stores ONLY the Control register: one `sw x5, 0(x6)`.
+1647c1658
+<   CHECK(count_progbuf_insn(bus.ops, sw) == 2u + HYBRID_L2C_WAYMASK_NUM);
+---
+>   CHECK(count_progbuf_insn(bus.ops, sw) == 1u);
+1690,1748d1700
+< }
+< 
+< // ---- v6: CSR write-mask gating -------------------------------------------
+< // When the handoff carries HYBRID_FLAG_WRITE_MASK, a mask-governed config CSR
+< // is restored ONLY if the producer's guest actually wrote it. An untouched
+< // CSR's drained value is just the producer's reset default -- restoring it
+< // would overwrite the engine's OWN reset value (msp_bound all-ones vs 0,
+< // milmb.IEN 0 vs 1, ...). Flag clear = pre-v6 file = restore everything.
+< 
+< TEST_CASE("v6: with a write-mask, only written Andes/M-ext CSRs are restored")
+< {
+<   RecordingBus bus;
+<   bus.dmstatus_value = (1u << 9) | (1u << 17);
+< 
+<   auto s = rv64_state(0x80001000, 0);
+<   s.flags |= HYBRID_FLAG_ANDES | HYBRID_FLAG_M_EXT | HYBRID_FLAG_WRITE_MASK;
+<   s.andes.mxstatus = 0x11;   // written by the guest
+<   s.andes.mpft_ctl = 0x22;   // NOT written: producer reset default only
+<   s.m_ext.menvcfg  = 0x33;   // written by the guest
+<   s.m_ext.mseccfg  = 0x44;   // NOT written
+<   s.andes.pmaaddr[0] = 0x55; // written
+<   s.andes.pmaaddr[1] = 0x66; // NOT written
+<   s.mcache_ctl = 0x77;       // NOT written
+<   hybrid_wm_set(s.write_mask, HYBRID_WM_ANDES_BASE + HYBRID_WM_ANDES_IDX_mxstatus);
+<   hybrid_wm_set(s.write_mask, HYBRID_WM_M_EXT_BASE + HYBRID_WM_M_EXT_IDX_menvcfg);
+<   hybrid_wm_set(s.write_mask, HYBRID_WM_PMAADDR_BASE + 0);
+< 
+<   hybrid::ResumeDriver driver(bus, kScratch);
+<   driver.resume(s);
+< 
+<   const auto ns = cmd_regnos(bus.ops);
+<   CHECK(contains_regno(ns, hybrid::regno_csr(0x7C4)));    // mxstatus written
+<   CHECK(!contains_regno(ns, hybrid::regno_csr(0x7C5)));   // mpft_ctl skipped
+<   CHECK(contains_regno(ns, hybrid::regno_csr(0x30A)));    // menvcfg written
+<   CHECK(!contains_regno(ns, hybrid::regno_csr(0x747)));   // mseccfg skipped
+<   CHECK(contains_regno(ns, hybrid::regno_csr(0xBD0)));    // pmaaddr0 written
+<   CHECK(!contains_regno(ns, hybrid::regno_csr(0xBD1)));   // pmaaddr1 skipped
+<   CHECK(!contains_regno(ns, hybrid::regno_csr(0x7CA)));   // mcache_ctl skipped
+< }
+< 
+< TEST_CASE("v6: without HYBRID_FLAG_WRITE_MASK every governed CSR restores (pre-v6 files)")
+< {
+<   RecordingBus bus;
+<   bus.dmstatus_value = (1u << 9) | (1u << 17);
+< 
+<   auto s = rv64_state(0x80001000, 0);
+<   s.flags |= HYBRID_FLAG_ANDES | HYBRID_FLAG_M_EXT;  // no write-mask flag
+<   s.andes.mpft_ctl = 0x22;
+<   s.m_ext.mseccfg  = 0x44;
+<   s.mcache_ctl     = 0x77;
+<   // write_mask bytes all zero -- must be IGNORED when the flag is clear.
+< 
+<   hybrid::ResumeDriver driver(bus, kScratch);
+<   driver.resume(s);
+< 
+<   const auto ns = cmd_regnos(bus.ops);
+<   CHECK(contains_regno(ns, hybrid::regno_csr(0x7C5)));   // mpft_ctl restored
+<   CHECK(contains_regno(ns, hybrid::regno_csr(0x747)));   // mseccfg restored
+<   CHECK(contains_regno(ns, hybrid::regno_csr(0x7CA)));   // mcache_ctl restored
