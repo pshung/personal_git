@@ -1,0 +1,705 @@
+commit ff2060273b07e0505e31fc06ec57691a8af01b48
+Author: Nick Hung <nick@andestech.com>
+Date:   Fri Jun 26 15:00:02 2026 +0800
+
+    Remove icount trigger, simpoint-driven trigger, and cosim features
+    
+    Removes three feature families end to end (code, build, tests, docs):
+    
+    - icount trigger: the --mode icount / --hybrid-icount / plugin icount=
+      instruction-count drain path.
+    - simpoint-driven trigger: the BBV profile -> SimPoint cluster -> per-phase
+      drain pipeline (hsim profile/cluster/estimate, --mode simpoint), the
+      plugin bbv_out=/slice=/slice_at=/drain_at_exit= modes, bbv_emit, and the
+      tools/simpoint submodule.
+    - cosim: hybrid checkpoint co-sim (--cosim/--cosim-interval/--cosim-refine)
+      and cycle lock-step DV (--mode cycle --cosim, --cosim-lockstep), the
+      driver cosim_lockstep core, the plugin cosim_*/lockstep_* oracle modes,
+      and cosim_redesign.md / the cosim tutorial notebook.
+    
+    Also removes the gem5-style warmup window (--vsim-warmup-icount, the
+    mcycle/minstret_at_measure_start wire-ABI fields, and the orchestrator
+    warmup/measure/total breakdown), which was specific to these paths.
+    
+    Survives: --mode fast|cycle|hybrid, the marker/pc triggers, --verify, the
+    hybrid handoff, state drain/resume, and archive/replay. Bumps the verilator
+    submodule to the matching hybrid-layer removal.
+    
+    Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+
+diff --git a/qemu_plugin/hybrid_handoff.c b/qemu_plugin/hybrid_handoff.c
+index 1d4664e..d605d4e 100644
+--- a/qemu_plugin/hybrid_handoff.c
++++ b/qemu_plugin/hybrid_handoff.c
+@@ -8,8 +8,6 @@
+ #include "hybrid/state_abi.h"
+ #include "hybrid/v_drain_policy.h"
+ 
+-#include "bbv_emit.h"
+-
+ #include <qemu-plugin.h>
+ 
+ #include <glib.h>
+@@ -65,11 +63,6 @@ typedef struct {
+     struct qemu_plugin_register *vl;
+     struct qemu_plugin_register *vlenb;
+     struct qemu_plugin_register *vreg[32];
+-
+-    // icount-trigger mode: per-vcpu retired-insn counter, incremented in
+-    // on_icount_tick. When icount_target is reached, the same drain path
+-    // as CSR/PC mode fires (on_handoff -> write_state_atomic -> exit 200).
+-    uint64_t icount_retired;
+ } VcpuRegs;
+ 
+ static struct qemu_plugin_scoreboard *vcpu_state;
+@@ -83,54 +76,10 @@ static char *outfile_path;
+ static uint64_t enter_pc_arg;
+ static int pc_mode;
+ 
+-// icount-trigger mode: when icount_target is non-zero (set via plugin arg
+-// `icount=N`), every translated insn gets an exec callback that bumps a
+-// per-vcpu counter; on threshold-cross the drain fires at that insn
+-// boundary. Coexists with CSR/PC modes - either trigger can win.
+-static uint64_t icount_target;
+-static int icount_mode;
+-
+-// BBV-emit mode (SimPoint profile): when bbv_mode is set (plugin args
+-// `bbv_out=PATH,slice=N`), every translated insn gets an exec callback
+-// that ticks a global BBV counter; one .bb row per N retired insns is
+-// flushed to PATH. Coexists with the drain triggers - independently
+-// registered before icount so that on co-firing (icount target == slice
+-// multiple) the slice row is emitted before exit(200).
+-static BbvEmit *bbv_emit;
+-static char    *bbv_out_path;
+-static uint64_t bbv_slice_target;
+-static int      bbv_mode;
+-
+-// Slice-consume mode (SimPoint replay; F11): when slice_consume_mode is
+-// set (plugin args `slice=N,slice_at=K`), the plugin counts slice
+-// boundaries (one boundary per N retired insns) and drains at the end
+-// of slice index K (0-based). With K=2 and slice=1000, drain fires at
+-// insn 3000 - the boundary that closes the third slice. The orchestrator
+-// chains one invocation per SimPoint cluster-representative slice idx.
+-// Shares the `slice=` parameter with BBV-emit; works independently of
+-// whether `bbv_out=` is also set.
+-static uint64_t slice_at_target;
+-static int      slice_consume_mode;
+-static uint64_t slice_consume_acc;
+-static uint64_t slice_consume_idx;
+-
+-// Drain-at-exit mode (F14): when drain_at_exit_mode is set (plugin arg
+-// `drain_at_exit=1`), the plugin registers a per-insn exec callback that
+-// bumps `atexit_insn_count`, and a `qemu_plugin_register_atexit_cb` that
+-// drains state on natural program exit (e.g. semihosting EXIT). The
+-// atexit callback overrides s.minstret with the plugin counter so the
+-// caller (./hsim estimate --icount 0) gets a true retired-insn count
+-// independent of QEMU's PMU semantics (which can return host ticks on
+-// system-mode without `-icount`). `drained_already` suppresses the
+-// atexit path if any other trigger (CSR/PC/icount/slice) drained first.
+-static int      drain_at_exit_mode;
+-static volatile int drained_already;
+-static uint64_t atexit_insn_count;
+-
+ // Oracle exit-drain mode (verify_oracle F1): when exit_marker_mode or
+ // exit_pc_mode is set (plugin args `exit_marker=1` / `exit_pc=0x...`), a
+ // pure-QEMU run produces the differential verifier's reference state. Every
+-// insn gets an exec callback (icount-mode cost class): the tick ARMS on the
++// insn gets an exec callback: the tick ARMS on the
+ // ROI exit boundary (EXIT marker match, or vaddr == exit_pc) and DRAINS on
+ // the next callback. Exec callbacks fire before their insn executes, so the
+ // armed drain captures "after the boundary insn retired" -- exactly vsim's
+@@ -153,44 +102,6 @@ static uint64_t drain_pc_arg;
+ static int      drain_pc_set;
+ static volatile int oracle_armed;
+ 
+-// Cosim oracle mode (cosim_roi F3): when cosim_marker_mode or cosim_pc_mode
+-// is set (plugin args `cosim_marker=1` / `cosim_pc=0x...`), a per-insn exec
+-// callback ARMS at the ROI entry boundary, then drains hybrid_state_v1 at
+-// the post-entry retire counts listed in cosim_counts=a:b:c (strictly
+-// ascending). Every count but the last writes <outfile>.ckpt<k> (k from 1)
+-// and execution continues; the LAST drains <outfile> and exits 200. The
+-// counts come from the vsim leg's checkpoint minstret deltas, so both
+-// engines sample the SAME architectural points (see docs/archive/cosim_roi.md).
+-//
+-// Counting mirrors the vsim leg's minstret reference point:
+-//   marker mode: the ENTER marker is counted by NEITHER side (QEMU1 drains
+-//     pre-marker, vsim resumes past it) -- the arming tick does not count.
+-//   pc mode: the boundary insn retires INSIDE the window (the pc-mode
+-//     handoff resumes AT the boundary), so the arming tick counts it.
+-// Exclusive with every other trigger mode (including the exit oracle).
+-static uint64_t *cosim_counts;
+-static size_t    cosim_n_counts;
+-static uint64_t  cosim_pc_arg;
+-static int       cosim_pc_mode;
+-static int       cosim_marker_mode;
+-static volatile int cosim_armed;
+-static uint64_t  cosim_done;   // post-entry retires so far
+-static size_t    cosim_idx;    // next cosim_counts[] target
+-
+-// Lock-step oracle mode (cosim_redesign F5): `lockstep_pc=0x...` arms at
+-// the given vaddr, then drains the full state BEFORE every execution
+-// attempt, appending each record to the `outfile` stream (outfile IS the
+-// stream in this mode; there is no separate final state file). Exec
+-// callbacks fire pre-execution, so record k = state before attempt k+1 --
+-// the exact point where vsim's dcsr.step halt lands, traps included (a
+-// trapped attempt's next callback is the handler entry on both sides).
+-// Stops at `lockstep_max=K` records (exit 200) or at natural program exit.
+-static uint64_t  lockstep_pc_arg;
+-static int       lockstep_pc_mode;
+-static uint64_t  lockstep_max;
+-static volatile int lockstep_armed;
+-static uint64_t  lockstep_count;
+-
+ static struct qemu_plugin_register *find_reg(GArray *regs, const char *name)
+ {
+     for (guint i = 0; i < regs->len; i++) {
+@@ -322,27 +233,9 @@ static int write_state_atomic(const struct hybrid_state_v1 *s, const char *path)
+     return 0;
+ }
+ 
+-// Append one record to a `.ckpts` stream (concatenated hybrid_state_v1,
+-// cosim_redesign F3). No tmp-rename dance: the stream has a single writer
+-// and readers only run after the producer exits.
+-static int append_state_stream(const struct hybrid_state_v1 *s,
+-                               const char *path)
+-{
+-    FILE *f = fopen(path, "ab");
+-    if (!f) {
+-        perror("hybrid_handoff: fopen stream");
+-        return -1;
+-    }
+-    const size_t n = fwrite(s, 1, sizeof(*s), f);
+-    fclose(f);
+-    return n == sizeof(*s) ? 0 : -1;
+-}
+-
+ // Drain CPU state into `*s`. pc is computed by the caller (from a
+-// HandoffSite for trigger paths, or 0 for the atexit path which lacks an
+-// insn context). If minstret_override is non-zero, it replaces QEMU's PMU
+-// minstret (used by drain_at_exit mode to record a plugin-counted
+-// retired-insn total).
++// HandoffSite for trigger paths). If minstret_override is non-zero, it
++// replaces QEMU's PMU minstret.
+ static void drain_state_into(unsigned int vcpu_idx, uint64_t pc,
+                              uint64_t minstret_override,
+                              struct hybrid_state_v1 *sp)
+@@ -444,8 +337,8 @@ static void drain_state_into(unsigned int vcpu_idx, uint64_t pc,
+     *sp = s;
+ }
+ 
+-// Drain CPU state to `path`. Does NOT call exit -- caller decides exit(200)
+-// (normal trigger) vs _exit(200) (inside atexit chain).
++// Drain CPU state to `path`. Does NOT call exit -- the caller decides
++// exit(200).
+ static void drain_state_to_file(unsigned int vcpu_idx, uint64_t pc,
+                                 uint64_t minstret_override, const char *path)
+ {
+@@ -464,8 +357,6 @@ static void drain_state_to_file(unsigned int vcpu_idx, uint64_t pc,
+ // as the vsim resume point, and exit 200.
+ static void handoff_drain(unsigned int vcpu_idx, uint64_t resume_pc)
+ {
+-    // F14: suppress the atexit drain path now that we have a real trigger.
+-    drained_already = 1;
+     drain_state_to_file(vcpu_idx, resume_pc, 0, outfile_path);
+     // 200 == kExitHandoffToQemu in verilator/src/hybrid/exit_codes.hpp.
+     // Distinguishes drain from workload completion (0) so the orchestrator
+@@ -485,7 +376,7 @@ static void on_handoff(unsigned int vcpu_idx, void *udata)
+     handoff_drain(vcpu_idx, compute_handoff_pc(site));
+ }
+ 
+-// pc/icount/slice boundary sites. Exec callbacks fire BEFORE the insn
++// pc boundary sites. Exec callbacks fire BEFORE the insn
+ // executes, and the boundary insn is real user code (unlike a marker NOP):
+ // the drained state must resume AT the boundary so the insn executes inside
+ // the vsim window rather than on neither leg. (Skipping it corrupts the
+@@ -498,51 +389,6 @@ static void on_handoff_boundary(unsigned int vcpu_idx, void *udata)
+     handoff_drain(vcpu_idx, site->vaddr);
+ }
+ 
+-// F14: per-insn tick. Increments a global counter every retired insn so the
+-// drain-at-exit path can report a true retired-insn total (independent of
+-// QEMU's PMU semantics).
+-static void on_count_tick(unsigned int vcpu_idx, void *udata)
+-{
+-    (void) vcpu_idx;
+-    (void) udata;
+-    atexit_insn_count++;
+-}
+-
+-// F14: atexit drain. Fires when QEMU exits naturally (no ROI trigger). The
+-// record is a CONTEXT-FREE count, not an architectural drain: depending on
+-// the guest's exit path this callback runs on the vCPU thread (semihosting
+-// EXIT) or on QEMU's main loop thread (vplat/SimControl shutdown request),
+-// and on the main thread there is no vCPU context -- any
+-// qemu_plugin_read_register aborts QEMU (api.c asserts current_cpu). The
+-// only consumer (the SimPoint estimate profile) reads minstret = the
+-// plugin-side retire counter (N_total); pc=0 is the positive marker that
+-// the atexit path drained (no trigger). If any other trigger already
+-// drained, return immediately (drained_already guards against double
+-// drain). Inside an atexit handler, exit() is UB per C11 7.22.4.4; use
+-// _exit() to skip the rest of the atexit chain.
+-static void on_atexit(qemu_plugin_id_t id, void *udata)
+-{
+-    (void) id;
+-    (void) udata;
+-    if (drained_already) return;
+-    if (!drain_at_exit_mode) return;
+-    struct hybrid_state_v1 s = {0};
+-    s.magic    = HYBRID_STATE_MAGIC;
+-    s.version  = HYBRID_STATE_VERSION;
+-    s.flags    = HYBRID_FLAG_RV64;
+-    s.priv     = 3;
+-    s.minstret = atexit_insn_count;
+-    if (write_state_atomic(&s, outfile_path) != 0)
+-        fprintf(stderr, "hybrid_handoff: failed to write state file\n");
+-    else
+-        fprintf(stderr,
+-                "hybrid_handoff: drained exit count record to %s "
+-                "(minstret=%" PRIu64 ")\n",
+-                outfile_path, s.minstret);
+-    fflush(stderr);
+-    _exit(200);
+-}
+-
+ // Per-insn tick for oracle exit-drain mode. udata is this insn's HandoffSite.
+ // When armed (the exit boundary's own tick ran), this tick fires before its
+ // insn executes, so a drain here records the post-retire state of the
+@@ -560,140 +406,11 @@ static void on_oracle_tick(unsigned int vcpu_idx, void *udata)
+     }
+ }
+ 
+-// Checkpoint drain for cosim mode: append to the <outfile>.ckpts stream and
+-// KEEP RUNNING (no exit, drained_already untouched -- the final count uses
+-// handoff_drain).
+-static void cosim_checkpoint_drain(unsigned int vcpu_idx, uint64_t pc,
+-                                   size_t k)
+-{
+-    g_autofree char *path = g_strdup_printf("%s.ckpts", outfile_path);
+-    struct hybrid_state_v1 s;
+-    drain_state_into(vcpu_idx, pc, 0, &s);
+-    if (append_state_stream(&s, path) != 0) {
+-        fprintf(stderr, "hybrid_handoff: failed to append checkpoint %zu\n",
+-                k);
+-        exit(2);
+-    }
+-    fprintf(stderr,
+-            "hybrid_handoff: checkpoint %zu appended to %s (pc=%#" PRIx64
+-            ")\n", k, path, s.pc);
+-}
+-
+-// Per-insn tick for cosim mode. udata is this insn's HandoffSite. Exec
+-// callbacks fire pre-execution: at an armed tick, `cosim_done` post-entry
+-// insns have retired and the current insn has not, so draining when
+-// cosim_done == target captures "entry + target retires" with pc = the
+-// dynamically-next insn's vaddr -- the same point as the vsim checkpoint's
+-// DPC at minstret delta == target.
+-static void on_cosim_tick(unsigned int vcpu_idx, void *udata)
+-{
+-    const HandoffSite *site = (const HandoffSite *) udata;
+-    if (!cosim_armed) {
+-        if (cosim_pc_mode ? (site->vaddr == cosim_pc_arg)
+-                          : (site->kind == HYBRID_HANDOFF_ENTER)) {
+-            cosim_armed = 1;
+-            // Marker mode: the marker is counted by neither side -- done.
+-            // pc mode: the boundary insn retires inside the window (the
+-            // handoff resumes AT it) -- fall through and count this tick.
+-            if (!cosim_pc_mode) return;
+-        } else {
+-            return;
+-        }
+-    }
+-    if (cosim_idx < cosim_n_counts && cosim_done == cosim_counts[cosim_idx]) {
+-        if (cosim_idx + 1 == cosim_n_counts)
+-            handoff_drain(vcpu_idx, site->vaddr);  // final: exits 200
+-        else
+-            cosim_checkpoint_drain(vcpu_idx, site->vaddr, cosim_idx + 1);
+-        cosim_idx++;
+-    }
+-    cosim_done++;
+-}
+-
+-// Per-insn tick for lock-step oracle mode. udata is this insn's
+-// HandoffSite. Drains BEFORE the insn executes (record k = state before
+-// attempt k+1) and appends to the outfile stream.
+-static void on_lockstep_tick(unsigned int vcpu_idx, void *udata)
+-{
+-    const HandoffSite *site = (const HandoffSite *) udata;
+-    if (!lockstep_armed) {
+-        if (site->vaddr != lockstep_pc_arg) return;
+-        lockstep_armed = 1;
+-    }
+-    struct hybrid_state_v1 s;
+-    drain_state_into(vcpu_idx, site->vaddr, 0, &s);
+-    if (append_state_stream(&s, outfile_path) != 0) {
+-        fprintf(stderr, "hybrid_handoff: failed to append lockstep record "
+-                "%" PRIu64 "\n", lockstep_count);
+-        exit(2);
+-    }
+-    lockstep_count++;
+-    if (lockstep_max != 0 && lockstep_count >= lockstep_max) {
+-        drained_already = 1;
+-        fprintf(stderr,
+-                "hybrid_handoff: lockstep done, %" PRIu64 " record(s) in "
+-                "%s\n", lockstep_count, outfile_path);
+-        fflush(stderr);
+-        exit(200);
+-    }
+-}
+-
+-// Per-insn tick for icount mode. udata is the per-insn HandoffSite
+-// pre-allocated at translation time, so on_handoff's compute_handoff_pc
+-// returns the lag-free post-trigger PC (same property as the CSR path).
+-static void on_icount_tick(unsigned int vcpu_idx, void *udata)
+-{
+-    VcpuRegs *v = qemu_plugin_scoreboard_find(vcpu_state, vcpu_idx);
+-    if (++v->icount_retired < icount_target) return;
+-    on_handoff_boundary(vcpu_idx, udata);
+-}
+-
+-// Per-insn tick for BBV-emit mode. udata is the bb_id (1-based) cast to
+-// pointer; that mapping is stable across calls because bbv_emit_assign_id
+-// is hashed by TB-start PC. The tick attributes one insn to the bb_id and
+-// flushes a slice row when the per-slice counter saturates.
+-static void on_bbv_tick(unsigned int vcpu_idx, void *udata)
+-{
+-    (void) vcpu_idx;
+-    uint64_t bb_id = (uint64_t) GPOINTER_TO_UINT(udata);
+-    bbv_emit_tick(bbv_emit, bb_id);
+-}
+-
+-// Per-insn tick for slice-consume mode (F11). Counts insns into the
+-// slice accumulator; on each slice boundary increments slice_consume_idx
+-// and resets the accumulator. Once slice_consume_idx exceeds the target
+-// slice index, drains via on_handoff at that same insn boundary. udata
+-// is the per-insn HandoffSite (allocated at translation time) so the
+-// post-trigger PC reaches on_handoff lag-free.
+-static void on_slice_consume_tick(unsigned int vcpu_idx, void *udata)
+-{
+-    if (++slice_consume_acc < bbv_slice_target) return;
+-    slice_consume_acc = 0;
+-    if (slice_consume_idx++ < slice_at_target) return;
+-    // After the post-increment above, slice_consume_idx == slice_at_target+1
+-    // (the count of fully retired slices). Log so the e2e test can verify
+-    // drain timing without relying on minstret (which is a cycle-counter
+-    // proxy on andes-ax45mpv and does not track plugin-counted insns).
+-    fprintf(stderr,
+-            "hybrid_handoff: slice-consume drain (idx=%" PRIu64
+-            " target=%" PRIu64 ")\n",
+-            slice_consume_idx, slice_at_target);
+-    on_handoff_boundary(vcpu_idx, udata);
+-}
+-
+ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
+ {
+     (void) id;
+     size_t n = qemu_plugin_tb_n_insns(tb);
+ 
+-    // BBV-mode: assign a stable bb_id to this TB (1-based, hashed by
+-    // TB-start vaddr). Same id is shared by every insn in the TB.
+-    uint64_t bb_id = 0;
+-    if (bbv_mode && n > 0) {
+-        uint64_t tb_pc = qemu_plugin_insn_vaddr(qemu_plugin_tb_get_insn(tb, 0));
+-        bb_id = bbv_emit_assign_id(bbv_emit, tb_pc);
+-    }
+-
+     for (size_t i = 0; i < n; i++) {
+         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+ 
+@@ -715,74 +432,6 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
+             continue;
+         }
+ 
+-        // Cosim oracle mode: exclusive with every other mode (enforced at
+-        // install). Same site shape as the exit oracle; kind carries the
+-        // marker match so the tick can arm on the ENTER marker.
+-        if (cosim_marker_mode || cosim_pc_mode) {
+-            HandoffSite *site = g_new0(HandoffSite, 1);
+-            site->kind  = HYBRID_HANDOFF_NONE;
+-            site->vaddr = qemu_plugin_insn_vaddr(insn);
+-            site->size  = (uint32_t) qemu_plugin_insn_size(insn);
+-            if (cosim_marker_mode && site->size == 4) {
+-                uint32_t raw = 0;
+-                if (qemu_plugin_insn_data(insn, &raw, sizeof(raw)) == sizeof(raw))
+-                    hybrid_match_handoff_insn(raw, &site->kind);
+-            }
+-            qemu_plugin_register_vcpu_insn_exec_cb(
+-                insn, on_cosim_tick, QEMU_PLUGIN_CB_R_REGS, site);
+-            continue;
+-        }
+-
+-        // Lock-step oracle mode: exclusive with every other mode (enforced
+-        // at install). Every insn ticks; the tick arms at lockstep_pc.
+-        if (lockstep_pc_mode) {
+-            HandoffSite *site = g_new0(HandoffSite, 1);
+-            site->kind  = HYBRID_HANDOFF_NONE;
+-            site->vaddr = qemu_plugin_insn_vaddr(insn);
+-            site->size  = (uint32_t) qemu_plugin_insn_size(insn);
+-            qemu_plugin_register_vcpu_insn_exec_cb(
+-                insn, on_lockstep_tick, QEMU_PLUGIN_CB_R_REGS, site);
+-            continue;
+-        }
+-
+-        // F14 count tick: registered FIRST so the count is incremented
+-        // before any trigger callback can call exit(200). NO_REGS keeps
+-        // the per-insn cost minimal (a single uint64 add).
+-        if (drain_at_exit_mode) {
+-            qemu_plugin_register_vcpu_insn_exec_cb(
+-                insn, on_count_tick, QEMU_PLUGIN_CB_NO_REGS, NULL);
+-        }
+-
+-        // BBV callback is registered BEFORE icount so that if both modes
+-        // fire on the same insn (icount target == slice multiple), the
+-        // slice row is emitted before exit(200) is called.
+-        if (bbv_mode) {
+-            qemu_plugin_register_vcpu_insn_exec_cb(
+-                insn, on_bbv_tick, QEMU_PLUGIN_CB_NO_REGS,
+-                GUINT_TO_POINTER((guint) bb_id));
+-        }
+-
+-        // Slice-consume callback (F11). Registered after BBV so a BBV
+-        // row at the same boundary is flushed first; ordering vs icount
+-        // is irrelevant (both drain).
+-        if (slice_consume_mode) {
+-            HandoffSite *site = g_new0(HandoffSite, 1);
+-            site->kind  = HYBRID_HANDOFF_ENTER;
+-            site->vaddr = qemu_plugin_insn_vaddr(insn);
+-            site->size  = (uint32_t) qemu_plugin_insn_size(insn);
+-            qemu_plugin_register_vcpu_insn_exec_cb(
+-                insn, on_slice_consume_tick, QEMU_PLUGIN_CB_R_REGS, site);
+-        }
+-
+-        if (icount_mode) {
+-            HandoffSite *site = g_new0(HandoffSite, 1);
+-            site->kind  = HYBRID_HANDOFF_ENTER;
+-            site->vaddr = qemu_plugin_insn_vaddr(insn);
+-            site->size  = (uint32_t) qemu_plugin_insn_size(insn);
+-            qemu_plugin_register_vcpu_insn_exec_cb(
+-                insn, on_icount_tick, QEMU_PLUGIN_CB_R_REGS, site);
+-        }
+-
+         if (pc_mode) {
+             // PC-trigger mode: vaddr-only match; the drain resumes AT the
+             // boundary (on_handoff_boundary), so the insn size is recorded
+@@ -836,38 +485,6 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
+             }
+             enter_pc_arg = (uint64_t) v;
+             pc_mode = 1;
+-        } else if (g_strcmp0(tok[0], "icount") == 0 && tok[1]) {
+-            char *endp = NULL;
+-            unsigned long long v = g_ascii_strtoull(tok[1], &endp, 0);
+-            if (!endp || *endp != '\0' || v == 0) {
+-                fprintf(stderr, "hybrid_handoff: invalid icount=%s\n",
+-                        tok[1]);
+-                return -1;
+-            }
+-            icount_target = (uint64_t) v;
+-            icount_mode = 1;
+-        } else if (g_strcmp0(tok[0], "bbv_out") == 0 && tok[1]) {
+-            bbv_out_path = g_strdup(tok[1]);
+-            bbv_mode = 1;
+-        } else if (g_strcmp0(tok[0], "slice") == 0 && tok[1]) {
+-            char *endp = NULL;
+-            unsigned long long v = g_ascii_strtoull(tok[1], &endp, 0);
+-            if (!endp || *endp != '\0' || v == 0) {
+-                fprintf(stderr, "hybrid_handoff: invalid slice=%s\n",
+-                        tok[1]);
+-                return -1;
+-            }
+-            bbv_slice_target = (uint64_t) v;
+-        } else if (g_strcmp0(tok[0], "slice_at") == 0 && tok[1]) {
+-            char *endp = NULL;
+-            unsigned long long v = g_ascii_strtoull(tok[1], &endp, 0);
+-            if (!endp || *endp != '\0') {
+-                fprintf(stderr, "hybrid_handoff: invalid slice_at=%s\n",
+-                        tok[1]);
+-                return -1;
+-            }
+-            slice_at_target = (uint64_t) v;
+-            slice_consume_mode = 1;
+         } else if (g_strcmp0(tok[0], "exit_pc") == 0 && tok[1]) {
+             char *endp = NULL;
+             unsigned long long v = g_ascii_strtoull(tok[1], &endp, 0);
+@@ -897,81 +514,6 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
+             }
+             drain_pc_arg = (uint64_t) v;
+             drain_pc_set = 1;
+-        } else if (g_strcmp0(tok[0], "cosim_pc") == 0 && tok[1]) {
+-            char *endp = NULL;
+-            unsigned long long v = g_ascii_strtoull(tok[1], &endp, 0);
+-            if (!endp || *endp != '\0') {
+-                fprintf(stderr, "hybrid_handoff: invalid cosim_pc=%s\n",
+-                        tok[1]);
+-                return -1;
+-            }
+-            cosim_pc_arg = (uint64_t) v;
+-            cosim_pc_mode = 1;
+-        } else if (g_strcmp0(tok[0], "lockstep_pc") == 0 && tok[1]) {
+-            char *endp = NULL;
+-            unsigned long long v = g_ascii_strtoull(tok[1], &endp, 0);
+-            if (!endp || *endp != '\0') {
+-                fprintf(stderr, "hybrid_handoff: invalid lockstep_pc=%s\n",
+-                        tok[1]);
+-                return -1;
+-            }
+-            lockstep_pc_arg = (uint64_t) v;
+-            lockstep_pc_mode = 1;
+-        } else if (g_strcmp0(tok[0], "lockstep_max") == 0 && tok[1]) {
+-            char *endp = NULL;
+-            unsigned long long v = g_ascii_strtoull(tok[1], &endp, 0);
+-            if (!endp || *endp != '\0') {
+-                fprintf(stderr, "hybrid_handoff: invalid lockstep_max=%s\n",
+-                        tok[1]);
+-                return -1;
+-            }
+-            lockstep_max = (uint64_t) v;
+-        } else if (g_strcmp0(tok[0], "cosim_marker") == 0 && tok[1]) {
+-            char *endp = NULL;
+-            unsigned long long v = g_ascii_strtoull(tok[1], &endp, 0);
+-            if (!endp || *endp != '\0') {
+-                fprintf(stderr, "hybrid_handoff: invalid cosim_marker=%s\n",
+-                        tok[1]);
+-                return -1;
+-            }
+-            cosim_marker_mode = (v != 0);
+-        } else if (g_strcmp0(tok[0], "cosim_counts") == 0 && tok[1]) {
+-            g_auto(GStrv) parts = g_strsplit(tok[1], ":", -1);
+-            size_t n = g_strv_length(parts);
+-            if (n == 0) {
+-                fprintf(stderr, "hybrid_handoff: empty cosim_counts\n");
+-                return -1;
+-            }
+-            cosim_counts = g_new0(uint64_t, n);
+-            for (size_t k = 0; k < n; k++) {
+-                char *endp = NULL;
+-                unsigned long long v = g_ascii_strtoull(parts[k], &endp, 0);
+-                if (parts[k][0] == '\0' || !endp || *endp != '\0') {
+-                    fprintf(stderr,
+-                            "hybrid_handoff: invalid cosim_counts entry: %s\n",
+-                            parts[k]);
+-                    return -1;
+-                }
+-                if (k > 0 && v <= cosim_counts[k - 1]) {
+-                    fprintf(stderr, "hybrid_handoff: cosim_counts must be "
+-                                    "strictly ascending\n");
+-                    return -1;
+-                }
+-                cosim_counts[k] = (uint64_t) v;
+-            }
+-            cosim_n_counts = n;
+-        } else if (g_strcmp0(tok[0], "drain_at_exit") == 0 && tok[1]) {
+-            // F14: any non-zero value enables. "1" is the canonical form
+-            // hsim emits; other ints (incl. negatives parsed as huge unsigned)
+-            // also enable -- the flag is a binary switch, not a count.
+-            char *endp = NULL;
+-            unsigned long long v = g_ascii_strtoull(tok[1], &endp, 0);
+-            if (!endp || *endp != '\0') {
+-                fprintf(stderr, "hybrid_handoff: invalid drain_at_exit=%s\n",
+-                        tok[1]);
+-                return -1;
+-            }
+-            drain_at_exit_mode = (v != 0);
+         } else {
+             fprintf(stderr, "hybrid_handoff: unknown option: %s\n", argv[i]);
+             return -1;
+@@ -986,44 +528,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
+                 "hybrid_handoff: PC-mode enter=0x%" PRIx64 "\n",
+                 enter_pc_arg);
+     }
+-    if (icount_mode) {
+-        fprintf(stderr,
+-                "hybrid_handoff: icount-mode target=%" PRIu64 "\n",
+-                icount_target);
+-    }
+-    if (bbv_mode) {
+-        if (bbv_slice_target == 0) {
+-            fputs("hybrid_handoff: bbv_out= requires slice=N\n", stderr);
+-            return -1;
+-        }
+-        bbv_emit = bbv_emit_new(bbv_out_path, bbv_slice_target);
+-        if (!bbv_emit) {
+-            fprintf(stderr, "hybrid_handoff: failed to open bbv_out=%s\n",
+-                    bbv_out_path);
+-            return -1;
+-        }
+-        fprintf(stderr,
+-                "hybrid_handoff: bbv-mode out=%s slice=%" PRIu64 "\n",
+-                bbv_out_path, bbv_slice_target);
+-    }
+-    if (slice_consume_mode) {
+-        if (bbv_slice_target == 0) {
+-            fputs("hybrid_handoff: slice_at= requires slice=N\n", stderr);
+-            return -1;
+-        }
+-        fprintf(stderr,
+-                "hybrid_handoff: slice-consume mode slice=%" PRIu64
+-                " slice_at=%" PRIu64 "\n",
+-                bbv_slice_target, slice_at_target);
+-    }
+-    if (drain_at_exit_mode) {
+-        fputs("hybrid_handoff: drain-at-exit mode enabled\n", stderr);
+-        qemu_plugin_register_atexit_cb(id, on_atexit, NULL);
+-    }
+     if (exit_marker_mode || exit_pc_mode) {
+-        if ((exit_marker_mode && exit_pc_mode) || pc_mode || icount_mode
+-            || bbv_mode || slice_consume_mode || drain_at_exit_mode
+-            || cosim_marker_mode || cosim_pc_mode) {
++        if ((exit_marker_mode && exit_pc_mode) || pc_mode) {
+             fputs("hybrid_handoff: oracle exit drain (exit_marker/exit_pc) "
+                   "is exclusive with the other trigger modes\n", stderr);
+             return -1;
+@@ -1045,55 +551,6 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
+               "(exit_marker/exit_pc)\n", stderr);
+         return -1;
+     }
+-    if (cosim_marker_mode || cosim_pc_mode) {
+-        if ((cosim_marker_mode && cosim_pc_mode) || pc_mode || icount_mode
+-            || bbv_mode || slice_consume_mode || drain_at_exit_mode) {
+-            fputs("hybrid_handoff: cosim mode (cosim_marker/cosim_pc) is "
+-                  "exclusive with the other trigger modes\n", stderr);
+-            return -1;
+-        }
+-        if (cosim_n_counts == 0) {
+-            fputs("hybrid_handoff: cosim mode requires cosim_counts=a:b:...\n",
+-                  stderr);
+-            return -1;
+-        }
+-        if (cosim_pc_mode) {
+-            fprintf(stderr,
+-                    "hybrid_handoff: cosim mode entry pc=0x%" PRIx64
+-                    ", %zu drain count(s)\n", cosim_pc_arg, cosim_n_counts);
+-        } else {
+-            fprintf(stderr,
+-                    "hybrid_handoff: cosim mode (entry marker), "
+-                    "%zu drain count(s)\n", cosim_n_counts);
+-        }
+-        // Fresh stream per run: the sink appends, so stale records from a
+-        // previous run would otherwise survive.
+-        g_autofree char *stream = g_strdup_printf("%s.ckpts", outfile_path);
+-        unlink(stream);
+-    } else if (cosim_n_counts != 0) {
+-        fputs("hybrid_handoff: cosim_counts requires cosim mode "
+-              "(cosim_marker/cosim_pc)\n", stderr);
+-        return -1;
+-    }
+-
+-    if (lockstep_pc_mode) {
+-        if (pc_mode || icount_mode || bbv_mode || slice_consume_mode
+-            || drain_at_exit_mode || exit_marker_mode || exit_pc_mode
+-            || cosim_marker_mode || cosim_pc_mode) {
+-            fputs("hybrid_handoff: lockstep_pc is exclusive with the other "
+-                  "trigger modes\n", stderr);
+-            return -1;
+-        }
+-        // outfile IS the record stream in this mode; start it fresh.
+-        unlink(outfile_path);
+-        fprintf(stderr,
+-                "hybrid_handoff: lockstep mode, arm pc=0x%" PRIx64
+-                ", max records=%" PRIu64 " (0 = until exit), stream=%s\n",
+-                lockstep_pc_arg, lockstep_max, outfile_path);
+-    } else if (lockstep_max != 0) {
+-        fputs("hybrid_handoff: lockstep_max requires lockstep_pc\n", stderr);
+-        return -1;
+-    }
+ 
+     vcpu_state = qemu_plugin_scoreboard_new(sizeof(VcpuRegs));
+     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
