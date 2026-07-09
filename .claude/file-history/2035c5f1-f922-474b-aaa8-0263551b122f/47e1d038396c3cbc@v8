@@ -1,0 +1,276 @@
+# ROADMAP: ILM/DLM content transport across the hybrid handoff (Approach A)
+
+Goal: make Hart 0 ILM (`0xA0000000..0xA01FFFFF`) and DLM (`0xA0200000..0xA03FFFFF`)
+memory CONTENT survive the QEMU1 -> vsim handoff, so a benchmark whose hot
+code/data lives in TCM measures correct results and correct cycles.
+
+Scope: content only. The config CSRs (`milmb`/`mdlmb`) are already transported in
+the v3 Andes block (verify-excluded). This roadmap is about the bytes.
+
+## Why this matters
+ILM/DLM are TCM (tightly-coupled memory) = single-cycle local RAM, the most
+performance-relevant memory in the AE350. Today the content is NOT transported
+(3 gaps: not in the shared mmap, plugin does not drain it, vsim `load_elf` only
+targets main_memory). vsim resumes with ILM/DLM at RTL reset (empty). Latent
+today (no fixture uses TCM); breaks/mis-measures any TCM benchmark.
+
+## Chosen approach: A (file sidecar + reuse `--ilm`/`--dlm`)
+Plugin drains ILM/DLM to sidecar files next to the state `--outfile`; the driver
+feeds them to the vsim leg via the EXISTING `--ilm`/`--dlm` args; vsim's existing
+`load_image` backdoor writes them into the RTL.
+
+Key reason A wins: the vsim restore leg already exists and is nearly free.
+- `--ilm`/`--dlm` -> `Simulator::load_image` (`vsim: src/simulator.hpp:524`)
+  -> `cpu.set_ilm`/`set_dlm`
+  (`vsim: src/cpu_wrappers/ax45mpv_premium_cpu_cluster_subsystem.hpp:392,466`).
+- `set_ilm` is NOT a bus/PB/DMI transfer. It is a Verilator hierarchical-reference
+  poke straight into the model SRAM array (`rootp->..__DOT__..mem[i] = word`),
+  costs zero sim cycles, and regenerates ECC/parity itself. So the plugin only
+  needs to drain RAW data; vsim rebuilds ECC.
+- No ABI change: content rides sidecar files, `hybrid_state_v1` is untouched.
+
+Alternatives (not chosen now): B shared-mmap-backed ILM/DLM (less invasive per
+run but changes mmap layout on both sides + QEMU device model); C add an ABI
+block (96KB into the state file, larger ABI surface). Revisit only if A hits a
+wall.
+
+## Established facts (verified in code; trust these, do not re-derive)
+- QEMU slave port: `subport_create` (`qemu: hw/riscv/andes_ae350.c:1381`) maps
+  `0xA0000000`/`0xA0200000` as `memory_region_init_io` with `subport_ops`, which
+  dispatch to the hart-local `env->mask_ilm`/`env->mask_dlm`
+  (`qemu: target/riscv/cpu_helper.c:1308-1330`). So the slave port aliases the
+  real ILM/DLM content.
+- TCM overlay is PER-CPU, not system memory: `andes_cpu_lm_realize`
+  (`qemu: target/riscv/cpu.c:673-696`) does `memory_region_init_ram` then
+  `memory_region_add_subregion_overlap(env->cpu_as_root, ...)` - the overlay
+  exists only in the CPU's address space, and only when `*_default_enable` is on
+  (dynamic enable via a guest `milmb` write is handled around
+  `qemu: target/riscv/andes_csr.c:1270`; F0 confirms that path in practice).
+- CONSEQUENCE - runtime-populate is REQUIRED, static-init is dead on arrival:
+  QEMU's ELF loader writes SYSTEM memory (DRAM). A static-initialized section
+  with a TCM VMA lands in DRAM; a hart with the overlay enabled then reads the
+  TCM (zeros) at that address, never the loaded bytes. So for BOTH ILM and DLM
+  the fixture itself must write the content at runtime (which is also how real
+  silicon TCM is populated - crt0/program copies it in). This kills any
+  "linker-places-static-sections-into-TCM" fixture design.
+- Sizes are configurable, NOT fixed. QEMU builds the actual RAM at the property
+  size: `qemu.cfg ilm_size` -> SoC prop -> `env->ilm_size`
+  (`qemu: target/riscv/cpu.c:640,643`) -> `memory_region_init_ram(env->mask_ilm,
+  env->ilm_size)` (`cpu.c:673`). `ax45mpv_premium` = ILM 64KB / DLM 32KB via the
+  `--print-qemu-config` -> `-readconfig qemu.cfg` path (`ilm_size=65536`,
+  `dlm_size=32768`, `*_default_enable=on`). QEMU compiled-in defaults are 2MB/2MB
+  + enable=off (the raw path plugin tests use). Only the slave-port ADDRESS
+  window is fixed (2MB in the memmap); just the first `ilm_size` bytes are
+  RAM-backed. Valid size 0 or pow2 in [1KB, 512MB].
+- Hart-local TCM ranges on the premium engine: ILM `0x0..0xFFFF` (64KB),
+  DLM `0x200000..0x207FFF` (32KB). Fixtures link at `0x100000` (readelf
+  verified: entry + PT_LOAD paddr 0x100000) -> ILM range is free; DLM range sits
+  only 1MB above the link base, so a big image could collide (see R3).
+- vsim premium RTL resets with ILM/DLM DISABLED: `milmb/mdlmb.EN = 0` at reset
+  (MEASURED by the F2 probe via csrr 0x7C0 -- overrides the CLAUDE.md line that
+  said vsim drains EN=1). Bases match (`NDS_ILM_BASE=0x0`,
+  `NDS_DLM_BASE=0x200000`). CONSEQUENCE for hybrid: a guest that uses TCM must
+  WRITE milmb/mdlmb itself (what real TCM firmware does anyway); that CSR write
+  is write-mask-tracked, so ResumeDriver restores it on the vsim leg and the
+  ROI sees an enabled TCM. F4 fixtures must therefore enable ILM/DLM in the
+  QEMU phase -- QEMU's cfg `*_default_enable=on` alone does NOT transport.
+- Plugin drains exactly one region today (L2C, `qemu_plugin: hybrid_handoff.c:444`
+  `qemu_plugin_read_memory_hwaddr`). Pattern to copy.
+- vsim `load_image` order: `main.cpp:446` (before `sc_start` 453, before
+  `sim.reset()` 529, before `apply_resume_from_qemu` 563).
+
+## Risks
+- R1 (was the gate, now RESOLVED by code read): can the plugin read the subport IO
+  region? YES. `qemu_plugin_read_memory_hwaddr` (`qemu: plugins/api.c:499-536`)
+  uses `address_space_rw`, which DOES dispatch to IO region read callbacks - not
+  only RAM like L2C. The subport callback forwards to `env->mask_ilm`/`mask_dlm`
+  (`qemu: cpu_helper.c:1308-1311`). The L2C drain already proves the plugin's CPU
+  address space reaches system-memory regions, and `0xA0000000` sits in the same
+  system memory. So F0 is a quick confirmation, not a gate; F0b (QEMU change) is
+  almost certainly unneeded.
+- R2: does `sim.reset()` preserve backdoor-loaded SRAM? (F2)
+- R3: hart-local collisions. ILM base is `0x0` (also C NULL - place the test
+  routine at base+0x100, cast via uintptr) and DLM `0x200000` is 1MB above the
+  fixture link base `0x100000` - the e2e fixtures must assert image end <
+  `0x200000` (or move the link base). Drain ALWAYS via the slave-port aperture
+  `0xA0000000`, never hart-local `0x0`.
+- R4: single hart only (hart0), matching current hybrid scope.
+
+## Features (TDD: each starts with a failing test; one feature per session)
+
+Repos: `andesim` (driver, plugin, fixtures, tests), `vsim` = /home/nick/work/vsim_andesim,
+`qemu` = /home/nick/work/qemu_andesim.
+
+| ID | Name | State |
+|----|------|-------|
+| F0 | Confirm the plugin can read the subport IO region (quick check) | DONE |
+| F1 | Plugin drains ILM/DLM content to sidecar files | DONE |
+| F2 | vsim resume-time LM load is correct + survives reset | DONE |
+| F3 | Driver wires drained LM files into the vsim leg | DONE |
+| F4a | E2E: DLM data round-trip (runtime-filled buffer + checksum) | DONE |
+| F4b | E2E: ILM code round-trip (asm blob executed from TCM) | TODO |
+| F5 | (stretch) --verify LM content round-trip | TODO |
+
+### F0 - Confirm the plugin can read the subport IO region (quick check)
+- Expected PASS (see R1): `qemu_plugin_read_memory_hwaddr` uses `address_space_rw`,
+  which handles IO regions. This just confirms it before building F1 on top.
+- Test: `tests/plugin/test_plugin_lm_drain.sh` + fixture that sets `milmb.EN=1`
+  (the raw-QEMU plugin-test path boots with `*_default_enable=off` and 2MB
+  sizes - no `-readconfig`), runtime-writes a known pattern at hart-local ILM,
+  hits the marker; assert the plugin read the pattern back from the SLAVE-PORT
+  base `0xA0000000`. This confirms three things at once: dynamic overlay map on
+  the `milmb` write, slave-port aliasing, and the IO-region drain.
+- If it unexpectedly fails/returns 0: add F0b = QEMU change to expose the subport
+  to the plugin (RAM alias, or a hart-local read path). Unlikely per R1.
+- May be folded into F1's first test rather than run as a separate step.
+- Key files: `tests/plugin/test_plugin_lm_drain.sh`, `tests/fixtures/lm_drain.{c,S}`,
+  `tests/fixtures/Makefile`
+- Deps: none
+
+### F1 - Plugin drains ILM/DLM content to sidecar files
+- At the ROI-entry trigger, drain `ilm_size` bytes @ ilm base and `dlm_size` @ dlm
+  base into `<outfile>.ilm` / `<outfile>.dlm`. New plugin args `ilm_base`,
+  `ilm_size`, `dlm_base`, `dlm_size` (defaults `0xA0000000`/`0`/`0xA0200000`/`0`;
+  size 0 => skip that memory, write no file). RAW bytes, little-endian.
+- RED test: extend `test_plugin_lm_drain.sh` - pattern round-trips into both files;
+  a `size=0` run produces no file (no regression for no-LM engines).
+- Key files: `qemu_plugin/hybrid_handoff.c`
+- Deps: F0
+
+### F2 - vsim resume-time LM load correct + survives reset
+- Confirm `--ilm`/`--dlm` -> `load_image` -> `set_ilm` populates RTL ILM/DLM AND
+  the content survives `sim.reset()` and the DMI resume so the ROI sees it. If
+  load-before-reset (main.cpp:446) is wiped by `reset()`, move the load to after
+  reset / into `apply_resume_from_qemu`.
+- RED test: hand-make a known `.bin`, `--ilm` it, reset, read back (mem[] or a tiny
+  ROI that reads ILM and reports); assert intact.
+- Key files: `vsim: src/main.cpp` (load ordering), maybe `vsim: src/simulator.hpp`
+- Deps: none (independent; uses a hand-made bin)
+
+### F3 - Driver wires drained LM files into the vsim leg
+- Driver passes ilm/dlm base+size to the QEMU1 plugin (from the engine
+  descriptor), predicts `<outfile>.ilm/.dlm`, and adds `--ilm <path> --dlm <path>`
+  to the vsim argv - only when the engine has LM. Add `ilm_size`/`dlm_size` to the
+  engine descriptor (`vsim: describe_engine` / `--print-qemu-config`) and parse it.
+- RED test: `driver/plan_test.cpp` - vsim argv gets `--ilm/--dlm` iff engine has
+  LM; QEMU argv gets the ilm/dlm plugin args; a no-LM engine adds neither.
+- Key files: `driver/run_plan.cpp`, `driver/plan.hpp`, `driver/run_plan.hpp`,
+  `driver/engine_registry.cpp`, `driver/plan_test.cpp`;
+  cross-repo `vsim: src/main.cpp describe_engine`, `driver/json*.cpp`
+- Deps: F1, F2
+
+### F4a - E2E: DLM data round-trip (runtime-filled buffer + checksum)
+- Fixture (no linker-script changes - raw pointers): QEMU phase first ENABLES
+  the TCM (csr write milmb/mdlmb EN=1 -- required: vsim RTL resets EN=0, and
+  the CSR write is what arms the write-mask restore), then loops a
+  runtime-COMPUTED pattern into `(uint32_t*)0x200000` (hart-local DLM). ROI
+  (vsim) reads the buffer back, checksums, prints `SUM=xxxxxxxx`; exit 0 iff
+  SUM == precomputed EXPECTED.
+- Why this is decisive: the bytes exist NOWHERE except the DLM (not in the ELF -
+  runtime-computed; not in DRAM - the store went to the overlay; vsim loads no
+  ELF content in hybrid). The ONLY road to a correct SUM is the handoff.
+- Negative control for free: this fixture FAILS today (vsim DLM empty -> SUM
+  wrong) and turns green when F1-F3 land - it IS the RED test for the feature.
+- Assert in the harness: fixture image end < `0x200000` (R3).
+- Key files: `tests/fixtures/rt_c_dlm_data.c`, `tests/fixtures/Makefile`,
+  `vsim: cmake/HybridConfig.cmake` (e2e registration), `tests/e2e.sh` if needed
+- Deps: F3
+
+### F4b - E2E: ILM code round-trip (asm blob executed from TCM)
+- Fixture: a small SELF-CONTAINED asm routine (`a0 = f(a0)`, no DRAM
+  relocations) carried as a data blob in DRAM. QEMU phase copies it to
+  hart-local ILM base+`0x100` (avoid NULL), `fence.i`, then ROI. ROI (vsim)
+  calls the function pointer at `0x100` - the fetch comes from the ILM RTL -
+  and checks the return value.
+- Loud failure mode: an empty ILM fetches all-zero words = RISC-V illegal
+  instruction -> traps inside the trap-free ROI (visible crash), on top of the
+  return-value mismatch.
+- Optional strengthening: patch an immediate inside the copied code with a
+  runtime value (+ `fence.i`) so the result depends on exact instruction bytes.
+- Cycle sanity (soft): DRAM-resident twin of the same kernel; expect
+  cycles(ILM) < cycles(DRAM twin). Wide threshold - a sanity check, not a perf
+  regression test.
+- Key files: `tests/fixtures/rt_c_ilm_code.c` (+ inline `.word` blob),
+  `tests/fixtures/Makefile`, `vsim: cmake/HybridConfig.cmake`
+- Deps: F4a (reuses its harness plumbing)
+
+### F5 - (stretch) --verify LM content round-trip
+- StateDrain re-reads ILM/DLM at exit (a `get_ilm`/`get_dlm` backdoor dual, or a
+  slave-port read); `state_diff` compares (full or checksum). Closes the loop.
+- Key files: `vsim: src/hybrid/state_drain.hpp`, `vsim` cpu wrapper get_ilm/get_dlm,
+  `driver/state_diff.cpp`
+- Deps: F4b
+
+## Dependency graph
+```
+F0 (quick confirm) -> F1 ─┐
+F2 ───────────────────────┼─> F3 -> F4a -> F4b -> F5 (stretch)
+```
+
+## Definition of done / invariants
+- No `hybrid_state_v1` ABI change (content rides sidecar files).
+- Active only when the engine has ILM/DLM AND size > 0; a no-LM engine adds no
+  args, drains no files, changes nothing (zero regression).
+- Plugin drains RAW data; vsim `set_ilm` regenerates ECC/parity.
+- QEMU and vsim sizes stay synced (already true via qemu.cfg).
+- Drain ALWAYS via the slave-port aperture (`0xA0000000`), never hart-local `0x0`.
+- Fixtures populate TCM at RUNTIME only (static-init cannot reach QEMU's TCM -
+  see Established facts) and keep their image below `0x200000`.
+
+## Progress log
+- 2026-07-09: F4a DONE. Fixture `rt_c_dlm_data.c`: QEMU phase enables the DLM
+  (csrw mdlmb -- arms the write-mask restore) and fills all 32 KB at hart-local
+  0x200000 with a runtime formula; the vsim ROI re-derives the formula,
+  compares every word, and prints DLM_OK/DLM_BAD INSIDE the ROI (post-exit
+  code never runs on the vsim leg). e2e.sh gained (a) CHECK_VSIM_STDOUT=<re>
+  (in-ROI verdict hook) and (b) the LM transport wiring mirroring the driver:
+  probe $VSIM_BIN --describe for ilm_size/dlm_size, add plugin sidecar args +
+  --ilm/--dlm; ILM_SIZE/DLM_SIZE env override, 0 = off (negative knob). TDD:
+  RED = DLM_BAD count=8192 (transport absent), GREEN = DLM_OK at window 44476
+  cycles on BOTH trigger modes (identical count - deterministic). Permanent
+  negative: drivers/rt_lm_transport_off.sh (transport forced off must fail
+  with DLM_BAD) in NEG_TESTS. Full suite with LM transport active suite-wide:
+  46 passed / 0 failed / 4 skipped (rt_priv_*: ax66 engine not built,
+  pre-existing). Next: F4b (ILM code round-trip).
+- 2026-07-09: F3 DONE. Descriptor: vsim `--describe` now reports
+  `ilm_size`/`dlm_size` in BYTES (scan_int of NDS_*_SIZE_KB * 1024); driver
+  parses them into EngineDescriptor. plan_argvs: the accurate engine's sizes
+  (scanned plan-wide, like vlen) fold `,ilm_size=N,dlm_size=N` into the
+  fast-leg's `{trigger}` plugin suffix (zero template churn, sidecar
+  descriptors keep working) and append `--ilm/--dlm <state_in>.ilm/.dlm` to
+  the accurate leg; each memory gates independently on size>0, so a no-LM
+  engine changes nothing. Verified live: dry-run argvs correct AND a real
+  `andesim run --mode hybrid` on premium now drains + loads the sidecars with
+  the same 74-cycle window (no regression); e2e smoke + F2 test green on the
+  rebuilt vsim. Tests: json_test (descriptor parse), plan_test (wiring + the
+  ILM-only gate; the exact no-LM check_eq was already locking the negative).
+  Docs: engine_interface.md fields + {trigger} note; USER_GUIDE hw-config sync
+  bullet. Next: F4a (DLM data e2e fixture).
+- 2026-07-09: F2 DONE. Found + fixed a REAL vsim bug: premium
+  `set_ilm/set_dlm` used `_NDS_*_SIZE_KB` (64/32) as a BYTE capacity -- any
+  --ilm/--dlm image over 64/32 bytes threw; fixed to `*1024` (vsim commit
+  f8f875d; d23/d25fse were already correct). R2 ANSWERED: the backdoor poke
+  SURVIVES elaboration (sc_start) + sim.reset() -- no load-ordering change
+  needed; both the hart-local view (after milmb.EN=1) and the slave-port
+  aperture read the loaded pattern. New measured fact: premium RTL resets
+  milmb/mdlmb.EN=0 -> probes/fixtures enable TCM themselves (real-firmware
+  behavior; write-mask then transports the enable in hybrid). Test:
+  `tests/vsim/test_vsim_lm_load.sh` (+ `lm_readback.c` vplat fixture; negative
+  control = same probe with no --ilm/--dlm must fail). e2e smoke
+  (handoff_roundtrip marker+pc) green on the rebuilt vsim. Next: F3 (driver
+  wiring).
+- 2026-07-09: F0+F1 DONE. Plugin drains ILM/DLM to `<outfile>.ilm/.dlm` via new
+  args `ilm_base/ilm_size/dlm_base/dlm_size` (defaults 0xA0000000/0/0xA0200000/0,
+  size 0 = no file). Sidecar write is a hard error on read/write failure (a
+  silent miss would resume vsim with empty TCM). Seam: `drain_state_to_file`
+  (all trigger modes). F0 answered empirically: `qemu_plugin_read_memory_hwaddr`
+  DOES read the subport IO region (guest store -> subport -> mask_ilm ->
+  plugin read round-trip verified at first+last word of each window; F0b not
+  needed). Tests: `tests/plugin/test_plugin_lm_drain.sh` + `lm_drain.S`
+  (slave-port patterns; no-size run asserts no sidecars). Structural precursor
+  commit: `write_blob_atomic` + `parse_u64_arg` extraction. Next: F2 (vsim
+  --ilm/--dlm load survives reset) in the vsim repo.
+- Design note: F4 was split into F4a (DLM data, raw-pointer fixture) and F4b
+  (ILM code, asm-blob copy + fence.i) after establishing that QEMU's ELF loader
+  writes system memory while the TCM overlay is per-CPU - so runtime-populate
+  is REQUIRED, not optional, and no linker-script TCM sections are used.
