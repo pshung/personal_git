@@ -1,0 +1,123 @@
+// Runtime engine discovery -- the hot-plug seam.
+//
+// discover_engines() returns the built-in qemu descriptor plus every engine
+// found by scanning a directory and asking each binary to self-report via
+// `--describe` (falling back to a <bin>.json sidecar). No engine is compiled
+// into the framework; dropping a freshly built sim_<cfg> into the scan dir
+// makes it appear here with no andesim rebuild.
+//
+// Scan dir: $ANDESIM_ENGINES_DIR (colon-separated; REPLACES the default and
+// accepts any executable) if set, else vsim_scan_dir() (filtered to sim_*
+// binaries) -- $VSIM_BIN_DIR, the external prebuilt vsim build dir mirroring
+// $QEMU_BIN_DIR.
+#ifndef ANDESIM_ENGINE_REGISTRY_HPP
+#define ANDESIM_ENGINE_REGISTRY_HPP
+
+#include <filesystem>
+#include <string>
+#include <vector>
+
+#include "engine_descriptor.hpp"
+#include "strutil.hpp"
+
+namespace andes_sim {
+
+// Built-in functional engine ids (the qemu64/qemu32 pair). Declared once here so
+// builtin_qemu_arch, the hybrid plan steps, and `run --mode fast` acceptance all
+// agree -- a renamed literal would otherwise break find_engine() lookups only at
+// run time.
+inline constexpr const char* kQemuId64 = "qemu64";
+inline constexpr const char* kQemuId32 = "qemu32";
+
+struct Discovery {
+  std::vector<EngineDescriptor> engines;   // deduped by id; qemu first
+  std::vector<std::string> warnings;       // binaries that failed to describe
+};
+
+Discovery discover_engines();
+
+// Directory discover_engines() scans for sim_* engines when $ANDESIM_ENGINES_DIR
+// is unset: VSIM_BIN_DIR (the external prebuilt vsim build, mirroring
+// QEMU_BIN_DIR) resolved env-first then from `config_file` (default: the repo
+// config.env); empty when unset everywhere.
+std::filesystem::path vsim_scan_dir();
+std::filesystem::path vsim_scan_dir(const std::filesystem::path& config_file);
+
+// The bundled qemu descriptor (no directory scan, no --describe subprocess).
+// discover_engines() seeds the registry with it; `run --mode fast` resolves
+// qemu through it directly, paying none of the Verilator-engine discovery cost.
+// builtin_qemu_arch(xlen) builds the rv64 "qemu64" (xlen=64) or rv32 "qemu32"
+// (xlen=32, qemu-system-riscv32); builtin_qemu() is the rv64 default.
+EngineDescriptor builtin_qemu_arch(int xlen);
+EngineDescriptor builtin_qemu();
+
+// Rewrite a discovered engine's identity from the third-party simulator name to
+// the product name: type "verilator" -> "vsim", id "verilator:<cfg>" ->
+// "vsim:<cfg>". discover_engines() applies this once, before the id is used for
+// dedup or shown anywhere, so every downstream consumer (list / --engine /
+// errors / run banner) speaks "vsim" and a user never sees "verilator". Any
+// other backend (qemu, a drop-in alioth/sid) passes through untouched.
+inline void normalize_engine_label(EngineDescriptor& d) {
+  if (d.type == "verilator") d.type = "vsim";
+  if (d.id.rfind("verilator:", 0) == 0) d.id = "vsim:" + d.id.substr(10);
+  // The CLI exposes the marker delimiter as `--trigger marker`; some engines
+  // report it under their internal name "csr" via --describe. Speak the CLI's
+  // vocabulary in list / doctor too, like verilator -> vsim above.
+  for (std::string& t : d.triggers)
+    if (t == "csr") t = "marker";
+}
+
+// Select the cycle-accurate engine for `run --mode cycle` from an
+// already-discovered set (pure; spawns nothing). With `want_id` empty, default
+// to the sole cycle-accurate engine -- erroring if there are none or more than
+// one (ambiguous). With `want_id` set, that engine must exist and be
+// cycle-accurate. Returns nullptr and sets `err` (naming the available
+// cycle-accurate ids) on any failure; the returned pointer aliases into
+// `engines`, so it must outlive the result.
+inline const EngineDescriptor* resolve_accurate_engine(
+    const std::vector<EngineDescriptor>& engines, const std::string& want_id,
+    std::string& err) {
+  auto is_accurate = [](const EngineDescriptor& e) {
+    return e.kind == "cycle-accurate";
+  };
+  auto accurate_ids = [&] {
+    std::vector<std::string> ids;
+    for (const EngineDescriptor& e : engines)
+      if (is_accurate(e)) ids.push_back(e.id);
+    return join(ids, ", ");
+  };
+
+  if (!want_id.empty()) {  // explicit --engine
+    for (const EngineDescriptor& e : engines) {
+      if (e.id != want_id) continue;
+      if (is_accurate(e)) return &e;
+      err = "engine '" + want_id + "' is " +
+            (e.kind.empty() ? "not cycle-accurate" : e.kind) +
+            "; a cycle-accurate engine is required";
+      return nullptr;
+    }
+    std::string have = accurate_ids();
+    err = "no engine '" + want_id + "'" +
+          (have.empty() ? " (no cycle-accurate engines found)"
+                        : " (cycle-accurate engines: " + have + ")");
+    return nullptr;
+  }
+
+  // No --engine: default to the sole cycle-accurate engine.
+  const EngineDescriptor* sole = nullptr;
+  int n = 0;
+  for (const EngineDescriptor& e : engines)
+    if (is_accurate(e)) { sole = &e; ++n; }
+  if (n == 1) return sole;
+  if (n == 0)
+    err = "model cycle: no cycle-accurate engine found "
+          "(point VSIM_BIN_DIR in config.env at your external vsim build/)";
+  else
+    err = "model cycle: multiple cycle-accurate engines; select one with "
+          "--engine (have: " + accurate_ids() + ")";
+  return nullptr;
+}
+
+}  // namespace andes_sim
+
+#endif  // ANDESIM_ENGINE_REGISTRY_HPP

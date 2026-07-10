@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# --dry-run applies to ALL run modes (fast, cycle, hybrid): it prints the exact
+# command(s) andesim WOULD spawn, shell-quoted, and executes nothing. Regression
+# guard for the bug where fast/cycle silently ignored --dry-run and ran the
+# program (e.g. `run --mode fast hello.elf --dry-run` printed "hello").
+#
+# Layers:
+#   1. fast   (always; needs only build/andesim + a fixture ELF): prints the
+#      full qemu command, exit 0, executes nothing.
+#   2. cycle  (needs a built vsim engine; SKIPs otherwise): the vsim standalone
+#      command, exit 0, executes nothing.
+#   3. hybrid (regression): still prints 2 commands.
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+
+bash "$ROOT/scripts/build_driver.sh" >/dev/null 2>&1 || fail "build_driver.sh failed"
+BIN="$ROOT/build/andesim"
+[ -x "$BIN" ] || fail "missing andesim binary: $BIN"
+elf=$(ls "$ROOT"/tests/fixtures/handoff_roundtrip.elf 2>/dev/null \
+      || ls "$ROOT"/tests/fixtures/*.elf 2>/dev/null | head -1)
+[ -n "$elf" ] || fail "no fixture ELF under tests/fixtures"
+
+# 1. fast: --dry-run prints the full qemu command and runs nothing. Use the
+#    reported arg order (flag AFTER the ELF) to lock the repro.
+out=$(timeout 30 "$BIN" run --mode fast "$elf" --dry-run 2>&1); rc=$?
+[ "$rc" -eq 0 ] || fail "fast --dry-run exit $rc (should preview, not run): $out"
+printf '%s\n' "$out" | grep -q 'dry-run: 1 command' \
+  || fail "fast --dry-run did not print the preview banner (it executed?): $out"
+printf '%s\n' "$out" | grep -q -- '-machine andes_ae350' \
+  || fail "fast --dry-run missing the qemu command: $out"
+printf '%s\n' "$out" | grep -q -- '-bios' \
+  || fail "fast --dry-run missing -bios <elf>: $out"
+ok "fast: --dry-run prints the full qemu command, executes nothing"
+
+# Resolve a built vsim engine the way the driver does (VSIM_BIN_DIR env, then
+# config.env) -- vsim_bin_dir comes from tests/lib/log.sh.
+BINDIR=$(vsim_bin_dir)
+SIM=$(ls "$BINDIR"/sim_* 2>/dev/null | grep -vE '\.(json|txt)$' | head -1)
+if [ -z "$SIM" ] || [ ! -x "$SIM" ]; then
+  ok "SKIP cycle + hybrid --dry-run: no built vsim engine under $BINDIR (set VSIM_BIN_DIR)"
+  exit 0
+fi
+id="vsim:$(basename "$SIM" | sed 's/^sim_//')"
+
+# 2. cycle: standalone vsim engine, --dry-run previews its command, runs nothing.
+out=$(timeout 30 env VSIM_BIN_DIR="$BINDIR" "$BIN" run --mode cycle --dry-run \
+      --engine "$id" "$elf" 2>&1); rc=$?
+[ "$rc" -eq 0 ] || fail "cycle --dry-run exit $rc (should preview, not run): $out"
+printf '%s\n' "$out" | grep -q 'dry-run: 1 command' \
+  || fail "cycle --dry-run did not print the preview banner (it executed?): $out"
+printf '%s\n' "$out" | grep -q "$(basename "$SIM")" \
+  || fail "cycle --dry-run missing the vsim command: $out"
+ok "cycle: --dry-run prints the vsim standalone command, executes nothing"
+
+# 3. hybrid regression: still 2 commands (probe -> stage -> inject path intact).
+out=$(timeout 30 env VSIM_BIN_DIR="$BINDIR" "$BIN" run --mode hybrid --trigger marker \
+      --dry-run --engine "$id" "$elf" 2>&1)
+printf '%s\n' "$out" | grep -q 'dry-run: 2 command' \
+  || fail "hybrid --dry-run regression: not 2 commands: $out"
+ok "hybrid: --dry-run still prints 2 commands"
