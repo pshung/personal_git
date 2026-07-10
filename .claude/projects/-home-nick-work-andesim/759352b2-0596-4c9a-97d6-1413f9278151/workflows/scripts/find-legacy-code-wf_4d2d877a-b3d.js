@@ -107,10 +107,12 @@ Checks you MUST do:
 5. Is it an INTENTIONAL fallback/compat layer per CLAUDE.md (e.g. semihost_exit.inc)?
 If ANY live reference or intentional-keep reason exists, verdict isLegacy=false. Default to false when uncertain. If true, give the exact deleteScope.`,
     { label: `verify:${f.path.split('/').pop()}`, phase: 'Verify', schema: VERDICT_SCHEMA })
-    .then(v => ({ ...f, verdict: v }))
+    .then(v => (v ? { ...f, verdict: v } : null))
 ))
 
 const done = verified.filter(Boolean)
+const lost = unique.length - done.length
+if (lost > 0) log(`${lost} candidates lost to failed verifier agents (not verified, not dismissed)`)
 const confirmed = done.filter(f => f.verdict.isLegacy && f.verdict.confidence !== 'low')
 const refuted = done.filter(f => !f.verdict.isLegacy)
 const lowConf = done.filter(f => f.verdict.isLegacy && f.verdict.confidence === 'low')
