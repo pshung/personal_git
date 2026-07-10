@@ -1,0 +1,111 @@
+// EX1: discover_engines() picks its vsim scan dir from $VSIM_BIN_DIR (the
+// external prebuilt vsim build, mirroring $QEMU_BIN_DIR), and -- when the env is
+// unset -- from the VSIM_BIN_DIR assignment in config.env, so `./andesim` finds
+// the external vsim without a prior `source ./setup.sh`. Pure environment/file
+// logic, no subprocess.
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+
+#include "config_env.hpp"
+#include "engine_registry.hpp"
+#include "repo_root.hpp"
+#include "test_check.hpp"
+
+namespace fs = std::filesystem;
+
+int main() {
+  using namespace andes_sim;
+
+  // --- vsim_scan_dir honors $VSIM_BIN_DIR (external, like $QEMU_BIN_DIR) ---
+  setenv("VSIM_BIN_DIR", "/opt/vsim_andesim/build", /*overwrite=*/1);
+  CHECK(vsim_scan_dir() == fs::path("/opt/vsim_andesim/build"));
+  unsetenv("VSIM_BIN_DIR");
+
+  // --- config_env_value: env first, else the KEY= line in the config file ---
+  fs::path cfg = fs::temp_directory_path() /
+                 ("andesim_cfgenv_test_" + std::to_string(::getpid()) + ".env");
+  {
+    std::ofstream f(cfg);
+    f << "# per-host config\n"
+         "HYBRID_TOOLCHAIN=/opt/tc\n"
+         "  VSIM_BIN_DIR=/from/config/build\n";  // leading ws tolerated
+  }
+
+  // env unset -> value comes from the config file
+  unsetenv("VSIM_BIN_DIR");
+  CHECK(config_env_value("VSIM_BIN_DIR", cfg) == "/from/config/build");
+
+  // env set (non-empty) wins over the config file
+  setenv("VSIM_BIN_DIR", "/from/env/build", /*overwrite=*/1);
+  CHECK(config_env_value("VSIM_BIN_DIR", cfg) == "/from/env/build");
+  unsetenv("VSIM_BIN_DIR");
+
+  // a key absent from both env and file -> empty
+  CHECK(config_env_value("NO_SUCH_KEY", cfg).empty());
+
+  // a missing config file is not an error -> empty (env still consulted first)
+  CHECK(config_env_value("VSIM_BIN_DIR", "/no/such/file.env").empty());
+
+  // builtin_qemu resolves its binary the same way: $VSIM_QEMU (the explicit
+  // binary) wins over the QEMU_BIN_DIR / default fallback.
+  setenv("VSIM_QEMU", "/opt/qemu/qemu-system-riscv64", /*overwrite=*/1);
+  CHECK(builtin_qemu().bin_path == "/opt/qemu/qemu-system-riscv64");
+  unsetenv("VSIM_QEMU");
+
+  // rv64 "qemu64" vs rv32 "qemu32": id, xlen, and binary differ.
+  const EngineDescriptor q64 = builtin_qemu_arch(64);
+  const EngineDescriptor q32 = builtin_qemu_arch(32);
+  CHECK(q64.id == "qemu64");
+  CHECK(q64.xlen == 64);
+  CHECK(q32.id == "qemu32");
+  CHECK(q32.xlen == 32);
+  CHECK(q64.bin_path.ends_with("qemu-system-riscv64"));
+  CHECK(q32.bin_path.ends_with("qemu-system-riscv32"));
+  // model=fast pins a concrete andes core (andes_ae350's generic default -cpu
+  // hangs the vplat fixtures): the vector-capable ax46mpv (rv64) / a46mpv (rv32).
+  // andesim passes NO vlen -- the cpu model's own QEMU default applies; a user
+  // who wants a specific width passes it via the post-`--` -cpu, which still wins.
+  auto fast_cpu = [](const EngineDescriptor& e) -> std::string {
+    const std::vector<std::string>* st = e.invoke_for("standalone");
+    if (!st) return "";
+    for (std::size_t i = 0; i + 1 < st->size(); ++i)
+      if ((*st)[i] == "-cpu") return (*st)[i + 1];
+    return "";
+  };
+  CHECK(fast_cpu(q64) == "andes-ax46mpv");
+  CHECK(fast_cpu(q32) == "andes-a46mpv");
+  // rv64 keeps the hybrid fast-leg; rv32 hybrid is not wired yet.
+  CHECK(q64.invoke_for("fast-leg") != nullptr);
+  CHECK(q32.invoke_for("fast-leg") == nullptr);
+
+  // resolve_accurate_engine serves BOTH --mode cycle and --mode hybrid, so its
+  // rejection of a functional engine must be mode-agnostic (the caller already
+  // prefixes "andesim run --mode <mode>:"); it must not hardcode "model cycle".
+  {
+    const std::vector<EngineDescriptor> engs = {q64};  // qemu64 is functional
+    std::string err;
+    CHECK(resolve_accurate_engine(engs, "qemu64", err) == nullptr);
+    CHECK(err.find("functional") != std::string::npos);
+    CHECK(err.find("cycle-accurate") != std::string::npos);
+    CHECK(err.find("model cycle") == std::string::npos);
+  }
+
+  // normalize_engine_label speaks the CLI's vocabulary: an engine that reports
+  // its marker delimiter under the internal name "csr" (via --describe) is shown
+  // as "marker" (what `--trigger marker` expects), like verilator -> vsim.
+  {
+    EngineDescriptor d;
+    d.type = "verilator";
+    d.id = "verilator:cfg";
+    d.triggers = {"csr", "pc"};
+    normalize_engine_label(d);
+    CHECK(d.type == "vsim");
+    CHECK(d.id == "vsim:cfg");
+    CHECK((d.triggers == std::vector<std::string>{"marker", "pc"}));
+  }
+
+  std::remove(cfg.c_str());
+  return andes_sim::test::report("engine-registry");
+}
