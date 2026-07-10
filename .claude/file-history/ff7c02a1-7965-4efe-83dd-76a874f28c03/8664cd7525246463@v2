@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Classify every spec CSR by its hybrid-handoff transport disposition.
+
+The OFFLINE mirror of the wire-format transport set. It reads the spec inventory
+snapshot (tests/andes_csr/csr_inventory.csv, produced by extract_csr_inventory.py)
+and assigns each CSR a disposition under the supported envelope: bare-metal,
+single-hart, M-mode or M+U-mode, trap-free ROI.
+
+The policy here must match what include/hybrid/state_abi.h actually transports.
+The guard test (tests/andes_csr/test_csr_coverage_complete.*) cross-checks the
+two, so a CSR added to the ABI without a matching disposition (or vice versa)
+fails CI -- the "nothing missed" flywheel.
+
+Dispositions:
+  TRANSPORT_NOW  already carried in hybrid_state_v1
+  NEW            writable M-mode plain state -- expansion target
+  NEW_TRIG       debug-trigger CSR (shares the Debug Module; transported guarded)
+  NEW_UDELTA     U-mode Andes control; transported, exercised only in M+U
+  CONST_RO       read-only config/info -- engine derives it; nothing to exchange
+  EXCL_RV32      RV32 high-half shadow -- irrelevant on RV64
+  EXCL_SIDEFX    read/write has side effects -- not architectural state
+  EXCL_W1C_HW    write-1-clear, hardware-driven (like mip)
+  EXCL_INDIRECT  miselect/mireg access mechanism, not a direct register
+  EXCL_NEXT      U-mode N-extension trap state (trap-free ROI + usually absent)
+  EXCL_DEBUG     Debug-mode CSR the handoff itself drives
+  EXCL_MODE      S-mode / Hypervisor -- outside the M / M+U envelope
+  EXCL_TRAP      detailed trap-cause latch, live only after a trap
+
+Usage:
+  classify_csr_coverage.py <csr_inventory.csv>            # write csr_coverage.csv beside it
+  classify_csr_coverage.py <csr_inventory.csv> --stdout   # print, do not write
+"""
+from __future__ import annotations
+
+import csv
+import sys
+from pathlib import Path
+
+# CSRs already carried in hybrid_state_v1 today (Bucket A). Names as the spec
+# summary tables print them (range rows kept verbatim, e.g. pmpaddr1~63).
+TRANSPORT_NOW = {
+    "mstatus", "mepc", "mtvec", "mcause", "mtval", "mscratch", "medeleg",
+    "mideleg", "mie", "mip", "mcycle", "minstret", "satp", "fcsr", "frm",
+    "fﬂags",  # "fflags" with the fi-ligature the PDF emits
+    "JVT", "mcache_ctl", "mmisc_ctl", "mxstatus", "mpft_ctl", "mclk_ctl",
+    "milmb", "mdlmb", "mecc_code", "mhsp_ctl", "msp_bound", "msp_base",
+    "mcountermask_m", "uitb", "ucode",
+    "pmpcfg0", "pmpcfg1", "pmpcfg2", "pmpcfg3", "pmpcfg4~15",
+    "pmpaddr0", "pmpaddr1~63",
+    "pmacfg0", "pmacfg2", "pmaaddr0~47",
+}
+
+# Per-name decisions that override the structural defaults below.
+OVERRIDE = {
+    "misa": "CONST_RO", "tinfo": "CONST_RO", "tdata3": "CONST_RO",
+    "mintstatus": "EXCL_RO",
+    # side-effecting: reading or writing performs an action, so the value is not
+    # state to round-trip.
+    "mnxti": "EXCL_SIDEFX", "mscratchcsw": "EXCL_SIDEFX",
+    "mscratchcswl": "EXCL_SIDEFX", "mcctlcommand": "EXCL_SIDEFX",
+    "mintsel_jal": "EXCL_SIDEFX", "pushmcause": "EXCL_SIDEFX",
+    "pushmepc": "EXCL_SIDEFX", "pushmxstatus": "EXCL_SIDEFX",
+    "wfe": "EXCL_SIDEFX", "txevt": "EXCL_SIDEFX", "ucctlcommand": "EXCL_SIDEFX",
+    "mcounterovf": "EXCL_W1C_HW",
+    "miselect": "EXCL_INDIRECT", "mireg": "EXCL_INDIRECT",
+    "mireg2": "EXCL_INDIRECT", "mireg3": "EXCL_INDIRECT",
+    "mireg4": "EXCL_INDIRECT", "mireg5": "EXCL_INDIRECT",
+    "mireg6": "EXCL_INDIRECT",
+    "dcsr": "EXCL_DEBUG", "dpc": "EXCL_DEBUG", "dscratch0": "EXCL_DEBUG",
+    "dscratch1": "EXCL_DEBUG", "scontext": "EXCL_MODE",
+    # writable M-mode plain state to add (the expansion).
+    "menvcfg": "NEW", "mseccfg": "NEW", "mnscratch": "NEW", "mnepc": "NEW",
+    "mncause": "NEW", "mnstatus": "NEW", "mnvec": "NEW", "mrnxvec": "NEW",
+    "mtvt": "NEW", "mintthresh": "NEW", "mcounteren": "NEW",
+    "mcountinhibit": "NEW", "mhpmcounter3~6": "NEW", "mhpmevent3~6": "NEW",
+    "mcounterwen": "NEW", "mcounterinten": "NEW", "mcountermask_s": "NEW",
+    "mcountermask_u": "NEW", "mdcause": "NEW", "mslideleg": "NEW",
+    "msavestatus": "NEW", "msaveepc1": "NEW", "msavecause1": "NEW",
+    "msaveepc2": "NEW", "msavecause2": "NEW", "msavedcause1": "NEW",
+    "msavedcause2": "NEW", "mstateen0": "NEW", "mstateen1": "NEW",
+    "mstateen2": "NEW", "mstateen3": "NEW", "mppib": "NEW", "mfiob": "NEW",
+    "mﬁob": "NEW",  # fi-ligature variant the PDF emits
+    "mcctlbeginaddr": "NEW", "mcctldata": "NEW", "mirq_entry": "NEW",
+    "pmacfg4": "NEW", "pmacfg6": "NEW", "pmacfg8": "NEW", "pmacfg10": "NEW",
+    "tselect": "NEW_TRIG", "mcontrol/tdata1": "NEW_TRIG", "tdata2": "NEW_TRIG",
+    "tcontrol": "NEW_TRIG", "mcontext": "NEW_TRIG",
+    "uzobctl": "NEW_UDELTA", "umisc_ctl": "NEW_UDELTA",
+    "sleepvalue": "NEW_UDELTA", "ucctlbeginaddr": "NEW_UDELTA",
+    "udcause": "EXCL_TRAP",
+}
+
+RV32_ONLY = {
+    "mcycleh", "minstreth", "mhpmcounter3h~6h", "mhpmevent3h~6h", "menvcfgh",
+    "mseccfgh", "mstateen0h", "mstateen1h", "mstateen2h", "mstateen3h",
+    "mcache_ctl2", "cycleh", "timeh", "instreth", "hpmcounter3h~6h",
+    "pmacfg1", "pmacfg3", "pmacfg5", "pmacfg7", "pmacfg9", "pmacfg11",
+}
+
+
+def classify(addr, priv, name, mode, section):
+    if name in TRANSPORT_NOW:
+        return "TRANSPORT_NOW"
+    if name in OVERRIDE:
+        return OVERRIDE[name]
+    if name in RV32_ONLY:
+        return "EXCL_RV32"
+    if mode in ("S-std", "S-andes", "H-std"):
+        return "EXCL_MODE"
+    if mode == "D-std" or name in ("dexc2dbg", "ddcause"):
+        return "EXCL_DEBUG"
+    if priv in ("MRO", "SRO", "URO", "DRO", "HRO"):
+        return "CONST_RO"
+    if mode == "U-std" and section == "N Extension CSRs":
+        return "EXCL_NEXT"
+    if mode == "U-std" and section == "Counter/Timer Registers":
+        return "CONST_RO"
+    raise SystemExit(f"unclassified CSR: {addr} {name} ({mode}/{section})")
+
+
+def main(argv):
+    if not argv:
+        print(__doc__)
+        return 2
+    inv = Path(argv[0])
+    to_stdout = "--stdout" in argv[1:]
+    rows = list(csv.DictReader(inv.open()))
+    out = [[r["addr"], r["priv"], r["name"], r["mode"], r["section"],
+            classify(r["addr"], r["priv"], r["name"], r["mode"], r["section"])]
+           for r in rows]
+    if to_stdout:
+        w = csv.writer(sys.stdout)
+    else:
+        dst = inv.with_name("csr_coverage.csv").open("w", newline="")
+        w = csv.writer(dst)
+    w.writerow(["addr", "priv", "name", "mode", "section", "decision"])
+    w.writerows(out)
+    if not to_stdout:
+        print(f"wrote {inv.with_name('csr_coverage.csv')} ({len(out)} rows)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
