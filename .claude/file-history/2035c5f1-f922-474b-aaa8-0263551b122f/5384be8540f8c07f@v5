@@ -1,0 +1,207 @@
+# ROADMAP: HVM (High-Bandwidth Vector Memory) content transport
+
+Goal: a hybrid workload that stages data in HVM (0x90000000) during the QEMU
+leg sees the same bytes in the vsim ROI, and the exit state carries the ROI's
+HVM writes back out -- same contract the ILM/DLM transport
+(ROADMAP_ilm_dlm.md, all DONE) established for the LM slave ports.
+
+## Established facts (verified 2026-07-10)
+
+- **DS220 map**: 0x90000000..0x9FFFFFFF = HVM Subordinate Port aperture
+  (256MB window); the actual memory is much smaller (engine config).
+- **QEMU model** (`hw/riscv/andes_ae350.c:1478-1489`): HVM = plain
+  `memory_region_init_ram` at `hvm_base` + a subport **alias of the same
+  RAM** at `hvm_subport_base` (defaults: both 0x90000000,
+  `andes_ae350.h:241-243`). Plain RAM, so unlike ILM/DLM there is NO
+  per-CPU overlay, NO enable bit, NO IO forwarder; the ELF loader CAN
+  write it and the plugin reads it with plain `read_memory_hwaddr`.
+- **QEMU default size is 1 BYTE**: `hvm_size_pow_2` defaults to 0
+  (`1 << 0`). Real geometry comes only from config:
+  - driver path: premium's `--print-qemu-config` ALREADY emits
+    `hvm_base=0x90000000` + `hvm_size_pow_2=18` (256KB) -> `-readconfig`.
+    Driver-side geometry sync is already done, for free.
+  - raw-harness path (tests/e2e.sh): needs `-global` sync like ILM/DLM,
+    but the property is `hvm_size_pow_2` with a LOG2 value, not bytes --
+    `lm_wire()` needs a variant.
+- **CSRs**: `mhvm_cfg` (0xFD0) / `mhvmb` (0xFD1) are CONST_RO, seeded by
+  QEMU from the soc props (`target/riscv/cpu.c:969-979`) and derived by
+  the engine from its config. Nothing to transport (already classified
+  in the CSR manifests). There is NO enable bit (no milmb analog).
+- **vsim premium RTL** (`Vax45mpv_premium config.inc`): 256KB HVM,
+  base 0x90000000, 2 banks, bank bit = addr[17] (bank0 = first 128KB,
+  bank1 = second 128KB), subport present (`NDS_IO_HVM_SUBP`). No ECC
+  defines. Verilator SRAM arrays (cluster level, NOT inside the core):
+  `ae350_vcpu_cluster_subsystem__DOT__u_ae350_hvm_ram_subsystem__DOT__
+  u_hvm{0,1}_ram__DOT__ram_inst__DOT__mem`, each
+  `VlUnpacked<VlWide<16>, 2048>` = 2048 rows x 64B = 128KB/bank.
+- **vsim platform** (`src/simulator.hpp:155-170`): interconnect routes
+  `{NDS_HVM_BASE, NDS_HVM_BASE + NDS_HVM_SIZE_KB*0x1000 - 1}` to the
+  CPU's `hvm_bfm` subordinate port. `*0x1000` looks like KB-math slop
+  (1MB window for a 256KB memory), but see Known altitude debt: the
+  ILM/DLM binding routes full fixed apertures too, so over-wide routing
+  is the platform's established style and no cheap test observes the
+  difference. Left as-is.
+- **ax46mpv_advanced**: config has HVM (256KB, 1 bank, RAM_TYPE 0) but
+  its wrapper has no backdoor (same status as its ILM/DLM). Capability
+  gating (`kCpuCanLoadHvm`/`kCpuCanDumpHvm`) makes it describe 0 -- the
+  F3-ax46-regression lesson is already encoded in the pattern.
+- **Content transport today: NONE.** QEMU's HVM RAM is not backed by the
+  shared mmap (separate init_ram), vsim's HVM SRAM resets to zeros, no
+  plugin sidecar / vsim CLI / driver wiring mention HVM. A workload
+  staging vector data in HVM pre-handoff reads zeros in the ROI.
+- Fixture header `tests/fixtures/runtime/memory_map.h` already has
+  `HVM_BASE 0x90000000`, `HVM_END 0x9003FFFF`, `TEST_HVM`.
+
+## Reusable machinery (from the LM transport)
+
+- plugin `drain_lm_sidecar(state_path, suffix, base, size)` is already
+  generic -- call it with `".hvm"`.
+- e2e.sh `lm_wire()` (needs a pow2 variant for the QEMU -global leg),
+  `CHECK_LM_EXIT_SIDECARS` byte-exact cmp, `hybrid_describe_int`.
+- vsim capability variable templates + describe gating + `--ilm/--dlm`
+  CLI pattern. NOT reusable: `lm_backdoor_read` decodes one logical word
+  per row (scalar, or the 2-lane ECC-64 VlWide case) -- HVM's 16
+  independent 32-bit lanes per row need their own codec pair
+  (`hvm_bank_write/read`).
+- driver `engine_descriptor` + `run_plan` lm_suffix / sidecar-arg block.
+
+## Risks
+
+- R1: backdoor pokes on the hvm bank arrays must be visible to BOTH the
+  VPU direct path and the subport path, and survive sc_start+reset.
+  ILM/DLM precedent says yes (same `ram_inst__DOT__mem` macro style);
+  F1's RED test proves it.
+- R2: VlWide<16> row byte order (word 0 = lowest 4 bytes?) -- pin with
+  head/tail pattern words exactly like test_vsim_lm_load.sh.
+- R3: raw-harness QEMU has 1-byte HVM until e2e.sh passes
+  `-global ...hvm_size_pow_2` -- a fixture touching 0x90000001+ before
+  that sync lands would fault/hang QEMU1 (keep `timeout` on the leg).
+- R4: single-hart scope, cluster-level memory -- no per-hart aperture
+  math (simpler than ILM/DLM).
+
+## Features
+
+### F1: vsim `--hvm` load backdoor + describe `hvm_size` -- DONE
+- premium wrapper: `set_hvm(std::span<const uint8_t>)` / `get_hvm()`
+  duals over the 2 bank arrays (bank = byte_offset >> 17, row = offset/64,
+  VlWide<16> lanes); capacity check in BYTES (learn from the ILM bug).
+- `kCpuCanLoadHvm`/`kCpuCanDumpHvm` variable templates before Simulator;
+  `--hvm <bin>` CLI (load_image), `"hvm_size"` in `--describe` gated on
+  load AND dump capability (premium 262144, ax46 0).
+- Test (RED first): `tests/vsim/test_vsim_hvm_load.sh` + `hvm_readback.c`
+  fixture -- pattern .bin -> probe reads head/tail of BOTH banks through
+  the 0x90000000 aperture -> exit 0; run 2 without `--hvm` must fail;
+  describe-gating asserts (premium 262144 / ax46 0).
+- Key files: `vsim src/cpu_wrappers/ax45mpv_premium_cpu_cluster_subsystem.hpp`,
+  `vsim src/simulator.hpp`, `vsim src/main.cpp`,
+  `andesim tests/vsim/test_vsim_hvm_load.sh`,
+  `andesim tests/fixtures/hvm_readback.c`.
+- Deps: none.
+
+### F2: plugin `.hvm` sidecar drain -- TODO
+- plugin args `hvm_base` (default 0x90000000) / `hvm_size` (default 0);
+  `drain_state_to_file` calls `drain_lm_sidecar(path, ".hvm", ...)`.
+- Test (RED first): extend `tests/plugin/test_plugin_lm_drain.sh`:
+  guest fills HVM head/tail via 0x90000000 stores (raw QEMU needs the
+  `-global` pow2 sync in the test), sidecar has right size + patterns;
+  no-arg run produces no `.hvm` file.
+- Key files: `qemu_plugin/hybrid_handoff.c`,
+  `tests/plugin/test_plugin_lm_drain.sh` (+ its fixture `lm_drain.S`).
+- Deps: none (parallel with F1).
+
+### F3: driver wiring -- TODO
+- `engine_descriptor.hpp`: `long hvm_size`; `run_plan.cpp`: append
+  `,hvm_size=N` to the plugin suffix and `--hvm <state_in>.hvm` to the
+  accurate leg when the engine describes hvm_size > 0.
+- qemu.cfg geometry: nothing to do (already emitted).
+- Test (RED first): `tests/andes_sim/` build-plan assert like the LM one.
+- Deps: F1 (describe field), F2 (sidecar exists at runtime).
+
+### F4: e2e fixture + harness wiring -- DONE
+- `tests/e2e.sh`: geometry/transport SPLIT. `lm_geom` (new) syncs QEMU's
+  raw geometry ALWAYS from the engine's describe (`-global`; hvm's
+  property is `hvm_size_pow_2` = log2) -- the raw analog of the driver's
+  `-readconfig`, so a transport-off negative still runs against real
+  geometry (QEMU's default HVM is 1 byte -> the fill would fault).
+  `lm_wire` keeps only the transport arming (`PLUGIN_ARGS += ,hvm_size=N`,
+  `VSIM_LM_ARGS += --hvm`), gated by the `HVM_SIZE` knob (default =
+  describe, 0 = negative-control off).
+- Fixture `rt_c_hvm_data.c` (rv64gcv): pre-handoff scalar fill of all
+  256KB via 0x90000000 with `pat(i)`; ROI verifies SAMPLED windows with
+  VECTOR loads (`vle32.v` -> `vse32.v` -> scalar cmp; bank0 head, bank
+  boundary straddle, bank1 tail -- exercises the VPU->HVM path in RTL and
+  stays cycle-cheap, 5.3k-cycle ROI); prints HVM_OK/HVM_BAD inside the
+  ROI. Totality is the harness's job: the byte-exact exit cmp covers all
+  256KB, so the ROI stays read-only (mirrors the lm fixtures).
+- Exit dump: `dump_lm_sidecars` gains the `.hvm` dual (get_hvm);
+  `CHECK_LM_EXIT_SIDECARS` covers ilm/dlm/hvm in one loop.
+- Negative: `tests/drivers/rt_hvm_transport_off.sh` (HVM_SIZE=0 ->
+  HVM_BAD). Both wired into `scripts/run_e2e.sh` (TIMEOUT=120).
+- Deps: F1+F2+F3.
+
+### F5: docs -- DONE
+- CLAUDE.md (memory-content sidecar paragraph: the whole ILM/DLM/HVM
+  family), docs/USER_GUIDE.md (plugin `hvm_size`/`hvm_base` args + the
+  hw-config-sync HVM bullet), this file's progress log.
+- Deps: F4.
+
+## Known altitude debt
+
+- `simulator.hpp` HVM routing window is `NDS_HVM_SIZE_KB*0x1000` (1MB for
+  a 256KB memory). Not fixed in F1: the ILM/DLM binding routes the full
+  fixed `{HART0_ILM_BASE, HART0_DLM_END}` aperture (4MB for 96KB) too, so
+  size-exact routing would diverge from the sibling pattern, the whole
+  0x90000000 region is otherwise empty, and no cheap test can observe the
+  difference (out-of-range subport behavior is RTL-defined). Revisit only
+  if something else ever claims 0x90040000+.
+- `lm_*` names (`lm_geom`/`lm_wire`/`drain_lm_sidecar`/`dump_lm_sidecars`/
+  `CHECK_LM_EXIT_SIDECARS`) now carry HVM, which is architecturally NOT a
+  local memory. Not renamed: `CHECK_LM_EXIT_SIDECARS` is user-facing
+  harness API (run_e2e.sh entries reference it) and a half-rename of only
+  the internals would be worse. Concrete trigger for the `lm_* -> mem_*`
+  sweep: the FOURTH memory kind, which must also turn the per-kind
+  parallel edits (descriptor field, run_plan gate, plugin arg, MEM_TYPE
+  case, describe line, e2e wiring -- ~8 files today) into a single
+  per-kind table/registration instead of a fourth copy.
+- vsim standalone ELF load still writes main_memory only; an ELF section
+  at 0x90000000 loads in QEMU but not in standalone vsim. Out of hybrid
+  scope (hybrid never vsim-loads the ELF).
+
+## Progress log
+
+- 2026-07-10: investigated; QEMU + vsim models both present, geometry
+  sync already done on the driver path, content transport absent.
+  ROADMAP written. F1 next on approval.
+- 2026-07-10: F1 DONE. vsim: set_hvm/get_hvm over the 2 cluster-level
+  banks (hvm_bank_write/read duals pin the VlWide lane order),
+  kCpuCanLoadHvm/kCpuCanDumpHvm, MEM_TYPE::HVM, --hvm CLI, describe
+  hvm_size gated on the backdoor pair (premium 262144, ax46 0). andesim:
+  hvm_readback.c fixture + test_vsim_hvm_load.sh (RED first: probe
+  exit=1 + "Unrecognized option: --hvm"; GREEN after impl; head/tail of
+  both banks through the aperture + negative control + describe
+  gating). R1/R2 resolved: pokes survive sc_start+reset and are visible
+  through the subport path; lane order = LE. Regression: vsim_lm_load
+  PASS, rt_c_hello+rt_c_dlm_data e2e 4/4. Routing-window fix demoted to
+  altitude debt (matches the ILM/DLM full-aperture binding style).
+  Side find: setup.sh declares VSIM_BIN_DIR/QEMU_BIN_DIR `local` then
+  exports them -- the export dies at function return (VSIM_QEMU works
+  because it is not in the local list). Fixed in a23fe6b (dropped the
+  two names from the local list; tests/setup/test_setup_exports.sh
+  pins child-process visibility).
+- 2026-07-10: F2 DONE. plugin hvm_base/hvm_size args feed the existing
+  drain_lm_sidecar(".hvm") at the drain_state_to_file choke point.
+  RED: "unknown option: hvm_size". lm_drain.S grew HVM head/tail
+  patterns; the plugin test asserts .hvm size+content and the no-arg
+  negative; both runs sync -global hvm_size_pow_2=18 (R3 confirmed:
+  QEMU default HVM is 1 byte).
+- 2026-07-10: F3 DONE. engine_descriptor hvm_size + run_plan
+  ",hvm_size=N" plugin suffix + accurate-leg "--hvm <state_in>.hvm",
+  all describe-gated. test_andes_sim_hvm_wiring.sh asserts both legs
+  via --dry-run + LM regression + the ax46 negative (describe 0 ->
+  nothing armed).
+- 2026-07-10: F4+F5 DONE (details in the feature specs above). RED was
+  the missing vsim .hvm exit dump; GREEN after dump_lm_sidecars gained
+  the get_hvm dual. Marker ROI 5282 cycles / pc 5281; byte-exact
+  256KB entry==exit both modes; rt_hvm_transport_off fails with
+  HVM_BAD as designed. Full suite 51p/0f/4s (was 48p/4s: +hvm
+  marker+pc, +1 neg). ALL FEATURES DONE.
