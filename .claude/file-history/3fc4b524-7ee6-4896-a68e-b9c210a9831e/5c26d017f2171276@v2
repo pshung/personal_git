@@ -1,0 +1,193 @@
+// andesim -- multi-engine driver for the Andes simulators (QEMU, Verilator,
+// and future backends). One C++20 binary that selects a model (fast / cycle
+// / hybrid), resolves engines at runtime, and either passes through to a single
+// engine or orchestrates a hybrid round-trip.
+//
+// This file owns argument dispatch only: parse the CLI, route to a command.
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <string>
+#include <string_view>
+
+#include "cli.hpp"
+#include "dev_mode.hpp"
+#include "log.hpp"
+
+namespace andes_sim {
+int cmd_list(const Cli& cli);
+int cmd_doctor(const Cli& cli);
+int cmd_run(const Cli& cli);
+}  // namespace andes_sim
+
+namespace {
+
+using andes_sim::Cli;
+using andes_sim::cmd_doctor;
+using andes_sim::cmd_list;
+using andes_sim::cmd_run;
+using andes_sim::is_dev_mode;
+
+// The known command names live in cli.cpp (is_subcommand): the parser needs
+// them for the default-command rule, so parse_cli only ever yields run/list/
+// doctor (or "" for no args / top-level help). Developer build/test/state-diff
+// tooling lives in scripts/, not the binary.
+
+// ---- help model: the user-facing surface rendered as a command tree --------
+//
+// `run`'s two subcommand groups -- the modes (the composition axis) ...
+struct ModeRow {
+  const char* name;
+  const char* brief;
+};
+constexpr ModeRow kRunModes[] = {
+    {"fast", "QEMU only -- functional, full speed"},
+    {"cycle", "one cycle-accurate engine, from reset"},
+    {"hybrid", "QEMU fast-forwards, then vsim measures the ROI"},
+};
+
+// `list`'s targets. `fixtures` (internal test ELFs) is a developer target,
+// shown only under ANDESIM_DEV; the product lists user-facing models/engines.
+struct TargetRow {
+  const char* name;
+  const char* brief;
+  bool dev;
+};
+constexpr TargetRow kListTargets[] = {
+    {"models", "the modes and their engines", false},
+    {"engines", "discovered cycle-accurate engines", false},
+    {"fixtures", "internal test ELFs (developer target)", true},
+};
+
+// ... and `run`'s options. Each `flag` carries its own leading indent (the pc
+// boundaries nest under --trigger pc). `tag` marks a required option (and WHEN
+// it is required); `dev` hides it unless ANDESIM_DEV is set.
+struct OptRow {
+  const char* flag;  // includes its own leading indent
+  const char* tag;
+  const char* brief;
+  bool dev;
+};
+constexpr OptRow kRunOpts[] = {
+    {"  --mode fast|cycle|hybrid", "REQUIRED", "which mode to run", false},
+    {"  --trigger marker|pc", "REQUIRED for hybrid", "the ROI delimiter", false},
+    {"    --pc-start <sym|0x>", "REQUIRED for --trigger pc", "ROI start boundary", false},
+    {"    --pc-end <sym|0x>", "REQUIRED for --trigger pc", "ROI end boundary", false},
+    {"  --engine <id>", "", "pick an engine, e.g. vsim:ax45mpv_premium (default: the sole one)", false},
+    {"  --mem-size <spec>", "", "guest RAM, e.g. 256M / 2G (hybrid: max 2G; fast: QEMU -m; cycle: ignored)", false},
+    {"  --dry-run", "", "print the exact engine command(s) and exit, running nothing (fast/cycle/hybrid)", false},
+    {"  --print-memmap", "", "print the hybrid guest memory map and exit, running nothing (hybrid only; ELF optional)", false},
+    {"  --verify", "", "cross-check the hybrid run against a QEMU oracle", false},
+    {"  --kanata <file>", "", "write a Kanata pipeline trace of the ROI (hybrid only; open in Konata)", false},
+    {"    --objdump <file>", "", "embed that objdump -d dump's disassembly in the trace (requires --kanata)", false},
+    {"  --gdb", "", "pause at startup for a debugger (fast: QEMU stub; cycle: vsim JTAG + $ICEMAN; not hybrid)", false},
+    {"  --gdb-port <port>", "", "override the --gdb port (fast 1234, cycle 9104)", false},
+    {"  --log-level <0-6>", "", "verbosity, vsim's scale: 0=trace 1=debug 2=info 3=warn 4=error 5=critical 6=off (default 2: program output + the cycle figure)", false},
+    {"  -- <args...>", "", "forward everything after -- verbatim to the engine (fast/cycle only; hybrid rejects -- args)", false},
+};
+
+// A major command line at column 0: `name   brief`.
+void print_major(std::FILE* out, const char* name, const char* brief) {
+  std::fprintf(out, "%-7s %s\n", name, brief);
+}
+
+// A subcommand/target line, indented two under its command: `  name   brief`.
+void print_sub(std::FILE* out, const char* name, const char* brief) {
+  std::fprintf(out, "  %-9s %s\n", name, brief);
+}
+
+// An option line: `<indent>--flag    [TAG  ]brief`, flags aligned to a column.
+void print_opt(std::FILE* out, const OptRow& o) {
+  if (o.tag[0])
+    std::fprintf(out, "%-29s %s  %s\n", o.flag, o.tag, o.brief);
+  else
+    std::fprintf(out, "%-29s %s\n", o.flag, o.brief);
+}
+
+// `run`: major line, the mode subcommands, then the option list (dev options
+// only under ANDESIM_DEV). Shared by the top-level tree and `run --help`.
+void print_run_block(std::FILE* out) {
+  print_major(out, "run", "run one simulation (the default: 'run' may be omitted)");
+  for (const ModeRow& m : kRunModes) print_sub(out, m.name, m.brief);
+  std::fputs("\n", out);
+  for (const OptRow& o : kRunOpts) {
+    if (o.dev && !is_dev_mode()) continue;
+    print_opt(out, o);
+  }
+}
+
+void print_list_block(std::FILE* out) {
+  print_major(out, "list", "list what is available");
+  for (const TargetRow& t : kListTargets) {
+    if (t.dev && !is_dev_mode()) continue;
+    print_sub(out, t.name, t.brief);
+  }
+}
+
+void print_doctor_block(std::FILE* out) {
+  print_major(out, "doctor", "check toolchain + fixtures are present");
+}
+
+// Top-level `andesim --help`: the whole tree -- every major command, its
+// subcommands, and run's full option list, so one screen shows everything.
+void print_usage(std::FILE* out) {
+  std::fputs("usage: andesim [command] [options] <ELF> [-- <engine args>]\n\n",
+             out);
+  std::fputs("Multi-engine driver for the Andes simulators (QEMU + vsim).\n\n",
+             out);
+  print_run_block(out);
+  std::fputs("\n", out);
+  print_list_block(out);
+  std::fputs("\n", out);
+  print_doctor_block(out);
+  std::fputs(
+      "\n'andesim run --help' / 'andesim list --help' for per-command "
+      "detail.\n",
+      out);
+}
+
+// Per-command `andesim <cmd> --help`: the matching slice of the same tree.
+// parse_cli admits only run/list/doctor, so `run` is the fallthrough.
+void print_subcommand_help(std::string_view name, std::FILE* out) {
+  if (name == "list") { print_list_block(out); return; }
+  if (name == "doctor") { print_doctor_block(out); return; }
+  print_run_block(out);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  using namespace andes_sim;
+
+  Cli cli = parse_cli(argc, argv);
+  if (!cli.error.empty()) {
+    std::fprintf(stderr, "andesim: %s\n", cli.error.c_str());
+    return 2;
+  }
+
+  if (!set_log_threshold(cli.log_level)) {
+    std::fprintf(stderr,
+                 "andesim: invalid --log-level '%s' (0=trace 1=debug 2=info "
+                 "3=warn 4=error 5=critical 6=off)\n",
+                 cli.log_level.c_str());
+    return 2;
+  }
+
+  if (cli.subcommand.empty()) {  // no command, or top-level -h
+    if (cli.help) {
+      print_usage(stdout);
+      return 0;
+    }
+    print_usage(stderr);
+    return 2;
+  }
+
+  if (cli.help) {
+    print_subcommand_help(cli.subcommand, stdout);
+    return 0;
+  }
+
+  if (cli.subcommand == "list") return cmd_list(cli);
+  if (cli.subcommand == "doctor") return cmd_doctor(cli);
+  return cmd_run(cli);  // parse_cli admits only run/list/doctor
+}

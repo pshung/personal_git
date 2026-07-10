@@ -1,0 +1,235 @@
+"""Build docs/hybrid_marker_quickstart.ipynb for the andesim repo."""
+import nbformat as nbf
+
+nb = nbf.v4.new_notebook()
+nb.metadata["kernelspec"] = {
+    "display_name": "Python 3",
+    "language": "python",
+    "name": "python3",
+}
+
+md = nbf.v4.new_markdown_cell
+code = nbf.v4.new_code_cell
+
+cells = []
+
+cells.append(md("""\
+# andesim quickstart: hybrid mode with the marker trigger
+
+This notebook runs real `./andesim` commands and shows their real output.
+It covers the simplest measuring flow:
+
+1. Check the install.
+2. Run a prebuilt ELF in hybrid mode with `--trigger marker`.
+3. Write, compile, and measure your own C program with ROI markers.
+4. Preview a run with `--dry-run`.
+
+**What hybrid mode does:** QEMU (fast, functional) runs your program until
+the ROI start marker. Then it hands the full CPU state and memory to the
+cycle-accurate engine (vsim, built from real RTL), which runs only your
+region-of-interest (ROI) and reports how many cycles it took.
+
+**Prerequisites:** a built andesim install (see `README.md`). Run this
+notebook from the repo (it lives in `docs/`; the first cell moves to the
+repo root). You can serve it with `scripts/notebook_server.sh`.
+"""))
+
+cells.append(code("""\
+# Move to the repo root (the notebook lives in docs/).
+import os
+if not os.path.exists("./andesim"):
+    %cd ..
+assert os.path.exists("./andesim"), "run this notebook from the andesim repo"
+print("repo root:", os.getcwd())\
+"""))
+
+cells.append(md("""\
+## Step 1: check the install
+
+`./andesim doctor` is a read-only health report. A healthy install ends
+with `0 FAIL`. It also lists the engines and where the shared memory for
+hybrid runs will live (`mmap tiers`).
+"""))
+
+cells.append(code("!./andesim doctor"))
+
+cells.append(md("""\
+`./andesim list engines` shows what `--engine` accepts. Hybrid mode needs
+one `vsim:` (cycle-accurate) engine. With more than one installed, you
+must pick one with `--engine`.
+"""))
+
+cells.append(code("!./andesim list engines"))
+
+cells.append(md("""\
+## Step 2: first hybrid run with a prebuilt ELF
+
+The install ships ready-made test ELFs under `tests/fixtures/`.
+`rt_c_hello.elf` already contains ROI markers, so `--trigger marker`
+works out of the box.
+
+The command has three required parts:
+
+- `--mode hybrid` picks the model.
+- `--trigger marker` says the ROI is the span between the markers in the
+  binary.
+- `--engine vsim:ax45mpv_premium` picks the cycle-accurate engine.
+"""))
+
+cells.append(code("""\
+!./andesim run --mode hybrid --trigger marker \\
+    --engine vsim:ax45mpv_premium tests/fixtures/rt_c_hello.elf\
+"""))
+
+cells.append(md("""\
+How to read the output:
+
+- The first line names the resolved engine, its VLEN, and the trigger.
+- `[hsim mmap]` names the shared-memory file both legs map. Program RAM
+  is shared, so memory needs no copy across the handoff.
+- `hello from QEMU1` is the program's own output from the fast leg.
+- `[marker window_cycles] N` is the answer: the ROI took N cycles on this
+  engine. It is the vsim `mcycle` delta across the window.
+- The run ends after the ROI. Code after the end marker never executes:
+  hybrid is a measuring tool, not a way to finish the program.
+
+Note: the FIRST hybrid run of a given (engine, ELF) pair is a few seconds
+slower. andesim captures the engine's reset state once and caches it under
+`~/.cache/andesim/`, so later runs skip restoring registers that still
+hold reset values. This never changes results.
+"""))
+
+cells.append(md("""\
+## Step 3: measure your own program
+
+Wrap the region you want to measure with the two ROI markers from
+`<andesim/ROI.h>` (shipped with the runtime):
+
+```c
+#include <andesim/ROI.h>
+
+andesim_ROI_begin();
+my_kernel(a, b, c);
+andesim_ROI_end();
+```
+
+The markers are RISC-V HINT instructions (architectural NOPs), so the
+same binary also runs unchanged on `fast`, on `cycle`, and on real
+silicon.
+
+Measurement hygiene: keep the kernel in a `__attribute__((noinline))`
+function called between the markers, and pass inputs/outputs through
+memory. This stops the compiler from moving your compute out of the
+measured window.
+
+The cell below writes a small dot-product program to a temp directory.
+"""))
+
+cells.append(code("""\
+import pathlib, tempfile
+
+WORK = pathlib.Path(tempfile.mkdtemp(prefix="andesim_nb_"))
+(WORK / "dot_product.c").write_text(r'''
+#include <stdio.h>
+#include <andesim/ROI.h>
+
+#define N 64
+
+static int a[N], b[N];
+static volatile long result;
+
+__attribute__((noinline))
+long dot_product(const int *x, const int *y, int n) {
+    long sum = 0;
+    for (int i = 0; i < n; i++)
+        sum += (long)x[i] * y[i];
+    return sum;
+}
+
+int main(void) {
+    for (int i = 0; i < N; i++) { a[i] = i; b[i] = N - i; }
+
+    printf("setup done, entering ROI\\n");
+
+    andesim_ROI_begin();
+    result = dot_product(a, b, N);
+    andesim_ROI_end();
+
+    /* never reached in a hybrid run -- the run ends at the ROI exit */
+    printf("dot product = %ld\\n", result);
+    return 0;
+}
+''')
+print("wrote", WORK / "dot_product.c")\
+"""))
+
+cells.append(md("""\
+Compile with your Andes RISC-V GCC (the one `doctor` reports), linked
+against the andesim runtime:
+
+- `-B build/runtime` points gcc at the runtime artifacts (use an absolute
+  path when compiling outside the repo).
+- `-specs=andesim.specs` swaps in the runtime's startup code and linker
+  script, so one ELF runs on every engine (no semihosting).
+"""))
+
+cells.append(code("""\
+import re, subprocess
+
+# Take the toolchain path from doctor so the notebook is not tied to one host.
+doctor = subprocess.run(["./andesim", "doctor"], capture_output=True, text=True).stdout
+GCC = re.search(r"riscv64-unknown-elf-gcc\\s+(\\S+)", doctor).group(1)
+print("toolchain:", GCC)
+
+!{GCC} -march=rv64gc -mabi=lp64d -O2 \\
+    -B build/runtime -specs=andesim.specs \\
+    {WORK}/dot_product.c -o {WORK}/dot_product.elf && echo COMPILED\
+"""))
+
+cells.append(md("""\
+Now measure it. Same command as step 2, only the ELF changed:
+"""))
+
+cells.append(code("""\
+!./andesim run --mode hybrid --trigger marker \\
+    --engine vsim:ax45mpv_premium {WORK}/dot_product.elf\
+"""))
+
+cells.append(md("""\
+`[marker window_cycles]` is the cycle cost of `dot_product(a, b, 64)` on
+the ax45mpv_premium core: the call, the multiply-accumulate loop, and the
+store to `result` -- and nothing else. Boot, `printf`, and the loop that
+filled the arrays all ran on the fast QEMU leg and cost zero measured
+cycles.
+
+Note `dot product = ...` is missing from the output: it sits after
+`andesim_ROI_end()`, and a hybrid run stops at the ROI exit.
+"""))
+
+cells.append(md("""\
+## Step 4: preview a run with `--dry-run`
+
+`--dry-run` prints the exact engine command lines (both legs for hybrid)
+and runs nothing. Use it to see precisely what a run will execute.
+"""))
+
+cells.append(code("""\
+!./andesim run --mode hybrid --trigger marker \\
+    --engine vsim:ax45mpv_premium --dry-run {WORK}/dot_product.elf\
+"""))
+
+cells.append(md("""\
+## Where to go next
+
+- `docs/USER_GUIDE.md` -- every option, one by one. Section 5.3 covers
+  the second trigger (`--trigger pc`) for binaries you cannot edit.
+- `--verify` (guide section 5.7) cross-checks a hybrid run against a
+  pure-QEMU oracle, field by field.
+- `--kanata` (guide section 5.8) writes a pipeline trace of exactly the
+  measured window.
+"""))
+
+nb.cells = cells
+path = "docs/hybrid_marker_quickstart.ipynb"
+nbf.write(nb, path)
+print("wrote", path)
