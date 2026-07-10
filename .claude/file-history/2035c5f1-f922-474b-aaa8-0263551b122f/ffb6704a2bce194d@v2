@@ -1,0 +1,110 @@
+#pragma once
+
+#include <boost/numeric/conversion/cast.hpp>
+#include <LIEF/LIEF.hpp>
+#include <spdlog/spdlog.h>
+
+#include <csignal>
+#include <cstdint>
+#include <cstring>
+
+#include <fstream>
+#include <limits>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <vector>
+
+template<typename T>
+  requires std::is_trivial_v<T>
+[[nodiscard]]
+auto memzeroed() -> T
+{
+  T t{};
+  std::memset(&t, 0, sizeof(t));
+  return t;
+}
+
+enum class MEM_TYPE
+{
+  ILM = 0,
+  DLM,
+  HVM,
+  RAM,
+};
+
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+inline volatile std::sig_atomic_t ctrlc = 0;
+
+static void sigint_handler(int)
+{
+  // Note: See `signal-safety (7)` for the list of functions you can call here.
+  if (ctrlc > 0) {
+    const char* buf = "Ctrl-C pressed again, bailing...\n";
+    std::ignore = ::write(STDERR_FILENO, buf, ::strlen(buf));
+    ::quick_exit(EXIT_FAILURE);
+  }
+
+  ctrlc = 1;
+}
+
+template<typename T>
+concept XLenT =
+  std::is_same_v<T, std::uint32_t> || std::is_same_v<T, std::uint64_t>;
+
+template<XLenT xlen_t>
+void read_elf_into_memory(const LIEF::ELF::Binary& elf,
+                          const xlen_t base_addr,
+                          const std::span<uint8_t> buf)
+{
+  namespace ELF = LIEF::ELF;
+
+  assert(buf.size() < std::numeric_limits<xlen_t>::max() - base_addr);
+
+  if (std::is_same_v<xlen_t, uint32_t>
+      && elf.type() != ELF::ELF_CLASS::ELFCLASS32) [[unlikely]]
+    throw std::runtime_error("Executable is not of ELFCLASS32");
+  else if (std::is_same_v<xlen_t, uint64_t>
+           && elf.type() != ELF::ELF_CLASS::ELFCLASS64) [[unlikely]]
+    throw std::runtime_error("Executable is not of ELFCLASS64");
+
+  if (elf.header().identity_data() != ELF::ELF_DATA::ELFDATA2LSB) [[unlikely]]
+    throw std::runtime_error("Only little-endian executables are supported");
+
+  if (elf.header().machine_type() != ELF::ARCH::EM_RISCV) [[unlikely]]
+    throw std::runtime_error("Not EM_RISCV");
+
+  for (const auto& seg: elf.segments()) {
+    if (seg.type() != ELF::SEGMENT_TYPES::PT_LOAD)
+      continue;
+
+    const auto paddr = boost::numeric_cast<xlen_t>(seg.physical_address());
+    const auto memsz = boost::numeric_cast<xlen_t>(seg.virtual_size());
+    const auto filesz = boost::numeric_cast<xlen_t>(seg.physical_size());
+    spdlog::info("loading segment: addr={:#x}, memsz={}, filesz={}", paddr,
+                 memsz, filesz);
+
+    if (memsz > std::numeric_limits<xlen_t>::max() - paddr)
+      throw std::runtime_error("PT_LOAD address overflow");
+    if (paddr < base_addr || paddr + memsz >= base_addr + buf.size())
+      throw std::runtime_error("PT_LOAD is not contained within memory region");
+
+    const auto offset = paddr - base_addr;
+    std::copy_n(seg.content().begin(), filesz, buf.subspan(offset).begin());
+    if (memsz > filesz)
+      std::fill_n(buf.subspan(offset + filesz).begin(), memsz - filesz, 0);
+  }
+}
+
+inline void read_binary_file(const std::string& path, auto&& setter)
+{
+  std::ifstream file(path, std::ios::binary);
+  if (!file)
+    throw std::runtime_error("Failed to open file: " + path);
+
+  std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
+                            std::istreambuf_iterator<char>());
+  setter(data);
+  spdlog::info("Loaded {} bytes from {}", data.size(), path);
+}

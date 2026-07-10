@@ -1,0 +1,99 @@
+/* HVM content transport e2e (ROADMAP_hvm F4): HVM data round-trip.
+ *
+ *   QEMU 1: fill the whole 256 KB HVM window (0x90000000 aperture, plain
+ *           RAM in QEMU, no enable bit) with a runtime-COMPUTED pattern.
+ *   vsim:   inside the ROI, pull three sampled windows back out of the RTL
+ *           HVM SRAM with VECTOR loads (vle32 -> vse32 -> scalar compare),
+ *           then print the verdict (HVM_OK / HVM_BAD). The harness greps the
+ *           vsim log (CHECK_VSIM_STDOUT=HVM_OK). The windows pin the spots
+ *           the backdoor could get wrong: bank0 head, the bank0/bank1
+ *           boundary straddle (bank = addr bit 17), and bank1 tail.
+ *
+ * Why this is decisive for the transport: the pattern bytes exist NOWHERE
+ * except the HVM. They are runtime-computed (not in the ELF), and QEMU's
+ * HVM RAM is NOT backed by the shared DRAM mmap. The ONLY road to the vsim
+ * RTL's HVM SRAM is the sidecar transport: plugin drain -> <state>.hvm ->
+ * --hvm backdoor load. No transport => vsim reads reset-empty SRAM =>
+ * HVM_BAD.
+ *
+ * Totality is covered by the harness, not the ROI: CHECK_LM_EXIT_SIDECARS
+ * compares the vsim exit dump (get_hvm) byte-for-byte against the entry
+ * sidecar, all 256 KB. The in-ROI vector reads only need to prove the RTL
+ * VPU->HVM path sees the loaded content (sampled, to keep the
+ * cycle-accurate ROI short).
+ */
+#include "runtime/rt_c_helpers.h"
+#include "runtime/memory_map.h"
+
+#include <stdint.h>
+#include <stdio.h>
+
+#define HVM_BYTES 262144u
+#define HVM_WORDS (HVM_BYTES / 4u)
+#define WIN_WORDS 64u
+
+/* Per-word pattern: cheap, position-dependent, never all-zero. */
+static inline uint32_t pat(uint32_t i) { return i * 2654435761u + 0x5A17u; }
+
+/* Copy n words out of the HVM through the VECTOR unit (vle32 loads the
+ * aperture, vse32 spills to a DRAM buffer for the scalar compare). Like
+ * rt_c_v_fill, v8 is used without a clobber: -O1 never touches V regs. */
+static void v_copy_words(uint32_t src_word, uint32_t *dst, uint32_t n)
+{
+  const uint32_t *src =
+    (const uint32_t *) (uintptr_t) (HVM_BASE + src_word * 4u);
+  while (n) {
+    unsigned long vl;
+    asm volatile("vsetvli %0, %1, e32, m1, ta, ma\n\t"
+                 "vle32.v v8, (%2)\n\t"
+                 "vse32.v v8, (%3)"
+                 : "=&r"(vl)
+                 : "r"((unsigned long) n), "r"(src), "r"(dst)
+                 : "memory");
+    src += vl;
+    dst += vl;
+    n -= (uint32_t) vl;
+  }
+}
+
+/* Returns the number of mismatching words in [w0, w0+WIN_WORDS). */
+static uint32_t check_window(uint32_t w0)
+{
+  uint32_t buf[WIN_WORDS];
+  v_copy_words(w0, buf, WIN_WORDS);
+  uint32_t bad = 0;
+  for (uint32_t i = 0; i < WIN_WORDS; i++)
+    if (buf[i] != pat(w0 + i)) bad++;
+  return bad;
+}
+
+int main(void)
+{
+  volatile uint32_t *hvm = (volatile uint32_t *) (uintptr_t) HVM_BASE;
+
+  /* QEMU phase: runtime-computed fill of the whole window. Also init stdio
+   * here so the ROI's verdict printf does not pay first-call setup. */
+  for (uint32_t i = 0; i < HVM_WORDS; i++) hvm[i] = pat(i);
+  printf("HVM filled\n");
+  fflush(stdout);
+
+  enter_vsim();
+
+  /* vsim ROI: sampled vector readback. Window starts: bank0 head, the
+   * bank boundary straddle (32 words each side of word 32768), bank1
+   * tail. */
+  uint32_t bad = 0;
+  bad += check_window(0);
+  bad += check_window(HVM_WORDS / 2u - WIN_WORDS / 2u);
+  bad += check_window(HVM_WORDS - WIN_WORDS);
+  if (bad == 0) {
+    printf("HVM_OK sampled=%u\n", (unsigned) (3 * WIN_WORDS));
+  } else {
+    printf("HVM_BAD count=%u\n", (unsigned) bad);
+  }
+  fflush(stdout);
+
+  exit_vsim();
+
+  return bad != 0;
+}
