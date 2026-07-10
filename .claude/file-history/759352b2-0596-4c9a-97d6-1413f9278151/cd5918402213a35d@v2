@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# F4 contract: HTIF file syscalls behave identically on both engines. The
+# SAME vplat_file.elf creates/writes/reads/removes a host file (served by
+# vsim's sim_control HTIF table and by QEMU's andes_sim_control mirror),
+# prints "file io ok" and exits 0. Run in a scratch cwd; the tmp file must
+# be gone afterwards (remove() worked host-side).
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+
+# shellcheck disable=SC1091
+. "$ROOT/config.env" 2>/dev/null
+export HYBRID_TOOLCHAIN="${HYBRID_TOOLCHAIN:?config.env missing}"
+
+ELF="$ROOT/tests/fixtures/vplat_file.elf"
+SIM="$(vsim_bin_dir)/sim_ax45mpv_premium"
+QEMU="${QEMU_BIN_DIR:-$(cfg_val QEMU_BIN_DIR)}/qemu-system-riscv64"
+[ -x "$SIM" ] || fail "cycle engine not found (source ./setup.sh): $SIM"
+[ -x "$QEMU" ] || fail "qemu not found (source ./setup.sh): $QEMU"
+
+make -C "$ROOT/tests/fixtures" vplat_file.elf >/dev/null || fail "fixture build failed"
+
+run_leg() {  # LABEL CMD...
+  local label="$1"; shift
+  local wd out rc
+  wd=$(mktemp -d)
+  out=$( cd "$wd" && timeout 120 "$@" </dev/null 2>&1 ); rc=$?
+  printf '%s\n' "$out" | grep -q 'file io ok' \
+    || { rm -rf "$wd"; fail "$label: missing 'file io ok': $out"; }
+  [ "$rc" -eq 0 ] || { rm -rf "$wd"; fail "$label: exit code $rc != 0"; }
+  [ ! -e "$wd/vplat_file_test.tmp" ] \
+    || { rm -rf "$wd"; fail "$label: tmp file not removed"; }
+  rm -rf "$wd"
+  echo "[ok] $label: file io ok, clean exit, tmp removed"
+}
+
+run_leg cycle "$SIM" "$ELF"
+run_leg fast "$QEMU" -machine andes_ae350 -cpu andes-ax45mpv,vlen=512 \
+  -nographic -semihosting-config enable=on,target=native -bios "$ELF"
+
+# rv32 leg (guarded): on rv32 the tohost command reaches the device as TWO
+# 32-bit halves (0x10 low, 0x14 high) instead of one 64-bit store, so it
+# exercises a distinct device path. Skips when the rv32 toolchain, runtime,
+# or qemu-system-riscv32 is absent.
+QEMU32="${QEMU_BIN_DIR:-$(cfg_val QEMU_BIN_DIR)}/qemu-system-riscv32"
+GCC32="$(cfg_val HYBRID_TOOLCHAIN32)/bin/riscv32-unknown-elf-gcc"
+if [ -x "$QEMU32" ] && [ -x "$GCC32" ] && [ -d "$ROOT/build/runtime/rv32" ]; then
+  ELF32=$(mktemp -t vplat_file32.XXXXXX.elf)
+  "$GCC32" -march=rv32gc -mabi=ilp32d -O1 -B "$ROOT/build/runtime/rv32" \
+    -specs=andesim.specs "$ROOT/tests/fixtures/vplat_file.c" -o "$ELF32" \
+    || fail "rv32 fixture build failed"
+  run_leg fast-rv32 "$QEMU32" -machine andes_ae350 -cpu andes-a45 \
+    -nographic -semihosting-config enable=on,target=native -bios "$ELF32"
+  rm -f "$ELF32"
+else
+  echo "[skip] fast-rv32 leg: rv32 toolchain/runtime/qemu not available"
+fi
+
+ok "F4 vplat_file.elf HTIF file io parity (cycle + fast, incl. rv32 halves)"
