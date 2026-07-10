@@ -1,0 +1,183 @@
+// Unit tests for the hybrid memory-map composer (driver/memmap.hpp).
+//
+// The map is composed from three sources the run already trusts:
+//   - the driver's own RAM window math (--mem-size + the V-scratch page),
+//   - the engine's --print-qemu-config text (ilm/dlm/hvm bases -- the same
+//     staged qemu.cfg the fast leg boots with),
+//   - the engine descriptor's ilm/dlm/hvm sizes (backdoor-gated transport).
+// PM rule: only hybrid-SUPPORTED regions appear; no QEMU-only devices, no
+// vsim-reserved holes.
+#include "memmap.hpp"
+
+#include "engine_descriptor.hpp"
+#include "test_check.hpp"
+
+namespace {
+
+using namespace andes_sim;
+
+// A premium-like engine cfg: ISA globals for the CPU driver interleaved with
+// the riscv.andes.ae350.soc geometry globals (the real --print-qemu-config
+// shape, abridged).
+const char kCfg[] =
+    "[global]\n"
+    "driver = \"andes-ax45mpv-riscv-cpu\"\n"
+    "property = \"vlen\"\n"
+    "value = \"512\"\n"
+    "\n"
+    "[global]\n"
+    "driver = \"riscv.andes.ae350.soc\"\n"
+    "property = \"ilm_base\"\n"
+    "value = \"0x0\"\n"
+    "\n"
+    "[global]\n"
+    "driver = \"riscv.andes.ae350.soc\"\n"
+    "property = \"dlm_base\"\n"
+    "value = \"0x200000\"\n"
+    "\n"
+    "[global]\n"
+    "driver = \"riscv.andes.ae350.soc\"\n"
+    "property = \"ilm_size\"\n"
+    "value = \"65536\"\n"
+    "\n"
+    "[global]\n"
+    "driver = \"riscv.andes.ae350.soc\"\n"
+    "property = \"hvm_base\"\n"
+    "value = \"0x90000000\"\n"
+    "\n"
+    "[global]\n"
+    "driver = \"riscv.andes.ae350.soc\"\n"
+    "property = \"hvm_size_pow_2\"\n"
+    "value = \"18\"\n";
+
+EngineDescriptor premium_like() {
+  EngineDescriptor e;
+  e.id = "verilator:ax45mpv_premium";
+  e.ilm_size = 65536;
+  e.dlm_size = 32768;
+  e.hvm_size = 262144;
+  return e;
+}
+
+const MemmapRow* find_row(const MemmapResult& r, const std::string& region) {
+  for (const MemmapRow& row : r.rows)
+    if (row.region == region) return &row;
+  return nullptr;
+}
+
+void test_qemu_cfg_soc_props() {
+  const auto p = qemu_cfg_soc_props(kCfg);
+  CHECK(p.count("ilm_base") == 1);
+  CHECK(p.at("ilm_base") == "0x0");
+  CHECK(p.at("dlm_base") == "0x200000");
+  CHECK(p.at("hvm_base") == "0x90000000");
+  // The CPU-driver globals must NOT leak in as soc properties.
+  CHECK(p.count("vlen") == 0);
+}
+
+void test_full_map_premium() {
+  const long long mem = 128LL * 1024 * 1024;
+  const MemmapResult r = hybrid_memmap(premium_like(), mem, kCfg);
+  CHECK(r.warnings.empty());
+  CHECK(r.rows.size() == 7);
+
+  const MemmapRow* dram = find_row(r, "DRAM");
+  CHECK(dram && dram->base == 0 && dram->end == 0x7ffffffULL);
+
+  // The V-scratch page sits immediately ABOVE program RAM: [mem, mem+4K).
+  const MemmapRow* vs = find_row(r, "V-scratch");
+  CHECK(vs && vs->base == 0x8000000ULL && vs->end == 0x8000fffULL);
+
+  const MemmapRow* ilm = find_row(r, "ILM");
+  CHECK(ilm && ilm->base == 0x0ULL && ilm->end == 0xffffULL);
+
+  const MemmapRow* dlm = find_row(r, "DLM");
+  CHECK(dlm && dlm->base == 0x200000ULL && dlm->end == 0x207fffULL);
+
+  const MemmapRow* hvm = find_row(r, "HVM");
+  CHECK(hvm && hvm->base == 0x90000000ULL && hvm->end == 0x9003ffffULL);
+
+  const MemmapRow* sc = find_row(r, "SimControl/HTIF");
+  CHECK(sc && sc->base == 0xe0080000ULL && sc->end == 0xe0080fffULL);
+
+  const MemmapRow* uart = find_row(r, "UART2");
+  CHECK(uart && uart->base == 0xf0300000ULL && uart->end == 0xf03fffffULL);
+}
+
+// An engine without transportable local memories (all describe sizes 0, like
+// ax46mpv_advanced whose wrapper has no set_/get_ backdoors) must not
+// advertise ILM/DLM/HVM -- hybrid cannot carry their content, so per the PM
+// rule the rows are omitted even though the cfg has the geometry.
+void test_no_lm_engine_omits_rows() {
+  EngineDescriptor e;
+  e.id = "verilator:ax46mpv_advanced";
+  const MemmapResult r = hybrid_memmap(e, 128LL * 1024 * 1024, kCfg);
+  CHECK(r.warnings.empty());
+  CHECK(r.rows.size() == 4);
+  CHECK(find_row(r, "ILM") == nullptr);
+  CHECK(find_row(r, "DLM") == nullptr);
+  CHECK(find_row(r, "HVM") == nullptr);
+  CHECK(find_row(r, "DRAM") != nullptr);
+  CHECK(find_row(r, "V-scratch") != nullptr);
+  CHECK(find_row(r, "SimControl/HTIF") != nullptr);
+  CHECK(find_row(r, "UART2") != nullptr);
+}
+
+// Transportable sizes but NO cfg geometry (engine lacks --print-qemu-config):
+// the bases are unknowable, so the rows are dropped WITH a warning naming the
+// missing probe -- never silently.
+void test_missing_cfg_warns() {
+  const MemmapResult r = hybrid_memmap(premium_like(), 128LL * 1024 * 1024, "");
+  CHECK(r.rows.size() == 4);
+  CHECK(find_row(r, "ILM") == nullptr);
+  CHECK(r.warnings.size() == 1);
+  CHECK(r.warnings[0].find("--print-qemu-config") != std::string::npos);
+}
+
+// --mem-size moves the DRAM top and the scratch page together.
+void test_mem_size_moves_scratch() {
+  const long long mem = 64LL * 1024 * 1024;
+  const MemmapResult r = hybrid_memmap(premium_like(), mem, kCfg);
+  const MemmapRow* dram = find_row(r, "DRAM");
+  CHECK(dram && dram->end == 0x3ffffffULL);
+  const MemmapRow* vs = find_row(r, "V-scratch");
+  CHECK(vs && vs->base == 0x4000000ULL && vs->end == 0x4000fffULL);
+}
+
+void test_fmt_size() {
+  CHECK(fmt_size(128ULL * 1024 * 1024) == "128M");
+  CHECK(fmt_size(4096) == "4K");
+  CHECK(fmt_size(262144) == "256K");
+  CHECK(fmt_size(2ULL * 1024 * 1024 * 1024) == "2G");
+  CHECK(fmt_size(1000) == "1000");  // not a whole K -> plain bytes
+}
+
+// The rendered table: one line per row, inclusive END column, human SIZE.
+void test_render() {
+  const MemmapResult r =
+      hybrid_memmap(premium_like(), 128LL * 1024 * 1024, kCfg);
+  const std::string t = render_memmap(r);
+  CHECK(t.find("REGION") != std::string::npos);
+  CHECK(t.find("TRANSPORT") != std::string::npos);
+  CHECK(t.find("0x7ffffff") != std::string::npos);   // DRAM inclusive end
+  CHECK(t.find("128M") != std::string::npos);        // DRAM size
+  CHECK(t.find("0xf03fffff") != std::string::npos);  // UART2 inclusive end
+  CHECK(t.find("V-scratch") != std::string::npos);
+  // Warnings surface in the rendering too.
+  const MemmapResult w =
+      hybrid_memmap(premium_like(), 128LL * 1024 * 1024, "");
+  CHECK(render_memmap(w).find("--print-qemu-config") != std::string::npos);
+}
+
+}  // namespace
+
+int main() {
+  test_qemu_cfg_soc_props();
+  test_full_map_premium();
+  test_no_lm_engine_omits_rows();
+  test_missing_cfg_warns();
+  test_mem_size_moves_scratch();
+  test_fmt_size();
+  test_render();
+  return andes_sim::test::report("memmap");
+}

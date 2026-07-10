@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# --print-memmap: `andesim run --mode hybrid --print-memmap` prints the
+# hybrid-SUPPORTED guest memory map (DRAM window sized by --mem-size, the
+# reserved V-scratch page, backdoor-gated ILM/DLM/HVM rows with bases from the
+# engine's --print-qemu-config, SimControl/HTIF, UART2) and exits 0 without
+# spawning a simulation. Unsupported regions (QEMU-only devices, PLDM, ...)
+# must NOT appear.
+#
+# Three layers:
+#   1. unit (fast, always runs): the composer's own tests
+#      (build/driver/andesim-memmap-test).
+#   2. driver behavior (needs a built vsim engine; SKIPs otherwise): the
+#      printed rows track --mem-size and the engine's --describe sizes.
+#   3. engine contract (same engine): the driver's platform-constant rows and
+#      LM/HVM bases appear in the engine's OWN `--print-memmap` interconnect
+#      dump -- the closed loop that catches driver/vsim drift.
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+
+# 1. unit: the pure composer
+bash "$ROOT/scripts/build_driver.sh" >/dev/null 2>&1 || fail "build_driver.sh failed"
+BIN="$ROOT/build/andesim"
+[ -x "$BIN" ] || fail "missing driver binary: $BIN"
+UNIT="$ROOT/build/driver/andesim-memmap-test"
+[ -x "$UNIT" ] || fail "missing unit-test binary: $UNIT"
+"$UNIT" >/dev/null || fail "memmap unit tests failed"
+ok "unit: hybrid memmap composer"
+
+# Mode gating needs no engine: the map is hybrid-only surface.
+expect 2 'requires --mode hybrid' "$BIN" run --mode fast --print-memmap
+expect 2 'requires --mode hybrid' "$BIN" run --mode cycle --print-memmap
+ok "gating: --print-memmap rejects fast/cycle"
+
+# 2 + 3 need a built vsim engine. Resolve like the driver does.
+BINDIR=$(vsim_bin_dir)
+SIM=$(ls "$BINDIR"/sim_* 2>/dev/null | head -1)
+if [ -z "$SIM" ] || [ ! -x "$SIM" ]; then
+  ok "SKIP driver/engine layers: no built vsim engine under $BINDIR (set VSIM_BIN_DIR)"
+  exit 0
+fi
+base=$(basename "$SIM"); base=${base#sim_}
+id="vsim:${base}"
+
+# 2. driver behavior. No ELF required: the map describes the run's window,
+# not a workload.
+out=$(VSIM_BIN_DIR="$BINDIR" "$BIN" run --mode hybrid --print-memmap \
+      --engine "$id" 2>&1); rc=$?
+[ "$rc" -eq 0 ] || fail "--print-memmap exit $rc: $out"
+printf '%s\n' "$out" | grep -q '^DRAM .*0x7ffffff ' \
+  || fail "DRAM row missing/incorrect for the 128M default: $out"
+printf '%s\n' "$out" | grep -q '^V-scratch .*0x8000000 .*0x8000fff ' \
+  || fail "V-scratch row missing/incorrect: $out"
+printf '%s\n' "$out" | grep -q '^SimControl/HTIF .*0xe0080000 ' \
+  || fail "SimControl row missing: $out"
+printf '%s\n' "$out" | grep -q '^UART2 .*0xf0300000 ' \
+  || fail "UART2 row missing: $out"
+# Unsupported regions must not leak in.
+printf '%s\n' "$out" | grep -qi 'PLDM\|PLIC\|UART1\|SMU' \
+  && fail "unsupported region leaked into the map: $out"
+ok "driver: DRAM/V-scratch/device rows for the 128M default"
+
+# --mem-size moves the DRAM top and the scratch page together.
+out64=$(VSIM_BIN_DIR="$BINDIR" "$BIN" run --mode hybrid --print-memmap \
+        --engine "$id" --mem-size 64M 2>&1); rc=$?
+[ "$rc" -eq 0 ] || fail "--print-memmap --mem-size 64M exit $rc: $out64"
+printf '%s\n' "$out64" | grep -q '^DRAM .*0x3ffffff ' \
+  || fail "DRAM row does not track --mem-size 64M: $out64"
+printf '%s\n' "$out64" | grep -q '^V-scratch .*0x4000000 ' \
+  || fail "V-scratch row does not track --mem-size 64M: $out64"
+ok "driver: rows track --mem-size"
+
+# LM rows follow the engine's --describe (backdoor-gated): present iff size>0.
+desc=$("$SIM" --describe 2>/dev/null)
+d_int() { printf '%s' "$desc" | tr -d ' \n' | grep -o "\"$1\":[0-9]*" | grep -o '[0-9]*$'; }
+ilm=$(d_int ilm_size); dlm=$(d_int dlm_size); hvm=$(d_int hvm_size)
+for pair in "ILM:${ilm:-0}" "DLM:${dlm:-0}" "HVM:${hvm:-0}"; do
+  region=${pair%%:*}; size=${pair##*:}
+  if [ "$size" -gt 0 ]; then
+    printf '%s\n' "$out" | grep -q "^$region " \
+      || fail "$region row missing though --describe size=$size: $out"
+  else
+    printf '%s\n' "$out" | grep -q "^$region " \
+      && fail "$region row present though --describe size=0: $out"
+  fi
+done
+ok "driver: ILM/DLM/HVM rows follow --describe sizes (ilm=${ilm:-0} dlm=${dlm:-0} hvm=${hvm:-0})"
+
+# 3. engine contract: the closed loop. Every platform base the driver prints
+# must be decoded by the engine's own interconnect (its --print-memmap), and
+# the LM/HVM bases the driver took from --print-qemu-config must appear too.
+# Base-only match: the engine dump's sizes carry a known +1 display bug (and
+# a 4x HVM aperture bug) until the vsim-side fixes land.
+edump=$("$SIM" --print-memmap 2>&1) || fail "engine --print-memmap failed: $edump"
+for b in 0xe0080000 0xf0300000; do
+  printf '%s\n' "$edump" | grep -q "\[$b-" \
+    || fail "engine dump missing platform base $b: $edump"
+done
+if [ "${hvm:-0}" -gt 0 ]; then
+  hvm_base=$(printf '%s\n' "$out" | awk '/^HVM /{print $2}')
+  printf '%s\n' "$edump" | grep -q "\[$hvm_base-" \
+    || fail "engine dump does not decode the driver's HVM base $hvm_base: $edump"
+fi
+ok "engine contract: driver bases appear in $base --print-memmap"
+
+echo "PASS test_andes_sim_print_memmap"
