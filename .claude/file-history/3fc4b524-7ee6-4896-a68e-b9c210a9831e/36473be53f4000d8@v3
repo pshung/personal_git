@@ -1,0 +1,133 @@
+# Debug-Logging Roadmap: log levels -> reproducible bugs
+
+Goal: use the `--log-level` scale (0=trace 1=debug 2=info 3=warn 4=error
+5=critical 6=off, shared with vsim) so that any failed or suspicious run
+can be REPRODUCED and diagnosed from its own output, without re-running
+under ad-hoc printf debugging.
+
+Principles
+- info (default) stays clean: program output + the answer line. All new
+  detail goes to debug/trace.
+- errors always print, and every error should carry enough to reproduce.
+- one scale end-to-end: andesim driver -> QEMU plugin -> vsim engine.
+- input/output of every feature is a printable contract a test can grep.
+
+Current state (done)
+- driver/log.hpp/.cpp: threshold + log_on/log_line/log_result; --log-level
+  and --log-file flags.
+- info: `[andesim] N cycles`; debug: banner, mmap line, window mcycle
+  detail, PASS, decision log; trace: exec command lines; warn:
+  unsupported-CSR + mem-size notes.
+- All of L0..L5 below are DONE (contract test:
+  tests/andes_sim/test_andes_sim_log_level.sh + test_andes_sim_repro.sh).
+  Remaining work: the V-side items (external hybrid_vsim repo).
+
+---
+
+## L0. log_line helper (structural)
+
+- Description: route the existing leveled fprintf sites through one
+  `log_line(level, fmt, ...)` helper (uniform `[andesim]` prefix, one
+  place to add a file sink later). No behavior change.
+- Key files: driver/log.hpp, driver/log.cpp, driver/cmd_run.cpp,
+  driver/shm.cpp
+- Depends on: nothing
+- State: DONE
+
+## L1. trace prints the exact leg commands
+
+- Description: at trace (0), before spawning each leg print the fully
+  resolved command line (same renderer as --dry-run). Contract:
+    `[andesim] exec fast-leg [qemu64]: qemu-system-riscv64 -object ...`
+    `[andesim] exec accurate-leg [vsim:x]: sim_x my.elf --resume-from-qemu ...`
+  Debugging one leg becomes copy-paste of one line.
+- Key files: driver/run_plan.cpp, driver/argv.hpp
+- Depends on: nothing (landed before L0; migrate to log_line with L0)
+- State: DONE (test: tests/andes_sim/test_andes_sim_log_level.sh 3b/3c)
+
+## L2. repro block on failure (error level, always on)
+
+- Description: when a leg fails (spawn/timeout/exit-code/state-read),
+  KEEP the run's small artifacts -- whatever the legs left in the workdir
+  (drained states, LM sidecars, staged qemu cfg) plus a copy of the ELF
+  (not the big mmap: the legs are deterministic, the kept commands
+  regenerate it) -- under `$XDG_CACHE_HOME/andesim/repro/<utc>-<elf>/`,
+  pruned to the newest 20, and print
+  `[andesim] repro: kept run artifacts at <dir>` at error level.
+  manifest.txt records the error, the failing step, and every leg's
+  exact command. A bug report becomes "attach this directory".
+  Follow-up (not landed): engine --describe hash, ELF sha256, per-leg
+  rc + wall time in the manifest; a --verify-mismatch bundle.
+- Key files: driver/run_plan.cpp, driver/cmd_run.cpp, driver/process.cpp
+- Depends on: L1 (same command renderer)
+- State: DONE (test: tests/andes_sim/test_andes_sim_repro.sh)
+
+## L3. debug decision log
+
+- Description: at debug, print the driver's resolutions so a "wrong
+  figure" report shows WHERE the run diverged from expectation. Landed:
+  engine choice + why (`[andesim] engine: <id> (sole cycle-accurate
+  engine | selected by --engine)`), pc-trigger resolution
+  (`[andesim] trigger pc: <spec> -> 0x...`); the banner already carries
+  engine/VLEN/trigger and the mmap line the tier. Follow-up (vsim-side,
+  see V1): reset-baseline cache hit/miss, write-mask restore summary.
+- Key files: driver/cmd_run.cpp, driver/hybrid.cpp,
+  driver/engine_registry.cpp
+- Depends on: L0
+- State: DONE
+
+## L4. one flag drives the whole pipeline
+
+- Description: forward the level to both legs. vsim leg: append
+  `--log-level N` verbatim (same scale by design) and, at <= debug, the
+  legs inherit our stderr so their diagnostics stream live (at info and
+  above stderr stays dropped, as before). QEMU plugin: new `log_level=N`
+  plugin arg; at <= debug it prints `[hybrid_handoff] drained state to
+  <file> (pc=..., flags=..., vlenb=...)`.
+- Key files: driver/run_plan.cpp, driver/vsim_filter.cpp,
+  qemu_plugin/hybrid_handoff.c
+- Depends on: L0
+- State: DONE
+
+## L5. --log-file: full trace to a file, console unchanged
+
+- Description: `--log-file <path>` writes ALL leveled messages
+  (trace..error) with timestamps to the file regardless of the console
+  threshold; the failure repro block (L2) names the file. One run, one
+  complete capsule to attach to a bug.
+- Key files: driver/log.hpp, driver/log.cpp, driver/cli.cpp,
+  driver/main.cpp
+- Depends on: L0 (every message must flow through log_line), L2
+- State: DONE
+
+---
+
+## V-side (external hybrid_vsim repo; separate sessions there)
+
+vsim already has spdlog + --log-level; these map the hybrid orchestration
+onto it. Can be delegated to a subagent working in the vsim checkout
+(pair with the csr-transport-bringup skill).
+
+- V1. debug: resume/drain phase summaries -- counts per block (GPR/FPR/
+  CSR/V), liveness-gate skip count, per-phase simulated-cycle cost.
+- V2. trace: per-op log -- each abstract command / progbuf batch with
+  CSR addr, value, cmderr result (the exec_progbuf fault-hunting pain).
+- V3. resume-abort diagnostics: on abort print the failing step, CSR,
+  drained-vs-WARL value, and an engine-caps hint.
+- Key files (vsim repo): src/hybrid/resume_driver.hpp,
+  src/hybrid/state_drain.hpp, src/hybrid/handoff_controller.hpp
+- Depends on: nothing on the andesim side; L4 makes them reachable from
+  one andesim flag.
+
+---
+
+Rollout: one feature per session, TDD-first (each feature's contract is
+grep-able, so its RED test goes in tests/andes_sim/test_andes_sim_log_*.sh
+or the vsim repo's ctest). Update docs/USER_GUIDE.md section 5.10 as each
+lands, and re-execute docs/hybrid_marker_quickstart.ipynb when the
+default-visible surface changes.
+
+Compound effect: L2+L5 make every failure self-documenting; L4 makes one
+flag capture the whole pipeline; V2 turns state-transport faults from
+printf-archaeology into a diff of two trace files. Over time, bug
+reports converge to "attach the repro dir + log file".
