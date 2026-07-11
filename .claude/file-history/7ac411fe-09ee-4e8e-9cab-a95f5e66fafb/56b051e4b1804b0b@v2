@@ -1,0 +1,135 @@
+/* Trust the figure: `--verify` cross-checks a hybrid run against QEMU.
+ *
+ * A hybrid cycle figure is only worth something if the cycle engine
+ * executed YOUR program state, not an approximation of it. `--verify`
+ * re-runs the same ELF on pure QEMU up to the ROI exit and compares the
+ * drained architectural state field by field -- PC, GPRs, FPRs, vector
+ * registers, V CSRs, privilege, and the round-tripping M-mode CSRs --
+ * against what the cycle engine drained.
+ *
+ * The workload is built to make that compare mean something: the ROI
+ * leaves dirty state in every compared class.
+ *
+ *   - GPR churn: an integer mix/rotate reduction over two arrays.
+ *   - Scalar FP: a Newton square-root iteration (raises inexact, so
+ *     fflags is non-zero; frm was set to RTZ before the ROI).
+ *   - RVV loop: a strip-mined vmacc kernel dirties v-registers and
+ *     leaves vl/vtype from its last vsetvl.
+ *   - CSR writes: frm/vxrm/mscratch staged before the ROI ride the
+ *     handoff; the kernel folds its result into mscratch INSIDE the
+ *     ROI, so the compared value was written by the cycle engine.
+ *
+ * Two builds from this one source:
+ *
+ *   verify.elf        the clean workload: verify must PASS.
+ *   verify_taint.elf  -DVERIFY_TAINT: right before the exit marker, one
+ *                     asm block samples mcycle into t6 (x31). The two
+ *                     engines count cycles differently BY DESIGN (that
+ *                     difference is the whole cycle-figure business), so
+ *                     x31 cannot match the oracle: verify must FAIL and
+ *                     name exactly that register. This is what catching
+ *                     real divergence looks like.
+ *
+ * VERIFY_OK prints after the ROI, so it appears on fast (and cycle)
+ * only; on hybrid the run ends at the exit trigger and the verdict is
+ * the driver's [state-diff]/[verify] lines, asserted by check.sh.
+ */
+
+#include <stdint.h>
+#include <stdio.h>
+#include <riscv_vector.h>
+#include <andesim/ROI.h>
+
+#define N 64
+
+static int32_t va[N], vb[N], vc[N];
+
+/* Small values in [-8, 7]. */
+static inline int32_t elem(uint32_t i, uint32_t salt)
+{
+  uint32_t h = (i + salt) * 2654435761u;
+  return (int32_t) (h >> 28) - 8;
+}
+
+/* ROI body, noinline and non-static so the call anchors it inside the
+ * marker span (see ROI.h's cycle-attribution contract). */
+__attribute__((noinline)) uint64_t verify_kernel(void)
+{
+  /* GPR churn. */
+  uint64_t acc = 0x9E3779B97F4A7C15ull;
+  for (int i = 0; i < N; i++) {
+    acc ^= (uint64_t) (uint32_t) va[i] * 2654435761u;
+    acc = (acc << 13) | (acc >> 51);
+    acc += (uint32_t) vb[i];
+  }
+
+  /* Scalar FP: Newton iteration for sqrt(x), x in [1, 2). Division is
+   * inexact here, so this leaves fflags.NX set on top of RTZ rounding. */
+  double x = 1.0 + (double) (acc & 0xFF) / 256.0;
+  double y = x;
+  for (int i = 0; i < 6; i++) y = 0.5 * (y + x / y);
+  uint64_t ybits;
+  __builtin_memcpy(&ybits, &y, sizeof ybits);
+  acc ^= ybits;
+
+  /* RVV: c[] = a[] * k + b[], strip-mined so any VLEN works. Integer on
+   * purpose -- this engine family's VPU is integer-only. */
+  int32_t k = (int32_t) (acc & 0xFFFF) | 1;
+  int i = 0;
+  while (i < N) {
+    size_t vl = __riscv_vsetvl_e32m1((size_t) (N - i));
+    vint32m1_t a = __riscv_vle32_v_i32m1(&va[i], vl);
+    vint32m1_t b = __riscv_vle32_v_i32m1(&vb[i], vl);
+    vint32m1_t c = __riscv_vmacc_vx_i32m1(b, k, a, vl);
+    __riscv_vse32_v_i32m1(&vc[i], c, vl);
+    i += (int) vl;
+  }
+  for (i = 0; i < N; i++) acc ^= (uint64_t) (uint32_t) vc[i] * (uint32_t) (i + 1);
+
+  /* CSR write inside the ROI: the value verify compares for mscratch
+   * was computed and written by the engine under test. */
+  __asm__ __volatile__("csrw mscratch, %0" : : "r"(acc));
+  return acc;
+}
+
+int main(void)
+{
+  for (int i = 0; i < N; i++) {
+    va[i] = elem((uint32_t) i, 0xAAAAu);
+    vb[i] = elem((uint32_t) i, 0xBBBBu);
+  }
+
+  /* CSR writes in the QEMU phase -- these ride the handoff: rounding
+   * mode RTZ (reset is RNE), a non-default vxrm, a seed in mscratch. */
+  __asm__ __volatile__("csrwi frm, 1");      /* RTZ */
+  __asm__ __volatile__("csrwi vxrm, 2");     /* rdn */
+  __asm__ __volatile__("csrw mscratch, %0" : : "r"(0x5EED0000C0FFEEull));
+
+  /* Golden run on the QEMU phase; the ROI recomputes it. */
+  uint64_t want = verify_kernel();
+  printf("VERIFY staged: %u-elem kernel, frm=RTZ, golden=%016llx\n",
+         (unsigned) N, (unsigned long long) want);
+
+  andesim_ROI_begin();
+  uint64_t got = verify_kernel();
+#ifdef VERIFY_TAINT
+  /* Poison x31 with engine-divergent state at the drain point: one asm
+   * block, so nothing can touch t6 between the sample and the exit
+   * marker (the same `slti` HINT ROI.h emits). */
+  __asm__ __volatile__(
+      "csrr t6, mcycle\n\t"
+      "slti x0, x0, 0x5A1\n"   /* andesim_ROI_end() */
+      : : : "t6", "memory");
+#else
+  andesim_ROI_end();
+#endif
+
+  /* Runs on fast and cycle only: a hybrid run ended at the exit trigger. */
+  if (got != want) {
+    printf("VERIFY_BAD got=%016llx want=%016llx\n",
+           (unsigned long long) got, (unsigned long long) want);
+    return 1;
+  }
+  printf("VERIFY_OK acc=%016llx\n", (unsigned long long) got);
+  return 0;
+}

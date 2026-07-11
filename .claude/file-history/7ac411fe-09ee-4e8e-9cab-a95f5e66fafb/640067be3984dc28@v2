@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Self-asserting harness for the verify demo: `--verify` must PASS on the
+# clean build and must FAIL -- naming exactly the poisoned register -- on the
+# taint build. Same pattern as demo/cache/check.sh.
+set -uo pipefail
+HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cd "$HERE"
+
+A=${ANDESIM_BIN:-/home/nick/work/andesim/andesim}
+ENG=${ENGINE:-vsim:ax45mpv_premium}
+
+pass=0 fail=0
+# assert DESC WANT_RC WANT_REGEX -- CMD...
+assert() {
+  local desc=$1 want_rc=$2 want_re=$3; shift 3
+  local out rc
+  out=$("$@" </dev/null 2>&1); rc=$?
+  if [ "$rc" -eq "$want_rc" ] && grep -qE "$want_re" <<<"$out"; then
+    printf '[PASS] %s\n' "$desc"; pass=$((pass+1))
+  else
+    printf '[FAIL] %s\n       rc=%s (want %s), no /%s/ in:\n       %s\n' \
+      "$desc" "$rc" "$want_rc" "$want_re" "$(head -1 <<<"$out")"
+    fail=$((fail+1))
+  fi
+}
+# expect DESC REGEX -- greps the captured $out of the last hybrid run
+expect() {
+  local desc=$1 re=$2
+  if grep -qE "$re" <<<"$out"; then
+    printf '[PASS] %s\n' "$desc"; pass=$((pass+1))
+  else
+    printf '[FAIL] %s: no /%s/ in output\n' "$desc" "$re"; fail=$((fail+1))
+  fi
+}
+
+echo "--- the workload is functionally sound (fast) ---"
+assert "fast verify:       VERIFY_OK" 0 "VERIFY_OK" \
+  "$A" run --mode fast verify.elf
+assert "fast verify_taint: VERIFY_OK (the taint is a NOP for the program)" 0 "VERIFY_OK" \
+  "$A" run --mode fast verify_taint.elf
+
+echo "--- clean build: the vsim drain must match the QEMU oracle ---"
+out=$("$A" run --mode hybrid --trigger marker --engine "$ENG" --verify \
+      verify.elf </dev/null 2>&1); rc=$?
+if [ "$rc" -eq 0 ]; then
+  printf '[PASS] hybrid --verify exits 0\n'; pass=$((pass+1))
+else
+  printf '[FAIL] hybrid --verify exits %s:\n%s\n' "$rc" "$out"; fail=$((fail+1))
+fi
+expect "a cycle figure came out"    '\[andesim\] [0-9]+ cycles'
+expect "field-by-field state PASS"  '\[state-diff\] PASS: [0-9]+ fields match'
+expect "verify verdict PASS"        '\[verify\] PASS: vsim drain matches the QEMU oracle'
+
+echo "--- taint build: x31 holds an mcycle sample, verify MUST catch it ---"
+out=$("$A" run --mode hybrid --trigger marker --engine "$ENG" --verify \
+      verify_taint.elf </dev/null 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  printf '[PASS] hybrid --verify exits non-zero on divergent state\n'; pass=$((pass+1))
+else
+  printf '[FAIL] hybrid --verify exited 0 on the taint build:\n%s\n' "$out"; fail=$((fail+1))
+fi
+expect "the diff names the poisoned register" '\[state-diff\] x31: ref=0x[0-9a-f]+ got=0x[0-9a-f]+'
+expect "and ONLY the poisoned register"       '\[state-diff\] FAIL: 1 mismatch'
+expect "verify verdict FAIL"                  'diverges from the QEMU oracle'
+grep -E '\[state-diff\] x31' <<<"$out" | sed 's/^/       /'
+
+echo "-----------------------------------------------------------"
+printf 'RESULT: %d passed, %d failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]
