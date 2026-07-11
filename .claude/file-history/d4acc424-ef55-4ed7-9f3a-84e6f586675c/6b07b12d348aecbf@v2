@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# --mem-size demo: different sizes / boundary / negative, across fast|cycle|hybrid.
+# Cheap cases only (validation + print-memmap): no vsim spawn except the two
+# tagged [RUN] fast cases at the end.
+set -uo pipefail
+cd /home/nick/work/andesim
+BIN=./build/andesim
+ELF=tests/fixtures/vplat_hello.elf     # engine-portable
+ENG=vsim:ax45mpv_premium
+
+row() { printf '%-7s %-9s %-4s %s\n' "$1" "$2" "$3" "$4"; }
+hdr() { printf '\n=== %s ===\n' "$1"; printf '%-7s %-9s %-4s %s\n' MODE SPEC RC 'KEY OUTPUT LINE'; }
+
+# hybrid sizing via print-memmap (no engine spawn): grab the DRAM line or the error.
+hy_size() {
+  local spec=$1
+  local out; out=$($BIN run --mode hybrid --print-memmap --engine "$ENG" --mem-size "$spec" 2>&1); local rc=$?
+  local line
+  if [ $rc -eq 0 ]; then line=$(echo "$out" | awk '/^DRAM/{print "DRAM "$2" .. "$3"  size="$4}')
+  else line=$(echo "$out" | grep -m1 -i 'mem-size\|invalid\|exceeds\|must be'); fi
+  row hybrid "$spec" "$rc" "$line"
+}
+
+# generic: run any mode, show first salient stderr line (or the success marker).
+gen() {
+  local mode=$1 spec=$2 want=$3; shift 3
+  local out; out=$("$@" 2>&1); local rc=$?
+  local line; line=$(echo "$out" | grep -m1 -iE "$want" | head -c 120)
+  [ -z "$line" ] && line=$(echo "$out" | grep -m1 -iE 'mem-size|invalid|must be|whole MiB|exceeds|Cannot model|nothing to size' | head -c 120)
+  row "$mode" "$spec" "$rc" "$line"
+}
+
+hdr "A. different valid sizes (hybrid: DRAM window sized to --mem-size)"
+for s in 64M 256M 1G 1.5G 131072K 2047M; do hy_size "$s"; done
+
+hdr "B. boundary (hybrid cap = 2 GiB - 4 KiB V-scratch; largest whole MiB = 2047M)"
+for s in 2047M 2048M 2G 3G; do hy_size "$s"; done
+
+hdr "C. negative / invalid (parse rejects before any spawn)"
+gen cycle 0     'must be'                 $BIN run --mode cycle  --engine "$ENG" --mem-size 0   "$ELF"
+gen cycle 0M    'must be'                 $BIN run --mode cycle  --engine "$ENG" --mem-size 0M  "$ELF"
+gen cycle -5    'invalid'                 $BIN run --mode cycle  --engine "$ENG" --mem-size -5  "$ELF"
+gen cycle abc   'invalid'                 $BIN run --mode cycle  --engine "$ENG" --mem-size abc "$ELF"
+gen cycle 1G2   'invalid'                 $BIN run --mode cycle  --engine "$ENG" --mem-size 1G2 "$ELF"
+gen cycle 10X   'invalid'                 $BIN run --mode cycle  --engine "$ENG" --mem-size 10X "$ELF"
+
+hdr "D. fast pass-through to QEMU -m (whole-MiB rule; QEMU 16 GiB ceiling)"
+gen fast  1000  'whole MiB'               $BIN run --mode fast --mem-size 1000 "$ELF"
+gen fast  0.5M  'whole MiB'               $BIN run --mode fast --mem-size 0.5M "$ELF"
+gen fast  32G   'Cannot model'            $BIN run --mode fast --mem-size 32G  "$ELF"   # [RUN] spawns QEMU, dies
+
+hdr "E. cycle: validated but nothing to size (still runs)"
+# validation-only demo (no spawn): show the warn by pairing a bad+good; good spawns vsim so skip.
+gen cycle 64M-parse-ok 'nothing to size'  $BIN run --mode cycle --engine "$ENG" --mem-size 64M --dry-run "$ELF"
+
+hdr "F. accepted + actually runs [RUN spawns QEMU]"
+gen fast  64M   'hello from vplat'         $BIN run --mode fast --mem-size 64M "$ELF"
+echo

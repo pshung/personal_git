@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Self-asserting harness for the memsize demo.
+#
+# This IS the "test framework" for these demos: a program's pass/fail is its
+# SimControl exit code + stdout marker, and the driver's pass/fail is its own
+# process exit code. Both are asserted here in portable bash -- no gtest, no
+# libstdc++ on the target, nothing to cross-compile. Same pattern as andesim's
+# own tests/andes_sim/*.sh.
+set -uo pipefail
+HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cd "$HERE"
+
+A=${ANDESIM_BIN:-/home/nick/work/andesim/andesim}
+ENG=${ENGINE:-vsim:ax45mpv_premium}
+SUM='0x5e949e00'          # checksum is --mem-size-independent (determinism)
+
+pass=0 fail=0
+# assert DESC WANT_RC WANT_REGEX -- CMD...
+assert() {
+  local desc=$1 want_rc=$2 want_re=$3; shift 3
+  local out rc
+  out=$("$@" </dev/null 2>&1); rc=$?
+  if [ "$rc" -eq "$want_rc" ] && grep -qiE "$want_re" <<<"$out"; then
+    printf '[PASS] %s\n' "$desc"; pass=$((pass+1))
+  else
+    printf '[FAIL] %s\n       rc=%s (want %s), no /%s/ in:\n       %s\n' \
+      "$desc" "$rc" "$want_rc" "$want_re" "$(head -1 <<<"$out")"
+    fail=$((fail+1))
+  fi
+}
+
+echo "--- accept + run (checksum is the same at any size) ---"
+assert "fast  64M  runs, checksum $SUM"  0 "memsize PASS checksum=$SUM" \
+  "$A" run --mode fast --mem-size 64M  memsize.elf
+assert "fast  256M runs, same checksum"  0 "memsize PASS checksum=$SUM" \
+  "$A" run --mode fast --mem-size 256M memsize.elf
+
+echo "--- different sizes: hybrid DRAM window tracks --mem-size ---"
+assert "hybrid 1.5G   -> DRAM 1536M"      0 "DRAM.*1536M" \
+  "$A" run --mode hybrid --print-memmap --engine "$ENG" --mem-size 1.5G   memsize.elf
+assert "hybrid 131072K-> DRAM 128M"       0 "DRAM.*128M" \
+  "$A" run --mode hybrid --print-memmap --engine "$ENG" --mem-size 131072K memsize.elf
+
+echo "--- boundary: cap = 2 GiB - one V-scratch page ---"
+assert "hybrid 2047M accepted (largest)"  0 "2047M" \
+  "$A" run --mode hybrid --print-memmap --engine "$ENG" --mem-size 2047M memsize.elf
+assert "hybrid 2G rejected (overflow)"    2 "exceeds the AE350 DRAM window" \
+  "$A" run --mode hybrid --trigger marker --engine "$ENG" --mem-size 2G memsize.elf
+
+echo "--- negative: invalid specs rejected before any spawn ---"
+assert "0   -> must be > 0"                2 "must be > 0" \
+  "$A" run --mode fast --mem-size 0   memsize.elf
+assert "-5  -> expected <number>"          2 "expected <number>" \
+  "$A" run --mode fast --mem-size -5  memsize.elf
+assert "abc -> expected <number>"          2 "expected <number>" \
+  "$A" run --mode fast --mem-size abc memsize.elf
+assert "fast 1000 -> whole MiB rule"       2 "whole MiB" \
+  "$A" run --mode fast --mem-size 1000 memsize.elf
+
+echo "--- fit: --mem-size vs the program's own 64 MiB static footprint ---"
+assert "big ELF @ 32M rejected"            2 "raise --mem-size" \
+  "$A" run --mode hybrid --trigger marker --engine "$ENG" --mem-size 32M memsize_big.elf
+assert "big ELF @ 128M fits DRAM"          0 "fits DRAM" \
+  "$A" run --mode hybrid --print-memmap --engine "$ENG" --mem-size 128M memsize_big.elf
+
+echo "-----------------------------------------------------------"
+printf 'RESULT: %d passed, %d failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

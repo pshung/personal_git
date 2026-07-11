@@ -1,0 +1,73 @@
+-include ../../Make.var
+
+# The "big" build reserves a 64 MiB static .bss array; the stack is moved above
+# it so the ELF stays linkable/runnable. It exists only to show the driver
+# reject a --mem-size smaller than the program's own footprint.
+BIGFLAGS := -DFOOTPRINT_MB=64 -Wl,--defsym,_stack=0x04180000
+
+all: memsize.elf memsize_big.elf memsize.dump
+
+memsize.elf: main.c
+	$(CC) $(CFLAGS) $< -o $@
+
+memsize_big.elf: main.c
+	$(CC) $(CFLAGS) $(BIGFLAGS) $< -o $@
+
+memsize.dump: memsize.elf
+	$(OBJDUMP) -d $< > $@
+
+# ---- headline: ONE ELF, every mode, --mem-size overridable (MEM=...) --------
+MEM ?= 256M
+memsize-fast: memsize.elf
+	$(ANDESIM_BIN) --mode fast --mem-size $(MEM) $(ANDESIM_FLAGS) $<
+
+memsize-cycle: memsize.elf
+	$(ANDESIM_BIN) --mode cycle --mem-size $(MEM) --engine $(ENGINE) $(ANDESIM_FLAGS) $<
+
+memsize-hybrid-marker: memsize.elf
+	$(ANDESIM_BIN) --mode hybrid --trigger marker --mem-size $(MEM) --engine $(ENGINE) $(ANDESIM_FLAGS) $<
+
+memsize-hybrid-pc: memsize.elf
+	$(ANDESIM_BIN) --mode hybrid --trigger pc \
+	    --pc-start work --pc-end memsize_roi_end \
+	    --mem-size $(MEM) --engine $(ENGINE) $(ANDESIM_FLAGS) $<
+
+# ---- different sizes: the SAME fast ELF at a spectrum of --mem-size ---------
+sizes: memsize.elf
+	@for s in 64M 256M 1G 1.5G; do \
+	  echo "== fast --mem-size $$s =="; \
+	  $(ANDESIM_BIN) --mode fast --mem-size $$s $(ANDESIM_FLAGS) $< ; \
+	done
+
+# ---- boundary: hybrid cap = 2 GiB DRAM window - one V-scratch page ----------
+boundary: memsize.elf
+	@echo "== 2047M: largest whole MiB that fits (accepted) =="; \
+	 $(ANDESIM_BIN) --mode hybrid --print-memmap --mem-size 2047M --engine $(ENGINE) $< | sed -n '1,3p'; \
+	 echo "== 2G: rejected -- overflows by the reserved V-scratch page =="; \
+	 $(ANDESIM_BIN) --mode hybrid --mem-size 2G --engine $(ENGINE) $< ; true
+
+# ---- fit: --mem-size vs the program's OWN static footprint ------------------
+fit: memsize_big.elf
+	@echo "== big ELF (64 MiB static) @ --mem-size 32M: too small, rejected =="; \
+	 $(ANDESIM_BIN) --mode hybrid --print-memmap --mem-size 32M --engine $(ENGINE) $< ; true; \
+	 echo "== big ELF @ --mem-size 128M: fits =="; \
+	 $(ANDESIM_BIN) --mode hybrid --print-memmap --mem-size 128M --engine $(ENGINE) $< | tail -1
+
+# ---- negative: invalid specs rejected at parse, before any engine spawns ----
+negative: memsize.elf
+	@for s in 0 -5 abc 1000; do \
+	  echo "== fast --mem-size $$s =="; \
+	  $(ANDESIM_BIN) --mode fast --mem-size $$s $(ANDESIM_FLAGS) $< ; true; \
+	done
+
+run: memsize-fast memsize-cycle memsize-hybrid-marker memsize-hybrid-pc
+
+# ---- self-asserting harness: pass/fail via exit code + output marker --------
+check: memsize.elf memsize_big.elf
+	@ANDESIM_BIN="$(ANDESIM_BIN)" ENGINE="$(ENGINE)" bash check.sh
+
+clean:
+	- rm -f memsize.elf memsize_big.elf memsize.dump
+
+.PHONY: all run sizes boundary fit negative check clean \
+        memsize-fast memsize-cycle memsize-hybrid-marker memsize-hybrid-pc
