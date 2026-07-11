@@ -1,0 +1,128 @@
+/* ILM/DLM content transport across the hybrid handoff.
+ *
+ * QEMU phase (before the ROI):
+ *   - enable the ILM and DLM (EN bit of milmb 0x7C0 / mdlmb 0x7C1)
+ *   - fill the whole DLM with a runtime-computed pattern
+ *   - assemble a 3-instruction kernel a0 = (a0 ^ IMM) + 0x321 into the
+ *     ILM and call it once as a sanity check
+ *
+ * vsim ROI:
+ *   - call the ILM kernel again (the fetch hits the ILM RTL SRAM)
+ *   - compare every DLM word against the pattern
+ *   - print the verdict: LM_OK, or ILM_BAD / DLM_BAD
+ *
+ * The pattern and the kernel bytes exist NOWHERE except the local
+ * memories -- they are computed at runtime, not stored in the ELF, and
+ * QEMU keeps ILM/DLM in per-CPU overlays outside the shared mmap. The
+ * only road to vsim is andesim's sidecar transport (<state>.ilm/.dlm,
+ * backdoor-loaded into the RTL SRAMs). No transport => LM_*_BAD, and an
+ * empty ILM fetches 0x00000000 = illegal instruction, so failure is loud.
+ *
+ * Geometry matches vsim:ax45mpv_premium hart 0 (see the engine's
+ * --describe): ILM 64 KB at 0x0 (kernel at 0x100, clear of NULL),
+ * DLM 32 KB at 0x200000. The program image sits at 0x100000, between
+ * the two windows. andesim syncs this geometry to QEMU automatically
+ * on the hybrid path.
+ */
+
+#include <stdint.h>
+#include <stdio.h>
+#include <andesim/ROI.h>
+
+#define ILM_FN_ADDR 0x100u
+#define DLM_BASE    0x200000u
+#define DLM_BYTES   32768u
+#define DLM_WORDS   (DLM_BYTES / 4u)
+
+typedef uint32_t (*ilm_fn)(uint32_t);
+
+/* Enable a local memory the way firmware does: read-modify-write the EN
+ * bit, preserving the WARL base/size fields. CSR number must be a
+ * literal in the asm string, hence the macro. */
+#define LM_ENABLE(csr_lit)                                        \
+  do {                                                            \
+    unsigned long long v_;                                        \
+    __asm__ __volatile__("csrr %0, " csr_lit : "=r"(v_));         \
+    __asm__ __volatile__("csrw " csr_lit ", %0" ::"r"(v_ | 1));   \
+    __asm__ __volatile__("fence" ::: "memory");                   \
+  } while (0)
+
+/* Per-word pattern: cheap, position-dependent, never all-zero. */
+static inline uint32_t pat(uint32_t i) { return i * 2654435761u + 0x5A17u; }
+
+/* Runtime-volatile so neither the expected value nor the patched
+ * instruction can be folded into a compile-time constant. */
+static volatile uint32_t imm_src = 0x5A5u;
+
+/* The ROI body, noinline and non-static so --trigger pc can name it: the
+ * pc window is lm_check .. lm_roi_end, the marker window is the HINTs
+ * around the call. */
+__attribute__((noinline)) int lm_check(ilm_fn f, uint32_t x, uint32_t want)
+{
+  volatile uint32_t *dlm = (volatile uint32_t *) (uintptr_t) DLM_BASE;
+
+  uint32_t got = f(x);
+  if (got != want) {
+    printf("ILM_BAD got=0x%08x want=0x%08x\n", (unsigned) got,
+           (unsigned) want);
+    return 1;
+  }
+
+  uint32_t bad = 0, first = 0;
+  for (uint32_t i = 0; i < DLM_WORDS; i++) {
+    if (dlm[i] != pat(i)) {
+      if (bad == 0) first = i;
+      bad++;
+    }
+  }
+  if (bad != 0) {
+    printf("DLM_BAD count=%u first=%u got=0x%08x want=0x%08x\n",
+           (unsigned) bad, (unsigned) first, (unsigned) dlm[first],
+           (unsigned) pat(first));
+    return 1;
+  }
+
+  printf("LM_OK ilm=0x%08x dlm_words=%u\n", (unsigned) got,
+         (unsigned) DLM_WORDS);
+  return 0;
+}
+
+int main(void)
+{
+  LM_ENABLE("0x7c0"); /* milmb: ILM on */
+  LM_ENABLE("0x7c1"); /* mdlmb: DLM on */
+
+  /* Fill the DLM with the runtime-computed pattern. */
+  volatile uint32_t *dlm = (volatile uint32_t *) (uintptr_t) DLM_BASE;
+  for (uint32_t i = 0; i < DLM_WORDS; i++) dlm[i] = pat(i);
+
+  /* Assemble the ILM kernel:
+   *   xori a0, a0, IMM   (I-type, base 0x00054513, IMM patched at runtime)
+   *   addi a0, a0, 0x321 (0x32150513)
+   *   ret                (0x00008067)                                    */
+  const uint32_t imm = imm_src & 0xFFFu;
+  volatile uint32_t *ilm = (volatile uint32_t *) (uintptr_t) ILM_FN_ADDR;
+  ilm[0] = 0x00054513u | (imm << 20);
+  ilm[1] = 0x32150513u;
+  ilm[2] = 0x00008067u;
+  __asm__ __volatile__("fence.i" ::: "memory");
+
+  ilm_fn f = (ilm_fn) (uintptr_t) ILM_FN_ADDR;
+  const uint32_t x = 0x1234u;
+  const uint32_t want = (x ^ imm) + 0x321u;
+
+  /* Pre-ROI sanity: a failure here is a setup problem, not transport. */
+  if (f(x) != want) {
+    printf("LM_STAGE_BAD\n");
+    return 2;
+  }
+  printf("LM staged\n");
+
+  andesim_ROI_begin();
+  int rc = lm_check(f, x, want);
+  andesim_ROI_end();
+  /* ROI end symbol for --pc-end: the point right after the call. */
+  __asm__ __volatile__(".globl lm_roi_end\nlm_roi_end:" ::: "memory");
+
+  return rc;
+}
