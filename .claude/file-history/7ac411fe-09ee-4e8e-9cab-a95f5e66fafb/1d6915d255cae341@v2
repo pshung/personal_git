@@ -1,0 +1,89 @@
+/* One binary, N cores: design-space exploration.
+ *
+ * The SAME ELF is measured on every cycle-accurate engine that
+ * `andesim list engines` reports -- check.sh parses that list at run
+ * time and runs one hybrid measurement per engine, so nothing about
+ * the installed engine set is hardcoded. Different cores retire the
+ * same window in different cycle counts; that gap is the design
+ * space. You pick a core by measuring YOUR kernel on each candidate,
+ * not by reading datasheets -- and hybrid mode makes each data point
+ * cost seconds, not an RTL boot from reset.
+ *
+ * The kernel is a plain rv64gc scalar matmul (16x16x16 int32): no V
+ * instructions, no custom CSRs, no I/O -- so the one binary runs
+ * unchanged on every rv64 engine the driver knows, and the figures
+ * differ only by microarchitecture (pipeline, issue width, caches).
+ *
+ * The staging phase fills A/B at runtime (the compiler cannot fold
+ * the product) and computes a reference result; the ROI runs the
+ * kernel; the verdict compares every element after the ROI, so
+ * ENGINES_OK prints on fast and cycle only -- a hybrid run ends at
+ * the exit trigger, and its pass signal is the per-engine cycle
+ * figure that check.sh asserts on.
+ */
+
+#include <stdint.h>
+#include <stdio.h>
+#include <andesim/ROI.h>
+
+#define N 16
+
+static int32_t A[N][N], B[N][N], C[N][N], ref[N][N];
+
+/* Small values in [-8, 7], different stream per seed. */
+static inline int32_t elem(uint32_t seed, uint32_t i)
+{
+  uint32_t h = (i + seed) * 2654435761u;
+  return (int32_t) (h >> 28) - 8;
+}
+
+/* ROI body, noinline and non-static so --trigger pc can name it. */
+__attribute__((noinline)) void engines_kernel(void)
+{
+  for (int i = 0; i < N; i++)
+    for (int j = 0; j < N; j++) {
+      int32_t acc = 0;
+      for (int k = 0; k < N; k++)
+        acc += A[i][k] * B[k][j];
+      C[i][j] = acc;
+    }
+}
+
+int main(void)
+{
+  for (int i = 0; i < N; i++)
+    for (int j = 0; j < N; j++) {
+      A[i][j] = elem(0xAAu, (uint32_t) (i * N + j));
+      B[i][j] = elem(0xBBu, (uint32_t) (i * N + j));
+    }
+
+  /* Reference result, computed before the ROI (on hybrid this runs on
+   * the fast QEMU leg, so it costs nothing in the measured window). */
+  for (int i = 0; i < N; i++)
+    for (int j = 0; j < N; j++) {
+      int32_t acc = 0;
+      for (int k = 0; k < N; k++)
+        acc += A[i][k] * B[k][j];
+      ref[i][j] = acc;
+    }
+
+  printf("ENGINES staged: %ux%ux%u int32 matmul, plain rv64gc\n",
+         (unsigned) N, (unsigned) N, (unsigned) N);
+
+  andesim_ROI_begin();
+  engines_kernel();
+  andesim_ROI_end();
+  /* ROI end symbol for --pc-end: the point right after the call. */
+  __asm__ __volatile__(".globl engines_roi_end\nengines_roi_end:" ::: "memory");
+
+  /* Runs on fast and cycle only: a hybrid run ended at the exit trigger. */
+  for (int i = 0; i < N; i++)
+    for (int j = 0; j < N; j++)
+      if (C[i][j] != ref[i][j]) {
+        printf("ENGINES_BAD C[%d][%d]=%ld want %ld\n",
+               i, j, (long) C[i][j], (long) ref[i][j]);
+        return 1;
+      }
+  printf("ENGINES_OK\n");
+  return 0;
+}
