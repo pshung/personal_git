@@ -1,0 +1,135 @@
+/* An EXTERNAL master writes the LM, the CPU reads it -- across the
+ * hybrid handoff.
+ *
+ * demo/lm_slave used the hart as its own bus master. Here the writer is
+ * a real second master: the ATCDMAC300 DMA controller (0xF0C00000).
+ *
+ * QEMU phase (before the ROI):
+ *   - enable the DLM
+ *   - fill a DRAM buffer with a runtime-computed pattern
+ *   - program DMA channel 0 to copy DRAM -> DLM slave-port aperture
+ *     (0xA0200000), poll INT_STATUS until the transfer-complete bit sets
+ *   - sanity: CPU spot-checks the DLM through the hart-local view
+ *
+ * vsim ROI:
+ *   - the CPU reads every DLM word through the hart-local view and
+ *     compares; prints DMA_OK / DMA_BAD
+ *
+ * There is deliberately NO cycle target: the vsim RTL testbench models
+ * no DMA controller, so this program cannot run on --mode cycle. That
+ * asymmetry is the point of the demo -- hybrid lets the setup phase use
+ * QEMU's device models (DMA here), while the measured ROI needs only
+ * the CPU; the DMA-written bytes still reach the RTL's DLM SRAM through
+ * the sidecar transport.
+ *
+ * Geometry matches vsim:ax45mpv_premium hart 0: DLM 32 KB
+ * (local 0x200000, slave aperture 0xA0200000).
+ */
+
+#include <stdint.h>
+#include <stdio.h>
+#include <andesim/ROI.h>
+
+#define DLM_LOCAL   0x200000u
+#define DLM_SLAVE   0xA0200000u
+#define DLM_BYTES   32768u
+#define DLM_WORDS   (DLM_BYTES / 4u)
+
+/* ATCDMAC300, channel 0. */
+#define DMAC_BASE   0xF0C00000u
+#define REG32(a)    (*(volatile uint32_t *) (uintptr_t) (a))
+#define DMAC_IDREV      REG32(DMAC_BASE + 0x00)
+#define DMAC_INT_STATUS REG32(DMAC_BASE + 0x30) /* W1C; TC = bit 16+ch */
+#define DMAC_CH0_CTL    REG32(DMAC_BASE + 0x40)
+#define DMAC_CH0_SIZE   REG32(DMAC_BASE + 0x44) /* in source-width units */
+#define DMAC_CH0_SRC_L  REG32(DMAC_BASE + 0x48)
+#define DMAC_CH0_SRC_H  REG32(DMAC_BASE + 0x4C)
+#define DMAC_CH0_DST_L  REG32(DMAC_BASE + 0x50)
+#define DMAC_CH0_DST_H  REG32(DMAC_BASE + 0x54)
+
+/* CH0 control: burst 16 transfers, 32-bit src/dst width, both addresses
+ * incrementing, all three interrupts MASKED (we poll), ENABLE. */
+#define DMA_CTL_GO  ((4u << 24) | (2u << 21) | (2u << 18) | 0xEu | 1u)
+#define DMA_TC0     (1u << 16)
+
+#define LM_ENABLE(csr_lit)                                        \
+  do {                                                            \
+    unsigned long long v_;                                        \
+    __asm__ __volatile__("csrr %0, " csr_lit : "=r"(v_));         \
+    __asm__ __volatile__("csrw " csr_lit ", %0" ::"r"(v_ | 1));   \
+    __asm__ __volatile__("fence" ::: "memory");                   \
+  } while (0)
+
+static inline uint32_t pat(uint32_t i) { return i * 2654435761u + 0xD3A7u; }
+
+static uint32_t src_buf[DLM_WORDS];
+
+/* ROI body, noinline and non-static so --trigger pc can name it. */
+__attribute__((noinline)) int dma_check(void)
+{
+  volatile uint32_t *dlm = (volatile uint32_t *) (uintptr_t) DLM_LOCAL;
+
+  uint32_t bad = 0, first = 0;
+  for (uint32_t i = 0; i < DLM_WORDS; i++) {
+    if (dlm[i] != pat(i)) {
+      if (bad == 0) first = i;
+      bad++;
+    }
+  }
+  if (bad != 0) {
+    printf("DMA_BAD count=%u first=%u got=0x%08x want=0x%08x\n",
+           (unsigned) bad, (unsigned) first, (unsigned) dlm[first],
+           (unsigned) pat(first));
+    return 1;
+  }
+  printf("DMA_OK words=%u\n", (unsigned) DLM_WORDS);
+  return 0;
+}
+
+int main(void)
+{
+  LM_ENABLE("0x7c1"); /* mdlmb: DLM on */
+
+  if (DMAC_IDREV == 0) { /* engine models no DMAC (e.g. --mode cycle) */
+    printf("DMA_NO_DEV\n");
+    return 2;
+  }
+
+  for (uint32_t i = 0; i < DLM_WORDS; i++) src_buf[i] = pat(i);
+  __asm__ __volatile__("fence" ::: "memory");
+
+  /* The external master writes: DRAM -> DLM slave-port aperture. */
+  DMAC_INT_STATUS = 0xFFFFFFFFu; /* clear stale status */
+  DMAC_CH0_SRC_L = (uint32_t) (uintptr_t) src_buf;
+  DMAC_CH0_SRC_H = 0;
+  DMAC_CH0_DST_L = DLM_SLAVE;
+  DMAC_CH0_DST_H = 0;
+  DMAC_CH0_SIZE = DLM_WORDS;
+  DMAC_CH0_CTL = DMA_CTL_GO;
+
+  uint32_t spins = 0;
+  while (!(DMAC_INT_STATUS & DMA_TC0)) {
+    if (++spins > (1u << 24)) {
+      printf("DMA_TIMEOUT int_status=0x%08x\n", (unsigned) DMAC_INT_STATUS);
+      return 2;
+    }
+  }
+  DMAC_INT_STATUS = DMA_TC0; /* W1C */
+  __asm__ __volatile__("fence" ::: "memory");
+
+  /* Sanity, still in QEMU: the CPU sees the DMA's writes locally. */
+  volatile uint32_t *dlm = (volatile uint32_t *) (uintptr_t) DLM_LOCAL;
+  if (dlm[0] != pat(0) || dlm[DLM_WORDS - 1] != pat(DLM_WORDS - 1)) {
+    printf("DMA_STAGE_BAD\n");
+    return 2;
+  }
+  printf("DMA staged\n");
+
+  andesim_ROI_begin();
+  int rc = dma_check();
+  andesim_ROI_end();
+  /* ROI end symbol for --pc-end: the point right after the call. */
+  __asm__ __volatile__(".globl dma_roi_end\ndma_roi_end:" ::: "memory");
+
+  return rc;
+}
