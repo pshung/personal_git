@@ -1,0 +1,134 @@
+/* An EXTERNAL master fills the HVM, the CPU reads it -- across the
+ * hybrid handoff.
+ *
+ * demo/hvm_slave used the hart as its own bus master into the HVM's
+ * subordinate port. Here the writer is a real second master: the
+ * ATCDMAC300 DMA controller (0xF0C00000) copies the pattern from DRAM
+ * into the HVM window (0x90000000; no enable CSR, always decoded).
+ *
+ * QEMU phase (before the ROI):
+ *   - fill a DRAM buffer with a runtime-computed pattern
+ *   - program DMA channel 0 to copy DRAM -> HVM, poll INT_STATUS until
+ *     the transfer-complete bit sets
+ *   - sanity: CPU spot-checks head and tail
+ *
+ * vsim ROI:
+ *   - scalar-read every 64th word plus the bank-boundary/tail words
+ *     (bank = address bit 17); prints HVM_DMA_OK / HVM_DMA_BAD
+ *
+ * There is deliberately NO cycle target: the vsim RTL testbench models
+ * no DMA controller, so this program cannot run on --mode cycle. As in
+ * demo/lm_dma, that asymmetry is the point -- hybrid lets the setup
+ * phase use QEMU's device models, while the measured ROI needs only the
+ * CPU; the DMA-written bytes still reach the RTL's HVM SRAM through the
+ * sidecar transport.
+ *
+ * Geometry matches vsim:ax45mpv_premium: HVM 256 KB at 0x90000000.
+ */
+
+#include <stdint.h>
+#include <stdio.h>
+#include <andesim/ROI.h>
+
+#define HVM_BASE   0x90000000u
+#define HVM_BYTES  262144u
+#define HVM_WORDS  (HVM_BYTES / 4u)
+#define STRIDE     64u
+
+/* ATCDMAC300, channel 0. */
+#define DMAC_BASE   0xF0C00000u
+#define REG32(a)    (*(volatile uint32_t *) (uintptr_t) (a))
+#define DMAC_IDREV      REG32(DMAC_BASE + 0x00)
+#define DMAC_INT_STATUS REG32(DMAC_BASE + 0x30) /* W1C; TC = bit 16+ch */
+#define DMAC_CH0_CTL    REG32(DMAC_BASE + 0x40)
+#define DMAC_CH0_SIZE   REG32(DMAC_BASE + 0x44) /* in source-width units */
+#define DMAC_CH0_SRC_L  REG32(DMAC_BASE + 0x48)
+#define DMAC_CH0_SRC_H  REG32(DMAC_BASE + 0x4C)
+#define DMAC_CH0_DST_L  REG32(DMAC_BASE + 0x50)
+#define DMAC_CH0_DST_H  REG32(DMAC_BASE + 0x54)
+
+/* CH0 control: burst 16 transfers, 32-bit src/dst width, both addresses
+ * incrementing, all three interrupts MASKED (we poll), ENABLE. */
+#define DMA_CTL_GO  ((4u << 24) | (2u << 21) | (2u << 18) | 0xEu | 1u)
+#define DMA_TC0     (1u << 16)
+
+static inline uint32_t pat(uint32_t i) { return i * 2654435761u + 0xDA77u; }
+
+static uint32_t src_buf[HVM_WORDS];
+
+static uint32_t check_word(uint32_t i)
+{
+  volatile uint32_t *hvm = (volatile uint32_t *) (uintptr_t) HVM_BASE;
+  return hvm[i] != pat(i);
+}
+
+/* ROI body, noinline and non-static so --trigger pc can name it. */
+__attribute__((noinline)) int hdma_check(void)
+{
+  uint32_t bad = 0, checked = 0;
+
+  for (uint32_t i = 0; i < HVM_WORDS; i += STRIDE) {
+    bad += check_word(i);
+    checked++;
+  }
+  static const uint32_t spots[3] = {HVM_WORDS / 2u - 1u, HVM_WORDS / 2u,
+                                    HVM_WORDS - 1u};
+  for (int s = 0; s < 3; s++) {
+    bad += check_word(spots[s]);
+    checked++;
+  }
+
+  if (bad != 0) {
+    printf("HVM_DMA_BAD count=%u\n", (unsigned) bad);
+    return 1;
+  }
+  printf("HVM_DMA_OK sampled=%u\n", (unsigned) checked);
+  return 0;
+}
+
+int main(void)
+{
+  if (DMAC_IDREV == 0) { /* engine models no DMAC (e.g. --mode cycle) */
+    printf("HVM_DMA_NO_DEV\n");
+    return 2;
+  }
+
+  for (uint32_t i = 0; i < HVM_WORDS; i++) src_buf[i] = pat(i);
+  __asm__ __volatile__("fence" ::: "memory");
+
+  /* The external master writes: DRAM -> HVM subordinate port. */
+  DMAC_INT_STATUS = 0xFFFFFFFFu; /* clear stale status */
+  DMAC_CH0_SRC_L = (uint32_t) (uintptr_t) src_buf;
+  DMAC_CH0_SRC_H = 0;
+  DMAC_CH0_DST_L = HVM_BASE;
+  DMAC_CH0_DST_H = 0;
+  DMAC_CH0_SIZE = HVM_WORDS;
+  DMAC_CH0_CTL = DMA_CTL_GO;
+
+  uint32_t spins = 0;
+  while (!(DMAC_INT_STATUS & DMA_TC0)) {
+    if (++spins > (1u << 24)) {
+      printf("HVM_DMA_TIMEOUT int_status=0x%08x\n",
+             (unsigned) DMAC_INT_STATUS);
+      return 2;
+    }
+  }
+  DMAC_INT_STATUS = DMA_TC0; /* W1C */
+  __asm__ __volatile__("fence" ::: "memory");
+
+  /* Sanity, still in QEMU: the CPU sees the DMA's writes. */
+  volatile uint32_t *hvm = (volatile uint32_t *) (uintptr_t) HVM_BASE;
+  if (hvm[0] != pat(0) || hvm[HVM_WORDS - 1] != pat(HVM_WORDS - 1)) {
+    printf("HVM_DMA_STAGE_BAD\n");
+    return 2;
+  }
+  printf("HVM_DMA staged\n");
+
+  andesim_ROI_begin();
+  int rc = hdma_check();
+  andesim_ROI_end();
+  /* ROI end symbol for --pc-end: the point right after the call. */
+  __asm__ __volatile__(".globl hdma_roi_end\nhdma_roi_end:" ::: "memory");
+
+  return rc;
+}

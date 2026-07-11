@@ -1,0 +1,134 @@
+# andesim-demo
+
+Demo programs for the `andesim` hybrid RISC-V simulator. One ELF runs on
+every mode: `fast` (QEMU), `cycle` (vsim, cycle-accurate), and `hybrid`
+(QEMU fast-forwards the boot, vsim measures your region of interest).
+
+## Prerequisites
+
+- An `andesim` checkout, already built (`bash scripts/build_all.sh`).
+  Check it with `./andesim doctor`.
+- An Andes RISC-V toolchain (the one `doctor` reports).
+
+## Step 1: Modify `Make.var`
+
+Fill in these settings if your paths differ:
+
+```Makefile
+ANDESIM ?=            # path to the andesim checkout
+TOOLCHAIN_PREFIX ?=   # e.g. .../bin/riscv64-unknown-elf-
+ENGINE ?=             # cycle-accurate engine, see `andesim list engines`
+```
+
+## Step 2: Build
+
+```bash
+make
+```
+
+Each demo links against the andesim runtime
+(`-B $(ANDESIM)/build/runtime -specs=andesim.specs`), so the same binary
+runs on every mode -- no per-engine builds, no semihosting.
+
+## Step 3: Run
+
+Run every mode of one demo:
+
+```bash
+make run-hello
+make run-lm
+make run-lm_slave
+make run-lm_dma
+make run-hvm_slave
+make run-hvm_dma
+```
+
+Or one mode at a time (the `lm-*` / `lm_slave-*` / `lm_dma-*` and
+`hvm_slave-*` / `hvm_dma-*` targets work the same way):
+
+| Target                     | What it shows                                          |
+|----------------------------|--------------------------------------------------------|
+| `make hello-fast`          | QEMU only: program output, full speed, no cycle figure |
+| `make hello-cycle`         | vsim from reset: program output + cycle figure         |
+| `make hello-hybrid-marker` | hybrid, ROI marked in source with `<andesim/ROI.h>`    |
+| `make hello-hybrid-pc`     | hybrid, same ROI named by symbols (`--pc-start`/`--pc-end`), no markers needed |
+
+`demo/lm` proves the hybrid handoff migrates QEMU data into vsim: the
+QEMU phase fills the DLM with a runtime-computed pattern and assembles a
+small function into the ILM (through the hart-local view -- both live
+outside normal RAM), and the vsim ROI executes the ILM function and
+checks every DLM word. `LM_OK` means the content crossed the handoff.
+On `lm-fast`, plain QEMU knows no engine geometry, so the target passes
+the ILM/DLM sizes itself with `-global` after `--`.
+
+`demo/lm_slave` proves the slave-port routing on top of that: the same
+SRAMs are also visible at the bus apertures (hart 0 ILM `0xA0000000`,
+DLM `0xA0200000`). The QEMU phase writes everything THROUGH the
+slave-port view; the vsim ROI reads it back through the slave-port view
+(each load goes out the bus master port and back in through the local
+memory's slave port). `SLV_OK` means both views alias one SRAM on both
+engines and the content crossed the handoff.
+
+`demo/lm_dma` makes the writer a real second master: the ATCDMAC300 DMA
+controller copies the pattern from DRAM into the DLM slave-port
+aperture during the QEMU phase, and the CPU verifies it inside the vsim
+ROI. It has NO cycle target -- the vsim RTL models no DMA controller.
+That is the demo's point: with hybrid, setup code may use QEMU's device
+models, while the measured ROI needs only the CPU; the DMA-written
+bytes still reach the RTL's DLM SRAM through the sidecar transport.
+
+The `hvm` demos repeat the slave-port and DMA tests for the HVM, the
+vector unit's 256 KB high-bandwidth memory at `0x90000000` (2 banks, no
+enable CSR). Unlike the ILM/DLM the HVM has no hart-local address --
+its one window IS the bus subordinate port -- so there is no local-view
+demo:
+
+- `demo/hvm_slave` fills the HVM in the QEMU phase and reads it back in
+  the vsim ROI (sampled, plus the bank-boundary words); on the RTL each
+  access leaves the hart's bus master port and enters the HVM through
+  its subordinate port -- the same port an external master uses.
+  `HVM_SLV_OK` means the content crossed the handoff.
+- `demo/hvm_dma` makes that external master real: the ATCDMAC300 copies
+  the pattern from DRAM into the HVM during the QEMU phase; like
+  `demo/lm_dma` it has no cycle target.
+
+On the `*-fast` targets, plain QEMU's compiled-in HVM is 1 byte, so
+each target passes the real size itself (`hvm_size_pow_2=18`, log2 of
+256 KB) with `-global` after `--`.
+
+Expected output (hybrid):
+
+```
+hello from andesim!
+[andesim] 3532 cycles
+```
+
+The two hybrid runs measure the same window, so their cycle figures are
+close; the small gap is the marker HINTs and boundary placement.
+
+## Debugging a failed run
+
+Use andesim's logs -- they are designed to locate the problem:
+
+```bash
+make hello-hybrid-marker ANDESIM_FLAGS="--log-level 1"   # + per-leg detail
+make hello-hybrid-marker ANDESIM_FLAGS="--log-level 0 --log-file run.log"
+```
+
+- `--log-level` uses vsim's scale: 0=trace 1=debug 2=info (default)
+  3=warn 4=error 5=critical 6=off.
+- On a hybrid failure andesim keeps a repro bundle (state files, exact
+  commands, manifest) under `~/.cache/andesim/repro/` and prints its path.
+
+## Layout
+
+```
+Make.var        shared configuration (paths, toolchain, engine)
+Makefile        builds and runs every demo below
+demo/hello/     hello world on all four modes
+demo/lm/        ILM/DLM content transport across the hybrid handoff
+demo/lm_slave/  the same SRAMs through the bus slave-port apertures
+demo/lm_dma/    a DMA master fills the DLM, the CPU reads it in the ROI
+demo/hvm_slave/ HVM content transport through the bus subordinate port
+demo/hvm_dma/   a DMA master fills the HVM, the CPU reads it in the ROI
+```
