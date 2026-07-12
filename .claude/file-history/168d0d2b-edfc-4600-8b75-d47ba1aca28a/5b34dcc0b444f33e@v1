@@ -1,0 +1,263 @@
+// Oracle differential compare. See state_diff.hpp for the policy.
+#include "state_diff.hpp"
+
+#include <cstdio>
+#include <string>
+#include <string_view>
+
+namespace andes_sim {
+
+namespace {
+
+void cmp(DiffReport& r, const std::string& field, unsigned long long ref,
+         unsigned long long got) {
+  ++r.compared;
+  if (ref != got) r.diffs.push_back({field, ref, got});
+}
+
+}  // namespace
+
+DiffReport diff_states(const hybrid_state_v1& ref, const hybrid_state_v1& got,
+                       const std::vector<std::string>& andes_supported) {
+  DiffReport r;
+
+  cmp(r, "magic", ref.magic, got.magic);
+  cmp(r, "version", ref.version, got.version);
+  cmp(r, "flags", ref.flags, got.flags);
+  cmp(r, "hart_id", ref.hart_id, got.hart_id);
+  cmp(r, "priv", ref.priv, got.priv);
+  cmp(r, "pc", ref.pc, got.pc);
+
+  // mepc/mcause: in the trap-free hybrid ROI they round-trip (L24: restored at
+  // resume, re-read at drain). mtval/mstatus stay out of scope where they are
+  // implementation-defined / carry dirty bits (false positives).
+  cmp(r, "mepc", ref.mepc, got.mepc);
+  cmp(r, "mcause", ref.mcause, got.mcause);
+
+  // Round-trip M-mode CSRs: mscratch (L23) and mtval/mie (L24) are restored at
+  // resume and re-read at drain, so a trap-free ROI must match the oracle on
+  // them. mip is excluded: its pending bits are hardware/platform-driven
+  // (timer/external) and diverge between QEMU's functional clock and vsim's
+  // cycle clock even with no trap (it still round-trips into the drained
+  // record, just not the verifier).
+  cmp(r, "mscratch", ref.mscratch, got.mscratch);
+  cmp(r, "mtval", ref.mtval, got.mtval);
+  cmp(r, "mie", ref.mie, got.mie);
+
+  for (int i = 0; i < 32; ++i)
+    cmp(r, "x" + std::to_string(i), ref.gpr[i], got.gpr[i]);
+
+  if (ref.flags & HYBRID_FLAG_FP) {
+    for (int i = 0; i < 32; ++i)
+      cmp(r, "f" + std::to_string(i), ref.fpr[i], got.fpr[i]);
+    cmp(r, "fcsr", ref.fcsr, got.fcsr);  // L20: frm + sticky fflags
+  }
+
+  if (ref.flags & HYBRID_FLAG_V) {
+    cmp(r, "vstart", ref.vstart, got.vstart);
+    cmp(r, "vtype", ref.vtype, got.vtype);
+    cmp(r, "vl", ref.vl, got.vl);
+    cmp(r, "vlenb", ref.vlenb, got.vlenb);
+    cmp(r, "vxsat", ref.vxsat, got.vxsat);
+    cmp(r, "vxrm", ref.vxrm, got.vxrm);
+    cmp(r, "vcsr", ref.vcsr, got.vcsr);
+
+    // One compared "field" per vector register; report the first differing
+    // byte as "v<i>[<byte>]".
+    for (int i = 0; i < 32; ++i) {
+      ++r.compared;
+      const uint8_t* a = &ref.vreg[static_cast<size_t>(i) * HYBRID_VLEN_BYTES_MAX];
+      const uint8_t* b = &got.vreg[static_cast<size_t>(i) * HYBRID_VLEN_BYTES_MAX];
+      for (int j = 0; j < HYBRID_VLEN_BYTES_MAX; ++j) {
+        if (a[j] != b[j]) {
+          r.diffs.push_back({"v" + std::to_string(i) + "[" +
+                                 std::to_string(j) + "]",
+                             a[j], b[j]});
+          break;
+        }
+      }
+    }
+  }
+
+  // Andes V5 CSR block (v3): the boot-static memory-system/extension CSRs plus
+  // the DSP overflow flag round-trip through the trap-free ROI (ResumeDriver
+  // restores them, StateDrain re-reads them), so a correct transport matches the
+  // oracle. The X-macro is the single source of truth shared with the plugin
+  // drain / resume / drain re-read, so this list can never drift out of sync.
+  //
+  // Exclusion: msp_bound/msp_base are the HW stack-protection bound registers.
+  // QEMU resets them to all-ones; a vsim core that does not implement HW stack
+  // protection drains 0. That divergence is an engine-implementation artifact,
+  // not a transport bug (the restore is a tolerant no-op on a core lacking the
+  // CSR) -- so they are transported but excluded from strict verify, exactly
+  // like mip's hardware-driven pending bits.
+  auto andes_verify_excluded = [](std::string_view name) {
+    // msp_bound/msp_base: engine-reset-divergent HW stack-protection bounds.
+    // milmb/mdlmb: ILM/DLM base+enable CSRs. The base address round-trips, but
+    // the enable bit (bit 0) is HW-presence state -- the vsim RTL has the local
+    // memories and drains EN=1, while QEMU models none and drains EN=0. Same
+    // class as msp_bound/msp_base (an engine-implementation artifact, not a
+    // transport bug), so excluded rather than half-compared via a bit mask.
+    // mhpmcounter3..6: hardware performance counters that increment DURING the
+    // ROI, so the vsim (cycle) and QEMU (functional) values legitimately differ
+    // -- transported and restored, but not strict-compared, like mcycle/mip.
+    // mdcause: vsim models it as HW-set (a direct write drains back 0).
+    // tdata1/tcontrol/mcontext: debug-trigger state whose reset defaults and
+    // WARL widths differ between QEMU and vsim. All transported + restored, but
+    // not cross-engine strict-compared.
+    // mnvec: QEMU resets it to 0; the Andes RTL resets it to the hart's reset
+    // vector and WARL-holds it (a restore write of 0 does not take), so a
+    // trap-free ROI always false-diffs. Seen live on both engines when the
+    // registration audit first claimed it (spec: "IM Requirement: Required").
+    static constexpr std::string_view kExcluded[] = {
+        "msp_bound", "msp_base", "milmb", "mdlmb",
+        "mhpmcounter3", "mhpmcounter4", "mhpmcounter5", "mhpmcounter6",
+        "mdcause", "tdata1", "tcontrol", "mcontext", "mnvec"};
+    for (std::string_view e : kExcluded)
+      if (e == name) return true;
+    return false;
+  };
+  // Engine capability gate (S4): skip any Andes CSR the cycle engine does not
+  // implement. Empty list = no engine info -> compare all (back-compat).
+  auto andes_supported_csr = [&](std::string_view name) {
+    if (andes_supported.empty()) return true;
+    for (const std::string& s : andes_supported)
+      if (s == name) return true;
+    return false;
+  };
+  // v6 write-mask gate: skip any mask-governed CSR the program never WROTE
+  // (per the oracle's mask, which covers boot + ROI). Unwritten CSRs hold
+  // QEMU's reset default in `ref` but the engine's own RTL reset in `got`
+  // (the restore skipped them too), so comparing would false-positive on
+  // every reset-value divergence. Flag clear = pre-v6 file = compare all.
+  auto wm_live = [&](int slot) {
+    if (!(ref.flags & HYBRID_FLAG_WRITE_MASK)) return true;
+    return hybrid_wm_test(ref.write_mask, static_cast<unsigned>(slot)) != 0;
+  };
+  if (ref.flags & HYBRID_FLAG_ANDES) {
+#define X(field, addr, name)                                     \
+  if (!andes_verify_excluded(name) && andes_supported_csr(name)  \
+      && wm_live(HYBRID_WM_ANDES_BASE + HYBRID_WM_ANDES_IDX_##field)) \
+    cmp(r, name, ref.andes.field, got.andes.field);
+    HYBRID_ANDES_CSR_LIST(X)
+#undef X
+    if (andes_supported_csr("pmacfg"))
+      for (int i = 0; i < HYBRID_PMA_CFG_NUM; ++i)
+        if (wm_live(HYBRID_WM_PMACFG_BASE + i))
+          cmp(r, "pmacfg" + std::to_string(i), ref.andes.pmacfg[i],
+              got.andes.pmacfg[i]);
+    if (andes_supported_csr("pmaaddr"))
+      for (int i = 0; i < HYBRID_PMA_ADDR_NUM; ++i)
+        if (wm_live(HYBRID_WM_PMAADDR_BASE + i))
+          cmp(r, "pmaaddr" + std::to_string(i), ref.andes.pmaaddr[i],
+              got.andes.pmaaddr[i]);
+  }
+
+  // M-ext CSR block (v4): same gate (the engine's supported list now includes
+  // the M-ext names) and the same HW-driven exclusion. A CSR the engine lacks
+  // is neither restored, drained, nor compared.
+  if (ref.flags & HYBRID_FLAG_M_EXT) {
+#define X(field, addr, name)                                     \
+  if (!andes_verify_excluded(name) && andes_supported_csr(name)  \
+      && wm_live(HYBRID_WM_M_EXT_BASE + HYBRID_WM_M_EXT_IDX_##field)) \
+    cmp(r, name, ref.m_ext.field, got.m_ext.field);
+    HYBRID_M_EXT_CSR_LIST(X)
+#undef X
+  }
+
+  // L2C MMIO config (v5): the L2C Control Register round-trips (restored at
+  // resume, re-read at drain), so compare its RW config bits (CEN, prefetch,
+  // ECC, RAM timing). INITSTATUS[14] is a read-only status bit -- a real L2C
+  // model drives it, QEMU's RAM stub does not -- so mask it to avoid a false
+  // positive. Only the writable Control Register is verified; the read-only
+  // Configuration Register and the volatile CCTL/error/counter registers are
+  // captured but not restored, so they are not compared.
+  if (ref.flags & HYBRID_FLAG_L2C) {
+    const uint64_t rw_mask = ~(uint64_t{1} << 14);  // clear INITSTATUS[14]
+    cmp(r, "l2c.ctrl",
+        ref.l2c.reg[HYBRID_L2C_OFF_CONTROL / 8] & rw_mask,
+        got.l2c.reg[HYBRID_L2C_OFF_CONTROL / 8] & rw_mask);
+  }
+
+  return r;
+}
+
+std::vector<std::string> unsupported_written_csrs(
+    const hybrid_state_v1& st, const std::vector<std::string>& andes_supported) {
+  std::vector<std::string> out;
+  if (!(st.flags & HYBRID_FLAG_WRITE_MASK)) return out;  // pre-v6: no info
+  if (andes_supported.empty()) return out;               // no engine info
+
+  const auto supported = [&](std::string_view name) {
+    for (const std::string& s : andes_supported)
+      if (s == name) return true;
+    return false;
+  };
+  const auto written = [&](int slot) {
+    return hybrid_wm_test(st.write_mask, static_cast<unsigned>(slot)) != 0;
+  };
+
+  // Andes scalars. ucode is skipped: the plugin sets its bit unconditionally
+  // (transport-always DSP flag), so it carries no real write information.
+#define X(field, addr, name)                                              \
+  if (std::string_view{name} != "ucode"                                   \
+      && written(HYBRID_WM_ANDES_BASE + HYBRID_WM_ANDES_IDX_##field)      \
+      && !supported(name))                                                \
+    out.push_back(name);
+  HYBRID_ANDES_CSR_LIST(X)
+#undef X
+
+  // PMA: one group marker each, matching the --describe list's convention.
+  for (int i = 0; i < HYBRID_PMA_CFG_NUM; ++i)
+    if (written(HYBRID_WM_PMACFG_BASE + i) && !supported("pmacfg")) {
+      out.push_back("pmacfg");
+      break;
+    }
+  for (int i = 0; i < HYBRID_PMA_ADDR_NUM; ++i)
+    if (written(HYBRID_WM_PMAADDR_BASE + i) && !supported("pmaaddr")) {
+      out.push_back("pmaaddr");
+      break;
+    }
+
+#define X(field, addr, name)                                              \
+  if (written(HYBRID_WM_M_EXT_BASE + HYBRID_WM_M_EXT_IDX_##field)         \
+      && !supported(name))                                                \
+    out.push_back(name);
+  HYBRID_M_EXT_CSR_LIST(X)
+#undef X
+
+  return out;
+}
+
+std::string unsupported_written_warning(
+    const hybrid_state_v1& st, const std::vector<std::string>& andes_supported,
+    const std::string& engine_id) {
+  const auto bad = unsupported_written_csrs(st, andes_supported);
+  if (bad.empty()) return {};
+  std::string names;
+  for (const std::string& n : bad) {
+    if (!names.empty()) names += ", ";
+    names += n;
+  }
+  return "[andesim] warning: the program wrote CSRs engine " + engine_id +
+         " does not implement: " + names +
+         " (on this engine's silicon these writes would trap; the hybrid "
+         "restore skipped them)\n";
+}
+
+void print_diff_report(const DiffReport& r) {
+  for (const FieldDiff& d : r.diffs)
+    std::printf("[state-diff] %s: ref=0x%llx got=0x%llx\n", d.field.c_str(),
+                d.ref, d.got);
+  if (r.ok()) {
+    std::printf(
+        "[state-diff] PASS: %d fields match (counters and passthrough CSRs "
+        "excluded)\n",
+        r.compared);
+  } else {
+    std::printf("[state-diff] FAIL: %zu mismatch(es) (%d fields compared)\n",
+                r.diffs.size(), r.compared);
+  }
+}
+
+}  // namespace andes_sim

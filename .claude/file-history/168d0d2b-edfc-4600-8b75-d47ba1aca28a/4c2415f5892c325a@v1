@@ -1,0 +1,117 @@
+// The phase-plan executor (F6) -- there is no QEMU2 handback leg.
+// run_plan spawns each leg of a Plan in order,
+// threads the drained hybrid_state_v1 file forward (leg N's --handoff-out is
+// leg N+1's --resume-from-qemu), and reports each leg's mcycle/minstret.
+//
+// plan_argvs is the pure core (no spawn, no mmap): it resolves each Step's
+// engine + role against the registry and fills the invoke template with the
+// threaded state paths, so the argv construction is unit-testable in isolation.
+#ifndef ANDESIM_RUN_PLAN_HPP
+#define ANDESIM_RUN_PLAN_HPP
+
+#include <string>
+#include <vector>
+
+#include "engine_descriptor.hpp"
+#include "plan.hpp"
+#include "process.hpp"
+
+namespace andes_sim {
+
+// The framework-owned values shared by every leg of a run: the resolved
+// shared-mmap path/size/base and the QEMU plugin path. Per-leg values
+// (bin/state_in/state_out) are derived by plan_argvs from this + the threading.
+struct RuntimeCtx {
+  std::string mmap_path;
+  long long mem_size = 0;
+  std::string mmap_base = "0x0";
+  std::string plugin_path;
+  // QEMU `-readconfig` file matching the accurate engine's ISA, distilled from
+  // its config.inc (the engine's `--print-qemu-config`). Empty => the fast leg
+  // keeps its descriptor's default `-cpu` (engines without the flag; FA2).
+  std::string qemu_cfg;
+};
+
+// hw-config sync: the QEMU fast leg models the hardware the accurate-leg
+// engine measures, so its -cpu vlen follows that engine's descriptor. 512 is
+// the fallback for engines that report none. One definition, used by both the
+// plan executor ({vlen} fill) and the hybrid banner.
+inline long synced_vlen(long engine_vlen) {
+  return engine_vlen > 0 ? engine_vlen : 512;
+}
+
+// A trigger's per-leg argv contribution, dispatched by the leg's role. The
+// QEMU plugin takes its trigger as a comma-suffix folded INTO the one `-plugin`
+// token (so it rides the `{trigger}` placeholder); vsim takes separate tokens
+// appended to its argv. marker contributes nothing (plugin/vsim detect the markers
+// themselves).
+struct LegTriggerArgs {
+  std::string plugin_suffix;        // qemu fast-leg: appended to {trigger}
+  std::vector<std::string> extra;   // vsim accurate-leg: appended tokens
+};
+
+// Map `t` onto `role`'s argv contribution. marker -> empty. pc -> qemu
+// `,enter_pc=<enter_pc>` / vsim `--hybrid-exit-pc <exit_pc>`. Roles other
+// than fast-leg/accurate-leg get nothing. A missing required param or an
+// unknown trigger kind sets `err` (and returns an empty contribution).
+//
+// NOTE (altitude debt): these flag spellings are framework-side per-engine
+// knowledge -- the one place F9 hardcodes a fast/accurate engine's CLI, unlike
+// the base argv which comes from each engine's `--describe` invoke template.
+// This is a deliberate scope cut: the principled form (per-(trigger,role) argv
+// templates carried in `--describe`, filled by build_argv like `invoke`) would
+// extend the F2 engine contract and is left for a later feature.
+LegTriggerArgs leg_trigger_args(const Trigger& t, const std::string& role,
+                                std::string& err);
+
+// Turn an accurate engine's `<bin> --print-qemu-config` probe into a QEMU
+// `-readconfig` file under `workdir`. On a clean probe (exit 0, non-empty
+// stdout) writes `workdir/qemu.cfg` and returns its path; on any failure
+// (engine without the flag -> the parser throws -> non-zero exit; timeout;
+// spawn failure; empty output; unwritable dir) returns "" -- the tolerant
+// fallback that leaves the fast leg on its descriptor's default -cpu.
+std::string stage_qemu_cfg(const std::string& workdir, const RunResult& probe);
+
+// Build every step's concrete argv, threading state files under `workdir`:
+//   state_in[0]  = ""                       (cold start; no resume)
+//   state_in[i]  = state_out[i-1]           (prior leg's drain)
+//   state_out[i] = workdir/"state-<i>.bin"  (this leg's drain)
+// Each step's engine is looked up in `engines` by id and its `role` template is
+// filled via build_argv. Pure (no spawn). Returns one argv per step; on any
+// error (unknown engine/role, unresolved placeholder) returns {} and sets `err`.
+std::vector<std::vector<std::string>> plan_argvs(
+    const Plan& plan, const std::vector<EngineDescriptor>& engines,
+    const std::string& workdir, const RuntimeCtx& ctx, std::string& err);
+
+// The exit code a leg returns after draining its state and handing off (the
+// driver-side mirror of vsim's kExitHandoffToQemu). Every plan step is a drain
+// step, so this is the expected per-leg exit.
+constexpr int kDrainRc = 200;
+
+struct PlanOptions {
+  int timeout_ms = 90000;     // per-leg spawn timeout
+  int expect_rc = kDrainRc;   // drain success code
+  std::string plugin_path;    // "" => $VSIM_PLUGIN else repo default
+  bool dry_run = false;       // build argvs (incl. qemu_cfg) but spawn nothing
+};
+
+// Compose the "plan step N exited wrong" diagnostic. A drain step (expect_rc is
+// the handoff/drain code) that exits 0 ran the ELF to completion without ever
+// reaching its ROI boundary -- the marker/pc trigger never fired; say so and
+// name the trigger kind so the fix (right ELF / right --trigger) is obvious.
+// Any other mismatch gets the plain "expected X, got Y" line.
+std::string plan_step_rc_error(size_t step, const Step& s, int expect_rc,
+                               int got_rc);
+
+// Execute `plan`: resolve the plugin, acquire the shared mmap (allocate one
+// under /dev/shm when plan.mmap_path is empty, and own it), spawn each leg with
+// a timeout, require exit == expect_rc, and read back each leg's mcycle/minstret
+// from its drained state file. Returns the per-leg results; on the first failure
+// `error` describes it and `phases` holds whatever completed before it.
+PlanResult run_plan(const Plan& plan,
+                    const std::vector<EngineDescriptor>& engines,
+                    const PlanOptions& opts = {});
+
+}  // namespace andes_sim
+
+#endif  // ANDESIM_RUN_PLAN_HPP
