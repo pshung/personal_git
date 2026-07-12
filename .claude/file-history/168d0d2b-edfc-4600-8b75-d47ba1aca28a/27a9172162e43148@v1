@@ -1,0 +1,208 @@
+// Andes-CSR capability gating.
+//
+// A core implements an Andes custom CSR only when the matching feature is
+// configured into it (config.inc). Restoring a CSR the target core lacks can
+// hang the DMI handshake -- observed on ax45mpv_premium for ucode (no DSP) and
+// mecc_code (no ECC). So the resume/drain loops transport only the CSRs the
+// target core supports, decided here from the core's feature gates.
+//
+// This header is Verilator/SystemC-free: it maps a CSR address to its gate and
+// answers "does a core with these gates support this CSR". The binding of each
+// gate to the core's compiled-in `_NDS_*` config macros lives in the sim binary
+// (see andes_caps_from_config), so this stays unit-testable in isolation.
+#ifndef ANDES_HYBRID_ANDES_CAPS_HPP
+#define ANDES_HYBRID_ANDES_CAPS_HPP
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "hybrid/state_abi.h"
+
+namespace hybrid {
+
+// The hardware feature that gates each transported CSR. ALWAYS = unconditionally
+// present (a base machine CSR every core has; never gated off). The first block
+// gates the v3 Andes custom CSRs; the second block (UMODE..TRIGGER) gates the v4
+// M-ext CSRs (HYBRID_M_EXT_CSR_LIST) -- standard + Andes M-mode CSRs whose
+// existence depends on a privilege level or extension the core may not have.
+enum class AndesGate : uint8_t {
+  ALWAYS = 0,
+  DSP,
+  CODENSE,
+  ZCMT,        // standard Zcmt table jump (jvt); NOT implied by CoDense
+  POWERBRAKE,
+  STACKSAFE,
+  ECC,
+  PMA,
+  ILM,
+  DLM,
+  PERF_MONITOR,
+  // The Andes PMNDS counter scheme (SPA: mmsc_cfg.PMNDS). RTL ground truth
+  // (kv_csr_dec.v existent_csr): these CSRs exist iff PERFORMANCE_MONITOR
+  // AND NOT SSCOFPMF -- a core with the standard Sscofpmf count-overflow
+  // extension REPLACES the Andes scheme. The _UMODE/_SMODE variants add the
+  // privilege term the spec conditions carry (PMNDS & misa[20] / misa[18]).
+  PMNDS,        // Andes-scheme perf counters (perf monitor && !Sscofpmf)
+  PMNDS_UMODE,  // PMNDS && U-mode
+  PMNDS_SMODE,  // PMNDS && S-mode
+  ALT_FP,       // umisc_ctl: spec ALT_FP_FMT|CST_CTL, RTL BF16_ARITH|ACE
+  // v4 M-ext gates.
+  UMODE,       // needs U-mode  (NDS_NUM_PRIVILEGE_LEVELS >= 2)
+  SMODE,       // needs S-mode  (NDS_NUM_PRIVILEGE_LEVELS == 3)
+  EPMP,        // ePMP / Smepmp (mseccfg)
+  SMRNMI,      // resumable NMI (mnscratch/mnepc/mncause/mnstatus/mnvec/mrnxvec)
+  EXCSLVL,     // exception save levels (msave*)
+  CLIC,        // CLIC / enhanced CLIC (mtvt/mintthresh/mcirq_entry)
+  SMSTATEEN,   // state-enable (mstateen0..3)
+  CCTL,        // cache control CSRs (mcctlbeginaddr/mcctldata)
+  PPI,         // private peripheral interface base (mppib)
+  FIO,         // fast IO base (mfiob)
+  TRIGGER,     // debug triggers (tselect/tdata1/tdata2/tcontrol/mcontext)
+};
+
+// Map an Andes CSR (by address) to the feature gate that enables it. Addresses
+// are the HYBRID_ANDES_CSR_LIST scalars plus the PMA block. A CSR with no
+// custom-extension gate is ALWAYS (a base machine CSR every Andes core has).
+// Maintainer note: a CSR added to HYBRID_ANDES_CSR_LIST that needs gating must
+// get a case here, else it defaults to ALWAYS (transported unconditionally).
+constexpr AndesGate andes_gate_for(uint16_t csr_addr)
+{
+  switch (csr_addr) {
+    case 0x801: return AndesGate::DSP;           // ucode (DSP overflow flag)
+    case 0x800: return AndesGate::CODENSE;        // uitb  (CoDense table base)
+    // jvt is Zcmt's table-jump base, NOT part of classic CoDense (exec.it +
+    // uitb): a CoDense core without Zcmt faults a csrr of it (seen on
+    // ax45mpv_premium, where it aborted the abstract-command drain).
+    case 0x017: return AndesGate::ZCMT;           // jvt   (Zcmt only)
+    case 0x7C5: return AndesGate::POWERBRAKE;     // mpft_ctl
+    case 0x7C2: return AndesGate::ECC;            // mecc_code
+    case 0x7C6:                                   // mhsp_ctl
+    case 0x7C7:                                   // msp_bound
+    case 0x7C8: return AndesGate::STACKSAFE;      // msp_base
+    case 0x7C0: return AndesGate::ILM;            // milmb (ILM base)
+    case 0x7C1: return AndesGate::DLM;            // mdlmb (DLM base)
+    // v4 M-ext CSR gates (HYBRID_M_EXT_CSR_LIST).
+    // The PMNDS counter block (SPA existence: mmsc_cfg.PMNDS, plus misa[20]
+    // or misa[18] for the U/S members). Over-claiming any of these faults a
+    // PB csrr with cmderr=3, aborting the abstract-command drain -- seen live for 0x7D1 on
+    // premium (M-only) and 0x7CF on advanced (Sscofpmf replaces PMNDS).
+    case 0x7CF: return AndesGate::PMNDS;          // mcounterinten
+    case 0x7CE: case 0x7D1: case 0x7D3:           // mcounterwen, mcountermask_m/_u
+      return AndesGate::PMNDS_UMODE;
+    case 0x7D2: return AndesGate::PMNDS_SMODE;    // mcountermask_s
+    case 0x30A: case 0x306:                       // menvcfg, mcounteren
+    case 0x808: case 0x80B: case 0x811:           // uzobctl, ucctlbeginaddr, sleepvalue
+      return AndesGate::UMODE;
+    // umisc_ctl: "Access Mode: User and above" is WHO may touch it, not an
+    // existence condition -- spec existence is ALT_FP_FMT | CST_CTL (RTL:
+    // BFLOAT16_ARITH | ACE, no privilege term). The UMODE gate under-claimed
+    // it on both (M-only) engines; found by the registration audit.
+    case 0x813: return AndesGate::ALT_FP;
+    case 0x7D5: return AndesGate::SMODE;          // mslideleg
+    case 0x747: return AndesGate::EPMP;           // mseccfg
+    // The STANDARD counters exist under either perf-monitor scheme (Zihpm);
+    // only the Andes PMNDS block above is scheme-dependent.
+    case 0x320: case 0xB03: case 0xB04: case 0xB05: case 0xB06:  // mcountinhibit, mhpmcounter3-6
+    case 0x323: case 0x324: case 0x325: case 0x326:              // mhpmevent3-6
+      return AndesGate::PERF_MONITOR;
+    case 0x740: case 0x741: case 0x742: case 0x744:  // mnscratch, mnepc, mncause, mnstatus
+    case 0x7DE:                                       // mrnxvec
+      return AndesGate::SMRNMI;
+    // mnvec is base Andes NMI state -- spec "IM Requirement: Required", RTL
+    // decodes it unconditionally on cores that lack Smrnmi entirely. It was
+    // wrongly grouped with the Smrnmi CSRs and under-claimed on every engine.
+    case 0x7C3:                                   // mnvec
+    case 0x7C9: return AndesGate::ALWAYS;         // mdcause (base Andes trap CSR)
+    case 0x7D6: case 0x7D7: case 0x7D8: case 0x7D9:  // msavestatus, msaveepc1, msavecause1, msaveepc2
+    case 0x7DA: case 0x7DB: case 0x7DC:              // msavecause2, msavedcause1, msavedcause2
+      return AndesGate::EXCSLVL;
+    case 0x307: case 0x347: case 0x7EC:           // mtvt, mintthresh, mcirq_entry
+      return AndesGate::CLIC;
+    case 0x30C: case 0x30D: case 0x30E: case 0x30F:  // mstateen0..3
+      return AndesGate::SMSTATEEN;
+    case 0x7CB: case 0x7CD: return AndesGate::CCTL;  // mcctlbeginaddr, mcctldata
+    case 0x7F0: return AndesGate::PPI;            // mppib
+    case 0x7F1: return AndesGate::FIO;            // mfiob
+    case 0x7A0: case 0x7A1: case 0x7A2: case 0x7A5: case 0x7A8:  // tselect, tdata1, tdata2, tcontrol, mcontext
+      return AndesGate::TRIGGER;
+    default:
+      // PMA cfg (0xBC0, 0xBC2) and addr (0xBD0..0xBDF) blocks.
+      if (csr_addr == HYBRID_PMA_CFG0_CSR || csr_addr == HYBRID_PMA_CFG0_CSR + 2)
+        return AndesGate::PMA;
+      if (csr_addr >= HYBRID_PMA_ADDR0_CSR &&
+          csr_addr < HYBRID_PMA_ADDR0_CSR + HYBRID_PMA_ADDR_NUM)
+        return AndesGate::PMA;
+      return AndesGate::ALWAYS;                    // mxstatus 0x7C4, mclk_ctl 0x7DF
+  }
+}
+
+// The set of Andes feature gates a target core has on. Built from the core's
+// compiled-in config (config.inc) in the sim binary and injected into the
+// resume/drain loops, so they transport only the CSRs the core implements.
+// Default = every gate on (all(): no gating, the prior unconditional behavior).
+struct AndesCaps {
+  uint32_t gate_mask = ~0u;
+
+  static constexpr AndesCaps all()  { return AndesCaps{~0u}; }
+  static constexpr AndesCaps none() { return AndesCaps{0u}; }
+
+  constexpr void set(AndesGate g, bool on = true)
+  {
+    const uint32_t bit = 1u << static_cast<unsigned>(g);
+    if (on) gate_mask |= bit;
+    else    gate_mask &= ~bit;
+  }
+
+  constexpr bool gate_on(AndesGate g) const
+  {
+    return (gate_mask >> static_cast<unsigned>(g)) & 1u;
+  }
+
+  // ALWAYS-gated CSRs are present on every core regardless of the mask.
+  constexpr bool supports_csr(uint16_t csr_addr) const
+  {
+    const AndesGate g = andes_gate_for(csr_addr);
+    return g == AndesGate::ALWAYS || gate_on(g);
+  }
+};
+
+// F6: build the caps from the CSR addresses the registered manifest transports,
+// instead of from config macros (andes_caps_from_config). The transported set is
+// a union of COMPLETE gate-groups -- supports_csr() keys on the gate, so every
+// CSR sharing a gate transports together -- hence setting each transported CSR's
+// gate reconstructs the EXACT caps. This lets the runtime be driven by the
+// measured/registered manifest, making the config->caps model (the andesim
+// mirror + parity guard) redundant. Verilator-free, so it stays unit-testable.
+inline AndesCaps andes_caps_from_transport_set(const std::vector<uint16_t>& transported)
+{
+  AndesCaps c = AndesCaps::none();
+  for (const uint16_t addr : transported)
+    c.set(andes_gate_for(addr), true);
+  return c;
+}
+
+// The gated CSR names this core supports, for the --describe card. Iterates the
+// two single-source-of-truth X-macro lists: the v3 Andes custom CSRs and the v4
+// M-ext CSRs. The driver uses this list to gate --verify, so a CSR the core
+// lacks is neither restored, drained, nor compared.
+inline std::vector<std::string> supported_andes_csr_names(const AndesCaps& caps)
+{
+  std::vector<std::string> out;
+#define X(field, addr, name) if (caps.supports_csr(addr)) out.push_back(name);
+  HYBRID_ANDES_CSR_LIST(X)
+#undef X
+  // PMA group markers (whole pmacfg[]/pmaaddr[] blocks share one gate), so a
+  // consumer can include/exclude PMA without listing all 18 entries.
+  if (caps.supports_csr(HYBRID_PMA_CFG0_CSR))  out.push_back("pmacfg");
+  if (caps.supports_csr(HYBRID_PMA_ADDR0_CSR)) out.push_back("pmaaddr");
+  // v4 M-ext CSRs share the same address->gate map and --describe list.
+#define X(field, addr, name) if (caps.supports_csr(addr)) out.push_back(name);
+  HYBRID_M_EXT_CSR_LIST(X)
+#undef X
+  return out;
+}
+
+}  // namespace hybrid
+
+#endif  // ANDES_HYBRID_ANDES_CAPS_HPP
