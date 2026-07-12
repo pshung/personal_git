@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""Derive the andesim hybrid Andes-CSR capability list from a core's config.inc.
+
+The OFFLINE checker for the hybrid handoff. It mirrors, in Python, the C++ gate
+logic the vsim engine compiles in (src/hybrid/andes_caps.hpp +
+andes_caps_config.hpp). At runtime the engine reports the same list via
+`sim_<core> --describe` ("andes_csrs"), and the andesim driver uses it to skip
+--verify on CSRs the engine lacks. Running this on the engine's own build
+config.inc must produce the same list -- a drift guard between the offline
+config and the built engine (the flywheel; see tests/andes_sim/
+test_andes_sim_caps_parity.sh).
+
+Each Andes CSR is gated by a config.inc feature: a core implements the CSR only
+when its feature is configured in. Restoring/draining a CSR the core lacks can
+hang the DM handshake, so the engine and this checker gate on the same map.
+
+Self-contained: the config.inc parser below is ported from Andes'
+cpu_config_to_march_converter (parse_inc / is_yes / _int), so this depends only
+on the Python stdlib.
+
+Usage:
+  config_inc_to_andes_caps.py <config.inc>                       # print the list
+  config_inc_to_andes_caps.py --check <config.inc> <csr> [csr...]  # assert exact
+"""
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+# --- config.inc parsing (ported from cpu_config_to_march_converter) ----------
+_DEFINE_RE = re.compile(r'^\s*`define\s+(\w+)(?:\s+(.+?))?\s*(?://\s*(.*))?$')
+
+
+def parse_inc(path) -> dict:
+    """{macro: string-value} from a Verilog config.inc (`define KEY VALUE)."""
+    out: dict = {}
+    for line in Path(path).read_text(errors="replace").splitlines():
+        m = _DEFINE_RE.match(line)
+        if not m:
+            continue
+        name = m.group(1)
+        raw = (m.group(2) or "").strip().rstrip(",")
+        comment = (m.group(3) or "").strip()
+        if not raw:                                   # bare `define NAME flag
+            out.setdefault(name, "1")
+            continue
+        if raw.startswith('"') and raw.endswith('"'):  # quoted string
+            out[name] = raw[1:-1]
+            continue
+        c = comment.strip().strip('"')                # numeric + // symbolic
+        if c and " " not in c:
+            out[name] = c
+            try:
+                int(raw, 0)
+                out.setdefault(name + "_INT", raw)
+            except ValueError:
+                pass
+            continue
+        out[name] = raw                               # bare integer / token
+    return out
+
+
+def _str(cfg: dict, key: str) -> str:
+    if key in cfg:
+        return cfg[key].strip().strip('"')
+    if key + "_INT" in cfg:
+        return cfg[key + "_INT"].strip()
+    return ""
+
+
+def _int(cfg: dict, key: str):
+    """Numeric view: prefer the _INT companion macro, else parse the value."""
+    for k in (key + "_INT", key):
+        if k in cfg:
+            try:
+                return int(cfg[k], 0)
+            except ValueError:
+                pass
+    return None
+
+
+def is_yes(cfg: dict, key: str) -> bool:
+    s = _str(cfg, key).lower()
+    if s in ("yes", "true", "on"):
+        return True
+    if s in ("no", "false", "off", ""):
+        return False
+    n = _int(cfg, key)
+    return n is not None and n == 1
+
+
+# --- Andes-CSR capability derivation -----------------------------------------
+_SIZED_HEX_RE = re.compile(r"^\d+'h([0-9a-fA-F]+)$")
+
+
+def _cpuid(cfg: dict):
+    """NDS_CPUID as an int (config.inc carries it as a sized literal 16'h8a66)."""
+    raw = (cfg.get("NDS_CPUID") or "").strip()
+    m = _SIZED_HEX_RE.match(raw)
+    if m:
+        return int(m.group(1), 16)
+    try:
+        return int(raw, 0)
+    except ValueError:
+        return None
+
+
+def is_mk_family(cfg: dict) -> bool:
+    """mk_core family (AX6x series): the CPUID series nibble is 6. The mk CSR
+    decoder (mk_csr_decode.v) diverges from kv_csr_dec.v, so several gates
+    bind differently -- mirrors ANDES_CAPS_MK_FAMILY in andes_caps_config.hpp."""
+    cpuid = _cpuid(cfg)
+    return cpuid is not None and (cpuid & 0xF0) == 0x60
+
+
+def _ecc_any(cfg: dict) -> bool:
+    """mecc_code exists if ANY RAM block is configured with ECC (type != none)."""
+    for blk in ("NDS_DCACHE_ECC_TYPE", "NDS_ICACHE_ECC_TYPE",
+                "NDS_ILM_ECC_TYPE", "NDS_DLM_ECC_TYPE"):
+        n = _int(cfg, blk)
+        if n is not None and n > 0:
+            return True
+    return False
+
+
+def _any_yes(cfg: dict, *keys: str) -> bool:
+    return any(is_yes(cfg, k) for k in keys)
+
+
+def gates(cfg: dict) -> dict:
+    """Feature gates, mirroring andes_caps_from_config() in the vsim binary."""
+    priv = _int(cfg, "NDS_NUM_PRIVILEGE_LEVELS") or 1   # 1=M, 2=M+U, 3=M+S+U
+    mk = is_mk_family(cfg)                              # mk_core CSR decoder
+    perf = is_yes(cfg, "NDS_PERFORMANCE_MONITOR")
+    # Andes PMNDS scheme: the standard Sscofpmf extension REPLACES the Andes
+    # counter CSRs (kv RTL existent_csr: PERFORMANCE_MONITOR & !SSCOFPMF).
+    # mk_csr_decode.v hard-wires SSCOFPMF=1 / PMNDS=0: never on mk.
+    pmnds = perf and not mk and not is_yes(cfg, "NDS_SSCOFPMF_SUPPORT")
+    return {
+        # ucode/umisc_ctl/jvt have no existent term in mk_csr_decode.v -- the
+        # gates stay off on mk even when the config knobs are on.
+        "DSP":          not mk and is_yes(cfg, "NDS_DSP_SUPPORT"),
+        "CODENSE":      is_yes(cfg, "NDS_CODENSE_SUPPORT"),
+        "POWERBRAKE":   is_yes(cfg, "NDS_POWERBRAKE_SUPPORT"),
+        "STACKSAFE":    is_yes(cfg, "NDS_STACKSAFE_SUPPORT"),
+        "PERF_MONITOR": perf,
+        "PMNDS":        pmnds,
+        "PMNDS_UMODE":  pmnds and priv >= 2,
+        "PMNDS_SMODE":  pmnds and priv >= 3,
+        "PMA":          (_int(cfg, "NDS_PMA_ENTRIES") or 0) > 0,
+        "ILM":          (_int(cfg, "NDS_ILM_SIZE_KB") or 0) > 0,
+        "DLM":          (_int(cfg, "NDS_DLM_SIZE_KB") or 0) > 0,
+        # mecc_code is UNCONDITIONAL in mk_csr_decode.v (ax66 probe: present
+        # with no ECC RAMs configured); kv gates it on the RAM ECC types.
+        "ECC":          mk or _ecc_any(cfg),
+        # Zcmt (jvt): the kv RTL gates jvt on ZCE_SUPPORT (newer config.inc
+        # generations carry the knob; older ones have none -- absent = off).
+        "ZCMT":         not mk and (is_yes(cfg, "NDS_ZCMT_SUPPORT")
+                                    or is_yes(cfg, "NDS_ZCE_SUPPORT")),
+        # umisc_ctl: spec ALT_FP_FMT | CST_CTL; kv RTL BFLOAT16_ARITH | ACE.
+        "ALT_FP":       not mk and (is_yes(cfg, "NDS_BFLOAT16_ARITH_SUPPORT")
+                                    or is_yes(cfg, "NDS_ACE_SUPPORT")),
+        "ALWAYS":       True,
+        # v4 M-ext gates.
+        "UMODE":        priv >= 2,
+        "SMODE":        priv >= 3,
+        "TRIGGER":      (_int(cfg, "NDS_NUM_TRIGGER") or 0) > 0,
+        # tcontrol: kv decodes it with the trigger module; mk comments it out
+        # (ax66 probe: absent) -- its own gate, never on mk.
+        "TCONTROL":     not mk and (_int(cfg, "NDS_NUM_TRIGGER") or 0) > 0,
+        # uzobctl/sleepvalue: NO current decoder generation implements them
+        # (spec-vs-RTL discrepancy; see the ax66 registration report).
+        "UZOB":         False,
+        "ESLEEP":       False,
+        # mseccfg is UNCONDITIONAL in mk_csr_decode.v; kv needs the ePMP knob.
+        "EPMP":         mk or _any_yes(cfg, "NDS_SMEPMP", "NDS_EPMP"),
+        "SMRNMI":       _any_yes(cfg, "NDS_SMRNMI", "NDS_RNMI"),
+        "EXCSLVL":      (_int(cfg, "NDS_EXCSLVL") or 0) > 0,
+        "CLIC":         _any_yes(cfg, "NDS_ECLIC", "NDS_CLIC"),
+        # mstateen0-3 ride the hypervisor extension on mk (SMSTATEEN_SUPPORT =
+        # RVH_SUPPORT in mk_csr_decode.v); kv has its own knob.
+        "SMSTATEEN":    (is_yes(cfg, "NDS_RVH_SUPPORT") if mk
+                         else is_yes(cfg, "NDS_SMSTATEEN")),
+        # CCTL: the RTL gates mcctl* on cache presence (no config generation
+        # emits a dedicated NDS_CCTLCSR knob), so bind the cache sizes too.
+        "CCTL":         _any_yes(cfg, "NDS_CCTLCSR", "NDS_CCTL")
+                        or (_int(cfg, "NDS_ICACHE_SIZE_KB") or 0) > 0
+                        or (_int(cfg, "NDS_DCACHE_SIZE_KB") or 0) > 0,
+        "PPI":          (_int(cfg, "NDS_PPI_SIZE_KB") or 0) > 0,
+        "FIO":          (_int(cfg, "NDS_FIO_SIZE_KB") or 0) > 0
+                        or is_yes(cfg, "NDS_FIO"),
+    }
+
+
+# (csr name, gate) in HYBRID_ANDES_CSR_LIST order, then the PMA group markers --
+# mirrors andes_caps.hpp andes_gate_for() + supported_andes_csr_names().
+_CSR_GATES = [
+    ("mxstatus",       "ALWAYS"),
+    ("mpft_ctl",       "POWERBRAKE"),
+    ("mclk_ctl",       "ALWAYS"),
+    ("milmb",          "ILM"),
+    ("mdlmb",          "DLM"),
+    ("mecc_code",      "ECC"),
+    ("mhsp_ctl",       "STACKSAFE"),
+    ("msp_bound",      "STACKSAFE"),
+    ("msp_base",       "STACKSAFE"),
+    # The PMNDS counter block: SPA existence mmsc_cfg.PMNDS (& misa[20]/[18]
+    # for the U/S members). jvt is Zcmt's table-jump base, NOT implied by
+    # classic CoDense. All were over-claimed once and faulted the PB drain
+    # sweep live (0x7D1 + jvt on premium, 0x7CF on advanced/Sscofpmf).
+    ("mcountermask_m", "PMNDS_UMODE"),
+    ("uitb",           "CODENSE"),
+    ("jvt",            "ZCMT"),
+    ("ucode",          "DSP"),
+    ("pmacfg",         "PMA"),
+    ("pmaaddr",        "PMA"),
+    # v4 M-ext CSRs, in HYBRID_M_EXT_CSR_LIST order (gdb mnemonics, matching
+    # supported_andes_csr_names which iterates that list after the Andes block).
+    ("menvcfg",        "UMODE"),
+    ("mseccfg",        "EPMP"),
+    ("mcounteren",     "UMODE"),
+    ("mcountinhibit",  "PERF_MONITOR"),
+    ("mhpmcounter3",   "PERF_MONITOR"),
+    ("mhpmcounter4",   "PERF_MONITOR"),
+    ("mhpmcounter5",   "PERF_MONITOR"),
+    ("mhpmcounter6",   "PERF_MONITOR"),
+    ("mhpmevent3",     "PERF_MONITOR"),
+    ("mhpmevent4",     "PERF_MONITOR"),
+    ("mhpmevent5",     "PERF_MONITOR"),
+    ("mhpmevent6",     "PERF_MONITOR"),
+    ("mcounterwen",    "PMNDS_UMODE"),
+    ("mcounterinten",  "PMNDS"),
+    ("mcountermask_s", "PMNDS_SMODE"),
+    ("mcountermask_u", "PMNDS_UMODE"),
+    ("mnscratch",      "SMRNMI"),
+    ("mnepc",          "SMRNMI"),
+    ("mncause",        "SMRNMI"),
+    ("mnstatus",       "SMRNMI"),
+    # mnvec: spec "IM Requirement: Required", RTL unconditional -- base Andes
+    # NMI state, NOT part of Smrnmi (registration-audit under-claim fix).
+    ("mnvec",          "ALWAYS"),
+    ("mrnxvec",        "SMRNMI"),
+    ("mdcause",        "ALWAYS"),
+    ("mslideleg",      "SMODE"),
+    ("msavestatus",    "EXCSLVL"),
+    ("msaveepc1",      "EXCSLVL"),
+    ("msavecause1",    "EXCSLVL"),
+    ("msaveepc2",      "EXCSLVL"),
+    ("msavecause2",    "EXCSLVL"),
+    ("msavedcause1",   "EXCSLVL"),
+    ("msavedcause2",   "EXCSLVL"),
+    ("mtvt",           "CLIC"),
+    ("mintthresh",     "CLIC"),
+    ("mcirq_entry",    "CLIC"),
+    ("mstateen0",      "SMSTATEEN"),
+    ("mstateen1",      "SMSTATEEN"),
+    ("mstateen2",      "SMSTATEEN"),
+    ("mstateen3",      "SMSTATEEN"),
+    ("mcctlbeginaddr", "CCTL"),
+    ("mcctldata",      "CCTL"),
+    ("mppib",          "PPI"),
+    ("mfiob",          "FIO"),
+    ("tselect",        "TRIGGER"),
+    ("tdata1",         "TRIGGER"),
+    ("tdata2",         "TRIGGER"),
+    ("tcontrol",       "TCONTROL"),  # kv-only: mk never decodes it
+    ("mcontext",       "TRIGGER"),
+    ("uzobctl",        "UZOB"),      # no generation decodes it (off)
+    ("ucctlbeginaddr", "UMODE"),
+    ("sleepvalue",     "ESLEEP"),    # no generation decodes it (off)
+    ("umisc_ctl",      "ALT_FP"),  # existence: BF16|ACE, not U-mode
+    # S/U trap CSRs (base hybrid_state_v1 fields; ax66 registration option A):
+    # restored/drained on S-mode engines, named after the M-ext block exactly
+    # as supported_andes_csr_names() emits them.
+    ("satp",           "SMODE"),
+    ("medeleg",        "SMODE"),
+    ("mideleg",        "SMODE"),
+]
+
+
+def supported_andes_csrs(cfg: dict) -> list:
+    g = gates(cfg)
+    return [name for name, gate in _CSR_GATES if g[gate]]
+
+
+def main(argv: list) -> int:
+    if argv and argv[0] == "--check":
+        if len(argv) < 2:
+            print(__doc__)
+            return 2
+        got = supported_andes_csrs(parse_inc(argv[1]))
+        want = argv[2:]
+        if got != want:
+            print(f"MISMATCH\n  got:  {got}\n  want: {want}", file=sys.stderr)
+            return 1
+        print("OK: " + " ".join(got))
+        return 0
+    if len(argv) != 1:
+        print(__doc__)
+        return 2
+    print(" ".join(supported_andes_csrs(parse_inc(argv[0]))))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
