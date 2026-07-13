@@ -1,0 +1,1 @@
+- [ax66_makatau syscall bug](ax66_makatau_syscall_bug.md) - engine sweep found gettimeofday/L2C bug in sibling andesim repo; confirmed software bug, not RTL, fix not yet applied
