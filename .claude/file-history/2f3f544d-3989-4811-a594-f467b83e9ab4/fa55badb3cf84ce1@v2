@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# gettimeofday() must succeed on every vsim engine, not just the default.
+# ax66_makatau's mmsc_cfg reports PL2C (L2 cache) support even though its
+# build has zero L2 KB configured; vplat_syscalls.c's flush_dcache(), run
+# before every HTIF syscall, must not treat that as "safe to touch the L2
+# MMIO window" -- gettimeofday is the runtime's first syscall, so a bad
+# probe there fails before the ROI even starts.
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+
+# shellcheck disable=SC1091
+. "$ROOT/config.env" 2>/dev/null
+export HYBRID_TOOLCHAIN="${HYBRID_TOOLCHAIN:?config.env missing}"
+
+ELF="$ROOT/tests/fixtures/vplat_gettimeofday.elf"
+QEMU="${QEMU_BIN_DIR:-$(cfg_val QEMU_BIN_DIR)}/qemu-system-riscv64"
+[ -x "$QEMU" ] || fail "qemu not found (source ./setup.sh): $QEMU"
+
+make -C "$ROOT/tests/fixtures" vplat_gettimeofday.elf >/dev/null \
+  || fail "fixture build failed"
+
+run_leg() {  # LABEL CMD...
+  local label="$1"; shift
+  local out rc
+  out=$(timeout 120 "$@" </dev/null 2>&1); rc=$?
+  printf '%s\n' "$out" | grep -q 'gettimeofday ok' \
+    || fail "$label: missing 'gettimeofday ok': $out"
+  [ "$rc" -eq 0 ] || fail "$label: exit code $rc != 0 (output: $out)"
+  echo "[ok] $label: gettimeofday ok, clean exit"
+}
+
+for eng in ax45mpv_premium ax46mpv_advanced ax66_makatau; do
+  SIM="$(vsim_bin_dir)/sim_$eng"
+  [ -x "$SIM" ] || fail "cycle engine not found (source ./setup.sh): $SIM"
+  run_leg "cycle:$eng" "$SIM" "$ELF"
+done
+
+run_leg fast "$QEMU" -machine andes_ae350 -cpu andes-ax45mpv,vlen=512 \
+  -nographic -semihosting-config enable=on,target=native -bios "$ELF"
+
+ok "gettimeofday.elf succeeds on every vsim engine + fast"
