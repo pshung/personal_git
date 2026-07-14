@@ -1,0 +1,380 @@
+/* vplat: one newlib syscall layer that works on EVERY engine.
+ *
+ * Replaces -lgloss_vh (semihosting) so a single ELF runs unmodified on
+ * QEMU (fast), vsim (cycle) and across a hybrid handoff. It only touches
+ * channels both engines model at the same addresses:
+ *
+ *   stdio (fd 0-2)  ATCUART100 UART2: THR @0xf0300020, LSR @0xf0300034.
+ *                   QEMU: serial_mm_init(UART2+0x20, shift 2) = serial_hd(0);
+ *                   vsim: src/platform/uart.hpp (vsim repo) -> host stdout.
+ *   exit            SimControl @0xe0080000: u32 exit code (<256).
+ *                   vsim: sim_control.hpp; QEMU: hw/riscv/andes_ae350.c
+ *                   (sim_ctrl_write).
+ *   file io (fd>2)  the SimControl syscall WINDOW @0xe0080800: eight u64
+ *                   arg/result slots + a data area for payloads, doorbell
+ *                   @0xe0080028. Served host-side (vsim: sim_control.hpp
+ *                   dispatch_window; QEMU: andes_ae350.c's mirror).
+ *
+ * The window lives in DEVICE space (PMA-uncached on every engine), so the
+ * whole exchange is coherent by construction: no guest cache line can
+ * shadow a host write. Its predecessor -- a magicmem block in cacheable
+ * RAM that the host peeked/poked by backdoor -- broke on any core with a
+ * private write-back L2 (ax66 PL2C): the guest read its own stale copy of
+ * the host's result, and no guest-side CCTL sequence can fix that (the
+ * VA-scoped forms trap on RVH cores, the ALL forms drop unrelated dirty
+ * lines). Marshaling payloads through the window costs a few uncached
+ * copies per call; correctness on every cache hierarchy is worth it.
+ *
+ * No semihosting, no ecall, and no "which engine am I on" probe -- hybrid
+ * migrates the running process between engines, so any boot-time detection
+ * would go stale at the handoff. Every call must be engine-blind.
+ */
+
+#include <stdint.h>
+#include <stddef.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+/* ---- UART2 (console) ------------------------------------------------- */
+
+#define UART_THR (*(volatile uint32_t*) 0xf0300020UL)
+#define UART_LSR (*(volatile uint32_t*) 0xf0300034UL)
+#define UART_LSR_THRE 0x20u
+
+static void uart_putc(char c)
+{
+  while (!(UART_LSR & UART_LSR_THRE))
+    ;
+  UART_THR = (uint32_t) (unsigned char) c;
+}
+
+/* ---- SimControl: exit + syscall window -------------------------------- */
+
+#define SIM_EXIT_ADDR   0xe0080000UL
+#define SYSCALL_GO_ADDR 0xe0080028UL
+
+/* Window layout -- must match the hosts (vsim src/platform/sim_control.hpp
+ * SYSCALL_WINDOW_*; QEMU hw/riscv/andes_ae350.c ANDESIM_SYSCALL_*):
+ * eight u64 arg/result slots, then the payload data area. All guest
+ * accesses are u64 loads/stores (the access width every engine already
+ * proves out on the legacy 0x10 doorbell). */
+#define WIN_SLOTS ((volatile uint64_t*) 0xe0080800UL)
+#define WIN_DATA_VA 0xe0080840UL
+#define WIN_DATA_SIZE (0x800u - 0x40u) /* 1984 bytes, 8-aligned */
+
+/* HTIF syscall numbers -- must match the table in the vsim repo's
+ * src/platform/sim_control.hpp (and the QEMU mirror device). */
+#define VH_SYS_GETTIMEOFDAY 5
+#define VH_SYS_OPEN         6
+#define VH_SYS_WRITE        7
+#define VH_SYS_GETCWD       8
+#define VH_SYS_LSEEK        9
+#define VH_SYS_READ         10
+#define VH_SYS_FLEN         11
+#define VH_SYS_CLOSE        12
+#define VH_SYS_ACCESS       13
+#define VH_SYS_FACCESSAT    14
+#define VH_SYS_FSTAT        15
+#define VH_SYS_FSTATAT      16
+#define VH_SYS_LINK         17
+#define VH_SYS_LSTAT        18
+#define VH_SYS_STAT         19
+#define VH_SYS_OPENAT       20
+#define VH_SYS_RENAME       21
+#define VH_SYS_UNLINK       22
+
+/* Copy guest memory into the window data area (u64 stores only; the final
+ * partial word over-stores into window slack, which is scratch). `woff` is
+ * a byte offset into the data area and must be 8-aligned. */
+static void win_store(size_t woff, const void* src, size_t len)
+{
+  const unsigned char* s = (const unsigned char*) src;
+  volatile uint64_t* w = (volatile uint64_t*) (WIN_DATA_VA + woff);
+  while (len) {
+    size_t n = len < 8 ? len : 8;
+    uint64_t word = 0;
+    for (size_t i = 0; i < n; ++i)
+      word |= (uint64_t) s[i] << (8 * i);
+    *w++ = word;
+    s += n;
+    len -= n;
+  }
+}
+
+/* Copy from the window data area into guest memory (u64 loads only). */
+static void win_load(void* dst, size_t woff, size_t len)
+{
+  unsigned char* d = (unsigned char*) dst;
+  volatile const uint64_t* w = (volatile const uint64_t*) (WIN_DATA_VA + woff);
+  while (len) {
+    size_t n = len < 8 ? len : 8;
+    uint64_t word = *w++;
+    for (size_t i = 0; i < n; ++i)
+      d[i] = (unsigned char) (word >> (8 * i));
+    d += n;
+    len -= n;
+  }
+}
+
+/* Stage a string at data-area offset `woff`; returns the byte offset just
+ * past its NUL, rounded up to 8, or (size_t)-1 if it does not fit. */
+static size_t win_store_str(size_t woff, const char* s)
+{
+  size_t len = 0;
+  while (s[len])
+    ++len;
+  ++len; /* NUL */
+  if (woff + len > WIN_DATA_SIZE)
+    return (size_t) -1;
+  win_store(woff, s, len);
+  return (woff + len + 7) & ~(size_t) 7;
+}
+
+/* One window syscall: stage the slots, ring the doorbell, read the result.
+ * The doorbell write is an uncached device store, so the host has served
+ * the call before the store retires; the fence orders the result load. */
+static intptr_t win_syscall(uint64_t n, uint64_t a0, uint64_t a1, uint64_t a2,
+                            uint64_t a3)
+{
+  WIN_SLOTS[0] = n;
+  WIN_SLOTS[1] = a0;
+  WIN_SLOTS[2] = a1;
+  WIN_SLOTS[3] = a2;
+  WIN_SLOTS[4] = a3;
+  WIN_SLOTS[5] = 0;
+  WIN_SLOTS[6] = 0;
+  WIN_SLOTS[7] = 0;
+  *(volatile uint32_t*) SYSCALL_GO_ADDR = 1;
+  __asm__ __volatile__("fence rw,rw" ::: "memory");
+  return (intptr_t) WIN_SLOTS[0];
+}
+
+/* Marshaling helpers for the recurring shapes. */
+
+static intptr_t win_call_str(uint64_t n, const char* s, uint64_t a1,
+                             uint64_t a2)
+{
+  if (win_store_str(0, s) == (size_t) -1)
+    return -1;
+  return win_syscall(n, WIN_DATA_VA, a1, a2, 0);
+}
+
+static intptr_t win_call_str2(uint64_t n, const char* s0, const char* s1)
+{
+  size_t off1 = win_store_str(0, s0);
+  if (off1 == (size_t) -1 || win_store_str(off1, s1) == (size_t) -1)
+    return -1;
+  return win_syscall(n, WIN_DATA_VA, WIN_DATA_VA + off1, 0, 0);
+}
+
+/* ---- newlib stubs ------------------------------------------------------
+ *
+ * stat family note: the guest's struct bounces through the window BOTH
+ * ways, so fields the host does not fill keep the caller's values (the
+ * hosts write pico_stat's st_mode/st_size at their newlib offsets). */
+
+__attribute__((used)) ssize_t _write(int fd, const void* ptr, size_t len)
+{
+  if (fd > 2) {
+    const unsigned char* p = (const unsigned char*) ptr;
+    size_t done = 0;
+    while (done < len) {
+      size_t n = len - done;
+      if (n > WIN_DATA_SIZE)
+        n = WIN_DATA_SIZE;
+      win_store(0, p + done, n);
+      intptr_t r = win_syscall(VH_SYS_WRITE, fd, WIN_DATA_VA, n, 0);
+      if (r < 0)
+        return done ? (ssize_t) done : (ssize_t) r;
+      done += (size_t) r;
+      if ((size_t) r < n)
+        break; /* short write */
+    }
+    return (ssize_t) done;
+  }
+  for (size_t i = 0; i < len; ++i)
+    uart_putc(((const char*) ptr)[i]);
+  return (ssize_t) len;
+}
+
+__attribute__((used)) ssize_t _read(int fd, void* buf, size_t len)
+{
+  if (fd > 2) {
+    unsigned char* p = (unsigned char*) buf;
+    size_t done = 0;
+    while (done < len) {
+      size_t n = len - done;
+      if (n > WIN_DATA_SIZE)
+        n = WIN_DATA_SIZE;
+      intptr_t r = win_syscall(VH_SYS_READ, fd, WIN_DATA_VA, n, 0);
+      if (r < 0)
+        return done ? (ssize_t) done : (ssize_t) r;
+      if (r > 0)
+        win_load(p + done, 0, (size_t) r);
+      done += (size_t) r;
+      if ((size_t) r < n)
+        break; /* EOF or short read */
+    }
+    return (ssize_t) done;
+  }
+  return 0; /* no console input on either engine: EOF */
+}
+
+__attribute__((used)) int _fstat(int fd, struct stat* st)
+{
+  if (fd > 2) {
+    win_store(0, st, sizeof(*st));
+    intptr_t ret = win_syscall(VH_SYS_FSTAT, fd, WIN_DATA_VA, 0, 0);
+    if (ret == 0)
+      win_load(st, 0, sizeof(*st));
+    return (int) ret;
+  }
+  st->st_mode = S_IFCHR; /* char device -> newlib line-buffers stdout */
+  return 0;
+}
+
+__attribute__((used)) int _isatty(int fd) { return fd <= 2; }
+
+__attribute__((used)) int _close(int fd)
+{
+  if (fd > 2)
+    return (int) win_syscall(VH_SYS_CLOSE, fd, 0, 0, 0);
+  return 0;
+}
+
+__attribute__((used)) off_t _lseek(int fd, off_t offset, int dir)
+{
+  if (fd > 2)
+    return win_syscall(VH_SYS_LSEEK, fd, offset, dir, 0);
+  return 0;
+}
+
+__attribute__((used)) int _open(const char* name, int flags, int mode, ...)
+{
+  return (int) win_call_str(VH_SYS_OPEN, name, flags, mode);
+}
+
+__attribute__((used)) int _openat(int dirfd, const char* name, int flags, ...)
+{
+  if (win_store_str(0, name) == (size_t) -1)
+    return -1;
+  return (int) win_syscall(VH_SYS_OPENAT, dirfd, WIN_DATA_VA, flags, 0);
+}
+
+__attribute__((used)) int _stat(const char* file, struct stat* st)
+{
+  size_t stoff = win_store_str(0, file);
+  if (stoff == (size_t) -1 || stoff + sizeof(*st) > WIN_DATA_SIZE)
+    return -1;
+  win_store(stoff, st, sizeof(*st));
+  intptr_t ret =
+    win_syscall(VH_SYS_STAT, WIN_DATA_VA, WIN_DATA_VA + stoff, 0, 0);
+  if (ret == 0)
+    win_load(st, stoff, sizeof(*st));
+  return (int) ret;
+}
+
+__attribute__((used)) int _lstat(const char* file, struct stat* st)
+{
+  size_t stoff = win_store_str(0, file);
+  if (stoff == (size_t) -1 || stoff + sizeof(*st) > WIN_DATA_SIZE)
+    return -1;
+  win_store(stoff, st, sizeof(*st));
+  intptr_t ret =
+    win_syscall(VH_SYS_LSTAT, WIN_DATA_VA, WIN_DATA_VA + stoff, 0, 0);
+  if (ret == 0)
+    win_load(st, stoff, sizeof(*st));
+  return (int) ret;
+}
+
+__attribute__((used)) int _fstatat(int dirfd, const char* file,
+                                   struct stat* st, int flags)
+{
+  size_t stoff = win_store_str(0, file);
+  if (stoff == (size_t) -1 || stoff + sizeof(*st) > WIN_DATA_SIZE)
+    return -1;
+  win_store(stoff, st, sizeof(*st));
+  intptr_t ret = win_syscall(VH_SYS_FSTATAT, dirfd, WIN_DATA_VA,
+                             WIN_DATA_VA + stoff, flags);
+  if (ret == 0)
+    win_load(st, stoff, sizeof(*st));
+  return (int) ret;
+}
+
+__attribute__((used)) int _access(const char* file, int mode)
+{
+  return (int) win_call_str(VH_SYS_ACCESS, file, mode, 0);
+}
+
+__attribute__((used)) int _faccessat(int dirfd, const char* file, int mode,
+                                     int flags)
+{
+  if (win_store_str(0, file) == (size_t) -1)
+    return -1;
+  return (int) win_syscall(VH_SYS_FACCESSAT, dirfd, WIN_DATA_VA, mode, flags);
+}
+
+__attribute__((used)) int _link(const char* oldn, const char* newn)
+{
+  return (int) win_call_str2(VH_SYS_LINK, oldn, newn);
+}
+
+__attribute__((used)) int _unlink(const char* file)
+{
+  return (int) win_call_str(VH_SYS_UNLINK, file, 0, 0);
+}
+
+__attribute__((used)) int _rename(const char* oldn, const char* newn)
+{
+  return (int) win_call_str2(VH_SYS_RENAME, oldn, newn);
+}
+
+__attribute__((used)) int _getcwd(const char* buf, int size)
+{
+  size_t n = (size_t) size;
+  if (n > WIN_DATA_SIZE)
+    n = WIN_DATA_SIZE;
+  intptr_t ret = win_syscall(VH_SYS_GETCWD, WIN_DATA_VA, n, 0, 0);
+  if (ret != 0)
+    win_load((void*) buf, 0, n);
+  return (int) ret;
+}
+
+__attribute__((used)) int _gettimeofday(struct timeval* tp, void* tzp)
+{
+  (void) tzp; /* both hosts ignore the timezone */
+  intptr_t ret = win_syscall(VH_SYS_GETTIMEOFDAY, WIN_DATA_VA, 0, 0, 0);
+  if (ret == 0) {
+    /* The host writes {sec, usec} at the target's register width -- the
+     * same bytes the legacy protocol wrote into the guest's struct. */
+    win_load(tp, 0, __riscv_xlen == 64 ? 16 : 8);
+  }
+  return (int) ret;
+}
+
+__attribute__((used)) int _kill(int pid, int sig)
+{
+  (void) pid;
+  (void) sig;
+  return -1;
+}
+
+__attribute__((used)) int _getpid(void) { return 1; }
+
+__attribute__((used)) void* _sbrk(intptr_t increment)
+{
+  extern char _end[];
+  static char* p = _end;
+  void* base = p;
+  p += increment;
+  return base;
+}
+
+/* Exit codes stay below 256: sim_control.hpp treats any command < 256 as
+ * the raw exit code (the 0x0123456x magic commands live above). */
+__attribute__((used, noreturn)) void _exit(int exit_status)
+{
+  *(volatile uint32_t*) SIM_EXIT_ADDR = (uint32_t) exit_status & 0xff;
+  for (;;)
+    ;
+}

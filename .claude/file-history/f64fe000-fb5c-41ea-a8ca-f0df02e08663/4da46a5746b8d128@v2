@@ -1,0 +1,109 @@
+/* Syscalls on every mode -- one binary, three channels.
+ *
+ * The andesim runtime routes newlib syscalls through MMIO devices both
+ * engines model, so the SAME ELF gets working stdio, file io and exit
+ * codes on fast (QEMU), cycle (vsim) and hybrid:
+ *
+ *   stdout        UART2 (0xf0300020) -- printf goes to your terminal
+ *   file io       the SimControl syscall window (0xe0080800, uncached
+ *                 device storage), served host-side: fopen/fread/fwrite
+ *                 hit REAL files in the working directory
+ *   time          gettimeofday(), same window, host clock
+ *   exit code     SimControl (0xe0080000) -- main's return value becomes
+ *                 the andesim exit code on fast and cycle
+ *
+ * Hybrid adds two rules, which this demo demonstrates:
+ *   - an open FILE* must be CLOSED before the handoff. Host file
+ *     descriptors live in the engine process and do not cross to vsim;
+ *     a closed file lives on the host filesystem, which both engines
+ *     share.
+ *   - a hybrid run ENDS at the ROI exit trigger (that is where the
+ *     cycle figure is drained), so code after the ROI never runs on
+ *     hybrid. Anything that must happen -- here the file cleanup --
+ *     belongs inside the ROI; the hybrid pass/fail signal is the
+ *     printed SYSCALL_OK, not main's return value.
+ *
+ * QEMU phase (before the ROI):
+ *   - gettimeofday() seeds a payload no compiler can precompute
+ *   - fwrite the payload to syscall_demo.tmp, fclose it
+ *
+ * vsim ROI:
+ *   - printf INSIDE the ROI (its UART cycles are simply part of the
+ *     figure)
+ *   - fopen/fread the file back, compare with the in-DRAM copy (the copy
+ *     crossed the handoff in the shared mmap; the file crossed on the
+ *     host filesystem), remove it; prints SYSCALL_OK / SYSCALL_BAD
+ */
+
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/time.h>
+#include <andesim/ROI.h>
+
+#define PATH "syscall_demo.tmp"
+
+static char payload[64];
+
+/* ROI body, noinline and non-static so --trigger pc can name it. */
+__attribute__((noinline)) int syscall_roi(void)
+{
+  printf("printf inside the ROI\n");
+
+  char back[sizeof payload];
+  memset(back, 0, sizeof back);
+  FILE *f = fopen(PATH, "r");
+  if (!f) {
+    printf("SYSCALL_BAD fopen\n");
+    return 1;
+  }
+  size_t n = fread(back, 1, sizeof back, f);
+  fclose(f);
+
+  size_t want = strlen(payload);
+  if (n != want || memcmp(back, payload, want) != 0) {
+    printf("SYSCALL_BAD readback n=%u\n", (unsigned) n);
+    return 1;
+  }
+  /* Cleanup lives INSIDE the ROI: on hybrid nothing after the ROI runs. */
+  if (remove(PATH) != 0) {
+    printf("SYSCALL_BAD remove\n");
+    return 1;
+  }
+  printf("SYSCALL_OK bytes=%u\n", (unsigned) want);
+  return 0;
+}
+
+int main(void)
+{
+  struct timeval tv;
+  if (gettimeofday(&tv, NULL) != 0) {
+    printf("SYSCALL_STAGE_BAD gettimeofday\n");
+    return 2;
+  }
+  snprintf(payload, sizeof payload, "syscall demo t=%lx.%06lx\n",
+           (unsigned long) tv.tv_sec, (unsigned long) tv.tv_usec);
+
+  FILE *f = fopen(PATH, "w");
+  if (!f) {
+    printf("SYSCALL_STAGE_BAD fopen\n");
+    return 2;
+  }
+  size_t want = strlen(payload);
+  size_t n = fwrite(payload, 1, want, f);
+  fclose(f); /* MUST close before the ROI: fds do not cross the handoff. */
+  if (n != want) {
+    printf("SYSCALL_STAGE_BAD short write\n");
+    return 2;
+  }
+  printf("SYSCALL staged\n");
+
+  andesim_ROI_begin();
+  int rc = syscall_roi();
+  andesim_ROI_end();
+  /* ROI end symbol for --pc-end: the point right after the call. */
+  __asm__ __volatile__(".globl syscall_roi_end\nsyscall_roi_end:" ::: "memory");
+
+  /* Runs on fast and cycle only: a hybrid run ended at the exit trigger. */
+  return rc; /* exit code travels via SimControl */
+}
