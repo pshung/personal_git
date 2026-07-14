@@ -1,0 +1,207 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+* Always update docs/USER_GUIDE.md if something changed.
+
+## Repository Overview
+
+Andes hybrid RISC-V simulator: QEMU 9.x (functional, MHz-level) + vsim (SystemC + Verilator, cycle-accurate) share architectural state across a magic-CSR boundary. The system runs a two-phase handoff: **QEMU1** (drain on CSR/PC trigger) -> **vsim** (resume + execute + drain). The cycle figure is the vsim `mcycle` delta; there is no QEMU2 leg (the handback was removed).
+
+One Git submodule:
+- `include/` - the shared ABI (`andesim_abi` repo): the `hybrid_state_v1` wire
+  contract under `include/hybrid/`, pinned by andesim AND by the external vsim, so
+  there is one source of truth.
+
+QEMU and vsim are NOT submodules -- both are prebuilt external binaries:
+- QEMU: point `QEMU_BIN_DIR` (config.env) at your `qemu-system-*` build dir.
+- vsim: point `VSIM_BIN_DIR` (config.env) at your external vsim `build/` dir (the
+  `sim_*` binaries). The vsim sources -- including the vsim-side hybrid
+  orchestration (`src/hybrid/*.hpp`), `CMakeLists.txt`, and `cmake/HybridConfig.cmake`
+  referenced throughout this doc -- live in the separate `hybrid_vsim` repo and are
+  built there (its own `build_vsim.sh`), no longer nested under `verilator/` here.
+
+## Build Commands
+
+**Primary path (`./andesim`)** -- the end-user driver (C++, self-builds on
+first use), the only driver, used in all user-facing docs.
+
+```sh
+bash scripts/build_all.sh        # builds qemu, vsim, plugin, fixtures
+bash scripts/test_all.sh         # unit + contract + e2e suite
+./andesim run --mode fast|cycle|hybrid [--trigger marker|pc] [--engine ID] <elf>
+./andesim profile [--engine ID] <elf>   # hot-loop detector (engine-synced QEMU; docs/profile.md)
+./andesim list <models|engines>
+```
+
+**Developer escape hatch** -- the underlying scripts. Use these when
+working on the build system, the harness, or a single leg in isolation:
+
+```sh
+# Build everything (locate external qemu -> vsim -> plugin)
+source ./setup.sh
+
+# QEMU and vsim are NOT built here -- both are prebuilt external binaries. Point
+# config.env's QEMU_BIN_DIR at your qemu-system-* build dir and VSIM_BIN_DIR at
+# your external vsim build/ dir (see config.env.example); setup.sh validates both
+# and exports VSIM_QEMU / VSIM_BIN_DIR.
+
+# Build individual components (vsim is built in its own external checkout)
+make -C qemu_plugin                        # TCG plugins (out-of-tree; vendored qemu-plugin.h, no QEMU source needed)
+
+# Build RISC-V ELF test fixtures
+make -C tests/fixtures              # all fixtures
+make -C tests/fixtures rt_c_v_regs.elf  # single fixture
+
+# Clean (vsim is external; not cleaned here)
+source ./setup.sh clean [plugin|all]
+```
+
+**Outputs:**
+- `qemu_plugin/libhybrid_handoff.so` (+ `libhotIterationLoop.so`, the `andesim profile` plugin)
+- the vsim `sim_*` binaries are produced in the external vsim checkout under
+  `$VSIM_BIN_DIR` (e.g. `/home/nick/work/vsim_andesim/build/sim_ax45mpv_premium`).
+
+QEMU and vsim are integrated as prebuilt external binaries, not built here:
+`$QEMU_BIN_DIR/qemu-system-riscv64` and `$VSIM_BIN_DIR/sim_*` (set both in
+`config.env`). The vsim repo's own `build_vsim.sh` is Docker-based (podman): it
+builds an image from its `Dockerfile` (target `env`), runs `./build.sh` inside,
+and pins the shared ABI as a nested submodule at `external/andesim_abi`.
+
+## Running Tests
+
+```sh
+# All e2e tests in parallel (auto-detects job count from nproc + /dev/shm headroom)
+bash scripts/run_e2e.sh
+
+# Run with specific options
+JOBS=4 MODE=marker bash scripts/run_e2e.sh         # 4-way parallel, marker-mode only
+JOBS=1 bash scripts/run_e2e.sh                  # sequential (debug)
+FILTER=rt_c_v bash scripts/run_e2e.sh           # regex filter on fixture name
+LOG_DIR=/tmp/my-logs bash scripts/run_e2e.sh    # custom log directory
+
+# Unit tests (inside vsim build container)
+# The container build runs: cmake --build build -j
+# To run ctest directly after build:
+#   podman run ... ./build.sh && podman exec ... ctest --test-dir build -L hybrid-e2e
+```
+
+**Important:** on a high-core-count machine (128+ cores) `default_jobs()` computes `min(nproc, /dev/shm_free/256MB)` which can reach 128+. Running that many vsim Verilator processes simultaneously saturates CPU and causes timeouts. Use `JOBS=8` (or lower) as a practical cap: `JOBS=8 bash scripts/run_e2e.sh`.
+
+`scripts/run_e2e.sh` exits 0 only when all tests pass. Logs go to a `mktemp` directory under `/tmp`; path is printed at the start of each run. Each test's full output lands in `$LOG_DIR/$mode--$name.log`.
+
+**Manual driver tests**: `tests/andes_sim/test_andes_sim_*.sh` cover the C++ driver's feature contracts. They run manually during driver development, not wired into `scripts/run_e2e.sh`. Each script is self-contained (sources `setup.sh` artifacts, runs one subcommand, asserts on stdout). The same convention applies to `tests/plugin/test_plugin_*.sh` (QEMU-plugin-only smoke tests).
+
+## Architecture
+
+### Two-Phase Handoff
+
+```
+QEMU1 --(state file + shared mmap)--> vsim (resume + run ROI + drain)
+```
+
+1. **QEMU plugin** (`qemu_plugin/hybrid_handoff.c`) - TCG plugin. On the marker trigger (`slti x0, x0, 0x5A0`) or PC-trigger, drains QEMU's architectural state into a binary `hybrid_state_v1` struct written to `--outfile`.
+2. **vsim handoff controller** (`src/hybrid/handoff_controller.hpp`) - Detects the trigger inside vsim, pauses the hart via DMI, then calls `ResumeDriver` to restore state.
+3. **ResumeDriver** (`src/hybrid/resume_driver.hpp`) - Writes GPRs/FPRs into the vsim hart via RISC-V Debug Module Abstract Commands, one write per register. Every CSR write -- the base M-mode scalars, the Andes V5 block, and the M-ext block -- also goes through Abstract Commands only, one write per CSR; there is no batched Program-Buffer sweep anywhere in the register/CSR transport, in either direction (a WARL/read-only CSR faulting mid-batch can't be tolerated the way the abstract path's per-CSR cmderr-clear can). `StateDrain` mirrors this: one abstract read per GPR/FPR/CSR. The Program Buffer carries only state the abstract command space cannot reach: the V-data sweep, `vtype`+`vl` (Tier B, see V-State Transport below), and the L2C MMIO window. **Liveness gate**: restores whose drained value equals the engine's own reset value are skipped (a no-op write; each DM op costs ~200-900 simulated cycles). The reset baseline is drained once per (engine build, ELF) on the first hybrid run and cached under `$XDG_CACHE_HOME/andesim/`; `--no-reset-baseline` disables. Never gated: mstatus, GPRs, dpc, dcsr, mcycle, minstret, the S/U PMP mirror. Verify-transparent by construction (skip only when the value is already there).
+4. **StateDrain** (`src/hybrid/state_drain.hpp`) - On vsim exit trigger, reads back the full architectural state via DMI Abstract Commands into `hybrid_state_v1`. This is the end of the run: the cycle figure is the vsim `mcycle` minus QEMU1's drained `mcycle`. The old QEMU2 resume leg was removed entirely.
+
+**CSR restore split**: `ResumeDriver` writes the CSRs the vsim phase can touch: `mstatus`, `mtvec`, `mscratch` (L23), `mepc`/`mcause`/`mtval`/`mie`/`mip` (L24), `mcycle`, `minstret`, `fcsr` (frm + sticky fflags, gated on `HYBRID_FLAG_FP`; L20), and the Andes machine-setup CSRs `mcache_ctl` (0x7CA) + `mmisc_ctl` (0x7D0) (L21). The cache pair matters for the cycle figure, not correctness: crt0 enables the L1 I/D caches via `mcache_ctl`, but that write runs on the cache-less functional engine, so without transporting it vsim resumes at the ROI with caches at their reset default (disabled) and the whole window runs uncached -- inflating the cycle count severalfold. All are tolerant writes: an engine without a given custom CSR mirrors the write as a no-op. In the trap-free ROI these writable M-mode CSRs are ordinary read/write state, so they round-trip fully: restored at resume, re-read at drain (`StateDrain::drain_with_passthrough`), and compared by `--verify` (`state_diff`). Two verify-side exceptions: `mip` is restored + re-read but NOT compared -- its pending bits are hardware/platform-driven (the timer bit tracks elapsed time, which advances differently in QEMU's functional clock vs vsim's cycle clock), so comparing it would false-positive; and `mtvec` is restored but not re-drained. The S/U trap CSRs `medeleg`/`mideleg`/`satp` are drained by the plugin since v1 and, since the ax66 registration (option A), restored + re-read + `--verify`-compared on S-mode-capable engines (caps gate SMODE; the describe list names them); on an M-only engine (`ax45mpv_premium`, `NDS_NUM_PRIVILEGE_LEVELS=1`) they stay drain-record-only. Other S-mode CSRs (`sstatus`, `sepc`, ...) remain deferred to the S/U-envelope work. The vsim phase is assumed trap-free, interrupt-free, and PMP-static; if a future workload needs traps or dynamic PMP inside the ROI, `ResumeDriver` must be extended.
+
+**Privilege (L6)**: the handoff carries the real privilege level. The plugin drains the gdbstub `priv` register, `ResumeDriver` read-modify-writes `dcsr.prv` before `dret` (and verifies the write took -- an M-mode-only RTL like the default `ax45mpv_premium`, `NDS_NUM_PRIVILEGE_LEVELS=1`, WARL-pins the field, and the resume aborts with a pick-an-S/U-capable-engine error), and `StateDrain` reads `dcsr.prv` back at the exit halt. For S/U handoffs the producer's PMP block (64 `pmpaddr` + the 8 even `pmpcfg`) is also mirrored into the hart, because with PMP implemented and no matching entry every S/U access faults; M-mode handoffs keep PMP pass-through-only (L2). The `rt_priv_smode`/`rt_priv_umode` fixtures run on the S/U-capable `ax66_makatau` engine paired with QEMU `-cpu andes-ax66` (see `scripts/run_e2e.sh`); the ROI itself must still be trap-free, single-privilege, and paging-off (S-mode CSRs are not transported).
+
+### Trigger Modes
+
+The repo ships 2 switching modes (triggers); each measures one region you
+choose. The C++ `andesim` driver exposes them via `--trigger marker|pc`.
+
+- **marker mode** (default): Pattern-matches `slti x0, x0, 0x5A0` (entry) / `slti x0, x0, 0x5A1` (exit) at retire time. The markers are RISC-V HINTs (rd=x0 discards the result), i.e. architectural NOPs -- a marker binary also runs standalone on every engine and on silicon. Users get them from `<andesim/ROI.h>` (`andesim_ROI_begin()/end()`).
+- **PC mode**: explicit boundary PCs passed as `--pc-start S --pc-end E` (symbol name or `0x` address) resolved at startup; marker insns are bypassed. Both args are required.
+
+`./andesim run --mode hybrid --trigger marker|pc` is the unified orchestrator; `tests/e2e.sh` drives marker/pc internally. The run yields a cycle figure: window cycles = the vsim `mcycle` delta (`hybrid_state_v1::mcycle`).
+
+### Shared ABI (`include/hybrid/state_abi.h`)
+
+`hybrid_state_v1` is the binary wire format exchanged between the QEMU plugin and vsim. It holds: 32 GPRs, 32 FPRs, fcsr, M-mode CSRs (mstatus, mepc, etc.), PMP (64 pmpaddr + 16 pmpcfg), the V extension block (vstart, vtype, vl, vlenb, 32 vreg[], vxsat, vxrm, vcsr), (v3) the Andes V5 CSR block `struct hybrid_andes_csr andes`, (v4) the writable M-mode CSR block `struct hybrid_m_ext_csr m_ext`, and (v5) the L2C MMIO register window `struct hybrid_l2c l2c`. `HYBRID_VLEN_BYTES_MAX=128` supports VLEN up to 1024 bits; the live width is the runtime `vlenb`, and a producer whose vlenb exceeds the ceiling refuses to drain instead of truncating (L11). Multi-byte fields are little-endian (native on RV64 + x86-64 host); the format is not endian-portable.
+
+**v3 Andes block**: `struct hybrid_andes_csr` carries the Andes-specific CSRs a bare-metal Andes core sets up before the ROI -- 13 scalar CSRs (mxstatus, mpft_ctl, mclk_ctl, milmb, mdlmb, mecc_code, mhsp_ctl, msp_bound, msp_base, mcountermask_m, uitb, jvt, ucode) + PMA (pmacfg[2] @ 0xBC0/0xBC2, pmaaddr[16] @ 0xBD0..0xBDF). The 13 scalars are defined ONCE by the X-macro `HYBRID_ANDES_CSR_LIST(X)` in `state_abi.h`, which every consumer iterates (plugin drain, `ResumeDriver` restore, `StateDrain` re-read, driver `state_diff` verify) -- so adding a CSR is one line, no consumer drifts. Live only when `HYBRID_FLAG_ANDES` is set (the plugin sets it when QEMU's gdbstub advertised at least one Andes CSR). All restores are tolerant (a core lacking the CSR no-ops the write); the block round-trips through the trap-free ROI and is `--verify`-compared, except `msp_bound`/`msp_base` (HW stack-protection bounds) and `milmb`/`mdlmb` (ILM/DLM base+enable) which are engine-reset-divergent -- QEMU resets `msp_bound`/`msp_base` to all-ones (a vsim core without HW stack protection drains 0), and drains the `milmb`/`mdlmb` enable bit clear while the vsim RTL drains it set -- so they are verify-excluded like `mip`.
+
+**v5 L2C block**: `struct hybrid_l2c` carries the **L2 cache controller's MMIO register window** (`reg[]` = offsets 0x0000..0x0527, DS220 11.8.5 Table 112). Unlike every other block this is DEVICE MMIO, not a CSR: the plugin drains the whole window with `qemu_plugin_read_memory_hwaddr` (physical address `l2c_base`, default 0xE0500000), and `ResumeDriver::restore_l2c` writes back ONLY the writable boot-static config registers -- Control (0x0008: `CEN` enable + prefetch + ECC + RAM timing), HPM Control (0x0010), Way Allocation Masks (0x0300..0x0328) -- via Program-Buffer word stores (`sw`, per DS220 11.8.3's <8-byte access rule). The read-only Configuration Register, the side-effecting CCTL command registers (writing one re-issues an L2 cache op), and the W1C error registers are captured but never restored. `StateDrain::drain_l2c` re-reads the config registers (`lwu`) for `--verify` (`state_diff` compares `l2c.ctrl` with the RO INITSTATUS[14] bit masked). This is the MMIO analog of the `mcache_ctl` (L1-enable) transport, and matters for the cycle figure the same way: an L2-enabled engine that resumed with L2 disabled would run the ROI severalfold slower. **Restore is HARD-gated on the engine having an L2C** (`Simulator::l2c_present()` from `_NDS_L2C_CACHE_SIZE_KB > 0`): a store to an absent L2C region faults the Program Buffer, unlike a tolerant CSR write. Every current engine is built `NDS_L2C_CACHE_SIZE_KB=0`, so the block is transported forward-looking and the restore/drain no-op today. QEMU seeds the L2C Control Register's reset value (`CEN=1`, DS220 11.8.7) at machine init (`andes_ae350.c`), so a guest that relies on the default is not drained as `CEN=0`.
+
+**v6 write-mask**: `write_mask[2]` (one bit per mask-governed config CSR, slot map + decode helpers in `include/hybrid/write_mask.h`, live under `HYBRID_FLAG_WRITE_MASK`) records **which CSRs the guest actually WROTE** during the QEMU phase. The plugin decodes CSR-write instructions at translation time (`csrrw`/`csrrwi` always write; `csrrs/c` only when rs1!=x0; `csrrsi/ci` only when uimm!=0) and registers an exec callback only on instructions that write a mask-governed CSR -- steady-state code carries zero instrumentation, so the fast leg is unaffected. Consumers (`ResumeDriver` restore, `state_diff` verify) skip any governed CSR whose bit is clear: an untouched CSR's drained value is only QEMU's reset default, which can legitimately differ from the engine's RTL reset value (`msp_bound` all-ones vs 0, `milmb.IEN` 0 vs 1), so skipping keeps the engine at ITS OWN reset value -- what real silicon of that engine would hold -- and makes producer/engine reset divergence harmless by construction for every current and future engine, with no per-engine data in QEMU. Governed set: the v3 Andes scalars + PMA, the v4 M-ext block, `mcache_ctl`/`mmisc_ctl`. Never governed: GPRs/FPRs/V, mstatus, dpc/dcsr, counters, fcsr, the trap-writable CSRs (mepc/mcause/mtval/mip/mie -- hardware writes them without a CSR insn), mtvec/mscratch, and PMP (the S/U mirror is a correctness requirement). `ucode` is transport-always (DSP ops set its sticky OV flag without a CSR insn). Flag clear (pre-v6 file) -> consumers fall back to restore/compare-everything.
+
+**Memory-content sidecars (NOT in `hybrid_state_v1`)**: ILM/DLM and HVM content travels OUTSIDE the state struct, as raw binary sidecar files next to each state file. The plugin (args `ilm_size`/`dlm_size`/`hvm_size` in bytes; bases default `0xA0000000`/`0xA0200000`/`0x90000000`) drains `<state>.ilm/.dlm/.hvm` through the slave-port/subordinate apertures; the vsim leg backdoor-loads them (`--ilm/--dlm/--hvm` -- zero-sim-cycle Verilator hierarchical-reference pokes into the RTL SRAMs, NOT the DM Program Buffer); the exit drain dumps the read-duals next to the handoff-out state. Armed by the engine's `--describe` sizes (`ilm_size`/`dlm_size`/`hvm_size`, bytes; 0 = no memory or wrapper lacks the set_*/get_* backdoor pair -- capability-gated so a config-has-it/wrapper-can't engine arms nothing). These QEMU memories are per-CPU overlays (LM) or standalone RAM (HVM), NOT backed by the shared mmap, so the sidecars are the only road their content travels; QEMU's raw geometry must be synced (`-readconfig` on the driver path, `-global` in tests/e2e.sh -- HVM's property is `hvm_size_pow_2`, log2) because QEMU's compiled-in defaults (2 MB ILM at 0x0, 1-BYTE HVM) are wrong for every engine.
+
+Flags (`HYBRID_FLAG_RV64`, `HYBRID_FLAG_FP`, `HYBRID_FLAG_V`, `HYBRID_FLAG_ANDES`, `HYBRID_FLAG_M_EXT`, `HYBRID_FLAG_L2C`, `HYBRID_FLAG_WRITE_MASK`) gate which state blocks are live. The ABI struct is validated by `tests/hybrid/state_abi.test.cpp` (in the external vsim repo).
+
+### V-State Transport
+
+V data registers (v0..v31) move through a scratch region in the shared mmap.
+L26: that region is the mmap's TOP page, `v_scratch_gpa(ram_base, ram_size) =
+ram_base + ram_size - HYBRID_V_SCRATCH_BYTES`, NOT a fixed address. The driver
+maps one page more than `--mem-size` (`shm.cpp physical_mmap_bytes`), so the
+scratch sits at `ram_base + --mem-size`, just above the program's RAM, where no
+program layout can collide with it (`cmd_run` also rejects an ELF whose static
+image would reach into it). `ResumeDriver`/`StateDrain` take the GPA as a
+required-when-V argument (the simulator passes `v_scratch_gpa()`); a V handoff
+with it unset throws. vsim drives the transfer via the Debug Module **Program
+Buffer** while the hart is halted, so benchmark binaries issue no transport code:
+- `stage_v_to_scratch` copies `hybrid_state_v1::vreg[]` into the scratch region
+  before resume; `ResumeDriver` then sweeps `vle8.v v0..v31` from scratch into the
+  regfile (`pb_v_data_sweep`, load=true).
+- At drain, `StateDrain` sweeps `vse8.v v0..v31` from the regfile back to scratch
+  (`pb_v_data_sweep`, load=false); `read_v_from_scratch` lifts the bytes into
+  `hybrid_state_v1::vreg[]` (the drained handoff file; there is no QEMU2 ship step).
+
+Each sweep leads with `vsetvl` to e8/m8 (vl=8*vlenb), which also forces vstart=0;
+with LMUL=8 one `vle8.v`/`vse8.v` moves a group of 8 registers, so all 32 move in
+4 grouped ops in a single Program-Buffer execution. The scratch is packed at the
+RUNTIME vlenb stride (`stage_v_to_scratch` drops the wire-format
+`HYBRID_VLEN_BYTES_MAX` padding so each 8-register group is contiguous).
+
+V scalar CSR transport (vtype, vl, vstart, vxsat, vxrm, vcsr):
+- **Tier A** (Abstract Commands): vstart, vxsat, vxrm, vcsr, mstatus.VS
+- **Tier B** (Program Buffer): vtype + vl via `vsetvl x0, x5, x6` (direct CSR write to vtype sets vill; vl is read-only; only `vsetvl` restores both atomically)
+
+Restore order in `ResumeDriver::resume()` when `HYBRID_FLAG_V` is set:
+1. `mstatus.VS` (enables V in the hart)
+2. V-data reload sweep: `vsetvl` e8/m8 then `vle8.v v0..v31` from scratch in the
+   Program Buffer. Runs BEFORE the architectural V-CSR restore (whose `vsetvl`
+   overwrites the sweep's vtype/vl/vstart) and uses x5/x6/x7 as scratch.
+3. `vsetvl x0, x5, x6` in Program Buffer (stages `vl` in x5, `vtype` in x6 via abstract GPR writes first)
+4. `vstart` (AFTER vsetvl: vsetvl resets vstart to 0)
+5. `vxsat`, `vxrm`, `vcsr`
+6. GPR loop (overwrites the x5/x6/x7 scratch - safe now)
+
+`StateDrain::drain_with_passthrough()` issues the matching `vse8.v` dump sweep
+LAST, after every architectural read (GPRs/FPRs/V-CSRs/mcycle/minstret), so the
+sweep's clobbers and any counter increments cannot corrupt the drained state.
+
+### Test Fixtures
+
+All fixtures run on the unified `tests/e2e.sh` harness, which
+sets up an `/dev/shm`-backed shared mmap (128 MB) so memory survives
+the QEMU1 -> vsim handoff. Three fixture families:
+
+| Family   | Examples                                                    | Notes |
+|----------|-------------------------------------------------------------|-------|
+| asm      | `handoff_roundtrip`, `rt_all_gprs`, `rt_csr_survival`, `rt_shared_mem` | no C runtime; don't strictly need shared mmap but use it anyway (~20 ms cost is negligible). |
+| C-level  | `rt_c_hello`, `rt_c_matmul`, `rt_c_v_regs`, `rt_c_v_csrs`   | hybrid round-trip tests, linked through the vplat runtime (below). Shared mmap is REQUIRED -- vsim resumes on QEMU1's memory, so the stack/heap and `main()`'s frame must survive the QEMU1 -> vsim handoff. |
+| vplat    | `vplat_hello`, `vplat_exit41`, `vplat_file`                 | smoke tests for the runtime's own features (exit code, file io). The runtime is engine-portable, shipped as `build/runtime/libandesim_runtime.a` (sources in `runtime/`; build with `make -C runtime` or `scripts/build_all.sh runtime`): UART stdio + SimControl exit + HTIF file io, NO semihosting -- the same ELF runs on fast, cycle AND hybrid. Users link with `-B build/runtime -specs=andesim.specs`. See docs/USER_GUIDE.md section 4; smoke tests in `tests/vplat/`. |
+
+The shared mmap is created with `mktemp -p /dev/shm` + `truncate`,
+then QEMU is launched with `-object memory-backend-file`.
+
+Fixture source lives in `tests/fixtures/`; the shared runtime sources live at the repo root in `runtime/`. ALL C fixtures (rt_c_* and vplat_*) link through the shipped vplat runtime with the user command (`-B build/runtime -specs=andesim.specs`); nothing in-tree links `-lgloss_vh` or uses semihosting syscalls anymore (asm fixtures still carry a semihosting exit fallback from `semihost_exit.inc`). V-using fixtures require `-march=rv64gcv`. Syscalls bottom out in MMIO devices both engines model (UART2 `0xf0300000`, SimControl/HTIF `0xe0080000` -- QEMU side is inline in `QEMU/hw/riscv/andes_ae350.c`), so a `printf` inside the ROI works on every engine (it just adds the real UART cycles to the figure); the old "Phase-2 no-syscall rule" survives only as a measurement-hygiene convention in cycle-measuring fixtures, and as a hard rule for user binaries that still link a semihosting libgloss. The ROI markers are HINT NOPs, so vplat binaries may carry them (`<andesim/ROI.h>`, installed to `build/runtime/include/`) and still run standalone on every engine; binaries you cannot edit delimit the ROI with PC symbols and `--trigger pc` instead.
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `include/hybrid/state_abi.h` | Wire-format struct (shared by all three components) |
+| `qemu_plugin/hybrid_handoff.c` | TCG plugin: drain on trigger |
+| `src/hybrid/handoff_controller.hpp` (vsim repo) | Phase dispatcher |
+| `src/hybrid/resume_driver.hpp` (vsim repo) | DMI state restore (Tier A+B) |
+| `src/hybrid/state_drain.hpp` (vsim repo) | DMI state capture |
+| `src/hybrid/v_regfile_xfer.hpp` (vsim repo) | V register transport via scratch region |
+| `cmake/HybridConfig.cmake` (vsim repo) | CTest registration for the hybrid doctest unit tests |
+| `scripts/run_e2e.sh` | Parallel e2e runner (FIFO job pool, per-test logs) |
+| `tests/fixtures/Makefile` | RISC-V ELF fixture build (Andes toolchain) |

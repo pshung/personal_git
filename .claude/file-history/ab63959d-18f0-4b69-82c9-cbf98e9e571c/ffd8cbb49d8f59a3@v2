@@ -1,0 +1,241 @@
+// Unit tests for the profile core (driver/profile.{hpp,cpp}): the pure logic
+// behind `andesim profile` -- plugin-log parsing, disassembly parsing, the
+// RVV filter, loop nesting, the measure window, both report renderers, and
+// the QEMU argv builder. All data-in/data-out; no QEMU, no ELF, no spawn.
+#include "profile.hpp"
+
+#include <string>
+#include <vector>
+
+#include "test_check.hpp"
+
+using namespace andes_sim;
+using andes_sim::test::check_eq;
+
+// A plugin log as `-d plugin -D <file>` writes it: header lines + CSV rows.
+static const char* kLog =
+    "hotIterationLoop: 3 distinct backward edges, 2 hot (>= 10 iters), "
+    "sorted by iterations desc\n"
+    "start_pc, end_pc, iterations\n"
+    "0x0000000080001000, 0x0000000080001040, 3200\n"
+    "0x0000000080001010, 0x0000000080001030, 640\n"
+    "0x0000000080002000, 0x0000000080002008, 3\n"
+    "not a row\n";
+
+static void test_parse_plugin_log() {
+  auto rows = parse_plugin_log(kLog);
+  CHECK(rows.size() == 3);
+  CHECK(rows[0].start == 0x80001000 && rows[0].end == 0x80001040 &&
+        rows[0].iters == 3200);
+  CHECK(rows[2].start == 0x80002000 && rows[2].iters == 3);
+  CHECK(parse_plugin_log("").empty());
+  CHECK(
+      parse_plugin_log("hotIterationLoop: 0 distinct backward edges\n").empty());
+}
+
+// objdump -d --no-show-raw-insn shape (GNU flavor): label lines are skipped
+// (no colon-after-hex), insn lines keyed by pc.
+static const char* kDisasm =
+    "\n"
+    "0000000080001000 <vadd_kernel>:\n"
+    "    80001000:\tvsetvli\ta5,a4,e32,m1,ta,ma\n"
+    "    80001004:\tvle32.v\tv1,(a0)\n"
+    "    80001008:\tadd\ta0,a0,a5\n"
+    "    8000100c:\tjal\tra,80002000 <memcpy>\n"
+    "    80001010:\tvadd.vv\tv1,v1,v2\n"
+    "    80001014:\tret\n";
+
+static void test_parse_disasm() {
+  auto d = parse_disasm(kDisasm);
+  CHECK(d.size() == 6);
+  CHECK(d.at(0x80001000).mnemonic == "vsetvli");
+  CHECK(d.at(0x80001008).mnemonic == "add");
+  CHECK(d.at(0x8000100c).operands == "ra,80002000 <memcpy>");
+  CHECK(d.find(0x80001000) != d.end());
+}
+
+static void test_is_rvv() {
+  CHECK(is_rvv("vadd.vv"));
+  CHECK(is_rvv("vsetvli"));
+  CHECK(is_rvv("Vle32.v"));
+  CHECK(!is_rvv("add"));
+  CHECK(!is_rvv("v"));    // too short
+  CHECK(!is_rvv("v0"));   // second char not alpha
+  CHECK(!is_rvv("ret"));
+}
+
+static void test_ranges() {
+  auto d = parse_disasm(kDisasm);
+  auto rvv = rvv_in_range(d, 0x80001000, 0x80001014);
+  CHECK(rvv.size() == 3);  // vsetvli, vle32.v, vadd.vv
+  CHECK(rvv[0].pc == 0x80001000 && rvv[0].mn == "vsetvli");
+  CHECK(rvv_in_range(d, 0x80001008, 0x8000100c).empty());
+
+  auto calls = calls_in_range(d, 0x80001000, 0x80001014);
+  CHECK(calls.size() == 1);
+  CHECK(calls[0].pc == 0x8000100c && calls[0].target == "memcpy");
+}
+
+static void test_filter_loops() {
+  auto d = parse_disasm(kDisasm);
+  std::vector<LoopEdge> rows = {
+      {0x80001008, 0x8000100c, 50},   // scalar-only body
+      {0x80001000, 0x80001014, 640},  // has RVV
+      {0x80002000, 0x80002008, 3},    // below min_iters
+      {0x80001010, 0x80001010, 3200}, // has RVV (vadd.vv)
+  };
+  auto out = filter_loops(rows, /*min_iters=*/10, /*rvv_only=*/true, d,
+                          /*limit=*/50);
+  CHECK(out.size() == 2);  // scalar + cold dropped
+  CHECK(out[0].iters == 3200 && out[1].iters == 640);  // sorted desc
+
+  // rvv_only=false keeps the scalar loop; limit truncates after sorting.
+  auto all = filter_loops(rows, 10, false, d, 2);
+  CHECK(all.size() == 2);
+  CHECK(all[0].iters == 3200 && all[1].iters == 640);
+}
+
+static void test_build_loops_nesting() {
+  std::vector<LoopEdge> rows = {
+      {0x100, 0x200, 900},  // L1: outer
+      {0x120, 0x180, 800},  // L2: inside L1
+      {0x130, 0x160, 700},  // L3: inside L2 (smallest enclosing wins)
+      {0x300, 0x310, 600},  // L4: disjoint
+      {0x300, 0x310, 500},  // L5: identical range to L4 -> NOT its parent
+  };
+  auto loops = build_loops(rows, 50);
+  CHECK(loops.size() == 5);
+  CHECK(loops[0].id == "L1" && loops[0].parent == -1);
+  CHECK(loops[1].parent == 0);   // L2 in L1
+  CHECK(loops[2].parent == 1);   // L3 in L2, not L1
+  CHECK(loops[3].parent == -1);
+  CHECK(loops[4].parent == -1);  // identical range excluded
+  CHECK(loops[0].children.size() == 1 && loops[0].children[0] == 1);
+  CHECK(loops[1].children.size() == 1 && loops[1].children[0] == 2);
+  CHECK(loops[3].children.empty());
+
+  // limit caps how many rows become loops.
+  CHECK(build_loops(rows, 2).size() == 2);
+}
+
+static void test_measure_ret_pc() {
+  auto d = parse_disasm(kDisasm);
+  // fn [0x80001000, 0x80001018): last insn at or below fn_end-1 is the ret.
+  CHECK(measure_ret_pc(d, 0x80001000, 0x80001018) == 0x80001014);
+  // No disasm coverage -> fall back to fn_end - 4.
+  CHECK(measure_ret_pc({}, 0x80001000, 0x80001018) == 0x80001014);
+}
+
+static void test_src_helpers() {
+  CHECK(src_basename("/a/b/vadd.c:42") == "vadd.c:42");
+  CHECK(src_basename("vadd.c:42 (discriminator 1)") ==
+        "vadd.c:42 (discriminator 1)");
+  auto [f, l] = parse_file_line("/a/b/vadd.c:42");
+  CHECK(f == "/a/b/vadd.c" && l == 42);
+  auto [f2, l2] = parse_file_line("??:0");
+  CHECK(f2.empty() && l2 == 0);
+}
+
+static void test_render_llm() {
+  auto d = parse_disasm(kDisasm);
+  std::vector<LoopEdge> rows = {{0x80001000, 0x80001010, 3200},
+                                {0x80001004, 0x8000100c, 640}};
+  auto loops = build_loops(rows, 50);
+  std::vector<LoopSyms> syms(2);
+  syms[0] = {"vadd_kernel", "vadd_kernel+0x10", "vadd_kernel",
+             0x80001000, 0x80001018, "/a/vadd.c:12", "/a/vadd.c:12",
+             "a[i] += b[i];"};
+  syms[1] = {"vadd_kernel+0x4", "vadd_kernel+0xc", "vadd_kernel",
+             0x80001000, 0x80001018, "", "", ""};
+
+  std::string r = render_llm(loops, syms, /*total_iters=*/4000, "vadd.elf", d,
+                             /*min_iters=*/10, /*rvv_filter=*/true);
+  CHECK(r.find("# HotIterationLoop Report") != std::string::npos);
+  CHECK(r.find("target:           vadd.elf") != std::string::npos);
+  CHECK(r.find("total_iters:      4000") != std::string::npos);
+  CHECK(r.find("rvv_filter:       on") != std::string::npos);
+  CHECK(r.find("[hottest]") != std::string::npos);
+  CHECK(r.find("(80.0% of total)") != std::string::npos);
+  CHECK(r.find("measure:      --pc-start 0x80001000 --pc-end 0x80001014") !=
+        std::string::npos);
+  CHECK(r.find("(all of vadd_kernel: entry -> ret)") != std::string::npos);
+  CHECK(r.find("source:       vadd.c:12") != std::string::npos);
+  CHECK(r.find("code:         a[i] += b[i];") != std::string::npos);
+  CHECK(r.find("rvv:          yes") != std::string::npos);
+  CHECK(r.find("children:     [L2]") != std::string::npos);
+  CHECK(r.find("parent:       L1") != std::string::npos);
+  CHECK(r.find("calls:\n") != std::string::npos);       // L1 contains the jal
+  CHECK(r.find("-> memcpy") != std::string::npos);
+  // TL;DR names the hottest loop's function.
+  CHECK(r.find("Hottest loop is L1 in `vadd_kernel`") != std::string::npos);
+}
+
+static void test_render_table() {
+  std::vector<LoopEdge> rows = {{0x80001000, 0x80001010, 3200}};
+  std::vector<LoopSyms> syms(1);
+  syms[0].sym_start = "vadd_kernel";
+  syms[0].sym_end = "vadd_kernel+0x10";
+  syms[0].src_start = "/a/vadd.c:12";
+  syms[0].src_end = "/a/vadd.c:12";
+
+  std::string t =
+      render_table(rows, syms, /*min_iters=*/10, /*rvv_filter=*/true);
+  CHECK(t.find("# hot loops (iters >= 10, RVV-only), sorted desc, top 1") !=
+        std::string::npos);
+  CHECK(t.find("0x0000000080001000 -> 0x0000000080001010") !=
+        std::string::npos);
+  CHECK(t.find("vadd_kernel -> vadd_kernel+0x10") != std::string::npos);
+  CHECK(t.find("vadd.c:12") != std::string::npos);
+
+  // Without source info the source column disappears.
+  syms[0].src_start.clear();
+  syms[0].src_end.clear();
+  std::string t2 = render_table(rows, syms, 10, false);
+  CHECK(t2.find("| source") == std::string::npos);
+  CHECK(t2.find("RVV-only") == std::string::npos);
+}
+
+static void test_profile_qemu_argv() {
+  ProfileQemuArgs a;
+  a.qemu_bin = "/opt/qemu/qemu-system-riscv64";
+  a.plugin_so = "/repo/qemu_plugin/libhotIterationLoop.so";
+  a.log_path = "/tmp/wd/plugin.log";
+  a.limit = 50;
+  a.min_iters = 10;
+  a.cpu = "andes-ax45mpv,vlen=512";
+  a.elf = "/tmp/vadd.elf";
+  check_eq(profile_qemu_argv(a),
+           {"/opt/qemu/qemu-system-riscv64", "-plugin",
+            "/repo/qemu_plugin/libhotIterationLoop.so,limit=50,min_iters=10", "-d",
+            "plugin", "-D", "/tmp/wd/plugin.log", "-M", "andes_ae350", "-cpu",
+            "andes-ax45mpv,vlen=512", "-nographic", "-semihosting", "-bios",
+            "/tmp/vadd.elf"},
+           "argv-min");
+
+  a.mem_size = "256M";
+  a.readconfig = "/tmp/wd/qemu.cfg";
+  a.passthrough = {"-icount", "shift=0"};
+  check_eq(profile_qemu_argv(a),
+           {"/opt/qemu/qemu-system-riscv64", "-plugin",
+            "/repo/qemu_plugin/libhotIterationLoop.so,limit=50,min_iters=10", "-d",
+            "plugin", "-D", "/tmp/wd/plugin.log", "-M", "andes_ae350", "-cpu",
+            "andes-ax45mpv,vlen=512", "-nographic", "-semihosting", "-bios",
+            "/tmp/vadd.elf", "-m", "256M", "-readconfig", "/tmp/wd/qemu.cfg",
+            "-icount", "shift=0"},
+           "argv-full");
+}
+
+int main() {
+  test_parse_plugin_log();
+  test_parse_disasm();
+  test_is_rvv();
+  test_ranges();
+  test_filter_loops();
+  test_build_loops_nesting();
+  test_measure_ret_pc();
+  test_src_helpers();
+  test_render_llm();
+  test_render_table();
+  test_profile_qemu_argv();
+  return andes_sim::test::report("profile");
+}
