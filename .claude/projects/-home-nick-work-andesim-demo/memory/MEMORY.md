@@ -1,2 +1,2 @@
-- [ax66_makatau syscall bug](ax66_makatau_syscall_bug.md) - HTIF syscalls crash on this engine; 2 theories disproven by runtime facts (not static docs), root cause still open
+- [ax66_makatau syscall bug](ax66_makatau_syscall_bug.md) - ROOT CAUSE FOUND: host backdoor-writes syscall results into flat RAM, invisible through ax66's private write-back L2 (PL2C); fix is vsim-side, not the guest runtime
 - [vsim build via container](vsim-build-via-container.md) - rebuild vsim_andesim only with ./build_vsim.sh; host cmake fails (/work paths)

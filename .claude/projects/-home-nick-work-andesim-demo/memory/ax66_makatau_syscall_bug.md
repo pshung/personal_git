@@ -1,127 +1,129 @@
 ---
 name: ax66-makatau-syscall-bug
-description: "vsim:ax66_makatau fails HTIF syscalls (gettimeofday, file io) in --mode cycle; TWO plausible theories built from static/vendor docs both disproven by runtime facts; root cause still open"
-metadata: 
+description: "vsim:ax66_makatau fails HTIF syscalls in --mode cycle; ROOT CAUSE FOUND - host services syscalls by a backdoor write into the flat backing store, invisible to the guest through ax66's private write-back L2 (PL2C). Fix belongs in the vsim platform, not the guest runtime."
+metadata:
   node_type: memory
   type: project
   originSessionId: 2f3f544d-3989-4811-a594-f467b83e9ab4
 ---
 
-`make check-all-engines` (in andesim-demo) sweeps all 3 vsim engines
-(`ax45mpv_premium`, `ax46mpv_advanced`, `ax66_makatau`) and found
+`make check-all-engines` (andesim-demo) sweeps the rv64 vsim engines and
 `vsim:ax66_makatau` fails `demo/syscall` in `--mode cycle`: the guest's
-first-ever HTIF syscall, `gettimeofday()`, fails right after boot. The
-other two engines and `--mode fast` (QEMU) pass fine.
+first HTIF syscall (`gettimeofday`) fails right after boot. ax45mpv_premium,
+ax46mpv_advanced, and `--mode fast` (QEMU) all pass.
 
-**Bisection evidence (empirical, still valid, from running real ELFs on
-sim_ax66_makatau):**
-- `vplat_hello.elf` (UART printf only, no HTIF) - PASSES.
-- `vplat_exit41.elf` (SimControl exit only, no HTIF) - PASSES.
-- `vplat_gettimeofday.c` / `vplat_file.elf` (both use the HTIF
-  magicmem mechanism) - FAIL. `vplat_file.elf` fails harder: a
-  SystemC/TLM "target socket not found for address 0x6300050980"
-  (~424GB, nonsense) + CPU trap (mcause 0x2).
-- The SAME compiled ELF runs against all 3 engines (test loops
-  `for eng in ax45mpv_premium ax46mpv_advanced ax66_makatau`) - this is
-  `andesim`'s deliberate "engine-blind" design (see
-  `andesim/runtime/vplat_syscalls.c`'s header comment). Any theory that
-  requires ax66 to see a DIFFERENT guest address than the other two
-  engines for the SAME ELF is very likely wrong - check symbol
-  addresses (`nm`) before trusting it.
+## ROOT CAUSE (found, evidence-backed - session 3)
 
-**THEORY 1, DISPROVEN (session 1).** Suspected `flush_dcache()`'s L2
-MMIO writeback (`mmsc_cfg` bit 46 gate) in `andesim/runtime/vplat_syscalls.c`.
-Disproven by bisection: skipping that whole code block, ax66 still
-fails identically. See git history / old revisions of this note for
-detail if needed - not repeating here, it's a dead end.
+The HTIF magicmem transport assumes host and guest share a coherent view of
+RAM. They do not on ax66.
 
-**THEORY 2, DISPROVEN (session 2 - this one).** Found (by reading
-`vsim_andesim`'s source directly) that `ax66_makatau` supports an
-"alias region" onto main RAM: `RAM_ALIAS_BASE = 0x800000000` in
-`src/platform/memory_map.h`, registered unconditionally for all engines
-in `Platform`'s constructor (`src/platform/platform.hpp:71`). Found that
-`SimControl::dispatch()` (`src/platform/sim_control.hpp`) and
-`guest_va_to_host()` (`src/htif/sys_call.hpp`) both resolved a guest
-pointer as `addr - region.base_address`, NEVER checking
-`alias_region` - a real bug, confirmed by writing a passing/failing
-unit test (`src/tests/platform/sim_control.test.cpp`, still in the repo,
-still green) and fixed via a new `SimpleMemory::base_for(addr)` helper
-(picks `alias_region.base_address` vs `region.base_address` by
-containment). Also fixed a genuinely separate, pre-existing bug found
-along the way: `src/htif/command.hpp` was missing `#include <cstdint>`
-(fixed, structural, zero behavior change).
+- The host services a syscall by writing the result **directly into the
+  SystemC flat backing store** - `SimControl::dispatch()`
+  (`vsim_andesim/src/platform/sim_control.hpp`) copies args from, and writes
+  the return value back into, `data_region.data.begin() + offset`. That is a
+  backdoor poke into `SimpleMemory::data` (`simple_memory.hpp`), which sits
+  **behind** the Verilated core's caches. `SimpleMemory` only serves a read
+  from `data` when the core actually issues a bus transaction; a line the
+  core still holds is never refetched, so the host's write is invisible.
+- On a core with a **private write-back L2**, the syscall buffers stay
+  resident across the handoff and the guest reads its own stale copy. ax66
+  has PL2C (256 KB; `mmsc_cfg` bit46 = 1, `mcache_ctl.pl2_en` bit32 = 1);
+  ax45/ax46 have no PL2C (`NDS_L2C_CACHE_SIZE_KB {0}`, bit46 = 0). That is the
+  whole difference.
 
-**This fix is REAL but WRONG FOR THIS BUG - IT DOES NOT FIX THE
-OBSERVED FAILURE.** Confirmed by rebuilding the actual `sim_ax66_makatau`
-binary (via the repo's proper containerized build, see "How to build"
-below) with the fix applied, and re-running
-`andesim/tests/vplat/test_vplat_gettimeofday.sh`: **identical failure,
-byte for byte** (`GETTIMEOFDAY: call failed`).
+**Controlled proof (identical ELF, three engines, `probe3.c` = a faithful
+replay of `htif_syscall()` then a readback; b_transport is synchronous so the
+host has already written the result before the readback runs):**
 
-Root of the mistake: `RAM_ALIAS_BASE=0x800000000` matches
-`DDR3_MEM_BASE` in the AX66 **vendor's own sample test patterns**
-(`external/ax66/andes_vip/patterns/samples/include/platform.h`) - a
-SEPARATE, vendor-authored test harness, unrelated to `andesim`'s guest
-runtime. Checked (via `nm`) where `andesim`'s ACTUAL compiled test
-ELFs place `magicmem`: `vplat_gettimeofday.elf` -> `0x108e80`,
-`vplat_file.elf` -> `0x109a80` - both low addresses, near the `0x100000`
-entry point, controlled by `andesim/runtime/andesim.ld`, the SAME for
-all 3 engines (confirms the "engine-blind" note above). These addresses
-are nowhere near the `0x800000000` alias window, so `base_for()`
-resolves them via the plain `region` path regardless of the fix -
-**the fix is a no-op for this specific bug.** The alias-region gap is
-still a real, independently-confirmed bug (kept fixed, unit-tested,
-worth keeping) - it just isn't THIS bug.
+| engine | PL2C | mmsc_cfg b46 | mcache_ctl | baseline read | tv_sec |
+|--------|------|--------------|------------|---------------|--------|
+| ax45mpv_premium | none | 0 | 1b03      | 0 (fresh) | real |
+| ax46mpv_advanced| none | 0 | 1b03      | 0 (fresh) | real |
+| ax66_makatau    | 256K | 1 | 100001f03 | 5 (stale) | 0 |
 
-**Lesson (this is now TWO theories in a row disproven by not checking
-real runtime values first):** a vendor datasheet or a "looks similar"
-constant/config from a DIFFERENT test harness in the same repo can be
-completely inapplicable to the actual code path being debugged, even
-when it's real, correctly-read, and internally consistent. Before
-trusting ANY address/constant/config value as relevant: check what the
-ACTUAL failing ELF/binary really uses at runtime (`nm`, `readelf`,
-actual build's `config.inc`, actual linker script) - do this FIRST,
-before forming a theory from docs/vendor samples/other-engine
-templates, not after.
+`tv_sec` is the clincher: it is a plain host-written **payload** buffer
+(gettimeofday's `tv`), not the dirty command word. ax66 reads the bss zero
+(0), ax45/ax46 read the real timestamp. So this is genuinely host-write /
+guest-cache incoherence, NOT the command word and NOT address translation.
 
-**Root cause: still OPEN.** What's actually confirmed and still true:
-- The bug is specific to the HTIF magicmem mechanism (not UART, not
-  the plain SimControl exit signal).
-- It is NOT the L2/L3 cache MMIO flush code (theory 1, disproven).
-- It is NOT an alias-region/guest-address-translation issue for THIS
-  ELF (theory 2, disproven) - the addresses involved are plain, low,
-  identical across all 3 engines.
-- `vplat_file.elf`'s crash address (`0x6300050980`, ~424GB) is a THIRD
-  number, matching neither the low guest addresses nor the alias base -
-  unexplained. Possibly pointer corruption somewhere else, or an
-  ax66-specific (mk_core family, first S/U-mode-capable engine, has an
-  MMU/PMA/PMP per the datasheet - unlike the M-mode-only kv_core family
-  ax45/ax46) address-translation/PMA/PMP default-state difference that
-  affects even identity-mapped low addresses. NOT YET INVESTIGATED -
-  this is the next lead, not a conclusion.
+**The guest runtime cannot robustly fix it on ax66:**
+- The architecturally correct move is "invalidate only the result buffers
+  after the call." That needs **VA-scoped CCTL**, which **traps** on ax66:
+  `mk_csr.v` sets `NO_CCTL_VA = RVH_SUPPORT`, and ax66 has
+  `NDS_RVH_SUPPORT {yes}` -> VA-form CCTL commands are removed. (probe1:
+  `L1D_VA_INVAL`/`L1D_VA_WBINVAL` -> traps=1 on ax66, =0 on ax45.)
+- The "ALL" variants don't work: `L1D_WBINVAL_ALL` (cmd 6, what
+  `vplat_syscalls.c::flush_dcache()` uses) leaves the guest reading stale;
+  `L1D_INVAL_ALL` (cmd 23) would also drop unrelated dirty lines (stack) and
+  corrupt the guest at a non-terminal point.
+- No guest knob tested exposed the write: WBINVAL_ALL, INVAL_ALL,
+  prefetch-off (clear IPREF/DPREF), and DC_COHEN all still read stale on
+  ax66. (DC_COHEN can't help - the host poke bypasses the coherence bus.)
 
-**How to build vsim_andesim (learned this session, wasted real time
-before finding it):** do NOT try to build natively by hand-patching
-CMakeCache.txt paths etc - this repo's build was made INSIDE a pinned
-Docker/Podman container (see `Dockerfile`), and native builds hit
-unrelated, pre-existing dependency breakage (e.g. vendored `LIEF`
-missing `#include <cstdint>`, vendored `systemc-components` API
-mismatch) with newer host compilers. Use `./build_vsim.sh` (builds the
-`env` container image, runs `./build.sh` inside it with the repo
-bind-mounted at `/work` - this is WHY `build/`'s CMakeCache.txt files
-show `/work` paths; that's correct for this workflow, not stale. Only
-hand-patch those paths if deliberately doing a native, non-Docker build
-AND accepting the vendored-dependency risk). A full rebuild of all 4
-CPUs takes appreciable time (single-CPU Verilation alone: ~7.5 min) -
-budget for it, run in background, don't block on it synchronously.
+**Blocking layer = vsim platform** (per andesim-demo/CLAUDE.md taxonomy):
+the SimControl/HTIF backdoor transport is incoherent with the modeled cache
+hierarchy for private-write-back-L2 cores. NOT RTL-capability (ax66 has the
+memory + CCTL), NOT the andesim driver, NOT the demo. Hybrid mode passes on
+ax66 for hello/rvv/fp/etc. precisely because it drains **registers** via the
+Debug Module (`state_drain.hpp`, DMI abstract reads) and never round-trips a
+host write through guest RAM - so it never hits this.
 
-**How to apply:** if asked to continue, do NOT restate either
-disproven theory as fact. Next step should start from real ground
-truth: dump/compare actual CSR state (mmsc_cfg, satp/PMA/PMP-related
-CSRs if any) between a passing engine and ax66_makatau at the point
-`htif_syscall()` executes, or trace exactly what address the CPU
-actually puts on the bus for the magicmem write on ax66 vs the other
-two (e.g. via vsim's own trace/debug logging) - don't theorize from
-static docs again before doing this. User has been told twice now that
-this investigation is open-ended and harder than scoped; check with
-them before spending significant further effort.
+## PROPER FIX (right layer = vsim, not yet implemented)
+
+After `dispatch()` writes results into `data`, the simulator must make those
+bytes visible to the core: invalidate the affected line(s) in the Verilated
+core's L1/PL2C model, or issue the result write as a bus transaction the
+caches observe - for every engine that models a write-back cache. The handler
+already knows the guest addresses it wrote (magicmem, plus each syscall's
+payload buffer: gettimeofday `tv`, read `buf`, stat `statbuf`, getcwd `buf`,
+...). This is the coherence QEMU gets for free (no guest cache model).
+Open question for implementation: whether the Verilated Andes model exposes a
+cache-invalidate/flush backdoor, or one must be added. No such primitive
+exists in the tree today (hybrid sidesteps RAM coherence via register drain).
+Cheap guest-side confirmation not yet run: read the buffers through an
+uncacheable mapping (e.g. the RAM_ALIAS 0x800000000 window if PMA marks it
+NC) - should return fresh, proving the data is in `data` and only the cache
+shadows it.
+
+## Dead ends (do NOT re-open)
+- THEORY 1 (session 1): `flush_dcache()`'s L2 MMIO writeback (`mmsc_cfg`
+  bit46 gate, 0xe0500000 window). Disproven: skipping the whole block, ax66
+  fails identically. (That MMIO window is the kv-core shared-L2C mechanism;
+  ax66's PL2C is private/CSR-controlled, so the block is a no-op there
+  anyway.)
+- THEORY 2 (session 2): alias-region guest-address translation
+  (`RAM_ALIAS_BASE 0x800000000`). Disproven: the ELF's magicmem/tv live at
+  low addresses (~0x109000), resolved via the plain `region` path; the
+  alias-region fix (`SimpleMemory::base_for`) is a real, unit-tested,
+  kept fix but a no-op for THIS bug.
+
+## Lesson (held)
+Confirm from real runtime values, not docs/vendor samples. Both dead theories
+came from reading static config; the answer came from running the same ELF on
+all three engines and diffing behavior (probe3). A vendor constant from a
+different test harness in the same repo can be entirely inapplicable.
+
+## How to build vsim_andesim (needed for the fix)
+Do NOT hand-patch CMakeCache paths. This repo builds INSIDE a pinned
+container: `./build_vsim.sh` (builds the `env` image, runs `./build.sh` with
+the repo bind-mounted at `/work` - that is why build/ CMakeCache shows /work
+paths; correct, not stale). Native host builds hit vendored-dependency
+breakage (LIEF missing `#include <cstdint>`, systemc-components API drift).
+Full rebuild of all 4 CPUs is slow (single-CPU Verilation ~7.5 min) - run in
+background, do not block synchronously. See [[vsim-build-via-container]].
+
+## Reproduce / probes (this session)
+`/tmp/.../scratchpad/probe3.c` (discriminator, no rebuild needed) and
+`cctl_probe.c` (CCTL sweep). Build: `riscv64-...-gcc -march=rv64gc -mabi=lp64d
+-O2 -B /home/nick/work/andesim/build/runtime -specs=andesim.specs`. Run:
+`sim_<engine> probe3.elf`. Runtime fixture:
+`andesim/tests/vplat/test_vplat_gettimeofday.sh` (RED on ax66). Build fixtures
+after `. /home/nick/work/andesim/config.env` (exports HYBRID_TOOLCHAIN).
+
+## How to apply
+Root cause is settled - do not restate it as open or re-run the dead
+theories. If asked to FIX: the change is vsim-side (cache-coherent syscall
+writeback) + a full container rebuild; it is significant. Confirm scope with
+the user before starting (they have said twice this is open-ended). A natural
+RED test already exists (`test_vplat_gettimeofday.sh` fails on ax66); a
+SimControl-level unit test could pin it before touching the transport.

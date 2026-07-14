@@ -1,0 +1,131 @@
+/* cctl_probe: which cache op makes the host's magicmem write-back visible?
+ *
+ * Repeats the exact htif_syscall() dance from vplat_syscalls.c (stage ->
+ * mcctlcommand=6 -> tohost MMIO write -> fence -> load magicmem[0]) and,
+ * when the load returns the stale staged value, applies one invalidation
+ * candidate and reads again. Runs with a trap-skipping handler so an
+ * unimplemented CSR/insn just counts as TRAP instead of dying.
+ */
+#include <stdint.h>
+#include <stdio.h>
+
+#define TOHOST (*(volatile uint64_t*) 0xe0080010UL)
+#define VH_SYS_GETTIMEOFDAY 5
+
+static uint64_t magicmem[8] __attribute__((aligned(64)));
+static uint64_t tvbuf[2];
+
+static volatile unsigned long trap_count;
+
+__attribute__((interrupt("machine"), aligned(4))) static void skip_trap(void)
+{
+  unsigned long mepc;
+  __asm__ __volatile__("csrr %0, mepc" : "=r"(mepc));
+  trap_count++;
+  mepc += 4;
+  __asm__ __volatile__("csrw mepc, %0" ::"r"(mepc));
+}
+
+static uint64_t csr_read_fc0(void) { uint64_t v = 0; __asm__ __volatile__("csrr %0, 0xFC0" : "=r"(v)); return v; }
+static uint64_t csr_read_fc1(void) { uint64_t v = 0; __asm__ __volatile__("csrr %0, 0xFC1" : "=r"(v)); return v; }
+static uint64_t csr_read_fc2(void) { uint64_t v = 0; __asm__ __volatile__("csrr %0, 0xFC2" : "=r"(v)); return v; }
+static uint64_t csr_read_fc3(void) { uint64_t v = 0; __asm__ __volatile__("csrr %0, 0xFC3" : "=r"(v)); return v; }
+static uint64_t csr_read_7ca(void) { uint64_t v = 0; __asm__ __volatile__("csrr %0, 0x7CA" : "=r"(v)); return v; }
+
+/* The htif_syscall() sequence up to (not including) the readback: the
+ * candidate op then runs BEFORE the first post-syscall load, exactly where
+ * a fix would sit. */
+static void dance_notouch(void)
+{
+  magicmem[0] = VH_SYS_GETTIMEOFDAY;
+  magicmem[1] = (uintptr_t) tvbuf;
+  magicmem[2] = 0;
+  magicmem[3] = 0;
+  magicmem[4] = 0;
+  magicmem[5] = 0;
+  magicmem[6] = 0;
+  magicmem[7] = 0;
+  __asm__ __volatile__("csrw mcctlcommand, %0" ::"rK"(6));
+  TOHOST = (uintptr_t) magicmem;
+  __asm__ __volatile__("fence rw,rw" ::: "memory");
+}
+
+static void op_none(void) {}
+
+static void touch(void)
+{
+  (void) *(volatile uint64_t*) &magicmem[0];
+}
+
+static void cctl_all(unsigned long cmd)
+{
+  __asm__ __volatile__("csrw mcctlcommand, %0\n"
+                       "fence rw,rw" ::"r"(cmd)
+                       : "memory");
+}
+
+static void cctl_va(unsigned long cmd)
+{
+  __asm__ __volatile__("csrw mcctlbeginaddr, %0\n"
+                       "csrw mcctlcommand, %1\n"
+                       "fence rw,rw" ::"r"((uintptr_t) magicmem), "r"(cmd)
+                       : "memory");
+}
+
+static void op_flush6(void) { cctl_all(6); }
+static void op_touch_flush6(void) { touch(); cctl_all(6); }
+static void op_touch_inval23(void) { touch(); cctl_all(23); }
+static void op_pl2_va128(void) { cctl_va(128); }
+static void op_pl2_va129(void) { cctl_va(129); }
+static void op_pl2_va130(void) { cctl_va(130); }
+static void op_pl2_all135(void) { cctl_all(135); }
+static void op_pl2_all136(void) { cctl_all(136); }
+static void op_pl2_all137(void) { cctl_all(137); }
+
+struct cand
+{
+  const char* name;
+  void (*op)(void);
+};
+
+static const struct cand cands[] = {
+  { "baseline(no-op)", op_none },
+  { "fixorder:flush6", op_flush6 },
+  { "touch+flush6", op_touch_flush6 },
+  { "touch+inval23", op_touch_inval23 },
+  { "PL2_VA?128", op_pl2_va128 },
+  { "PL2_VA?129", op_pl2_va129 },
+  { "PL2_VA?130", op_pl2_va130 },
+  { "PL2_ALL?135", op_pl2_all135 },
+  { "PL2_ALL?136", op_pl2_all136 },
+  { "PL2_ALL?137", op_pl2_all137 },
+};
+
+int main(void)
+{
+  __asm__ __volatile__("csrw mtvec, %0" ::"r"((uintptr_t) &skip_trap));
+
+  unsigned long t0 = trap_count;
+  uint64_t micm = csr_read_fc0();
+  uint64_t mdcm = csr_read_fc1();
+  uint64_t mmsc = csr_read_fc2();
+  uint64_t mmsc2 = csr_read_fc3();
+  uint64_t mcache = csr_read_7ca();
+  printf("CSR micm_cfg=%lx mdcm_cfg=%lx mmsc_cfg=%lx mmsc_cfg2=%lx "
+         "mcache_ctl=%lx traps=%lu\n",
+         micm, mdcm, mmsc, mmsc2, mcache, trap_count - t0);
+  printf("mmsc_cfg bit46(L2C)=%lu\n", (mmsc >> 46) & 1);
+  printf("magicmem @ %p\n", (void*) magicmem);
+
+  for (unsigned i = 0; i < sizeof(cands) / sizeof(cands[0]); ++i) {
+    unsigned long tb = trap_count;
+    dance_notouch();
+    cands[i].op();
+    uint64_t ret = *(volatile uint64_t*) &magicmem[0];
+    printf("%-16s read=%ld traps=%lu\n", cands[i].name, (long) ret,
+           trap_count - tb);
+  }
+
+  printf("PROBE_DONE\n");
+  return 0;
+}
