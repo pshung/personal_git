@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# `andesim profile` contract: hot inner-loop detection rides the engine's own
+# QEMU config. Like hybrid, profile picks a cycle-accurate engine (--engine or
+# the sole one) and derives the QEMU launch from it: -cpu from the engine's
+# `--print-qemu-config` driver globals, vlen from its --describe, the staged
+# qemu.cfg as -readconfig. Layers:
+#
+#   1. unit (fast, pure): the profile core (parse/filter/nest/render/argv)
+#      plus the CLI parse of the profile flags.
+#   2. fake engines (no real vsim, no QEMU): throwaway engine scripts that
+#      answer --describe AND --print-qemu-config drive the real
+#      discover -> resolve -> probe -> argv path; --dry-run prints the exact
+#      QEMU command without spawning it, so every assertion is deterministic.
+#   3. real engine (guarded): the probe/argv against a built sim_* binary,
+#      still --dry-run (the full QEMU run is covered by
+#      tests/plugin/test_plugin_hotIterationLoop_measure.sh).
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+
+BIN="$ROOT/build/andesim"
+
+bash "$ROOT/scripts/build_driver.sh" >/dev/null 2>&1 || fail "build_driver.sh failed"
+
+# 1. unit: profile core + CLI parse
+"$ROOT/build/driver/andesim-profile-test" || fail "profile unit tests failed"
+"$ROOT/build/driver/andesim-cli-test" || fail "cli unit tests failed"
+
+# --- fixtures: throwaway engine scripts in a scanned dir --------------------
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+# mkengine DIR FILE ID VLEN CPU: a fake cycle-accurate engine whose
+# --print-qemu-config names CPU (a minimal but valid -readconfig text). An
+# empty CPU makes the probe FAIL (exit 1), like an engine without the hook.
+mkengine() {
+  local f="$1/$2"
+  cat >"$f" <<EOF
+#!/bin/sh
+if [ "\$1" = "--describe" ]; then
+  printf '%s\n' '{"id":"$3","type":"vsim","kind":"cycle-accurate","xlen":64,"vlen":$4,"roles":["standalone","accurate-leg"],"invoke":{"standalone":["{bin}","{elf}"]}}'
+elif [ "\$1" = "--print-qemu-config" ]; then
+  [ -n "$5" ] || exit 1
+  printf '[global]\ndriver = "$5-riscv-cpu"\nproperty = "vlen"\nvalue = "$4"\n'
+else
+  echo "RAN:\$*"
+fi
+EOF
+  chmod +x "$f"
+}
+
+D1="$TMP/one"; D2="$TMP/two"; DE="$TMP/empty"; DN="$TMP/nocfg"
+mkdir -p "$D1" "$D2" "$DE" "$DN"
+mkengine "$D1" v1 "vsim:v1" 256 "andes-ax45mpv"
+mkengine "$D2" v1 "vsim:v1" 512 "andes-ax45mpv"
+mkengine "$D2" v2 "vsim:v2" 128 "andes-ax66"
+mkengine "$DN" v1 "vsim:v1" 512 ""   # probe fails -> default -cpu, no -readconfig
+
+DUMMY="$TMP/dummy.elf"; : >"$DUMMY"
+
+# 2a. sole engine is the default; the dry-run shows the full QEMU command with
+# the engine-derived -cpu (model from the probe, vlen from --describe), the
+# staged -readconfig, the plugin with default limit/min_iters, and -bios.
+# One spawn, grepped per assertion (each run pays discovery + probe spawns).
+out=$(env ANDESIM_ENGINES_DIR="$D1" "$BIN" profile --dry-run "$DUMMY" 2>&1 </dev/null); rc=$?
+[ "$rc" -eq 0 ] || fail "2a dry-run: rc=$rc: $out"
+for re in \
+  '\-plugin .*libhotIterationLoop\.so,limit=50,min_iters=1' \
+  '\-cpu andes-ax45mpv,vlen=256' \
+  '\-readconfig .*/qemu\.cfg' \
+  '\-bios .*dummy\.elf' \
+  'dry-run: 1 command\(s\), not executed'; do
+  printf '%s\n' "$out" | grep -Eq -- "$re" || fail "2a dry-run: missing /$re/: $out"
+done
+# 2b. --limit/--min-iters ride the -plugin arg; --mem-size becomes -m; the
+# post--- args land on the QEMU command verbatim.
+expect 0 '\-plugin .*,limit=7,min_iters=3' \
+  env ANDESIM_ENGINES_DIR="$D1" "$BIN" profile --dry-run --limit 7 --min-iters 3 "$DUMMY"
+expect 0 '\-m 256M' \
+  env ANDESIM_ENGINES_DIR="$D1" "$BIN" profile --dry-run --mem-size 256M "$DUMMY"
+expect 0 '\-icount shift=0' \
+  env ANDESIM_ENGINES_DIR="$D1" "$BIN" profile --dry-run "$DUMMY" -- -icount shift=0
+# 2c. two engines, no --engine: ambiguous, names both; --engine picks one and
+# its OWN cpu/vlen pair follows (ax66 + vlen=128).
+expect 2 'multiple cycle-accurate.*vsim:v1.*vsim:v2' \
+  env ANDESIM_ENGINES_DIR="$D2" "$BIN" profile --dry-run "$DUMMY"
+expect 0 '\-cpu andes-ax66,vlen=128' \
+  env ANDESIM_ENGINES_DIR="$D2" "$BIN" profile --dry-run --engine vsim:v2 "$DUMMY"
+# 2d. no cycle-accurate engine discoverable: the same clear error hybrid gives
+expect 2 'no cycle-accurate engine' \
+  env ANDESIM_ENGINES_DIR="$DE" "$BIN" profile --dry-run "$DUMMY"
+expect 2 "no engine 'vsim:nope'" \
+  env ANDESIM_ENGINES_DIR="$D1" "$BIN" profile --dry-run --engine vsim:nope "$DUMMY"
+# 2e. an engine whose --print-qemu-config fails: tolerant fallback -- default
+# -cpu family, vlen still synced from --describe, and NO -readconfig.
+out=$(env ANDESIM_ENGINES_DIR="$DN" "$BIN" profile --dry-run --log-level 3 "$DUMMY" 2>&1 </dev/null)
+rc=$?
+[ "$rc" -eq 0 ] || fail "probe-less engine: rc=$rc: $out"
+printf '%s\n' "$out" | grep -Eq -- '-cpu andes-ax45mpv,vlen=512' \
+  || fail "probe-less engine: missing default -cpu: $out"
+printf '%s\n' "$out" | grep -q -- '-readconfig' \
+  && fail "probe-less engine: unexpected -readconfig: $out"
+printf '%s\n' "$out" | grep -q 'no --print-qemu-config' \
+  || fail "probe-less engine: missing the fallback warning: $out"
+# 2f. CLI shape errors
+expect 2 'missing ELF' \
+  env ANDESIM_ENGINES_DIR="$D1" "$BIN" profile --dry-run
+expect 2 'QEMU args go after --' \
+  env ANDESIM_ENGINES_DIR="$D1" "$BIN" profile --dry-run a.elf b.elf
+expect 2 'ELF not found' \
+  env ANDESIM_ENGINES_DIR="$D1" "$BIN" profile --dry-run "$TMP/nope.elf"
+# 2g. run-only flags are rejected loudly, not silently ignored
+expect 2 'not a profile option' \
+  env ANDESIM_ENGINES_DIR="$D1" "$BIN" profile --dry-run --trigger marker "$DUMMY"
+expect 2 'not a profile option' \
+  env ANDESIM_ENGINES_DIR="$D1" "$BIN" profile --dry-run --mode fast "$DUMMY"
+expect 2 'not a profile option' \
+  env ANDESIM_ENGINES_DIR="$D1" "$BIN" profile --dry-run --verify "$DUMMY"
+# 2h. profile appears in the help tree
+expect 0 'profile' "$BIN" --help
+expect 0 'profile' "$BIN" profile --help
+echo "[ok] fake-engine profile: engine-derived cfg, errors, dry-run argv"
+
+# 3. real engine (guarded, still --dry-run): the staged cfg + cpu come from the
+# actual sim_ax45mpv_premium probe.
+SIM="$(vsim_bin_dir)/sim_ax45mpv_premium"
+if [ -x "$SIM" ]; then
+  out=$("$BIN" profile --dry-run --engine vsim:ax45mpv_premium \
+        "$ROOT/tests/fixtures/rt_c_hello.elf" 2>&1 </dev/null); rc=$?
+  [ "$rc" -eq 0 ] || fail "real engine dry-run: rc=$rc: $out"
+  for re in '\-cpu andes-ax45mpv,vlen=[0-9]+' '\-readconfig .*/qemu\.cfg'; do
+    printf '%s\n' "$out" | grep -Eq -- "$re" || fail "real engine dry-run: missing /$re/: $out"
+  done
+  echo "[ok] real engine probe: -cpu/-readconfig derived from sim_ax45mpv_premium"
+else
+  echo "[skip] real engine layer: no built $SIM"
+fi
+
+ok "profile: engine-synced QEMU profile command"
