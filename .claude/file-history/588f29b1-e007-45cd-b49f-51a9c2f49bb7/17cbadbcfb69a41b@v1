@@ -1,0 +1,293 @@
+#pragma once
+
+#include "pybind11.hpp"
+
+#ifdef ENABLE_INTERNAL_SIGNALS
+#include "signals/internal_signals_ax66.hpp"
+#endif // ENABLE_INTERNAL_SIGNALS
+
+#include "utils/ahb.hpp"
+#include "utils/axi.hpp"
+#include "utils/cpu_signal_registry.hpp"
+#include "utils/duplicator.hpp"
+#include "utils/signals.hpp"
+
+#include <axi/pin/axi4_initiator.h>
+#include <axi/pin/axi4_target.h>
+#include <axi/signal_if.h>
+#include <systemc>
+#include <Vandes.h>
+
+#include <cstddef>
+
+#include <array>
+#include <vector>
+
+struct ax66_cpu_cluster_subsystem
+    : public Vandes,
+      public CpuSignalRegistry<ax66_cpu_cluster_subsystem>
+{
+  using SC_CURRENT_USER_MODULE = ax66_cpu_cluster_subsystem;
+
+  ax66_cpu_cluster_subsystem(const sc_core::sc_module_name& name = "ax66")
+      : Vandes{name}
+  {}
+
+#define VERILOG_DEFINE(key, value) static constexpr auto key = value;
+#include <Vandes_config.h>
+
+  // Limit maximum number of cores to 2 due to performance concerns
+  static_assert(
+    _NDS_NHART <= 2,
+    "This subsystem only supports up to 2 cores. Please reconfigure with _NDS_NHART <= 2");
+
+  static constexpr auto SYSTEM_BUS_TYPE = BusTypes::AXI;
+
+  static constexpr auto dmi_addr_width = 9;
+  static constexpr auto dmi_data_width = 32;
+  static constexpr auto has_shared_cache = (NDS_L3C_CACHE_SIZE_KB > 0);
+  static constexpr size_t int_src_width = 34;
+
+  using Vandes::contextp;
+  using Vandes::final;
+  using Vandes::modelName;
+  using Vandes::threads;
+
+  using bus_cfg =
+    axi::axi4_cfg<NDS_BIU_DATA_WIDTH, NDS_BIU_ADDR_WIDTH, NDS_BIU_ID_WIDTH, 1>;
+
+  // System bus (64-bit data, 12-bit ID, slave port on CPU)
+  static constexpr auto sys_data_width = 64;
+  static constexpr auto sys_id_width = 12;
+  using sys_bus_cfg =
+    axi::axi4_cfg<sys_data_width, NDS_BIU_ADDR_WIDTH, sys_id_width, 1>;
+
+  axi_signals<bus_cfg> mem0{"mem0"};
+  axi_signals<bus_cfg> mmio{"mmio"};
+  axi_signals<sys_bus_cfg> sys{"sys"};
+  axi_signals<sys_bus_cfg> mmr{"mmr"};
+
+  axi::pin::axi4_target<bus_cfg> mem_bfm{"mem0_bfm"};
+  axi::pin::axi4_target<bus_cfg> mmio_bfm{"mmio_bfm"};
+  axi::pin::axi4_initiator<sys_bus_cfg> sys_bfm{"sys_bfm"};
+  axi::pin::axi4_initiator<sys_bus_cfg> mmr_bfm{"mmr_bfm"};
+
+#if _NDS_NHART > 1
+  // signal adapter for multi-core clock
+  BoolToUint<_NDS_NHART> mp_clk_dup{"mp_clk_dup"};
+  sc_core::sc_signal<sc_dt::sc_uint<_NDS_NHART>> mp_core_clk;
+  sc_core::sc_signal<bool> wfi_signal_hart1;
+#endif // _NDS_NHART
+
+  UintToBool<_NDS_NHART> reset_narrow{"reset_narrow"};
+  sc_core::sc_signal<bool> resetn_bool;
+
+  void bind(
+    const sc_core::sc_clock& clk,
+    const sc_core::sc_signal<sc_dt::sc_uint<_NDS_NHART>>& reset,
+    std::array<sc_core::sc_signal<vlpin<NDS_VALEN>>, _NDS_NHART>& reset_vector,
+    ahb::signals<dmi_addr_width, dmi_data_width>& dmi,
+    sc_core::sc_signal<bool>& wfi_signal,
+    sc_core::sc_signal<sc_dt::sc_uint<int_src_width>>& int_trigger)
+  {
+    // extract bit 0 from multi-bit reset for single-bit ports
+    reset_narrow.sig_in.bind(reset);
+    reset_narrow.sig_out.bind(resetn_bool);
+
+#if _NDS_NHART > 1
+    mp_clk_dup.sig_in.bind(clk);
+    mp_clk_dup.sig_out.bind(mp_core_clk);
+    this->core_clk.bind(mp_core_clk);
+    this->core_clk_en.bind(signals::one2);
+    this->dc_clk_en.bind(signals::one2);
+#else // _NDS_NHART == 1
+    this->core_clk.bind(clk);
+    this->core_clk_en.bind(signals::one);
+    this->dc_clk_en.bind(signals::one);
+#endif // _NDS_NHART
+
+#if _NDS_NHART > 1
+    this->core_resetn.bind(reset);
+#else
+    this->core_resetn.bind(resetn_bool);
+#endif
+
+    this->mem_bfm.clk_i.bind(clk);
+    this->mmio_bfm.clk_i.bind(clk);
+    this->sys_bfm.clk_i.bind(clk);
+    this->mmr_bfm.clk_i.bind(clk);
+
+#define BIND_AXI(bfm, signals) \
+  bfm.bind_ar(signals); \
+  bfm.bind_r(signals); \
+  bfm.bind_aw(signals); \
+  bfm.bind_w(signals); \
+  bfm.bind_b(signals);
+
+    BIND_AXI(this->mem_bfm, this->mem0);
+    BIND_AXI(this->mmio_bfm, this->mmio);
+    BIND_AXI(this->sys_bfm, this->sys);
+    BIND_AXI(this->mmr_bfm, this->mmr);
+
+#define X(ch, name) \
+  this->mem0_##ch##name.bind(this->mem0.ch##_##name); \
+  this->mmio_##ch##name.bind(this->mmio.ch##_##name); \
+  signals::ignore(this->iocp0_##ch##name); \
+  this->sys_msi_##ch##name.bind(this->sys.ch##_##name); \
+  this->cluster0_mmr_##ch##name.bind(this->mmr.ch##_##name);
+
+    EXPAND_AXI4_SIGNALS
+
+#undef X
+
+#define X(name) this->dmi_##name.bind(dmi.name);
+    EXPAND_AHB_SIGNALS_NO_HREADY
+#undef X
+    this->dmi_hreadyout.bind(dmi.hready);
+
+    this->dmi_hsel.bind(signals::one);
+    this->dmi_hready.bind(signals::one);
+
+    this->mtime_clk.bind(clk);
+    this->aclk.bind(clk);
+    this->l3_clk.bind(clk);
+
+    this->por_rstn.bind(resetn_bool);
+    this->test_rstn.bind(resetn_bool);
+    this->l3_resetn.bind(resetn_bool);
+    this->aresetn.bind(resetn_bool);
+    this->dmi_resetn.bind(resetn_bool);
+
+    this->axi_bus_clk_en.bind(signals::one);
+    this->l3_clk_en.bind(signals::one);
+    this->test_mode(signals::zero);
+    this->scan_enable(signals::one);
+    this->test_rst_sel(signals::one);
+
+    signals::ignore(this->mbist_enable);
+    signals::ignore(this->dbg_srst_req);
+    signals::ignore(this->dmactive);
+    signals::ignore(this->l3c_err_int);
+
+    this->hart0_reset_vector.bind(reset_vector[0]);
+    signals::ignore(this->hart0_dcache_disable_init);
+    signals::ignore(this->hart0_icache_disable_init);
+    signals::ignore(this->hart0_l2c_disable_init);
+    signals::ignore(this->hart0_nmi);
+    signals::ignore(this->hart0_wakeup_event);
+
+#if _NDS_NHART > 1
+    this->hart1_reset_vector.bind(reset_vector[1]);
+    signals::ignore(this->hart1_dcache_disable_init);
+    signals::ignore(this->hart1_icache_disable_init);
+    signals::ignore(this->hart1_l2c_disable_init);
+    signals::ignore(this->hart1_nmi);
+    signals::ignore(this->hart1_wakeup_event);
+#endif // _NDS_NHART
+
+    this->int_src.bind(int_trigger);
+    this->hart0_core_wfi_mode.bind(wfi_signal);
+
+#if _NDS_NHART > 1
+    this->hart1_core_wfi_mode.bind(wfi_signal_hart1);
+#endif
+  }
+
+#ifdef ENABLE_INTERNAL_SIGNALS
+  uint64_t get_current_pc() { return this->rootp->COMMIT0_PC_C0 << 1; }
+
+  // Returns all committed PCs from all cores and all issue slots
+  // Result: vector[core_id] contains vector of committed PCs for that core
+  // Each inner vector has 0-4 entries depending on how many instructions
+  // committed
+  std::vector<std::vector<uint64_t>> get_committed_pc()
+  {
+    std::vector<std::vector<uint64_t>> result(_NDS_NHART);
+
+    // Core 0 - 4 issue slots
+    if (this->rootp->RETIRE0_VALID_C0 & this->rootp->COMMIT0_TAKEN_C0) {
+      result[0].push_back(this->rootp->COMMIT0_PC_C0 << 1);
+    }
+    if (this->rootp->RETIRE1_VALID_C0 & this->rootp->COMMIT1_TAKEN_C0) {
+      result[0].push_back(this->rootp->COMMIT1_PC_C0 << 1);
+    }
+    if (this->rootp->RETIRE2_VALID_C0 & this->rootp->COMMIT2_TAKEN_C0) {
+      result[0].push_back(this->rootp->COMMIT2_PC_C0 << 1);
+    }
+    if (this->rootp->RETIRE3_VALID_C0 & this->rootp->COMMIT3_TAKEN_C0) {
+      result[0].push_back(this->rootp->COMMIT3_PC_C0 << 1);
+    }
+
+#if _NDS_NHART > 1
+    // Core 1 - 4 issue slots
+    if (this->rootp->RETIRE0_VALID_C1 & this->rootp->COMMIT0_TAKEN_C1) {
+      result[1].push_back(this->rootp->COMMIT0_PC_C1 << 1);
+    }
+    if (this->rootp->RETIRE1_VALID_C1 & this->rootp->COMMIT1_TAKEN_C1) {
+      result[1].push_back(this->rootp->COMMIT1_PC_C1 << 1);
+    }
+    if (this->rootp->RETIRE2_VALID_C1 & this->rootp->COMMIT2_TAKEN_C1) {
+      result[1].push_back(this->rootp->COMMIT2_PC_C1 << 1);
+    }
+    if (this->rootp->RETIRE3_VALID_C1 & this->rootp->COMMIT3_TAKEN_C1) {
+      result[1].push_back(this->rootp->COMMIT3_PC_C1 << 1);
+    }
+#endif
+
+    return result;
+  }
+
+  // Returns last PC values from all issue slots (no taken/valid check)
+  // Result: vector[core_id] contains all PC values from that core's issue slots
+  // Always returns 4 entries per core (may contain stale values if slot didn't
+  // commit)
+  std::vector<std::vector<uint64_t>> get_last_committed_pc()
+  {
+#if _NDS_NHART > 1
+    return {{static_cast<uint64_t>(this->rootp->COMMIT0_PC_C0) << 1,
+             static_cast<uint64_t>(this->rootp->COMMIT1_PC_C0) << 1,
+             static_cast<uint64_t>(this->rootp->COMMIT2_PC_C0) << 1,
+             static_cast<uint64_t>(this->rootp->COMMIT3_PC_C0) << 1},
+            { static_cast<uint64_t>(this->rootp->COMMIT0_PC_C1) << 1,
+              static_cast<uint64_t>(this->rootp->COMMIT1_PC_C1) << 1,
+              static_cast<uint64_t>(this->rootp->COMMIT2_PC_C1) << 1,
+              static_cast<uint64_t>(this->rootp->COMMIT3_PC_C1) << 1 }};
+#else
+    return {
+      { static_cast<uint64_t>(this->rootp->COMMIT0_PC_C0) << 1,
+        static_cast<uint64_t>(this->rootp->COMMIT1_PC_C0) << 1,
+        static_cast<uint64_t>(this->rootp->COMMIT2_PC_C0) << 1,
+        static_cast<uint64_t>(this->rootp->COMMIT3_PC_C0) << 1 }};
+#endif
+  }
+#endif // ENABLE_INTERNAL_SIGNALS
+
+  static CpuSignalRegistry<ax66_cpu_cluster_subsystem>::Registry
+  build_signal_registry()
+  {
+    using Self = ax66_cpu_cluster_subsystem;
+    CpuSignalRegistry<Self>::Registry reg;
+
+#ifdef ENABLE_INTERNAL_SIGNALS
+#define X(name, signal) \
+  reg.emplace(#name, [](const Self& s) -> uint64_t { \
+    return widen_to_u64(s.rootp->signal); \
+  });
+    EXPAND_INTERNAL_SIGNALS
+#undef X
+#endif // ENABLE_INTERNAL_SIGNALS
+
+    return reg;
+  }
+
+#if ENABLE_PYBIND11
+  static void bind_pybind11(pybind11::module_& m)
+  {
+    auto c = pybind11::class_<ax66_cpu_cluster_subsystem>(
+      m, "ax66_cpu_cluster_subsystem");
+#ifdef ENABLE_INTERNAL_SIGNALS
+    bind_registry_to_pybind11(c);
+#endif // ENABLE_INTERNAL_SIGNALS
+  }
+#endif
+};
