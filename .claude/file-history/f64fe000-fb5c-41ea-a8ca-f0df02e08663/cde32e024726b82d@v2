@@ -1,0 +1,129 @@
+/* probe3: discriminate WHY ax66 reads a stale magicmem return value.
+ *
+ * Faithfully replays htif_syscall()'s real sequence (write args ->
+ * mcctlcommand=6 -> tohost MMIO -> fence), then reads magicmem[0]. The host
+ * has already written 0 into the backing store by the time the tohost store
+ * retires (b_transport is synchronous), so any non-zero read is the guest's
+ * own cache shadowing the host write.
+ *
+ * Variants isolate the cause:
+ *   A baseline            - exactly the runtime; expect stale on ax66
+ *   B inval_all_after     - INVAL(23) after tohost, no touch; minimal candidate
+ *   C wbinval_all_after   - WBINVAL(6) after tohost; expect it clobbers -> stale
+ *   D prefetch_off        - clear I/D-prefetch before the dance; 0 => prefetch
+ *   E dc_cohen_on         - enable hw dcache coherence; does snoop help?
+ *   F read_twice          - is the stale value persistent, not a one-shot?
+ */
+#include <stdint.h>
+#include <stdio.h>
+
+#define TOHOST (*(volatile uint64_t*) 0xe0080010UL)
+#define VH_SYS_GETTIMEOFDAY 5
+#define MCACHE_CTL 0x7ca
+#define IPREF_EN 0x200
+#define DPREF_EN 0x400
+#define DC_COHEN 0x00080000
+#define DC_COHSTA 0x00100000
+
+struct tv64 { int64_t sec; int64_t usec; };
+
+static uint64_t magicmem[8] __attribute__((aligned(64)));
+static struct tv64 tvbuf;
+
+static volatile unsigned long trap_count;
+__attribute__((interrupt("machine"), aligned(4))) static void skip_trap(void)
+{
+  unsigned long mepc;
+  __asm__ __volatile__("csrr %0, mepc" : "=r"(mepc));
+  trap_count++;
+  __asm__ __volatile__("csrw mepc, %0" ::"r"(mepc + 4));
+}
+
+static inline uint64_t rd_mcache(void)
+{
+  uint64_t v;
+  __asm__ __volatile__("csrr %0, %1" : "=r"(v) : "i"(MCACHE_CTL));
+  return v;
+}
+static inline void wr_mcache(uint64_t v)
+{
+  __asm__ __volatile__("csrw %0, %1" ::"i"(MCACHE_CTL), "r"(v) : "memory");
+}
+static inline void cctl_all(unsigned long cmd)
+{
+  __asm__ __volatile__("csrw mcctlcommand, %0\n fence rw,rw" ::"r"(cmd)
+                       : "memory");
+}
+
+/* real htif_syscall() up to the readback */
+static void dance(void)
+{
+  magicmem[0] = VH_SYS_GETTIMEOFDAY;
+  magicmem[1] = (uintptr_t) &tvbuf;
+  for (int i = 2; i < 8; ++i)
+    magicmem[i] = 0;
+  cctl_all(6);
+  TOHOST = (uintptr_t) magicmem;
+  __asm__ __volatile__("fence rw,rw" ::: "memory");
+}
+
+static int64_t A_baseline(void)
+{
+  dance();
+  return (int64_t) magicmem[0];
+}
+static int64_t B_inval_after(void)
+{
+  dance();
+  cctl_all(23);
+  return (int64_t) magicmem[0];
+}
+static int64_t C_wbinval_after(void)
+{
+  dance();
+  cctl_all(6);
+  return (int64_t) magicmem[0];
+}
+static int64_t D_prefetch_off(void)
+{
+  uint64_t save = rd_mcache();
+  wr_mcache(save & ~(uint64_t)(IPREF_EN | DPREF_EN));
+  dance();
+  int64_t r = (int64_t) magicmem[0];
+  wr_mcache(save);
+  return r;
+}
+static int64_t E_cohen_on(void)
+{
+  uint64_t save = rd_mcache();
+  wr_mcache(save | DC_COHEN);
+  for (int i = 0; i < 1000 && !(rd_mcache() & DC_COHSTA); ++i)
+    ;
+  dance();
+  int64_t r = (int64_t) magicmem[0];
+  return r;
+}
+static int64_t F_read_twice(void)
+{
+  dance();
+  volatile int64_t first = (int64_t) magicmem[0];
+  (void) first;
+  return (int64_t) magicmem[0];
+}
+
+int main(void)
+{
+  __asm__ __volatile__("csrw mtvec, %0" ::"r"((uintptr_t) &skip_trap));
+  printf("mcache_ctl=%lx  magicmem=%p\n", rd_mcache(), (void*) magicmem);
+
+  printf("A baseline        ret=%ld\n", (long) A_baseline());
+  printf("B inval_after(23) ret=%ld  tv_sec=%ld\n", (long) B_inval_after(),
+         (long) tvbuf.sec);
+  printf("C wbinval_after(6)ret=%ld\n", (long) C_wbinval_after());
+  printf("D prefetch_off    ret=%ld\n", (long) D_prefetch_off());
+  printf("E dc_cohen_on     ret=%ld  cohsta=%lu\n", (long) E_cohen_on(),
+         (rd_mcache() & DC_COHSTA) ? 1UL : 0UL);
+  printf("F read_twice      ret=%ld\n", (long) F_read_twice());
+  printf("PROBE3_DONE\n");
+  return 0;
+}
