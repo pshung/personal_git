@@ -392,6 +392,24 @@ explicitly optional 27B stretch-goal track, not deleted.
   updated with the confirmed command + cycle figure; a new section 5.11
   documents `--step-timeout-ms` (existing 5.11/5.12 renumbered to
   5.12/5.13, cross-references updated).
+
+  **Same-session addendum (2026-07-16), user asked to extend to N
+  consecutive iterations + verify the pipeline dump**: (1) ROI marker
+  now takes `ANDESIM_ROI_MUL_MAT_N` (default 1) alongside
+  `ANDESIM_ROI_MUL_MAT_K` -- brackets nodes [K, K+N-1]. Confirmed
+  K=51..52 (V+K projection): 13040043 cycles (~2x single-iteration, as
+  expected). (2) `--kanata` under hybrid had NEVER been exercised
+  against real vsim before -- found a real, zero-coverage bug: the
+  driver unconditionally sent a `--kanata-roi` flag that does not exist
+  in vsim (confirmed via vsim's own `--help` + full source grep), so
+  every hybrid `--kanata` run failed immediately
+  (`Unrecognized option: --kanata-roi`). Fixed by removing it
+  (`driver/hybrid.cpp`) -- vsim's hybrid leg only ever executes the ROI
+  by construction (resumes at trigger, exits on trigger), so plain
+  `--kanata` was always sufficient; `driver/hybrid_test.cpp`'s own
+  assertions were asserting the broken behavior and got corrected too.
+  Confirmed against real llama-completion: 651 MB well-formed Kanata
+  trace. See docs/llama_roi_howto.md sections 6-7.
 - U10, U11: PLANNED, explicitly optional/parallel, only needed if Bonsai-27B
   is revisited later.
 
