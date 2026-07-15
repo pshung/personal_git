@@ -1,0 +1,135 @@
+/* HTIF syscall-window client implementation. See htif_client.h. */
+
+#include "htif_client.h"
+
+/* ---- UART2 (console) --------------------------------------------------- */
+
+#define UART_THR (*(volatile uint32_t*) 0xf0300020UL)
+#define UART_LSR (*(volatile uint32_t*) 0xf0300034UL)
+#define UART_LSR_THRE 0x20u
+
+void htif_uart_putc(char c)
+{
+  while (!(UART_LSR & UART_LSR_THRE))
+    ;
+  UART_THR = (uint32_t) (unsigned char) c;
+}
+
+/* ---- SimControl syscall window ------------------------------------------ */
+
+#define SYSCALL_GO_ADDR 0xe0080028UL
+#define WIN_SLOTS ((volatile uint64_t*) 0xe0080800UL)
+
+/* Copy guest memory into the window data area (u64 stores only; the final
+ * partial word over-stores into window slack, which is scratch). */
+void htif_win_store(size_t woff, const void* src, size_t len)
+{
+  const unsigned char* s = (const unsigned char*) src;
+  volatile uint64_t* w = (volatile uint64_t*) (WIN_DATA_VA + woff);
+  while (len) {
+    size_t n = len < 8 ? len : 8;
+    uint64_t word = 0;
+    for (size_t i = 0; i < n; ++i)
+      word |= (uint64_t) s[i] << (8 * i);
+    *w++ = word;
+    s += n;
+    len -= n;
+  }
+}
+
+/* Copy from the window data area into guest memory (u64 loads only). */
+void htif_win_load(void* dst, size_t woff, size_t len)
+{
+  unsigned char* d = (unsigned char*) dst;
+  volatile const uint64_t* w = (volatile const uint64_t*) (WIN_DATA_VA + woff);
+  while (len) {
+    size_t n = len < 8 ? len : 8;
+    uint64_t word = *w++;
+    for (size_t i = 0; i < n; ++i)
+      d[i] = (unsigned char) (word >> (8 * i));
+    d += n;
+    len -= n;
+  }
+}
+
+size_t htif_win_store_str(size_t woff, const char* s)
+{
+  size_t len = 0;
+  while (s[len])
+    ++len;
+  ++len; /* NUL */
+  if (woff + len > WIN_DATA_SIZE)
+    return (size_t) -1;
+  htif_win_store(woff, s, len);
+  return (woff + len + 7) & ~(size_t) 7;
+}
+
+intptr_t htif_syscall(uint64_t n, uint64_t a0, uint64_t a1, uint64_t a2,
+                       uint64_t a3)
+{
+  WIN_SLOTS[0] = n;
+  WIN_SLOTS[1] = a0;
+  WIN_SLOTS[2] = a1;
+  WIN_SLOTS[3] = a2;
+  WIN_SLOTS[4] = a3;
+  WIN_SLOTS[5] = 0;
+  WIN_SLOTS[6] = 0;
+  WIN_SLOTS[7] = 0;
+  *(volatile uint32_t*) SYSCALL_GO_ADDR = 1;
+  __asm__ __volatile__("fence rw,rw" ::: "memory");
+  return (intptr_t) WIN_SLOTS[0];
+}
+
+intptr_t htif_call_str(uint64_t n, const char* s, uint64_t a1, uint64_t a2)
+{
+  if (htif_win_store_str(0, s) == (size_t) -1)
+    return -1;
+  return htif_syscall(n, WIN_DATA_VA, a1, a2, 0);
+}
+
+intptr_t htif_call_str2(uint64_t n, const char* s0, const char* s1)
+{
+  size_t off1 = htif_win_store_str(0, s0);
+  if (off1 == (size_t) -1 || htif_win_store_str(off1, s1) == (size_t) -1)
+    return -1;
+  return htif_syscall(n, WIN_DATA_VA, WIN_DATA_VA + off1, 0, 0);
+}
+
+ssize_t htif_write(int fd, const void* ptr, size_t len)
+{
+  const unsigned char* p = (const unsigned char*) ptr;
+  size_t done = 0;
+  while (done < len) {
+    size_t n = len - done;
+    if (n > WIN_DATA_SIZE)
+      n = WIN_DATA_SIZE;
+    htif_win_store(0, p + done, n);
+    intptr_t r = htif_syscall(VH_SYS_WRITE, fd, WIN_DATA_VA, n, 0);
+    if (r < 0)
+      return done ? (ssize_t) done : (ssize_t) r;
+    done += (size_t) r;
+    if ((size_t) r < n)
+      break; /* short write */
+  }
+  return (ssize_t) done;
+}
+
+ssize_t htif_read(int fd, void* buf, size_t len)
+{
+  unsigned char* p = (unsigned char*) buf;
+  size_t done = 0;
+  while (done < len) {
+    size_t n = len - done;
+    if (n > WIN_DATA_SIZE)
+      n = WIN_DATA_SIZE;
+    intptr_t r = htif_syscall(VH_SYS_READ, fd, WIN_DATA_VA, n, 0);
+    if (r < 0)
+      return done ? (ssize_t) done : (ssize_t) r;
+    if (r > 0)
+      htif_win_load(p + done, 0, (size_t) r);
+    done += (size_t) r;
+    if ((size_t) r < n)
+      break; /* EOF or short read */
+  }
+  return (ssize_t) done;
+}
