@@ -1,0 +1,113 @@
+// See manifest.hpp.
+#include "manifest.hpp"
+
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+
+// The one source of truth for the wire struct, shared with vlinux's own
+// main.c -- same pattern as include/hybrid/state_abi.h for the hybrid ABI.
+#include "../runtime/linux/manifest.h"
+
+#include "argv.hpp"
+#include "config_env.hpp"
+#include "log.hpp"
+#include "process.hpp"
+#include "repo_root.hpp"
+#include "tempdir.hpp"
+
+namespace fs = std::filesystem;
+
+namespace andes_sim {
+
+std::vector<uint8_t> build_manifest_blob(const std::string& app_path,
+                                         uint64_t mem_size, std::string& err) {
+  err.clear();
+  vlinux_manifest m{};
+  m.magic = VLINUX_MANIFEST_MAGIC;
+  m.version = VLINUX_MANIFEST_VERSION;
+  m.mem_size = mem_size;
+  if (app_path.size() >= sizeof(m.app_path)) {
+    err = "app path too long for the manifest (" +
+          std::to_string(app_path.size()) + " bytes, max " +
+          std::to_string(sizeof(m.app_path) - 1) + "): " + app_path;
+    return {};
+  }
+  std::memcpy(m.app_path, app_path.c_str(), app_path.size() + 1);  // + NUL
+
+  std::vector<uint8_t> blob(sizeof(m));
+  std::memcpy(blob.data(), &m, sizeof(m));
+  return blob;
+}
+
+std::vector<std::string> manifest_objcopy_argv(const std::string& objcopy_bin,
+                                               const std::string& blob_path,
+                                               const std::string& vlinux_elf) {
+  return {objcopy_bin, "--update-section", ".manifest=" + blob_path,
+          vlinux_elf};
+}
+
+std::string stage_linux_runtime(const std::string& app_elf_abs,
+                                uint64_t mem_size, std::string& err) {
+  err.clear();
+  const fs::path vlinux_src =
+      repo_root() / "build" / "runtime" / "linux" / "vlinux.elf";
+  std::error_code ec;
+  if (!fs::is_regular_file(vlinux_src, ec)) {
+    err = "vlinux.elf not built: " + vlinux_src.string() +
+          " (run: bash scripts/build_all.sh vlinux)";
+    return "";
+  }
+
+  const std::string toolchain = config_env_value("HYBRID_TOOLCHAIN");
+  if (toolchain.empty()) {
+    err = "HYBRID_TOOLCHAIN not set (env or config.env; needed to run objcopy)";
+    return "";
+  }
+  const std::string objcopy_bin = toolchain + "/bin/riscv64-unknown-elf-objcopy";
+
+  const std::string wd = make_temp_dir("andesim-linux");
+  if (wd.empty()) {
+    err = "failed to create a linux-runtime work dir";
+    return "";
+  }
+
+  const std::string vlinux_run = wd + "/vlinux-run.elf";
+  fs::copy_file(vlinux_src, vlinux_run, fs::copy_options::overwrite_existing,
+                ec);
+  if (ec) {
+    err = "failed to stage vlinux.elf: " + ec.message();
+    return "";
+  }
+
+  const std::vector<uint8_t> blob =
+      build_manifest_blob(app_elf_abs, mem_size, err);
+  if (!err.empty()) return "";
+
+  const std::string blob_path = wd + "/manifest.bin";
+  std::ofstream bf(blob_path, std::ios::binary | std::ios::trunc);
+  bf.write(reinterpret_cast<const char*>(blob.data()),
+           static_cast<std::streamsize>(blob.size()));
+  if (!bf) {
+    err = "failed to write manifest blob: " + blob_path;
+    return "";
+  }
+  bf.close();
+
+  const std::vector<std::string> argv =
+      manifest_objcopy_argv(objcopy_bin, blob_path, vlinux_run);
+  // The stamping step has no other visible trace (unlike the final engine
+  // command, which --dry-run prints itself) -- always show it, so a dry run
+  // actually previews the whole "what would land in vlinux-run.elf" story.
+  log_line(kLogInfo, "[andesim] --runtime linux: exec %s",
+           render_argv(argv).c_str());
+  const RunResult r = run_process(argv, /*timeout_ms=*/10000);
+  if (r.spawn_failed || r.timed_out || r.rc != 0) {
+    err = "objcopy --update-section .manifest failed (rc=" +
+          std::to_string(r.rc) + "): " + render_argv(argv);
+    return "";
+  }
+  return vlinux_run;
+}
+
+}  // namespace andes_sim
