@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# U6 contract (ROADMAP_LINUX_RUNTIME.md): clock_gettime (REALTIME +
+# MONOTONIC), clock_getres, nanosleep, clock_nanosleep -- the pattern
+# ggml_time_us() (llama.cpp's own timing helper) uses unpatched.
+#
+# tests/fixtures/rt_linux_time.c: two CLOCK_MONOTONIC stamps around a 10M-
+# iteration loop must never go backward (delta is real host wall-clock
+# time, not deterministic, so the test greps a pattern not an exact value).
+#
+# Needs LINUX_TOOLCHAIN (config.env / env) -- SKIPs cleanly if unset, same
+# as test_vlinux_glibc_hello.sh / test_vlinux_file.sh.
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+
+TC="${HYBRID_TOOLCHAIN:-$(cfg_val HYBRID_TOOLCHAIN)}"
+[ -n "$TC" ] || fail "HYBRID_TOOLCHAIN not set (env or config.env)"
+export HYBRID_TOOLCHAIN="$TC"
+
+LTC="${LINUX_TOOLCHAIN:-$(cfg_val LINUX_TOOLCHAIN)}"
+if [ -z "$LTC" ] || [ ! -x "$LTC/bin/riscv64-linux-gcc" ]; then
+  ok "SKIP: LINUX_TOOLCHAIN unset/unreachable (config.env) -- no static-glibc toolchain on this host"
+  exit 0
+fi
+
+bash "$ROOT/scripts/build_driver.sh" >/dev/null 2>&1 || fail "build_driver.sh failed"
+BIN="$ROOT/build/andesim"
+[ -x "$BIN" ] || fail "missing andesim binary: $BIN"
+
+make -C "$ROOT/runtime/linux" >/dev/null || fail "vlinux build failed"
+[ -f "$ROOT/build/runtime/linux/vlinux.elf" ] || fail "missing vlinux.elf"
+
+make -C "$ROOT/tests/fixtures" rt_linux_time.elf LINUX_TOOLCHAIN="$LTC" >/dev/null \
+  || fail "time fixture build failed"
+APP="$ROOT/tests/fixtures/rt_linux_time.elf"
+[ -f "$APP" ] || fail "missing $APP"
+
+SIM="$(vsim_bin_dir)/sim_ax45mpv_premium"
+[ -x "$SIM" ] || fail "cycle engine not found (source ./setup.sh): $SIM"
+
+check_leg() {
+  local label="$1" rc="$2" out="$3"
+  printf '%s\n' "$out" | grep -qE 'TIME: monotonic delta=[0-9]+ us ok' \
+    || fail "$label: missing monotonic delta line in: $out"
+  local line
+  for line in "TIME: realtime ok" "TIME: clock_getres ok" \
+              "TIME: nanosleep ok" "TIME: clock_nanosleep ok" "time ok"; do
+    printf '%s\n' "$out" | grep -qF "$line" \
+      || fail "$label: missing '$line' in: $out"
+  done
+  [ "$rc" -eq 0 ] || fail "$label: exit $rc != 0: $out"
+  ok "$label: clock_gettime(REALTIME+MONOTONIC)/clock_getres/nanosleep/clock_nanosleep all correct"
+}
+
+# 1. fast leg.
+out=$(cd "$ROOT" && timeout 30 "$BIN" run --mode fast --runtime linux "$APP" 2>&1); rc=$?
+check_leg "fast" "$rc" "$out"
+
+# 2. cycle leg: the SAME staged vlinux-run.elf (U1's dual-engine pattern).
+#    Same ~7min glibc-startup cost as U4/U5 (see those tests' comments).
+vlinux_run=$(printf '%s\n' "$out" | grep -oE '/[^ ]*/vlinux-run\.elf' | head -1)
+[ -n "$vlinux_run" ] && [ -f "$vlinux_run" ] \
+  || fail "staged vlinux-run.elf not found on disk: $vlinux_run"
+
+out=$(timeout 600 "$SIM" "$vlinux_run" 2>&1); rc=$?
+check_leg "cycle" "$rc" "$out"
