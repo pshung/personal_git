@@ -1,0 +1,97 @@
+/* C++ on the andesim runtime -- static ctors, libstdc++, dtors at exit.
+ *
+ * The runtime side (andesim repo, 2026-07-15): crt0 walks .init_array
+ * via newlib's __libc_init_array (andesim.ld PROVIDEs the bounds), the
+ * specs link crtbegin/crtend, and main's return routes through exit()
+ * so static destructors run. This demo is the guest-side proof:
+ *
+ * QEMU phase (before the ROI):
+ *   - the static Banner constructor assembles the "CPP" tag one
+ *     character at a time into a std::string. The tag cannot exist
+ *     unless .init_array ran before main.
+ *
+ * vsim ROI (checks and the CPP_OK print live INSIDE the ROI: a hybrid
+ * run ends at the exit trigger, so code after it never runs there):
+ *   - the ctor-written tag is re-checked FROM THE RTL side -- the
+ *     Banner object's bytes crossed the handoff in the shared mmap;
+ *   - std::vector growth + std::string concat exercise operator new /
+ *     the newlib _sbrk heap inside the measured window and compose the
+ *     "CPP_OK" pass string at runtime.
+ *
+ * fast/cycle epilogue (hybrid never gets here):
+ *   - ~Banner prints CPP_DTOR_OK after main returns -- return-from-main
+ *     == exit(rc) per C++ -- and the exit code rides SimControl.
+ *
+ * printf, not iostream: iostreams add code size and static-init work
+ * that lengthen a cycle-mode boot for no extra proof.
+ */
+
+#include <cstdio>
+#include <string>
+#include <vector>
+#include <andesim/ROI.h>
+
+namespace {
+
+struct Banner {
+  int ctor_ran = 0; /* plain int: safe to test even if the ctor never ran */
+  std::string tag;
+  Banner()
+  {
+    tag += 'C';
+    tag += 'P';
+    tag += 'P';
+    ctor_ran = 1;
+  }
+  ~Banner() { printf("CPP_DTOR_OK tag=%s\n", tag.c_str()); }
+};
+
+Banner banner; /* static storage: ctor rides .init_array */
+
+} /* namespace */
+
+static volatile int src[4] = {1, 2, 3, 4};
+
+/* ROI body, noinline so --trigger pc can name it. extern "C": the pc
+ * trigger resolves symbols by name, so keep it unmangled (plain
+ * `cpp_roi`, not `_Z7cpp_roiv`). */
+extern "C" __attribute__((noinline)) int cpp_roi(void)
+{
+  if (!banner.ctor_ran) {
+    printf("CPP_FAIL static ctor did not run\n");
+    return 1;
+  }
+  if (banner.tag != "CPP") {
+    printf("CPP_FAIL ctor tag='%s' want='CPP'\n", banner.tag.c_str());
+    return 1;
+  }
+
+  std::vector<int> v;
+  for (int i = 0; i < 4; i++) {
+    int x = src[i]; /* volatile read anchors the loop in the window */
+    v.push_back(x);
+  }
+  int sum = 0;
+  for (int x : v)
+    sum += x;
+  if (sum != 10) {
+    printf("CPP_FAIL vector sum=%d want=10\n", sum);
+    return 1;
+  }
+
+  std::string msg = banner.tag + "_OK"; /* pass string built at runtime */
+  printf("%s sum=%d\n", msg.c_str(), sum);
+  return 0;
+}
+
+int main()
+{
+  andesim_ROI_begin();
+  int rc = cpp_roi();
+  andesim_ROI_end();
+  /* ROI end symbol for --pc-end: the point right after the call. */
+  __asm__ __volatile__(".globl cpp_roi_end\ncpp_roi_end:" ::: "memory");
+
+  /* Runs on fast and cycle only: a hybrid run ended at the exit trigger. */
+  return rc; /* return-from-main == exit(rc): ~Banner fires next */
+}
