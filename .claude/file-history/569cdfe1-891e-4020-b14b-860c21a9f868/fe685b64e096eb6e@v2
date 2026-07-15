@@ -1,0 +1,157 @@
+/* Why platform-cache MMIO transport matters: the shared-cache config.
+ *
+ * Andes cores place a platform-level shared cache at 0xE0500000: the
+ * L2C on the 45-series (no private L2, the shared cache IS the L2), the
+ * L3C on the 46/66-series (cores carry private L2s, the shared cache is
+ * the L3) -- same register layout at the transported offsets: DS295
+ * Table 33 == DS220 Table 112 for Control/HPM/WAYMASK. Its Control, HPM
+ * Control and Way Allocation Mask registers are boot-static RW config:
+ * firmware writes them once, before any measured region.
+ *
+ * ONE source, TWO builds -- the tests are separate because the caches
+ * are: l2c.elf (default) prints L2C_* and runs on engines whose CACHE
+ * is L2:<size> in `andesim list engines`; l3c.elf (-DSHC_L3) prints
+ * L3C_* and runs on L3:<size> engines (ax66_makatau today). check.sh
+ * picks the leg per engine from that column.
+ *
+ * On hybrid that firmware write runs on QEMU, whose AE350 models the
+ * block as a RAM stub. The ONLY reason the vsim ROI sees the written
+ * config is that the handoff drains the MMIO window (HYBRID_FLAG_L2C)
+ * and the resume driver stores the writable registers back into the
+ * REAL cache controller RTL before the ROI runs.
+ *
+ * This demo is that transport's teeth, hybrid-only by design:
+ *
+ *   pre-ROI  (QEMU leg)  write distinct patterns to every register the
+ *                        handoff restores -- Control's policy bits via
+ *                        read-modify-write, HPM Control 0, WAYMASK0-4.
+ *   in-ROI   (vsim leg)  read them back FROM THE RTL and print the
+ *                        verdict before the exit marker (a hybrid run
+ *                        ends at the exit trigger, so an after-ROI
+ *                        print would never appear).
+ *
+ * Excluded on purpose: the read-only registers (Configuration, CCTL
+ * status, INITSTATUS[14] inside Control) and every side-effect
+ * register (CCTL command/access, error/interrupt W1C) -- those are not
+ * config, and poking them changes cache state instead of describing it.
+ *
+ * Register-width reality checks baked into the asserts:
+ *   - Control [13:8] are RAM-timing fields the RTL resets from its
+ *     hardware config; the restore must NOT clobber them, so the demo
+ *     compares policy bits [7:0] only.
+ *   - WAYMASK2-4 address allocation domains a 1-core cluster does not
+ *     have; such an RTL implements them RAZ/WI (probe-verified on
+ *     ax66_makatau), so their pattern legally reads back as 0.
+ *
+ * Deliberately NOT --verify-able: the oracle's in-ROI reads hit QEMU's
+ * stub while the vsim leg reads the RTL, so the ROI's register state
+ * legitimately diverges (RTL-owned Control bits, RAZ way masks). The
+ * driver's own l2c.ctrl verify compare handles that with the policy
+ * mask; this demo asserts in-guest instead.
+ */
+
+#include <stdint.h>
+#include <stdio.h>
+#include <andesim/ROI.h>
+
+/* The printed family name: L3C on engines with private L2s (ax66), L2C
+ * otherwise. Same block, same offsets, same transport. */
+#ifdef SHC_L3
+#define SHC "L3C"
+#else
+#define SHC "L2C"
+#endif
+
+#define L2C_BASE 0xE0500000ull /* NDS_L2C/L3C_REG_BASE on every engine cfg */
+
+#define OFF_CFG_LO 0x00u  /* Configuration lo: SIZE/ECC (RO)     */
+#define OFF_CFG_HI 0x04u  /* Configuration hi: IP-ID (RO)        */
+#define OFF_CTRL 0x08u    /* Control 0: CEN + policy + RAM timing */
+#define OFF_HPM_CTL0 0x10u/* HPM Control 0: event selects (RW)   */
+#define OFF_WAYMASK0 0x300u /* Way Allocation Mask 0..4, stride 8 */
+#define WAYMASK_NUM 5u      /* the set the handoff transports      */
+
+/* Control policy bits [7:0]: CEN, PFTHRES, IPFDPT, DPFDPT, ECCEN.
+ * Pattern keeps CEN=1 and sets PFTHRES=2, IPFDPT=1. */
+#define CTRL_POLICY_MASK 0xFFu
+#define CTRL_POLICY_WANT 0x0Du
+
+#define HPM_WANT 0x21u
+
+static const uint32_t wm_pat[WAYMASK_NUM] = {
+  0x00FFu, 0xFF00u, 0xA5A5u, 0x5A5Au, 0x0F0Fu
+};
+
+static inline uint32_t rd(uint32_t off)
+{
+  return *(volatile uint32_t *) (L2C_BASE + off);
+}
+static inline void wr(uint32_t off, uint32_t v)
+{
+  *(volatile uint32_t *) (L2C_BASE + off) = v;
+}
+
+int main(void)
+{
+  /* Stage the config on the fast leg. CFG identifies the model: the
+   * QEMU stub reads 0, a real controller reports size/ECC/IP-ID. */
+  printf(SHC " staged: cfg=%08x/%08x ctrl=%08x -> policy=%02x hpm=%02x wm0..4 patterns\n",
+         rd(OFF_CFG_LO), rd(OFF_CFG_HI), rd(OFF_CTRL),
+         (unsigned) CTRL_POLICY_WANT, (unsigned) HPM_WANT);
+
+  wr(OFF_CTRL, (rd(OFF_CTRL) & ~CTRL_POLICY_MASK) | CTRL_POLICY_WANT);
+  wr(OFF_HPM_CTL0, HPM_WANT);
+  for (uint32_t i = 0; i < WAYMASK_NUM; i++)
+    wr(OFF_WAYMASK0 + 8u * i, wm_pat[i]);
+
+  andesim_ROI_begin();
+
+  /* Now on the cycle engine: these loads hit the RTL register block,
+   * which holds the staged values only if the handoff transported and
+   * restored them. */
+  uint32_t ctrl = rd(OFF_CTRL);
+  uint32_t hpm = rd(OFF_HPM_CTL0);
+  uint32_t wm[WAYMASK_NUM];
+  for (uint32_t i = 0; i < WAYMASK_NUM; i++)
+    wm[i] = rd(OFF_WAYMASK0 + 8u * i);
+
+  int bad = 0;
+  if ((ctrl & CTRL_POLICY_MASK) != CTRL_POLICY_WANT) {
+    printf(SHC "_MISMATCH ctrl policy got=%02x want=%02x (raw %08x)\n",
+           ctrl & CTRL_POLICY_MASK, (unsigned) CTRL_POLICY_WANT, ctrl);
+    bad++;
+  }
+  if (hpm != HPM_WANT) {
+    printf(SHC "_MISMATCH hpm_ctl0 got=%08x want=%02x\n", hpm,
+           (unsigned) HPM_WANT);
+    bad++;
+  }
+  /* The teeth: the two domains every cluster has (core 0 + IOCP) must
+   * hold the exact pattern. */
+  for (uint32_t i = 0; i < 2; i++) {
+    if (wm[i] != wm_pat[i]) {
+      printf(SHC "_MISMATCH waymask%u got=%08x want=%08x\n", i, wm[i],
+             wm_pat[i]);
+      bad++;
+    }
+  }
+  for (uint32_t i = 2; i < WAYMASK_NUM; i++) {
+    /* RAZ/WI (== 0) is legal for a domain this cluster does not have;
+     * any OTHER value means the restore wrote garbage. */
+    if (wm[i] != wm_pat[i] && wm[i] != 0) {
+      printf(SHC "_MISMATCH waymask%u got=%08x want=%08x or 0\n", i, wm[i],
+             wm_pat[i]);
+      bad++;
+    }
+  }
+
+  if (bad)
+    printf(SHC "_BAD %d mismatch(es): ctrl=%08x hpm=%08x wm=%04x/%04x/%04x/%04x/%04x\n",
+           bad, ctrl, hpm, wm[0], wm[1], wm[2], wm[3], wm[4]);
+  else
+    printf(SHC "_OK ctrl=%08x hpm=%08x wm=%04x/%04x/%04x/%04x/%04x\n", ctrl,
+           hpm, wm[0], wm[1], wm[2], wm[3], wm[4]);
+
+  andesim_ROI_end();
+  return bad ? 1 : 0;
+}
