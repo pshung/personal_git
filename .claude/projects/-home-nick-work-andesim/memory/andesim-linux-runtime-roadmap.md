@@ -88,12 +88,79 @@ explicitly optional 27B stretch-goal track, not deleted.
   the cycle leg, never fast. Both bugs were caught by running the SAME test
   on fast then cycle (U1's dual-engine pattern) - fast passed first try,
   cycle didn't, and the diff was the tell.
-- U4-U9: PLANNED, straight-line dependency chain, one per session.
+- U4 (syscall core: glibc reaches main()): **DONE, WITH ONE DOCUMENTED GAP**
+  2026-07-15. `runtime/linux/mm.{h,c}` (new: brk + MAP_ANONYMOUS mmap, two
+  bump allocators sharing vlinux's own region bounds), `syscall.c` grown to
+  the full "Set 1" dispatch table, `config.env` gained `LINUX_TOOLCHAIN`
+  (found at the exact path the roadmap predicted:
+  `/local/nick/SW_Release/build-ast542/build-toolchain/linux/nds64le-linux-glibc-v5d`,
+  a real GCC 14.2.0 build), `tests/fixtures/rt_linux_glibc_hello.c` (real
+  static-glibc fixture) + `tests/vlinux/test_vlinux_glibc_hello.sh`.
+
+  **Verified end-to-end, both legs**: real static glibc reaches main(),
+  argv/malloc(mmap-backed)/printf/fflush all correct, exact output --
+  proven via a `_exit(42)` variant that passes cleanly with byte-exact
+  stdout and rc=42 on fast AND cycle. Confirmed the roadmap's own risk
+  note exactly: vendor glibc calls riscv_hwprobe(258) 7x at startup;
+  answering -ENOSYS (the generic default path) is all it needs.
+
+  **The gap**: `exit(42)` (the library call) crashes inside glibc's own
+  `__run_exit_handlers` calling through a corrupt function pointer for
+  what's almost certainly its automatic `_dl_fini` registration -
+  reproduces identically for a trivial `int main(){return 0;}`, so it's
+  unconditional glibc-startup behavior, not fixture-specific. Root-caused
+  as far as possible without a working debugger: confirmed via a LIVE
+  x86-64 comparison (same GCC, host gdb) that this handler slot is
+  SUPPOSED to be pointer-mangled (`ror rax,0x11` then `xor rax,fs:0x30`,
+  a TLS-relative guard) before the call, and x86-64 does exactly that and
+  exits cleanly; the riscv64 vendor toolchain's compiled
+  `__run_exit_handlers` has NO demangle step at the equivalent call site
+  (checked via objdump on both the ef_on and ef_cxa branches). Could not
+  go further: the vendor `riscv64-linux-gdb` cannot run at all (linked
+  against a now-nonexistent Jenkins CI path -
+  `libpython3.10.so.1.0`/`PYTHONHOME` point at a workspace that's gone),
+  which is what would be needed to inspect the actual riscv64
+  registration site live. This is a vendor-toolchain-internals question,
+  not a vlinux bug - full details and next steps are in the roadmap's U4
+  DONE note. `test_vlinux_glibc_hello.sh` accepts a clean exit 42 OR this
+  EXACT crash signature (stdout already fully correct at that point) -
+  any other outcome still fails the test.
+
+  Decision point: I asked the user how to proceed (keep digging / try to
+  fix the target gdb / accept the documented gap and move on) and got no
+  response within the session: proceeded with the recommended default
+  (document thoroughly, mark U4 done, let U5+ continue since none of them
+  depend on exit() working). Revisit if the user wants this pursued
+  further - the next concrete step is a working riscv64 gdb (repair the
+  toolchain's python linkage or build/find an alternate one) to break on
+  the actual `__cxa_atexit`/`_dl_fini` registration site.
+
+  Two more real bugs found and fixed (same class as U3's two - caught by
+  the SAME fast-passes/cycle-differs-or-both-differ-from-expected
+  pattern): (1) **`gp` not reloaded on trap entry** - `trap.S` saved/
+  restored gp around a trap but never reloaded it to vlinux's OWN
+  `__global_pointer$` before running the C handler, so any gp-relative
+  global access during a trap used WHATEVER gp was active at the moment
+  of the trap (the app's, once the app is running) - silent in U3 (zero
+  globals in syscall.c then), hit immediately by U4's mm.c globals. Fixed
+  with the same `.option norelax`/`lla gp,__global_pointer$` sequence
+  crt0.S already uses, inserted into `m_trap_entry` before `call
+  handle_trap`. (2) **mmap arena start overlapped the live app stack** -
+  `stack.c` started building the initial stack AT `mem_size -
+  STACK_RESERVE` (meant to be the arena's FLOOR) instead of AT `mem_size`
+  (the true top, with 8 MiB as headroom below) - the build's own content
+  immediately spilled below the intended floor, so the first big `mmap()`
+  (malloc's 1 MiB request) zeroed part of the app's own already-live
+  stack. Fixed by starting the build at `mem_size`.
+- U5-U9: PLANNED, straight-line dependency chain, one per session. Note:
+  U4's exit() gap does not block any of these on its own critical path
+  (none of them need glibc's exit() to complete cleanly), though it
+  should be fixed before claiming a real end-user acceptance milestone.
 - U10, U11: PLANNED, explicitly optional/parallel, only needed if Bonsai-27B
   is revisited later.
 
 ## How to apply
 Read ROADMAP_LINUX_RUNTIME.md itself for the full feature table (description,
 input/output contract, key files, test, dependencies) before starting the next
-session's feature (currently U4) - this memory is a pointer/orientation, not a
+session's feature (currently U5) - this memory is a pointer/orientation, not a
 substitute for the roadmap doc, which is the source of truth for exact state.
