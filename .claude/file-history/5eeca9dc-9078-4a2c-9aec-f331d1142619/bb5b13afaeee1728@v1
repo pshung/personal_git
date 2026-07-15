@@ -1,0 +1,298 @@
+# Linux-Runtime Roadmap: run static glibc binaries (llama.cpp) on andesim
+
+Goal: a prebuilt RISC-V **static glibc** binary (built with the Andes
+`nds64le-linux-glibc-v5d` toolchain, e.g. `llama-bench`) runs on every
+andesim mode (fast / cycle / hybrid) **unmodified**, with real argv, and
+hybrid measures ONE kernel iteration (marker or PC trigger) on vsim.
+
+How: a small M-mode **proxy kernel** (`vlinux.elf`, new `runtime/linux/`
+component, pattern: riscv-pk) that loads the app ELF, builds the Linux
+initial stack (argc/argv/envp/auxv), and answers the app's `ecall`s by
+emulating ~30 Linux syscalls on top of the existing HTIF syscall window.
+The hybrid transport, triggers, plugin, resume driver, and engines need
+NO changes: the guest stays bare-metal, M-mode, paging-off, single-hart,
+exactly the current ROI envelope.
+
+Non-goals (explicitly out of scope here)
+- No real Linux kernel boot, no S/U-mode, no paging, no interrupts
+  (that is FRS FR-109, a separate track).
+- No threads: `clone` returns -ENOSYS; llama.cpp runs with `-t 1`
+  (verified: at n_threads=1 ggml never calls pthread_create, and
+  uncontended glibc mutexes never reach futex).
+- No dynamic linking: the app must be `-static` (the toolchain ships
+  `libc.a`; a static hello links at vaddr 0x50000, inside DRAM).
+- Full 3.8 GB Bonsai-27B residency is blocked by the 2 GiB DRAM window;
+  that lift is feature U10 (platform track). Until then use a
+  layer-sliced GGUF (U11) - per-layer kernel shapes are identical.
+
+Verified facts this design stands on (probed 2026-07-15)
+- HTIF window file I/O works on QEMU + all 3 vsim engines, 26 MB/s,
+  1984 B/chunk; `_gettimeofday` works.
+- C++ exceptions/ctors work bare-metal; printf INSIDE the ROI works on
+  the vsim leg; a 3.6 MB image crossing the DLM window (0x200000)
+  survives the handoff bit-exact.
+- Hybrid QEMU leg is engine-synced (`-cpu andes-ax45mpv,vlen=512`), no
+  zfh/zvfh; RTL is ELEN=32. llama.cpp must be built with
+  `GGML_RV_ZFH=OFF GGML_RV_ZVFH=OFF GGML_CPU_REPACK=OFF -mext-zvlsseg`.
+- Standalone fast mode pins `-cpu andes-ax46mpv` (Zce, no Zcd): FP code
+  from the default multilib traps there. vlinux runs are engine-synced
+  or must pass `-- -cpu andes-ax45mpv,vlen=512` until U2 fixes the
+  default for `--runtime linux`.
+
+## Guest memory map (vlinux contract, DRAM base 0x0)
+
+| Region                  | Range                          | Owner |
+|-------------------------|--------------------------------|-------|
+| ILM aperture            | 0x0000_0000 .. 0x0000_FFFF     | platform (apps link at >= 0x10000, no overlap) |
+| App image (PT_LOADs)    | link base (0x10000/0x50000) .. | app ELF; loader rejects overlap with vlinux |
+| brk arena               | app image end .. 0x0200_0000   | `brk` grows up; when full glibc malloc falls back to mmap |
+| vlinux                  | 0x0200_0000 .. 0x0220_0000     | proxy text/data/bss + its own stack (2 MB) |
+| mmap arena              | 0x0220_0000 .. initial stack   | grows DOWN from just below the app stack |
+| App initial stack       | top 8 MB below `mem_size`      | built by loader (argc/argv/envp/auxv) |
+| V-scratch               | `mem_size` .. +4 KB            | hybrid V transport (existing, untouched) |
+
+DLM aperture 0x200000..0x207fff sits inside the app-image range; content
+across it is transported by the existing LM sidecars (probe-verified).
+Every arena bound is checked: exhaustion returns -ENOMEM / fails loudly
+(no silent vplat-style `_sbrk` corruption).
+
+---
+
+## U0. Extract shared HTIF window client (structural)
+
+- Description: move the window protocol client (`win_syscall`, slot
+  staging, chunk loop) and `uart_putc` out of `runtime/vplat_syscalls.c`
+  into `runtime/htif_client.{c,h}` so vplat and vlinux share one
+  implementation. No behavior change.
+- Input/Output: existing vplat fixtures before == after.
+- Key files: runtime/htif_client.c (new), runtime/htif_client.h (new),
+  runtime/vplat_syscalls.c, runtime/Makefile
+- Test: existing tests/vplat/*.sh all stay green (that IS the test).
+- Depends on: nothing
+- State: PLANNED
+
+## U1. vlinux skeleton: boot, banner, manifest reader
+
+- Description: new `runtime/linux/` payload with its own crt.S + linker
+  script at 0x0200_0000 (built with HYBRID_TOOLCHAIN, freestanding +
+  newlib for internal printf). Boots via `-bios vlinux.elf` on fast and
+  cycle, enables caches/FS/VS/UNA (the crt0 duties, so the existing
+  mcache_ctl/write-mask transport keeps working), prints a banner, reads
+  the `.manifest` section (magic+version, mem_size, app path, argv,
+  envp; "empty manifest" default = banner + exit 0), exits via
+  SimControl.
+- Input/Output: `vlinux.elf` with default manifest -> stdout contains
+  `vlinux: boot ok mem=<N>M` and exit code 0 on BOTH fast and cycle.
+- Key files: runtime/linux/{crt.S,vlinux.ld,main.c,manifest.h},
+  runtime/linux/Makefile, scripts/build_all.sh
+- Test: tests/vlinux/test_vlinux_boot.sh (fast leg + sim_ax45mpv_premium)
+- Depends on: U0
+- State: PLANNED
+
+## U2. Driver: `--runtime linux` plumbing
+
+- Description: new run flag. The driver copies vlinux.elf per run and
+  `objcopy --update-section .manifest=<blob>` (toolchain objcopy from
+  config.env) with: absolute app ELF path, `mem_size`, argv[0..n] (from
+  `-- <args...>`, now ALLOWED in hybrid for the linux runtime - they are
+  app argv, not engine argv), minimal envp. The manifested vlinux.elf is
+  what every leg loads, so fast/cycle/hybrid stay uniform. Linux runtime
+  defaults: `--mem-size 1G`; standalone fast leg uses the engine-synced
+  CPU (`andes-ax45mpv,vlen=512`), not the ax46 default. `--pc-start/end`
+  symbols resolve against the APP ELF in this mode.
+- Input/Output: `./andesim run --mode fast --runtime linux app.elf -- -m x.gguf -t 1`
+  -> dry-run prints the objcopy step + `-bios <workdir>/vlinux-run.elf`;
+  manifest blob round-trips (dump tool or readelf grep).
+- Key files: driver/cli.cpp, driver/cmd_run.cpp, driver/run_plan.cpp,
+  driver/manifest.cpp (new), docs/USER_GUIDE.md
+- Test: tests/andes_sim/test_andes_sim_runtime_linux.sh (dry-run
+  contract + manifest content grep)
+- Depends on: U1
+- State: PLANNED
+
+## U3. ELF loader + Linux initial stack + auxv
+
+- Description: vlinux HTIF-reads the app ELF (26 MB/s -> ~0.5 s for a
+  10 MB binary), maps PT_LOADs (reject overlap with vlinux/V-scratch/
+  window), zeroes BSS tails, builds the initial stack at the top of the
+  app arena: argc/argv/envp then auxv (AT_PHDR/PHENT/PHNUM from the
+  loaded headers, AT_ENTRY, AT_PAGESZ=4096, AT_RANDOM 16 bytes,
+  AT_HWCAP=IMAFDCV bits, AT_UID/GID/EUID/EGID=0, AT_SECURE=0,
+  AT_EXECFN), sets sp, jumps to the app entry in M-mode.
+- Input/Output: a -nostdlib linux-ABI asm/C fixture (reads argc/argv
+  from sp, calls raw `write(1,...)` + `exit_group`) prints its argv and
+  auxv AT_PAGESZ. Proves loader+stack with only 2 syscalls, before glibc.
+- Key files: runtime/linux/{loader.c,stack.c}, tests/fixtures Makefile
+  (new LINUX_TOOLCHAIN fixtures; config.env.example gains
+  LINUX_TOOLCHAIN=/local/nick/SW_Release/build-ast542/build-toolchain/linux/nds64le-linux-glibc-v5d)
+- Test: tests/vlinux/test_vlinux_loader.sh (fast + cycle, argv echo)
+- Depends on: U1, U2
+- State: PLANNED
+
+## U4. Syscall core: glibc reaches main()
+
+- Description: M-mode ecall handler + dispatch table. Set 1 (the ones a
+  static glibc needs from `_start` to `printf`+`malloc`+`exit`):
+  exit(93), exit_group(94), write(64)/writev(66) fd1/2 -> UART,
+  brk(214), mmap(222 MAP_ANONYMOUS)/munmap(215)/mprotect(226 noop),
+  set_tid_address(96), set_robust_list(99), rseq(293 -ENOSYS),
+  uname(160; release "6.1.0-andesim" - MUST be >= the binary's "for
+  GNU/Linux 4.15.0" note or glibc aborts), getpid/gettid/getuid/geteuid/
+  getgid/getegid (1/1/0/0/0/0), prlimit64(261), getrandom(278;
+  rdcycle-seeded), sched_getaffinity(123; 1-cpu mask), sched_yield(124),
+  rt_sigaction(134)/rt_sigprocmask(135)/sigaltstack(132) -> record+0
+  (no delivery exists), tgkill(131) on fatal signal -> SimControl exit
+  128+sig, ioctl(29 -ENOTTY), fcntl(25 basic). Unknown syscall -> print
+  `vlinux: ENOSYS <nr>` once + return -ENOSYS (loud, grep-able).
+- Input/Output: glibc-static fixture using argv + malloc(1MB) + printf +
+  fflush + exit(42) -> exact stdout + exit code 42, fast AND cycle.
+- Key files: runtime/linux/{trap.S,syscall.c,mm.c}
+- Test: tests/vlinux/test_vlinux_glibc_hello.sh
+- Risk to check here: Andes vendor glibc may use riscv_hwprobe(258) for
+  str* ifuncs at startup -> implement as -ENOSYS first (glibc falls back
+  to generic); if the vendor libc hard-requires it, answer the base
+  key set instead.
+- Depends on: U3
+- State: PLANNED
+
+## U5. File I/O syscall set (HTIF window bridge)
+
+- Description: openat(56), close(57), read(63), pread64(67), lseek(62),
+  fstat(80), fstatat(79)/statx(291 basic mask), faccessat(48),
+  readlinkat(78 -EINVAL), getcwd(17), getdents64(61 -ENOSYS). All
+  bridge to the existing window ops (open/read/lseek/fstat already
+  host-served); paths are host-side, same semantics as vplat file I/O.
+  stdin read -> 0 (EOF), as today.
+- Input/Output: glibc fixture fopen/fread/fseek/ftell-checksums a host
+  file; byte-identical result fast vs cycle (parity, like vplat_file).
+- Key files: runtime/linux/syscall.c, runtime/htif_client.h
+- Test: tests/vlinux/test_vlinux_file.sh
+- Depends on: U4
+- State: PLANNED
+
+## U6. Time syscalls
+
+- Description: clock_gettime(113) for REALTIME + MONOTONIC (both from
+  the window GETTIMEOFDAY host clock; MONOTONIC = delta from a boot
+  baseline so it never goes backward), clock_getres(114),
+  nanosleep(101)/clock_nanosleep(115) -> return 0 immediately (no timer
+  exists; sleeping burns no sim time). This makes `ggml_time_us()` work
+  unpatched. Note: values are HOST wall time - meaningful on the fast
+  leg, meaningless inside a vsim ROI (the cycle figure is the answer
+  there).
+- Input/Output: glibc fixture prints two monotonic stamps with
+  delta >= 0 around a 10M-loop; llama-style timing pattern compiles and
+  runs.
+- Key files: runtime/linux/syscall.c
+- Test: tests/vlinux/test_vlinux_time.sh
+- Depends on: U4
+- State: PLANNED
+
+## U7. File-backed private mmap (llama.cpp default load path)
+
+- Description: mmap(fd, MAP_PRIVATE, PROT_READ...) = allocate from the
+  mmap arena + HTIF-read the range (private read-only copy is
+  semantically correct for GGUF loading). Region table for munmap /
+  partial unmap (llama unmaps unused tail ranges); mremap -> -ENOMEM.
+  Arena exhaustion -> -ENOMEM (llama then reports the real reason
+  instead of corrupting). With this, stock llama.cpp default
+  `use_mmap=true` works; `--no-mmap` also works via U5 read path.
+- Input/Output: glibc fixture mmaps a 64 MB host file, checksums,
+  munmaps; same checksum as host `sha256sum` prefix.
+- Key files: runtime/linux/mm.c
+- Test: tests/vlinux/test_vlinux_mmap.sh
+- Depends on: U5
+- State: PLANNED
+
+## U8. llama.cpp acceptance on the fast leg
+
+- Description: document + script the static build and prove end-to-end
+  text generation. Build recipe (docs/USER_GUIDE.md new section):
+  riscv64-linux-gcc/g++, `-static`, `BUILD_SHARED_LIBS=OFF`,
+  `LLAMA_BUILD_COMMON=ON` is fine now (glibc has everything),
+  `GGML_OPENMP=OFF`, `GGML_RV_ZFH=OFF GGML_RV_ZVFH=OFF
+  GGML_CPU_REPACK=OFF`, `-mext-zvlsseg`, `GGML_NATIVE=OFF`. Run:
+  `./andesim run --mode fast --runtime linux llama-bench -- -m tiny.gguf -t 1 -p 8 -n 4 -r 1`.
+- Input/Output: llama-bench table printed, exit 0, on a <= 1 GB model
+  with `--mem-size` sized to model + 300 MB headroom.
+- Key files: docs/USER_GUIDE.md, tests/vlinux/test_vlinux_llama_smoke.sh
+  (env-gated: needs LINUX_TOOLCHAIN + a small GGUF; manual-tier like
+  tests/andes_sim/*)
+- Depends on: U6, U7
+- State: PLANNED
+
+## U9. Hybrid: one-kernel-iteration ROI
+
+- Description: the actual goal. Two supported ways to delimit ONE
+  iteration: (a) marker build - a 5-line llama.cpp patch snippet
+  (documented, kept in docs/) adds `<andesim/ROI.h>` markers around the
+  target op guarded by an iteration counter (`if (++n == K)`), markers
+  are HINT NOPs so the same binary still runs everywhere; (b) no-source
+  route - `andesim profile` finds the hot loop, then `--trigger pc
+  --pc-start/--pc-end` with symbols resolved from the app ELF (U2).
+  Results print INSIDE the ROI (nothing after ROI-end executes - the
+  existing contract). Expectation note for the guide: one 27B-shape
+  q1_0 matvec is ~10-100 M cycles -> minutes to ~1 h at vsim's 9-50 kHz;
+  a full token would be days - that is why we measure one iteration.
+- Input/Output: hybrid run of a marker'd glibc matvec fixture (and then
+  llama-bench with the counter patch) prints in-ROI checksum + `[andesim]
+  N cycles`, N stable across two runs (deterministic single hart).
+- Key files: docs/USER_GUIDE.md, docs/llama_roi_howto.md (new, with the
+  counter-marker snippet), tests/vlinux/test_vlinux_hybrid_roi.sh
+- Depends on: U4 (fixture), U8 (llama-bench variant)
+- State: PLANNED
+
+## U10. Platform track: DRAM window >= 6 GB (full Bonsai-27B)
+
+- Description: lift the 2 GiB ceiling so the untouched 3.8 GB GGUF +
+  arenas (~4.5 GB) fit. Three coordinated changes: (1) qemu_andesim
+  andes_ae350 machine model DRAM window (currently "Cannot model more
+  than 2GB RAM"); (2) vsim RTL platform address decode for the same
+  window (external hybrid_vsim/RTL config - needs its own
+  investigation: is the testbench memory size parameterizable per
+  engine build?); (3) driver `max_program_mem_bytes()` (driver/
+  shm.cpp:91), memmap print, and the vlinux arena bounds (already
+  mem_size-driven). ABI is u64 addresses throughout - no wire change.
+  First step is a spike: confirm the RTL decode location and cost; if
+  the RTL cannot grow, evaluate a high-DRAM alias window instead.
+- Input/Output: `--mem-size 6G` accepted; U8 smoke passes with the full
+  Bonsai-27B-Q1_0.gguf resident; U9 measures its layer-0 kernel.
+- Key files: qemu_andesim (hw/riscv/andes_ae350.c), hybrid_vsim repo,
+  driver/shm.cpp, driver/cmd_run.cpp, docs/USER_GUIDE.md
+- Depends on: independent of U0-U9 (parallel track); U8/U9 consume it
+- State: PLANNED
+
+## U11. Bridge tool: GGUF layer-slice script (host side)
+
+- Description: `scripts/gguf_slice.py` (gguf-py): keep the first K
+  transformer blocks + embeddings + output head, rewrite
+  `block_count`/tensor list, so Bonsai-27B becomes a <= 1.5 GB model
+  whose per-layer kernel SHAPES are identical to the real one. This is
+  the U8/U9 workload until U10 lands. Sliced-model quality is garbage
+  (fine - we measure kernels, not perplexity).
+- Input/Output: `python scripts/gguf_slice.py Bonsai-27B-Q1_0.gguf 12`
+  -> `Bonsai-27B-Q1_0.k12.gguf`, loads in stock llama.cpp on the host,
+  `llama-bench` runs on it.
+- Key files: scripts/gguf_slice.py (new)
+- Test: host-side pytest-style check of tensor count + metadata.
+- Depends on: nothing (host tool)
+- State: PLANNED
+
+---
+
+Rollout: one feature per session, TDD-first - every feature's contract
+above is a grep-able stdout/exit-code check, so its RED test goes in
+tests/vlinux/ (or tests/andes_sim/ for U2) before the implementation.
+Update docs/USER_GUIDE.md as each lands.
+
+Order: U0 -> U1 -> U2 -> U3 -> U4 -> U5 -> {U6, U7} -> U8 -> U9.
+U10 and U11 run in parallel with the main line (U11 any time; U10 is
+the only cross-repo item).
+
+Compound effect: U0-U7 give andesim a general "run Linux userspace
+binaries" capability - every future glibc workload (SPEC kernels,
+libnn perf tests, any vendor benchmark) reuses vlinux with zero
+per-app porting, and U9's counter-marker recipe becomes the standard
+way to cycle-measure ONE iteration of any hot kernel inside a large
+application. When FR-109 (real Linux, S/U+paging) eventually lands,
+its acceptance workloads and test fixtures are already here.
