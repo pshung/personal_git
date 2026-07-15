@@ -202,10 +202,39 @@ explicitly optional 27B stretch-goal track, not deleted.
   verification power (the real contract is "delta >= 0", independent of
   loop size). Worth remembering for any future fixture sized for fast
   that also runs on cycle.
-- U7-U9: PLANNED, straight-line dependency chain. Note: U4's exit() gap
-  does not block any of these on its own critical path (none of them need
-  glibc's exit() to complete cleanly), though it should be fixed before
-  claiming a real end-user acceptance milestone.
+- U7 (File-backed private mmap): **DONE** 2026-07-15. `mm.c` grew a
+  MAP_PRIVATE file-backed branch of `sys_mmap` (arena-allocate + eager
+  `htif_pread` into it - a private owned copy) + `sys_mremap` (always
+  -ENOMEM) + `tests/fixtures/rt_linux_mmap.c` + `test_vlinux_mmap.sh`.
+  `sys_munmap` needed NO change - real POSIX munmap(2) already tolerates
+  unmapping any range including a partial/tail one (llama.cpp's own
+  pattern), so the existing U4-era always-succeeds no-op already answers
+  it correctly; a "region table" turned out to be unneeded once that was
+  checked, not a shortcut.
+
+  Structural step first (Tidy-First): extracted U5's `pread64`
+  seek-read-restore logic out of syscall.c into a new shared
+  `htif_pread()` primitive in `htif_client.{h,c}` (parallel to the
+  existing htif_read/htif_write) - both pread64 and the new mmap path
+  need it, and reaching across files for a `static` function would have
+  been the wrong alternative to sharing it properly.
+
+  Third occurrence of the "size a fixture for the SLOWER (cycle) leg it
+  also runs on, not just fast" lesson (U6 was first): a 256 KB test file
+  (~258 window round trips) hung past 600s with zero output; rather than
+  guess, ran a direct 4 KB diagnostic first - it completed in 435s,
+  matching the established ~7min baseline almost exactly, confirming the
+  mmap code itself was correct and this was purely a timeout-budget
+  question. Settled on 16 KB (~9 round trips each way) + 900s timeout.
+  General lesson solidifying across U6/U7: when a new cycle-leg fixture
+  times out with NO crash trace and NO output at all (unlike the U3/U4/U5
+  bug class, which always produces a distinct fault signature), suspect
+  a data-size/timeout budget problem first, and confirm it FAST with a
+  much-smaller diagnostic input before assuming a real bug or blindly
+  bumping the timeout.
+- U8-U9: PLANNED. Note: U4's exit() gap does not block either on its own
+  critical path (neither needs glibc's exit() to complete cleanly), though
+  it should be fixed before claiming a real end-user acceptance milestone.
 - U10, U11: PLANNED, explicitly optional/parallel, only needed if Bonsai-27B
   is revisited later.
 
