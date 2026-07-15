@@ -152,15 +152,60 @@ explicitly optional 27B stretch-goal track, not deleted.
   immediately spilled below the intended floor, so the first big `mmap()`
   (malloc's 1 MiB request) zeroed part of the app's own already-live
   stack. Fixed by starting the build at `mem_size`.
-- U5-U9: PLANNED, straight-line dependency chain, one per session. Note:
-  U4's exit() gap does not block any of these on its own critical path
-  (none of them need glibc's exit() to complete cleanly), though it
-  should be fixed before claiming a real end-user acceptance milestone.
+- U5 (File I/O syscall set): **DONE** 2026-07-15. `syscall.c` grown with
+  openat/close/read/pread64/lseek/fstat/fstatat/statx/faccessat/getcwd
+  (readlinkat/getdents64 are deliberate silent stubs, -EINVAL/-ENOSYS) +
+  `tests/fixtures/rt_linux_file.c` + `tests/vlinux/test_vlinux_file.sh`.
+  Verified fast+cycle: real glibc fopen/fread/fseek/ftell plus direct
+  syscall() probes for the rest of the set all correct.
+
+  Two ABI-translation facts, verified against LINUX_TOOLCHAIN's own
+  sysroot headers (not assumed): (1) the HTIF host's open/openat handlers
+  speak NEWLIB's O_* flag bits, not Linux's (only the low 2 access-mode
+  bits agree - O_CREAT is 0x40 in Linux vs 0x200 in newlib) - a static
+  glibc app's flags need translating at the syscall boundary
+  (`linux_to_newlib_open_flags()`) or O_CREAT silently drops and
+  `fopen(path,"w")` fails ENOENT. (2) the HTIF host's fstat/fstatat
+  handlers fill exactly 2 fixed byte offsets (st_mode u32@+4, st_size
+  u64@+16) in whatever buffer they're given - NOT a whole-struct bounce,
+  and those offsets match newlib's struct stat (what vplat relies on) but
+  NOT Linux riscv64's struct stat (mode@+16, size@+48) or struct statx at
+  all - vlinux must construct the real Linux-shaped struct from those 2
+  host-given fields, zeroing/reasonable-defaulting the rest.
+
+  **Third occurrence of the "fast tolerates it, cycle enforces the real
+  HW contract" bug class** (see U3's fence.i, U4's gp-reload): the first
+  cut read st_mode via `htif_win_load(&m, woff+4, 4)` - htif_client.h
+  documents this primitive as u64-load-only with an 8-ALIGNED woff
+  requirement (it dereferences a `uint64_t*`); QEMU's byte-addressable
+  MMIO silently tolerated the misaligned 4-byte read and returned the
+  right bytes anyway (fast passed outright), but the cycle-accurate
+  engine's real uncached-device bus logic faulted (mcause=5 load access
+  fault, mtval pointing exactly at the misaligned window address). Fixed
+  by loading a whole 8-aligned 24-byte block and extracting fields
+  locally via little-endian shifts. Worth watching for again: any new
+  HTIF/DMI-adjacent code that reads/writes sub-8-byte or misaligned
+  chunks of a window/register interface will pass on fast and fault only
+  on cycle - always test both legs, never trust fast alone for this class
+  of code.
+- U6-U9: PLANNED, straight-line dependency chain. Note: U4's exit() gap
+  does not block any of these on its own critical path (none of them need
+  glibc's exit() to complete cleanly), though it should be fixed before
+  claiming a real end-user acceptance milestone.
 - U10, U11: PLANNED, explicitly optional/parallel, only needed if Bonsai-27B
   is revisited later.
+
+2026-07-15: the user set a session-scoped `/goal` ("finish all tasks until
+you could run llama-completion with andesim hybrid mode"), authorizing
+continuous autonomous work through U5-U9 in one session without stopping
+to confirm each "Ux go ahead" as the normal one-feature-per-session
+convention would otherwise require. This is session-scoped (does not
+carry to a new conversation) - a future session should still default to
+the normal one-feature-at-a-time confirmation pattern unless the user
+sets `/goal` again or otherwise explicitly asks for continuous work.
 
 ## How to apply
 Read ROADMAP_LINUX_RUNTIME.md itself for the full feature table (description,
 input/output contract, key files, test, dependencies) before starting the next
-session's feature (currently U5) - this memory is a pointer/orientation, not a
+session's feature (currently U6) - this memory is a pointer/orientation, not a
 substitute for the roadmap doc, which is the source of truth for exact state.
