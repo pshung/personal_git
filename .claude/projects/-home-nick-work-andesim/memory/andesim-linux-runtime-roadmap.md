@@ -296,7 +296,7 @@ explicitly optional 27B stretch-goal track, not deleted.
   `./andesim run --mode hybrid --trigger marker --runtime linux`, cycle-
   accurate leg measures one real matmul, **6528953 cycles**, reproducible
   across 2 independent runs. Small matvec fixture (`rt_linux_matvec.c`,
-  13739 cycles, wired into the automated sweep) verified the core
+  13737 cycles, wired into the automated sweep) verified the core
   mechanism first, same two-step pattern as every other U-feature.
 
   **Mechanism gap fixed (driver-only, zero vsim source changes, per the
