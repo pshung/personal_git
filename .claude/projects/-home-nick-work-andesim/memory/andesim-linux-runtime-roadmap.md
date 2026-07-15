@@ -1,6 +1,6 @@
 ---
 name: andesim-linux-runtime-roadmap
-description: State and primary target of ROADMAP_LINUX_RUNTIME.md (vlinux proxy-kernel effort to run static-glibc llama.cpp on andesim).
+description: ROADMAP_LINUX_RUNTIME.md is COMPLETE (U0-U9 all DONE, 2026-07-16) - vlinux proxy kernel runs static-glibc llama-completion under andesim fast AND hybrid mode; only optional U10/U11 (Bonsai-27B stretch) remain.
 metadata: 
   node_type: memory
   type: project
@@ -291,10 +291,107 @@ explicitly optional 27B stretch-goal track, not deleted.
     real 4B model's RVV matmuls are slow under pure functional
     emulation by design, which is exactly why U9 measures ONE kernel
     iteration, not a whole token.
-- U9: PLANNED - the last step to the primary goal (hybrid ROI measurement
-  of an actual llama.cpp kernel). Note: U4's exit() gap does not block it
-  (doesn't need glibc's exit() to complete cleanly), though it should be
-  fixed before claiming a full end-user acceptance milestone.
+- U9 (hybrid: one-kernel-iteration ROI): **DONE** 2026-07-16 - the
+  roadmap's primary goal, met: real `llama-completion` runs under
+  `./andesim run --mode hybrid --trigger marker --runtime linux`, cycle-
+  accurate leg measures one real matmul, **6528953 cycles**, reproducible
+  across 2 independent runs. Small matvec fixture (`rt_linux_matvec.c`,
+  13739 cycles, wired into the automated sweep) verified the core
+  mechanism first, same two-step pattern as every other U-feature.
+
+  **Mechanism gap fixed (driver-only, zero vsim source changes, per the
+  roadmap's own constraint)**: vsim's `CsrTrigger` statically pre-scans
+  its OWN boot ELF for markers at configure time (LIEF), so it never sees
+  markers inside a dynamically-loaded `--runtime linux` app. Fixed with
+  `driver/elf_syms.{hpp,cpp}`'s new `find_roi_markers()` (reuses the
+  SAME shared `include/hybrid/insn_match.h` both QEMU's plugin and vsim
+  already use - no reimplementation drift) + `cmd_run.cpp` converting
+  vsim's leg from marker- to the EXISTING `--hybrid-exit-pc` PC-trigger
+  flag when `--runtime linux` is active. QEMU's leg stays marker-based
+  (its plugin watches the executed stream, no such gap).
+
+  **New CLI flag, `--step-timeout-ms`**: `PlanOptions.timeout_ms` was a
+  hardcoded 90000 with no override - fine for fixtures, not for a real
+  transformer matmul on the ~8.6kHz cycle leg (needs minutes). Added
+  table-driven like `--mem-size`, RED test first in `cli_test.cpp`
+  (compile failure), threaded into `PlanOptions` in `cmd_run.cpp`, new
+  black-box test `test_andes_sim_step_timeout.sh`.
+
+  **Getting the REAL llama-completion binary through it: four genuine
+  illegal-instruction (mcause=2) sites**, same "fast-permissive/cycle-
+  enforces" bug family as U3/U4/U5 but at the ELEN/vector-unit level -
+  hybrid's QEMU leg is engine-synced (`elen=32`), unlike fast mode's own
+  unconstrained cpu string, so QEMU1 itself now enforces the real vector
+  width limit fast mode never did:
+  1. `ggml_vec_dot_f16`/`ggml_vec_dot_bf16` (llama.cpp `vec.cpp`): GCC
+     auto-vectorizes their scalar `double`-accumulated fallback loop into
+     illegal e64. Fixed with `__attribute__((target("arch=rv64gc")))` on
+     just those two functions - confirmed empirically this works on this
+     GCC/RISC-V (14.3.0) when `optimize` attribute and `#pragma GCC
+     push_options` do NOT (both tried, objdump-verified no change either
+     way).
+  2. `ggml_vec_cvar_f32`/`ggml_vec_soft_max_f32` (same file): explicit
+     `vfloat64m1_t` widening-reduce accumulator, unlike every OTHER
+     architecture's branch in the SAME two functions (which reduce in f32
+     then widen ONE scalar per chunk in plain C) - a real inconsistency
+     with its own siblings, not a hardware need. Fixed by matching the
+     sibling pattern (non-widening f32 reduce + scalar widen).
+  3. `quantize_row_q8_0`/`quantize_row_q8_1` (llama.cpp `arch/riscv/
+     quants.c`): hardcoded LMUL=8 for a FLOAT op (`vfabs`/`vfredmax`);
+     `ax45mpv_premium`'s vector FPU datapath doesn't reach LMUL=8 for
+     float (confirmed: an INTEGER load at the same LMUL=8 executes fine
+     right before the float op faults - FP-datapath-specific, correlates
+     with the engine's `isa-vl4` config bit). Per TDD.md's "remove and
+     rewrite": both now call their existing portable `_ref` scalar
+     implementations unconditionally, not a build-flag suppression (no
+     compiler flag could pick a smaller-LMUL alternative that doesn't
+     exist in this code). Only ~1/650th of the matmul's actual work
+     (activation quantization once per row, reused by the dot-product
+     loop), so this cost nothing measurable.
+  4. Stale ccache / incomplete incremental rebuild (not a code bug, a
+     process trap): `compile_commands.json` showing the right `-march`
+     was NOT sufficient evidence the `.o` had actually been recompiled -
+     `find -delete` + rebuild silently did not reproduce one object file;
+     only an explicit `rm -f` of its exact path forced real recompilation.
+     Cost real debugging time before being recognized as a build-cache
+     artifact, not a fix that "didn't work."
+
+  **Diagnosability gap found and fixed while root-causing #3** (which
+  only manifests on vsim, not QEMU1, so needed vsim's own stderr):
+  `runtime/handler.c`'s shared trap handler calls `fprintf` then
+  `_exit()` - `_exit()` never flushes stdio, so on vlinux's fully-
+  buffered stderr the WHOLE diagnostic was silently lost on every trap,
+  not just this session's. Fixed with `fflush(stderr)` before `_exit()`
+  (a real permanent fix) plus a new `raw_print_hex()` using the existing
+  `htif_uart_putc()` directly (no stdio/malloc) to print mcause/mepc/mtval
+  BEFORE even attempting fprintf - cheap insurance for a future trap
+  whose corrupted state might take fprintf itself out. Separately
+  observed (not fixed, orthogonal): the `andesim` driver's own capture of
+  a spawned subprocess's stdout silently dropped vsim's raw output in at
+  least one path during this investigation; invoking `sim_ax45mpv_premium`
+  directly (bypassing the driver) is what surfaced it. Worth a future
+  driver-side look if it recurs.
+
+  **ROI target selection - the roadmap's own "confirm actual figure once
+  measured" note, taken literally**: the original K=50 pick (layer 7's Q
+  projection, 2560->4096) is real, correct, e64-free code once the above
+  4 fixes land, but too large for the cycle-accurate leg to finish even
+  inside 900000ms (15 min). Rather than keep raising the timeout blindly,
+  dumped every mul_mat's operand shapes for one real forward pass on a
+  NATIVE x86 build (fast, no simulator - a throwaway env-gated fprintf,
+  reverted after use) and ranked relative cost: FFN gate/up/down (2560x9728)
+  are actually ~2.4x LARGER than Q, not smaller; K/V-projection (2560x1024,
+  this model's grouped-query attention) is the smallest matmul shape
+  anywhere in the architecture, ~4x fewer MACs than Q. Retargeted to K=51
+  (the very next node, layer 7's V projection) via a plain `-D` reconfigure
+  (no source change) - completed comfortably inside budget both times.
+
+  Full details (exact code diffs, the size-dump technique, the marker
+  patch snippet) in `docs/llama_roi_howto.md` (new) and the roadmap's own
+  U9 DONE note (longer, blow-by-blow). `docs/USER_GUIDE.md` section 11
+  updated with the confirmed command + cycle figure; a new section 5.11
+  documents `--step-timeout-ms` (existing 5.11/5.12 renumbered to
+  5.12/5.13, cross-references updated).
 - U10, U11: PLANNED, explicitly optional/parallel, only needed if Bonsai-27B
   is revisited later.
 
@@ -305,11 +402,17 @@ to confirm each "Ux go ahead" as the normal one-feature-per-session
 convention would otherwise require. This is session-scoped (does not
 carry to a new conversation) - a future session should still default to
 the normal one-feature-at-a-time confirmation pattern unless the user
-sets `/goal` again or otherwise explicitly asks for continuous work.
+sets `/goal` again or otherwise explicitly asks for continuous work. The
+goal's condition was met 2026-07-16 (U9 done, confirmed twice) - the
+Stop hook auto-clears itself, nothing for a future session to undo.
 
 ## How to apply
 Read ROADMAP_LINUX_RUNTIME.md itself for the full feature table (description,
-input/output contract, key files, test, dependencies) before starting the next
-session's feature (currently U9, the last one - hybrid ROI wiring) - this
-memory is a pointer/orientation, not a substitute for the roadmap doc, which
-is the source of truth for exact state.
+input/output contract, key files, test, dependencies) - this memory is a
+pointer/orientation, not a substitute for the roadmap doc. All of U0-U9 are
+now DONE (the primary goal); only the explicitly-optional U10/U11 (Bonsai-27B
+stretch track) remain PLANNED, and only worth picking up if 27B specifically
+is requested again. If asked to extend this work, read
+`docs/llama_roi_howto.md` first - it has the exact recipe (marker patch,
+K-selection method, the 4 upstream ggml fixes) for retargeting or re-deriving
+a ROI on a different kernel/model.
