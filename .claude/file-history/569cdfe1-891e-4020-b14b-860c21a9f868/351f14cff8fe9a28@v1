@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Self-asserting harness for the cache demo: the transported cache-enable
+# state must be worth a multiple in the hybrid cycle figure. Same pattern as
+# demo/memsize/check.sh.
+set -uo pipefail
+HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cd "$HERE"
+
+A=${ANDESIM_BIN:-/home/nick/work/andesim/andesim}
+ENG=${ENGINE:-vsim:ax45mpv_premium}
+RATIO_MIN=${RATIO_MIN:-2}   # uncached must cost > RATIO_MIN x cached
+
+pass=0 fail=0
+# assert DESC WANT_RC WANT_REGEX -- CMD...
+assert() {
+  local desc=$1 want_rc=$2 want_re=$3; shift 3
+  local out rc
+  out=$("$@" </dev/null 2>&1); rc=$?
+  if [ "$rc" -eq "$want_rc" ] && grep -qiE "$want_re" <<<"$out"; then
+    printf '[PASS] %s\n' "$desc"; pass=$((pass+1))
+  else
+    printf '[FAIL] %s\n       rc=%s (want %s), no /%s/ in:\n       %s\n' \
+      "$desc" "$rc" "$want_rc" "$want_re" "$(head -1 <<<"$out")"
+    fail=$((fail+1))
+  fi
+}
+
+# run_cycles CMD... -> echoes the N of "[andesim] N cycles", empty on failure
+run_cycles() {
+  local out
+  out=$("$@" </dev/null 2>&1) || { printf '%s\n' "$out" >&2; return 1; }
+  sed -n 's/.*\[andesim\] \([0-9]\{1,\}\) cycles.*/\1/p' <<<"$out" | head -1
+}
+
+echo "--- both builds are functionally sound (fast; QEMU has no caches) ---"
+assert "fast cache_on:  CACHE_OK"  0 "CACHE_OK" \
+  "$A" run --mode fast cache_on.elf
+assert "fast cache_off: CACHE_OK"  0 "CACHE_OK" \
+  "$A" run --mode fast cache_off.elf
+
+echo "--- the same ROI, hybrid, cached vs uncached ---"
+on=$(run_cycles "$A" run --mode hybrid --trigger marker --engine "$ENG" cache_on.elf)
+off=$(run_cycles "$A" run --mode hybrid --trigger marker --engine "$ENG" cache_off.elf)
+
+if [ -z "$on" ] || [ -z "$off" ]; then
+  echo "[FAIL] hybrid figure missing (on='$on' off='$off')"; fail=$((fail+1))
+else
+  ratio=$(awk -v a="$off" -v b="$on" 'BEGIN{printf "%.1f", a/b}')
+  printf 'cached   (crt0 enable transported): %8s cycles\n' "$on"
+  printf 'uncached (program cleared IC|DC):   %8s cycles\n' "$off"
+  printf 'ratio: %sx (must be > %sx)\n' "$ratio" "$RATIO_MIN"
+  if [ "$off" -gt $((RATIO_MIN * on)) ]; then
+    printf '[PASS] cache-enable transport is worth %sx on this kernel\n' "$ratio"
+    pass=$((pass+1))
+  else
+    printf '[FAIL] uncached/cached ratio %sx did not clear %sx\n' "$ratio" "$RATIO_MIN"
+    fail=$((fail+1))
+  fi
+fi
+
+echo "-----------------------------------------------------------"
+printf 'RESULT: %d passed, %d failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]
