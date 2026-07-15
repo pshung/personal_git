@@ -1,0 +1,113 @@
+/* See stack.h. Builds the stack top-down: strings first (highest
+ * addresses), then the fixed-size auxv/envp/argv/argc block. The fixed
+ * block's total size (14 auxv pairs + envp NULL + argv[ptr,NULL] + argc =
+ * 256 bytes) is itself a multiple of 16, so aligning to 16 ONCE right
+ * before it starts is enough to leave the final sp (== &argc, the last
+ * thing written) 16-byte aligned too, with no trailing gap -- the RISC-V
+ * psABI requires 16-byte alignment at a function entry, which is exactly
+ * how the app's entry point is reached (main.c's asm trampoline).
+ */
+#include "stack.h"
+
+#include <elf.h>
+#include <string.h>
+
+#define STACK_RESERVE (8ull * 1024 * 1024) /* top 8 MiB of RAM (roadmap) */
+
+struct writer {
+  char* p; /* next push lands just BELOW this (stack grows down) */
+};
+
+static char* push_bytes(struct writer* w, const void* src, size_t len)
+{
+  w->p -= len;
+  memcpy(w->p, src, len);
+  return w->p;
+}
+
+static void align_down(struct writer* w, size_t align)
+{
+  w->p = (char*) ((uintptr_t) w->p & ~(align - 1));
+}
+
+/* AT_HWCAP: one bit per ISA letter present, bit = letter - 'A' (the RISC-V
+ * Linux convention; see arch/riscv/kernel/cpufeature.c). Computed rather
+ * than a magic number, so the extension set stays self-documenting. */
+static unsigned long hwcap_imafdcv(void)
+{
+  unsigned long h = 0;
+  for (const char* c = "IMAFDCV"; *c; ++c) h |= 1ul << (*c - 'A');
+  return h;
+}
+
+/* 16 bytes of AT_RANDOM filler. Not a security boundary here (simulator);
+ * mcycle-seeded like ROADMAP_LINUX_RUNTIME.md U4's planned getrandom, so a
+ * glibc stack-protector canary is at least not predictable all-zero. Reads
+ * the M-mode CSR (mcycle, 0xB00) directly, NOT the rdcycle/rdtime pseudo-ops
+ * -- those target the UNPRIVILEGED shadow CSRs (0xC00/0xC01, optional
+ * Zicntr), which the real RTL does not implement and traps on; mcycle is
+ * mandatory in M-mode on every engine. */
+static void fill_random16(unsigned char out[16])
+{
+  unsigned long a;
+  asm volatile("csrr %0, mcycle" : "=r"(a));
+  const unsigned long b = a ^ 0x9e3779b97f4a7c15ul; /* golden-ratio mix */
+  for (int i = 0; i < 8; ++i) {
+    out[i] = (unsigned char) (a >> (8 * i));
+    out[8 + i] = (unsigned char) (b >> (8 * i));
+  }
+}
+
+uintptr_t build_initial_stack(const char* app_path, uint64_t mem_size,
+                              const struct loaded_elf* elf)
+{
+  struct writer w;
+  w.p = (char*) (uintptr_t) (mem_size - STACK_RESERVE);
+
+  /* Strings: app_path (argv[0] / AT_EXECFN), then AT_RANDOM's bytes. */
+  char* argv0 = push_bytes(&w, app_path, strlen(app_path) + 1);
+  unsigned char rnd[16];
+  fill_random16(rnd);
+  char* at_random = push_bytes(&w, rnd, sizeof(rnd));
+
+  /* The fixed-size block below totals 256 bytes (a multiple of 16); aligning
+   * here makes its END -- the final sp -- 16-aligned too. */
+  align_down(&w, 16);
+
+#define AUX(t, v)                                                          \
+  do {                                                                     \
+    long pair[2] = {(long) (t), (long) (uintptr_t) (v)};                   \
+    push_bytes(&w, pair, sizeof(pair));                                    \
+  } while (0)
+
+  /* Pushed high-to-low, so the FIRST push (AT_NULL) ends up at the highest
+   * address -- i.e. last when the app scans forward from the final sp. */
+  AUX(AT_NULL, 0);
+  AUX(AT_EXECFN, argv0);
+  AUX(AT_SECURE, 0);
+  AUX(AT_EGID, 0);
+  AUX(AT_GID, 0);
+  AUX(AT_EUID, 0);
+  AUX(AT_UID, 0);
+  AUX(AT_HWCAP, hwcap_imafdcv());
+  AUX(AT_RANDOM, at_random);
+  AUX(AT_ENTRY, elf->entry);
+  AUX(AT_PAGESZ, 4096);
+  AUX(AT_PHNUM, elf->phnum);
+  AUX(AT_PHENT, elf->phentsize);
+  AUX(AT_PHDR, elf->phdr_vaddr);
+#undef AUX
+
+  long envp_null = 0;
+  push_bytes(&w, &envp_null, sizeof(envp_null));
+
+  long argv_null = 0;
+  push_bytes(&w, &argv_null, sizeof(argv_null));
+  long argv0_ptr = (long) (uintptr_t) argv0;
+  push_bytes(&w, &argv0_ptr, sizeof(argv0_ptr));
+
+  long argc = 1;
+  push_bytes(&w, &argc, sizeof(argc));
+
+  return (uintptr_t) w.p;
+}

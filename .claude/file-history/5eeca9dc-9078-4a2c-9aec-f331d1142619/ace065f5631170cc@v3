@@ -1,0 +1,89 @@
+# Build the user-facing andesim runtime library into build/runtime/:
+#
+#   libandesim_runtime.a   trap.o handler.o htif_client.o vplat_syscalls.o
+#   crt0.o                   startfile; kept OUTSIDE the archive because
+#                            nothing references _start, so the linker
+#                            would never extract it from a .a (same
+#                            reason toolchains ship crt0.o next to libc.a)
+#   andesim.ld             linker script (load base 0x00100000)
+#   include/andesim/ROI.h  ROI markers (HINT NOPs; same dir rides -B)
+#
+# Users link with:
+#   gcc ... -B <repo>/build/runtime -specs=andesim.specs hello.c
+# or, without the gcc driver:
+#   gcc ... -nostartfiles -nodefaultlibs -T andesim.ld crt0.o hello.c \
+#       -L <repo>/build/runtime \
+#       -Wl,--start-group -landesim_runtime -lc -lgcc -Wl,--end-group
+#
+# Toolchain location comes from config.env (HYBRID_TOOLCHAIN), same as
+# tests/fixtures/Makefile.
+
+# ARCH selects the target width: rv64 (default) or rv32. Each arch has its own
+# toolchain (HYBRID_TOOLCHAIN / HYBRID_TOOLCHAIN32), triple, -march/-mabi, and
+# output dir. rv64 stays at build/runtime (back-compat with `-B build/runtime`);
+# rv32 lands at build/runtime/rv32 (`-B build/runtime/rv32`).
+ARCH ?= rv64
+
+ifeq ($(ARCH),rv64)
+  TOOLCHAIN ?= $(HYBRID_TOOLCHAIN)
+  TRIPLE    := riscv64-unknown-elf
+  ARCHFLAGS := -march=rv64gc -mabi=lp64d
+  OUT       ?= ../build/runtime
+else ifeq ($(ARCH),rv32)
+  TOOLCHAIN ?= $(HYBRID_TOOLCHAIN32)
+  TRIPLE    := riscv32-unknown-elf
+  ARCHFLAGS := -march=rv32gc -mabi=ilp32d
+  OUT       ?= ../build/runtime/rv32
+else
+  $(error ARCH must be rv64 or rv32, got '$(ARCH)')
+endif
+
+ifeq ($(strip $(TOOLCHAIN)),)
+$(error No toolchain for ARCH=$(ARCH). Set HYBRID_TOOLCHAIN (rv64) / HYBRID_TOOLCHAIN32 (rv32) in config.env, `source ./setup.sh`, or pass TOOLCHAIN=/path)
+endif
+
+CC := $(TOOLCHAIN)/bin/$(TRIPLE)-gcc
+AR := $(TOOLCHAIN)/bin/$(TRIPLE)-ar
+
+# rvNNgc objects link cleanly into rvNNgcv programs (ld unions the RISC-V arch
+# attributes), so one build serves both -march variants of the arch.
+CFLAGS := $(ARCHFLAGS) -O1 -Wall
+
+LIB_OBJS := $(OUT)/trap.o $(OUT)/handler.o $(OUT)/htif_client.o $(OUT)/vplat_syscalls.o
+
+.PHONY: all clean
+
+all: $(OUT)/libandesim_runtime.a $(OUT)/crt0.o $(OUT)/andesim.ld \
+     $(OUT)/andesim.specs $(OUT)/include/andesim/ROI.h
+
+$(OUT):
+	mkdir -p $@
+
+$(OUT)/%.o: %.S | $(OUT)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OUT)/%.o: %.c | $(OUT)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OUT)/trap.o: core_v5.h
+$(OUT)/handler.o: ecall_hook.h
+$(OUT)/htif_client.o: htif_client.h
+$(OUT)/vplat_syscalls.o: htif_client.h
+
+$(OUT)/libandesim_runtime.a: $(LIB_OBJS)
+	$(AR) rcs $@ $^
+
+$(OUT)/andesim.ld: andesim.ld | $(OUT)
+	cp $< $@
+
+$(OUT)/andesim.specs: andesim.specs | $(OUT)
+	cp $< $@
+
+# gcc adds <-B prefix>/include to the include path, so the two-flag user
+# command resolves #include <andesim/ROI.h> with no extra -I.
+$(OUT)/include/andesim/ROI.h: ROI.h | $(OUT)
+	mkdir -p $(dir $@)
+	cp $< $@
+
+clean:
+	rm -rf $(OUT)
