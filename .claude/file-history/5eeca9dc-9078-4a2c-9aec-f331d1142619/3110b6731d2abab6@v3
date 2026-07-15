@@ -1,0 +1,118 @@
+/* See mm.h. Two independent bump allocators (brk grows up from the app's
+ * image end; mmap grows down from just below the app's stack) sharing
+ * vlinux's own region bounds (_vlinux_base/_stack, vlinux.ld) as their
+ * far walls -- the same linker symbols loader.c's overlap check uses, one
+ * source of truth.
+ */
+#include "mm.h"
+
+#include <string.h>
+
+#include "../htif_client.h"
+
+#define PAGE_SIZE 4096ul
+
+#define PROT_WRITE 0x2      /* asm-generic/mman-common.h */
+#define MAP_SHARED 0x01     /* bits/mman-linux.h */
+#define MAP_PRIVATE 0x02
+#define MAP_ANONYMOUS 0x20  /* asm-generic/mman-common.h */
+
+#define ENOMEM 12 /* asm-generic/errno-base.h */
+#define EINVAL 22
+#define ENOSYS 38
+
+extern char _vlinux_base[]; /* brk's ceiling */
+extern char _stack[];       /* mmap's floor (== vlinux's own end) */
+
+static uint64_t g_brk_start;   /* app image end: brk's floor */
+static uint64_t g_brk_cur;
+static uint64_t g_brk_ceiling; /* _vlinux_base */
+static uint64_t g_mmap_top;    /* next allocation lands just below this */
+static uint64_t g_mmap_floor;  /* _stack */
+static uint64_t g_mem_size;    /* the manifest's guest RAM size */
+
+void mm_init(uint64_t app_image_end, uint64_t mem_size)
+{
+  g_brk_start = app_image_end;
+  g_brk_cur = app_image_end;
+  g_brk_ceiling = (uint64_t) (uintptr_t) _vlinux_base;
+  g_mmap_floor = (uint64_t) (uintptr_t) _stack;
+  g_mmap_top = mem_size - (8ull * 1024 * 1024); /* stack.c's STACK_RESERVE */
+  g_mem_size = mem_size;
+}
+
+uint64_t mm_total_ram(void) { return g_mem_size; }
+
+long sys_brk(unsigned long addr)
+{
+  if (addr == 0) return (long) g_brk_cur;
+  if (addr < g_brk_start || addr > g_brk_ceiling)
+    return (long) g_brk_cur; /* Linux brk(2): failure returns the OLD break */
+  g_brk_cur = addr;
+  return (long) g_brk_cur;
+}
+
+long sys_mmap(unsigned long addr, unsigned long length, long prot, long flags,
+             long fd, long offset)
+{
+  (void) addr;
+  /* Every page is already RWX -- no MMU to restrict with -- EXCEPT prot
+   * still decides whether a MAP_SHARED file mapping is safe to serve
+   * below (a read-only one is; see there). */
+  if (length == 0) return -EINVAL;
+
+  const uint64_t need = ((uint64_t) length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+  if (need > g_mmap_top - g_mmap_floor) return -ENOMEM;
+  g_mmap_top -= need;
+  void* base = (void*) (uintptr_t) g_mmap_top;
+
+  if (flags & MAP_ANONYMOUS) {
+    memset(base, 0, need);
+    return (long) (uintptr_t) base;
+  }
+
+  /* File-backed (ROADMAP_LINUX_RUNTIME.md U7): read the file's
+   * [offset, offset+length) range into the freshly-allocated arena
+   * space, a private owned copy. MAP_SHARED without PROT_WRITE is
+   * accepted too -- llama.cpp's own mmap loader (llama-mmap.cpp) uses
+   * exactly this (MAP_SHARED, PROT_READ only) -- because a mapping
+   * nothing ever writes through has no OBSERVABLE difference between
+   * MAP_PRIVATE and MAP_SHARED (the distinction is entirely about write
+   * visibility). A writable MAP_SHARED request has no write-back path
+   * here and is refused (-ENOSYS) rather than silently downgraded to a
+   * private copy a caller might rely on staying shared. */
+  if (flags & MAP_SHARED) {
+    if (prot & PROT_WRITE) return -ENOSYS;
+  } else if (!(flags & MAP_PRIVATE)) {
+    return -ENOSYS;
+  }
+  const ssize_t n = htif_pread(fd, base, length, offset);
+  if (n < 0) return n;
+  if ((size_t) n < need) memset((char*) base + n, 0, need - (size_t) n);
+  return (long) (uintptr_t) base;
+}
+
+long sys_munmap(unsigned long addr, unsigned long length)
+{
+  (void) addr;
+  (void) length;
+  return 0;
+}
+
+long sys_mprotect(unsigned long addr, unsigned long length, long prot)
+{
+  (void) addr;
+  (void) length;
+  (void) prot;
+  return 0;
+}
+
+long sys_mremap(unsigned long old_addr, unsigned long old_size,
+                unsigned long new_size, unsigned long flags)
+{
+  (void) old_addr;
+  (void) old_size;
+  (void) new_size;
+  (void) flags;
+  return -ENOMEM;
+}

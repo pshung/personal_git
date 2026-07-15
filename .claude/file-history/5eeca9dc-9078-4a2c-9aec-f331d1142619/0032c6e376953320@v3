@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# U3 contract (ROADMAP_LINUX_RUNTIME.md): vlinux reads the app ELF named by
+# its manifest (g_manifest.app_path, U2), maps its PT_LOAD segments, builds
+# the Linux initial stack (argc/argv/envp/auxv), and jumps to the app entry
+# in M-mode. Proved with tests/fixtures/rt_linux_argv.elf (a -nostdlib
+# fixture -- no glibc needed yet, that's U4): it reads argv/auxv straight off
+# sp and echoes argv[0] + AT_PAGESZ via raw ecalls, which exercises U3's
+# minimal 2-syscall (write, exit_group) dispatch too.
+#
+# Two legs, same staged artifact (U1's dual-engine pattern): `andesim run
+# --mode fast --runtime linux` builds+boots the manifested vlinux-run.elf for
+# the fast leg and prints its staged path; that SAME staged ELF is then run
+# directly on the cycle engine (--mode cycle --runtime linux is not wired
+# until later -- ROADMAP_LINUX_RUNTIME.md U2's scope note).
+#
+# U8 addition: `-- extra args` after the app ELF thread through as
+# argv[1..] (deferred by U2/U3, needed once U8's real invocation --
+# `llama-completion -- -m model.gguf -t 1` -- has actual flags to pass).
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+
+TC="${HYBRID_TOOLCHAIN:-$(cfg_val HYBRID_TOOLCHAIN)}"
+[ -n "$TC" ] || fail "HYBRID_TOOLCHAIN not set (env or config.env)"
+export HYBRID_TOOLCHAIN="$TC"
+
+bash "$ROOT/scripts/build_driver.sh" >/dev/null 2>&1 || fail "build_driver.sh failed"
+BIN="$ROOT/build/andesim"
+[ -x "$BIN" ] || fail "missing andesim binary: $BIN"
+
+make -C "$ROOT/runtime/linux" >/dev/null || fail "vlinux build failed"
+[ -f "$ROOT/build/runtime/linux/vlinux.elf" ] || fail "missing vlinux.elf"
+
+make -C "$ROOT/tests/fixtures" rt_linux_argv.elf >/dev/null || fail "fixture build failed"
+APP="$ROOT/tests/fixtures/rt_linux_argv.elf"
+[ -f "$APP" ] || fail "missing $APP"
+
+SIM="$(vsim_bin_dir)/sim_ax45mpv_premium"
+[ -x "$SIM" ] || fail "cycle engine not found (source ./setup.sh): $SIM"
+
+# 1. fast leg: real run (not --dry-run) -- loader + stack + auxv + the app's
+#    own ecalls all execute for real. "-- extra1 extra2 extra3" (3 extras)
+#    must land as argv[1..3] (U8), not be silently dropped (U2/U3's old
+#    behavior). argc==4 here is EVEN -- deliberately, not argc==1's odd
+#    parity: the fixed auxv/envp/argv/argc block's size is a multiple of
+#    16 only for odd argc (see stack.c), so an even argc is the one that
+#    actually exercises the new alignment-padding branch. A real
+#    llama.cpp invocation (U8's actual target) also lands on an even argc,
+#    so this parity matters, not just argc==1's original coincidence.
+out=$(timeout 30 "$BIN" run --mode fast --runtime linux "$APP" -- extra1 extra2 extra3 2>&1); rc=$?
+[ "$rc" -eq 0 ] || fail "fast run exit $rc: $out"
+printf '%s\n' "$out" | grep -qF "argv[0]=$APP" \
+  || fail "fast: missing argv[0]=$APP in: $out"
+printf '%s\n' "$out" | grep -qF 'argv[1]=extra1' \
+  || fail "fast: missing argv[1]=extra1 in: $out"
+printf '%s\n' "$out" | grep -qF 'argv[2]=extra2' \
+  || fail "fast: missing argv[2]=extra2 in: $out"
+printf '%s\n' "$out" | grep -qF 'argv[3]=extra3' \
+  || fail "fast: missing argv[3]=extra3 in: $out"
+printf '%s\n' "$out" | grep -q 'AT_PAGESZ=4096' \
+  || fail "fast: missing AT_PAGESZ=4096 in: $out"
+ok "fast --runtime linux: loader + stack + auxv + 2-syscall dispatch (argv[0..3], even argc, + AT_PAGESZ echoed)"
+
+# 2. cycle leg: the SAME staged vlinux-run.elf, run directly on the cycle
+#    engine (proves the loader/stack/dispatch code is engine-blind, like
+#    every other vlinux/vplat mechanism).
+vlinux_run=$(printf '%s\n' "$out" | grep -oE '/[^ ]*/vlinux-run\.elf' | head -1)
+[ -n "$vlinux_run" ] && [ -f "$vlinux_run" ] \
+  || fail "staged vlinux-run.elf not found on disk: $vlinux_run"
+
+out=$(timeout 120 "$SIM" "$vlinux_run" 2>&1); rc=$?
+[ "$rc" -eq 0 ] || fail "cycle run exit $rc: $out"
+printf '%s\n' "$out" | grep -qF "argv[0]=$APP" \
+  || fail "cycle: missing argv[0]=$APP in: $out"
+printf '%s\n' "$out" | grep -qF 'argv[1]=extra1' \
+  || fail "cycle: missing argv[1]=extra1 in: $out"
+printf '%s\n' "$out" | grep -qF 'argv[2]=extra2' \
+  || fail "cycle: missing argv[2]=extra2 in: $out"
+printf '%s\n' "$out" | grep -q 'AT_PAGESZ=4096' \
+  || fail "cycle: missing AT_PAGESZ=4096 in: $out"
+ok "cycle: the same staged vlinux-run.elf boots and runs the app identically (argv[0..2])"

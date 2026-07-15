@@ -1,0 +1,151 @@
+/* See stack.h. Builds the stack top-down: strings first (highest
+ * addresses), then the block of auxv/envp/argv/argc. That block's size is
+ * NOT fixed once argv has more than one entry (ROADMAP_LINUX_RUNTIME.md
+ * U8): 14 auxv pairs (224 bytes, always) + envp NULL (8) + (argc+1)*8
+ * (argv pointers + NULL) + argc (8) is a multiple of 16 only for odd argc
+ * (e.g. argc==1: 224+8+16+8=256). For even argc it is 8 mod 16, so an
+ * extra 8-byte pad word is inserted between the strings and this block
+ * whenever needed -- computed from the REAL argc, not assumed -- so the
+ * final sp (== &argc, the last thing written) is always 16-byte aligned,
+ * per the RISC-V psABI requirement at a function entry (exactly how the
+ * app's entry point is reached, main.c's asm trampoline).
+ */
+#include "stack.h"
+
+#include <elf.h>
+#include <string.h>
+
+#include "manifest.h"
+
+#define STACK_RESERVE (8ull * 1024 * 1024) /* top 8 MiB of RAM (roadmap) */
+
+struct writer {
+  char* p; /* next push lands just BELOW this (stack grows down) */
+};
+
+static char* push_bytes(struct writer* w, const void* src, size_t len)
+{
+  w->p -= len;
+  memcpy(w->p, src, len);
+  return w->p;
+}
+
+static void align_down(struct writer* w, size_t align)
+{
+  w->p = (char*) ((uintptr_t) w->p & ~(align - 1));
+}
+
+/* AT_HWCAP: one bit per ISA letter present, bit = letter - 'A' (the RISC-V
+ * Linux convention; see arch/riscv/kernel/cpufeature.c). Computed rather
+ * than a magic number, so the extension set stays self-documenting. */
+static unsigned long hwcap_imafdcv(void)
+{
+  unsigned long h = 0;
+  for (const char* c = "IMAFDCV"; *c; ++c) h |= 1ul << (*c - 'A');
+  return h;
+}
+
+/* 16 bytes of AT_RANDOM filler. Not a security boundary here (simulator);
+ * mcycle-seeded like ROADMAP_LINUX_RUNTIME.md U4's planned getrandom, so a
+ * glibc stack-protector canary is at least not predictable all-zero. Reads
+ * the M-mode CSR (mcycle, 0xB00) directly, NOT the rdcycle/rdtime pseudo-ops
+ * -- those target the UNPRIVILEGED shadow CSRs (0xC00/0xC01, optional
+ * Zicntr), which the real RTL does not implement and traps on; mcycle is
+ * mandatory in M-mode on every engine. */
+static void fill_random16(unsigned char out[16])
+{
+  unsigned long a;
+  asm volatile("csrr %0, mcycle" : "=r"(a));
+  const unsigned long b = a ^ 0x9e3779b97f4a7c15ul; /* golden-ratio mix */
+  for (int i = 0; i < 8; ++i) {
+    out[i] = (unsigned char) (a >> (8 * i));
+    out[8 + i] = (unsigned char) (b >> (8 * i));
+  }
+}
+
+uintptr_t build_initial_stack(const char* app_path, uint64_t mem_size,
+                              const struct loaded_elf* elf,
+                              const char* extra_argv_buf,
+                              uint32_t extra_argv_count)
+{
+  struct writer w;
+  /* Start at the true top of RAM, not at mem_size - STACK_RESERVE: that
+   * offset is the FLOOR the stack must stay above (mm.c's mmap arena starts
+   * there and grows further down) -- starting the build AT the floor would
+   * push this content below it immediately, into the mmap arena's own
+   * territory (found via a real collision: the app's first sizeable mmap
+   * landed exactly on top of its own live stack and zeroed it). The
+   * reserved 8 MiB between here and the floor is the app's headroom to
+   * grow into during execution, not space this initial build should use. */
+  w.p = (char*) (uintptr_t) mem_size;
+
+  /* Strings: app_path (argv[0] / AT_EXECFN), then each extra arg
+   * (argv[1..]), then AT_RANDOM's bytes -- capturing every argv pointer
+   * as we go, since the pointer array below is built AFTER all strings
+   * (it needs every address up front). */
+  const uint32_t argc = 1 + extra_argv_count;
+  char* argv_ptrs[1 + VLINUX_MANIFEST_ARGV_MAX_COUNT];
+  argv_ptrs[0] = push_bytes(&w, app_path, strlen(app_path) + 1);
+  const char* p = extra_argv_buf;
+  for (uint32_t i = 0; i < extra_argv_count; ++i) {
+    const size_t n = strlen(p) + 1;
+    argv_ptrs[1 + i] = push_bytes(&w, p, n);
+    p += n;
+  }
+  unsigned char rnd[16];
+  fill_random16(rnd);
+  char* at_random = push_bytes(&w, rnd, sizeof(rnd));
+
+  /* The block below is 14 auxv pairs (224) + envp NULL (8) +
+   * (argc+1)*8 argv slots + argc (8) -- a multiple of 16 only for odd
+   * argc. align_down alone assumed a fixed 256-byte block (true only for
+   * argc==1); for the general case, drop one more pad word whenever the
+   * real block size is 8 mod 16, so the block's END (== final sp) lands
+   * 16-aligned regardless of argc. */
+  const size_t block_size = 224 + 8 + (size_t) (argc + 1) * 8 + 8;
+  align_down(&w, 16);
+  w.p -= (16 - (block_size % 16)) % 16;
+
+#define AUX(t, v)                                                          \
+  do {                                                                     \
+    long pair[2] = {(long) (t), (long) (uintptr_t) (v)};                   \
+    push_bytes(&w, pair, sizeof(pair));                                    \
+  } while (0)
+
+  /* Pushed high-to-low, so the FIRST push (AT_NULL) ends up at the highest
+   * address -- i.e. last when the app scans forward from the final sp. */
+  AUX(AT_NULL, 0);
+  AUX(AT_EXECFN, argv_ptrs[0]);
+  AUX(AT_SECURE, 0);
+  AUX(AT_EGID, 0);
+  AUX(AT_GID, 0);
+  AUX(AT_EUID, 0);
+  AUX(AT_UID, 0);
+  AUX(AT_HWCAP, hwcap_imafdcv());
+  AUX(AT_RANDOM, at_random);
+  AUX(AT_ENTRY, elf->entry);
+  AUX(AT_PAGESZ, 4096);
+  AUX(AT_PHNUM, elf->phnum);
+  AUX(AT_PHENT, elf->phentsize);
+  AUX(AT_PHDR, elf->phdr_vaddr);
+#undef AUX
+
+  long envp_null = 0;
+  push_bytes(&w, &envp_null, sizeof(envp_null));
+
+  long argv_null = 0;
+  push_bytes(&w, &argv_null, sizeof(argv_null));
+  /* Reverse order: argv[argc-1]'s pointer pushed first (highest address
+   * among the argv slots), argv[0]'s pointer pushed LAST -- landing right
+   * above argc, exactly the layout a Linux process expects reading
+   * forward from its initial sp: argc, argv[0], argv[1], ..., NULL. */
+  for (uint32_t i = argc; i-- > 0;) {
+    long ptr = (long) (uintptr_t) argv_ptrs[i];
+    push_bytes(&w, &ptr, sizeof(ptr));
+  }
+
+  long argc_val = (long) argc;
+  push_bytes(&w, &argc_val, sizeof(argc_val));
+
+  return (uintptr_t) w.p;
+}

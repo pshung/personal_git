@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# U7 contract (ROADMAP_LINUX_RUNTIME.md): file-backed MAP_PRIVATE mmap --
+# llama.cpp's default GGUF load path (mmap(fd, MAP_PRIVATE, PROT_READ)),
+# partial munmap of unused tail ranges, and mremap correctly refused
+# (ENOMEM, not silent corruption).
+#
+# tests/fixtures/rt_linux_mmap.c: mmaps a 16 KB host file, checksums it,
+# partially unmaps, re-checksums the remainder, confirms mremap fails.
+#
+# Needs LINUX_TOOLCHAIN (config.env / env) -- SKIPs cleanly if unset, same
+# as the other U4+ glibc tests.
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+
+TC="${HYBRID_TOOLCHAIN:-$(cfg_val HYBRID_TOOLCHAIN)}"
+[ -n "$TC" ] || fail "HYBRID_TOOLCHAIN not set (env or config.env)"
+export HYBRID_TOOLCHAIN="$TC"
+
+LTC="${LINUX_TOOLCHAIN:-$(cfg_val LINUX_TOOLCHAIN)}"
+if [ -z "$LTC" ] || [ ! -x "$LTC/bin/riscv64-linux-gcc" ]; then
+  ok "SKIP: LINUX_TOOLCHAIN unset/unreachable (config.env) -- no static-glibc toolchain on this host"
+  exit 0
+fi
+
+bash "$ROOT/scripts/build_driver.sh" >/dev/null 2>&1 || fail "build_driver.sh failed"
+BIN="$ROOT/build/andesim"
+[ -x "$BIN" ] || fail "missing andesim binary: $BIN"
+
+make -C "$ROOT/runtime/linux" >/dev/null || fail "vlinux build failed"
+[ -f "$ROOT/build/runtime/linux/vlinux.elf" ] || fail "missing vlinux.elf"
+
+make -C "$ROOT/tests/fixtures" rt_linux_mmap.elf LINUX_TOOLCHAIN="$LTC" >/dev/null \
+  || fail "mmap fixture build failed"
+APP="$ROOT/tests/fixtures/rt_linux_mmap.elf"
+[ -f "$APP" ] || fail "missing $APP"
+
+SIM="$(vsim_bin_dir)/sim_ax45mpv_premium"
+[ -x "$SIM" ] || fail "cycle engine not found (source ./setup.sh): $SIM"
+
+check_leg() {
+  local label="$1" rc="$2" out="$3"
+  local line
+  for line in "MMAP: checksum ok" "MMAP: partial munmap ok, remaining half intact" \
+              "MMAP: full munmap ok" "MMAP: mremap correctly ENOMEM" "mmap ok"; do
+    printf '%s\n' "$out" | grep -qF "$line" \
+      || fail "$label: missing '$line' in: $out"
+  done
+  [ "$rc" -eq 0 ] || fail "$label: exit $rc != 0: $out"
+  ok "$label: file-backed MAP_PRIVATE mmap + partial munmap + mremap-refused all correct"
+}
+
+# 1. fast leg.
+out=$(cd "$ROOT" && timeout 30 "$BIN" run --mode fast --runtime linux "$APP" 2>&1); rc=$?
+check_leg "fast" "$rc" "$out"
+
+# 2. cycle leg: the SAME staged vlinux-run.elf (U1's dual-engine pattern).
+#    Same ~7min glibc-startup baseline as U4/U5/U6 plus ~18 window round
+#    trips for the 16 KB transfer; 900s gives headroom beyond the ~435s
+#    measured for a near-trivial transfer at this same baseline.
+vlinux_run=$(printf '%s\n' "$out" | grep -oE '/[^ ]*/vlinux-run\.elf' | head -1)
+[ -n "$vlinux_run" ] && [ -f "$vlinux_run" ] \
+  || fail "staged vlinux-run.elf not found on disk: $vlinux_run"
+
+out=$(timeout 900 "$SIM" "$vlinux_run" 2>&1); rc=$?
+check_leg "cycle" "$rc" "$out"

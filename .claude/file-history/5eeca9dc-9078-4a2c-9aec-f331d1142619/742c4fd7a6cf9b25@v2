@@ -1,0 +1,155 @@
+// Unit tests for resolve_pc (F9): the pc-trigger boundary resolver. A boundary
+// is either a "0x"-prefixed hex address (used verbatim, prefix stripped) or a
+// symbol name looked up in the ELF .symtab -> st_value. C++ port of
+// tests/lib/roi.sh:resolve_pc, but reading the symtab directly (no `nm`).
+//
+// Fixtures are real built ELFs: handoff_roundtrip.elf defines `_start` at
+// 0x100000 (a stable linker-script entry). Plain assert-and-count harness.
+#include <elf.h>
+
+#include <filesystem>
+#include <fstream>
+#include <string>
+
+#include "elf_syms.hpp"
+#include "repo_root.hpp"
+#include "test_check.hpp"
+
+using namespace andes_sim;
+
+int main() {
+  const std::string elf =
+      (repo_root() / "tests" / "fixtures" / "handoff_roundtrip.elf").string();
+
+  // A 0x address resolves to itself with the prefix stripped (verbatim, no
+  // symtab touched) -- matches roi.sh `${boundary#0[xX]}`.
+  {
+    std::string err;
+    CHECK(resolve_pc(elf, "0x100000", err) == "100000");
+    CHECK(err.empty());
+  }
+  // 0X (capital) prefix is also stripped; the remaining digits are kept as-is.
+  {
+    std::string err;
+    CHECK(resolve_pc(elf, "0X1ABC", err) == "1ABC");
+    CHECK(err.empty());
+  }
+  // A defined symbol resolves to its st_value as bare lowercase hex.
+  {
+    std::string err;
+    CHECK(resolve_pc(elf, "_start", err) == "100000");
+    CHECK(err.empty());
+  }
+  // An undefined symbol is a hard error (empty result + message naming it).
+  {
+    std::string err;
+    CHECK(resolve_pc(elf, "definitely_not_a_symbol_xyz", err).empty());
+    CHECK(!err.empty());
+    CHECK(err.find("definitely_not_a_symbol_xyz") != std::string::npos);
+  }
+  // A 0x prefix with non-hex characters is malformed, NOT a silent verbatim
+  // pass: returning "ZZZ"/"10zz" lets the downstream strtoull truncate them to
+  // 0x0 / 0x10, so the hybrid run silently measures the wrong PC window.
+  {
+    std::string err;
+    CHECK(resolve_pc(elf, "0xZZZ", err).empty());
+    CHECK(!err.empty());
+  }
+  {  // partial-hex: must reject, not keep the valid prefix
+    std::string err;
+    CHECK(resolve_pc(elf, "0x10zz", err).empty());
+    CHECK(!err.empty());
+  }
+  // An unreadable ELF is an error, not a crash.
+  {
+    std::string err;
+    CHECK(resolve_pc("/no/such/file.elf", "_start", err).empty());
+    CHECK(!err.empty());
+  }
+
+  // L26/F3: elf_load_top -- the highest byte of the ELF's static image
+  // (max p_paddr + p_memsz over PT_LOAD). handoff_roundtrip has one LOAD
+  // segment at 0x100000; its top sits just past the base and well below any
+  // realistic --mem-size ceiling, so the driver's scratch-overlap guard never
+  // false-fires on it.
+  {
+    std::string err;
+    const uint64_t top = elf_load_top(elf, err);
+    CHECK(err.empty());
+    CHECK(top > 0x100000ull);          // base + segment content
+    CHECK(top < 0x00110000ull);        // tiny fixture: within 64 KiB of base
+    // Clearance decision the driver makes: image must end at/below the scratch
+    // GPA (= ram_base + program_mem). Fits a 128 MiB program, overlaps a 1 MiB.
+    CHECK(top <= 128ull * 1024 * 1024);     // 128M ceiling -> OK
+    CHECK(top > 1ull * 1024 * 1024);        // 1M ceiling   -> would overlap
+  }
+  // An unreadable / non-ELF file is an error (0 + message), not a crash.
+  {
+    std::string err;
+    CHECK(elf_load_top("/no/such/file.elf", err) == 0u);
+    CHECK(!err.empty());
+  }
+
+  // elf_xlen: the ELF class width (rv32/rv64) from e_ident. Source of truth for
+  // the fast auto-pick and the cycle/hybrid arch-match guard (F1).
+  {
+    namespace fs = std::filesystem;
+    // Real rv64 fixture -> 64.
+    CHECK(elf_xlen(elf) == 64);
+    // Fabricated rv32 e_ident (ELFMAG + ELFCLASS32) -> 32. Proves the 32 path
+    // with no rv32 toolchain / fixture (those arrive in F3).
+    const std::string p32 =
+        (fs::temp_directory_path() / "andesim_elf_xlen_rv32.bin").string();
+    {
+      unsigned char ident[EI_NIDENT] = {ELFMAG0, ELFMAG1, ELFMAG2, ELFMAG3,
+                                        ELFCLASS32};
+      std::ofstream(p32, std::ios::binary | std::ios::trunc)
+          .write(reinterpret_cast<const char*>(ident), sizeof(ident));
+    }
+    CHECK(elf_xlen(p32) == 32);
+    fs::remove(p32);
+    // Non-ELF and missing -> 0 (no crash, no false width).
+    const std::string pg =
+        (fs::temp_directory_path() / "andesim_elf_xlen_garbage.bin").string();
+    { std::ofstream(pg, std::ios::binary | std::ios::trunc) << "not an elf"; }
+    CHECK(elf_xlen(pg) == 0);
+    fs::remove(pg);
+    CHECK(elf_xlen("/no/such/file.elf") == 0);
+  }
+
+  // U9: find_roi_markers scans PT_LOAD+PF_X segments for the ROI HINT
+  // markers, needed when vsim boots a DIFFERENT ELF than the one
+  // containing them (ROADMAP_LINUX_RUNTIME.md's --runtime linux under
+  // hybrid: vsim boots the staged vlinux-run.elf, but the markers live in
+  // the app ELF vlinux loads at runtime -- vsim's own trigger only
+  // static-pre-scans whatever ELF it is handed, so the driver must find
+  // the marker PCs itself and feed them through PC-mode instead).
+  // handoff_roundtrip.elf's markers are known from objdump: entry
+  // (0x5A0) at 0x100000, exit (0x5A1) at 0x10000c -- with real 2-byte
+  // compressed instructions between them, so this also proves the scan
+  // is RVC-aware (a naive 4-byte-stride scan would still find these two,
+  // by coincidence of alignment here, but a stride bug would silently
+  // misparse a real mixed RVC/32-bit stream elsewhere).
+  {
+    RoiMarkerPcs m = find_roi_markers(elf);
+    CHECK(m.enter_pc == 0x100000ull);
+    CHECK(m.exit_pc == 0x10000cull);
+  }
+  // No markers -> both zero, not a crash (elf_xlen's own rv32 fixture has
+  // no PT_LOAD segments at all, an easy no-markers case to reuse).
+  {
+    namespace fs = std::filesystem;
+    const std::string p32 =
+        (fs::temp_directory_path() / "andesim_elf_xlen_rv32.bin").string();
+    unsigned char ident[EI_NIDENT] = {ELFMAG0, ELFMAG1, ELFMAG2, ELFMAG3,
+                                      ELFCLASS32};
+    std::ofstream(p32, std::ios::binary | std::ios::trunc)
+        .write(reinterpret_cast<const char*>(ident), sizeof(ident));
+    RoiMarkerPcs m = find_roi_markers(p32);
+    CHECK(m.enter_pc == 0);
+    CHECK(m.exit_pc == 0);
+    fs::remove(p32);
+  }
+
+  return andes_sim::test::report("elf-syms");
+}

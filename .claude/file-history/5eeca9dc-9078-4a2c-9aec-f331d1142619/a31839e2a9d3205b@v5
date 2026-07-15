@@ -1,0 +1,693 @@
+/* ecall dispatch: the "Set 1" syscalls a static glibc needs from _start to
+ * printf+malloc+exit (ROADMAP_LINUX_RUNTIME.md U4). Reuses vplat's own
+ * _write/_exit (already linked into vlinux via ../vplat_syscalls.c) and
+ * mm.c's brk/mmap arenas rather than adding a second UART/SimControl path
+ * or memory manager.
+ *
+ * Unknown syscalls are NOT fatal: glibc is designed to tolerate some optional
+ * syscalls being unavailable (ROADMAP_LINUX_RUNTIME.md's own risk note about
+ * riscv_hwprobe falling back to generic code), so an unimplemented number
+ * prints once (grep-able) and returns -ENOSYS, same as real Linux would for
+ * a syscall the running kernel does not implement -- it does not trap.
+ */
+#include "../ecall_hook.h"
+#include "../htif_client.h"
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/types.h>
+
+#include "mm.h"
+
+extern ssize_t _write(int fd, const void* ptr, size_t len);
+extern ssize_t _read(int fd, void* buf, size_t len);
+extern void _exit(int status) __attribute__((noreturn));
+
+/* trap.S register-save-frame slot indices (see ecall_hook.h). */
+#define REG_A0 10
+#define REG_A1 11
+#define REG_A2 12
+#define REG_A3 13
+#define REG_A4 14
+#define REG_A5 15
+#define REG_A7 17
+#define REG_MEPC 32
+
+#define SYS_write 64
+#define SYS_writev 66
+#define SYS_exit 93
+#define SYS_exit_group 94
+#define SYS_set_tid_address 96
+#define SYS_futex 98
+#define SYS_set_robust_list 99
+#define SYS_sched_yield 124
+#define SYS_sched_getaffinity 123
+#define SYS_sigaltstack 132
+#define SYS_rt_sigaction 134
+#define SYS_rt_sigprocmask 135
+#define SYS_uname 160
+#define SYS_getpid 172
+#define SYS_getuid 174
+#define SYS_geteuid 175
+#define SYS_getgid 176
+#define SYS_getegid 177
+#define SYS_gettid 178
+#define SYS_fcntl 25
+#define SYS_ioctl 29
+#define SYS_mprotect 226
+#define SYS_munmap 215
+#define SYS_mmap 222
+#define SYS_mremap 216
+#define SYS_brk 214
+#define SYS_tgkill 131
+#define SYS_rseq 293
+#define SYS_prlimit64 261
+#define SYS_getrandom 278
+
+/* ROADMAP_LINUX_RUNTIME.md U5: File I/O syscall set, bridged onto the
+ * existing HTIF window ops (runtime/htif_client.h) -- numbers verified
+ * against LINUX_TOOLCHAIN's asm-generic/unistd.h. */
+#define SYS_getcwd 17
+#define SYS_faccessat 48
+#define SYS_openat 56
+#define SYS_close 57
+#define SYS_getdents64 61
+#define SYS_lseek 62
+#define SYS_read 63
+#define SYS_pread64 67
+#define SYS_readlinkat 78
+#define SYS_fstatat 79
+#define SYS_fstat 80
+#define SYS_sysinfo 179
+#define SYS_fadvise64 223
+#define SYS_madvise 233
+#define SYS_statx 291
+
+/* ROADMAP_LINUX_RUNTIME.md U6: time syscalls, backed by the same
+ * VH_SYS_GETTIMEOFDAY host clock the window protocol already exposes
+ * (runtime/vplat_syscalls.c's own _gettimeofday). */
+#define SYS_nanosleep 101
+#define SYS_clock_gettime 113
+#define SYS_clock_getres 114
+#define SYS_clock_nanosleep 115
+
+#define CLOCK_REALTIME 0
+#define CLOCK_MONOTONIC 1
+
+/* AT_FDCWD (fcntl.h): openat/fstatat/faccessat/statx's "use my cwd"
+ * dirfd. Numerically identical on guest and host (Linux UAPI constant,
+ * not architecture-specific), so it forwards to the host calls as-is. */
+#define AT_FDCWD (-100)
+
+#define EINVAL 22
+#define ENOTTY 25
+#define ERANGE 34
+#define ENOSYS 38
+
+/* struct utsname (glibc's sys/utsname.h): 6 x char[65]. Defined locally --
+ * vlinux is built with the bare-metal HYBRID_TOOLCHAIN, which has no such
+ * header (there is no "Linux" to report from on a freestanding target). */
+struct vlinux_utsname {
+  char sysname[65];
+  char nodename[65];
+  char release[65];
+  char version[65];
+  char machine[65];
+  char domainname[65];
+};
+
+struct vlinux_iovec {
+  void* iov_base;
+  unsigned long iov_len;
+};
+
+/* struct sysinfo (linux/sysinfo.h), verified the same way. On LP64
+ * (riscv64) the trailing _f[] padding array is zero-length, so this is
+ * the whole struct: 108 bytes, 8-aligned to 112. */
+struct vlinux_sysinfo {
+  long uptime;
+  unsigned long loads[3];
+  unsigned long totalram, freeram, sharedram, bufferram;
+  unsigned long totalswap, freeswap;
+  unsigned short procs, pad;
+  unsigned long totalhigh, freehigh;
+  unsigned int mem_unit;
+};
+
+/* Linux generic riscv64 ABI struct stat (asm-generic/stat.h, verified
+ * against LINUX_TOOLCHAIN's sysroot -- NOT newlib's layout, see
+ * fill_stat_from_host below for why that distinction matters). 128 bytes. */
+struct vlinux_stat {
+  unsigned long st_dev, st_ino;
+  unsigned int st_mode, st_nlink, st_uid, st_gid;
+  unsigned long st_rdev, __pad1;
+  long st_size;
+  int st_blksize, __pad2;
+  long st_blocks;
+  long st_atime;
+  unsigned long st_atime_nsec;
+  long st_mtime;
+  unsigned long st_mtime_nsec;
+  long st_ctime;
+  unsigned long st_ctime_nsec;
+  unsigned int __unused4, __unused5;
+};
+
+/* struct statx / statx_timestamp (bits/types/struct_statx.h), verified the
+ * same way. 256 bytes. */
+struct vlinux_statx_timestamp {
+  long long tv_sec;
+  unsigned int tv_nsec;
+  int __reserved;
+};
+
+struct vlinux_statx {
+  unsigned int stx_mask;
+  unsigned int stx_blksize;
+  unsigned long long stx_attributes;
+  unsigned int stx_nlink, stx_uid, stx_gid;
+  unsigned short stx_mode, __pad1;
+  unsigned long long stx_ino, stx_size, stx_blocks, stx_attributes_mask;
+  struct vlinux_statx_timestamp stx_atime, stx_btime, stx_ctime, stx_mtime;
+  unsigned int stx_rdev_major, stx_rdev_minor, stx_dev_major, stx_dev_minor;
+  unsigned long long __pad2[14];
+};
+
+#define STATX_TYPE 0x0001U
+#define STATX_MODE 0x0002U
+#define STATX_NLINK 0x0004U
+#define STATX_UID 0x0008U
+#define STATX_GID 0x0010U
+#define STATX_SIZE 0x0200U
+
+/* Linux struct timespec (bits/types/struct_timespec.h): tv_sec/tv_nsec are
+ * both `long` on LP64 riscv64 (glibc's __USE_TIME_BITS64 __time64_t is
+ * just `long` there too -- time_t is already 64-bit natively). 16 bytes. */
+struct vlinux_timespec {
+  long tv_sec;
+  long tv_nsec;
+};
+
+/* One bit per syscall number (0..511): "print vlinux: ENOSYS <nr> once" --
+ * the diagnostic should not repeat if the same unimplemented syscall is
+ * hit again later. */
+static unsigned char g_enosys_seen[64];
+
+static int enosys_already_seen(unsigned long nr)
+{
+  if (nr >= 512) return 0; /* out of the table's range: always print */
+  const unsigned long byte = nr / 8, bit = nr % 8;
+  if (g_enosys_seen[byte] & (unsigned char) (1u << bit)) return 1;
+  g_enosys_seen[byte] |= (unsigned char) (1u << bit);
+  return 0;
+}
+
+static long sys_writev(int fd, const struct vlinux_iovec* iov, int iovcnt)
+{
+  long total = 0;
+  for (int i = 0; i < iovcnt; ++i) {
+    const ssize_t n = _write(fd, iov[i].iov_base, iov[i].iov_len);
+    if (n < 0) return total ? total : n;
+    total += n;
+    if ((size_t) n < iov[i].iov_len) break; /* short write */
+  }
+  return total;
+}
+
+static void sys_uname(struct vlinux_utsname* u)
+{
+  /* release MUST be >= the binary's "GNU/Linux 4.15.0" .note requirement
+   * (ROADMAP_LINUX_RUNTIME.md) or glibc aborts at startup. */
+  static const char sysname[] = "Linux";
+  static const char release[] = "6.1.0-andesim";
+  static const char version[] = "#1 SMP PREEMPT andesim";
+  static const char machine[] = "riscv64";
+  int i;
+  for (i = 0; sysname[i]; ++i) u->sysname[i] = sysname[i];
+  u->sysname[i] = '\0';
+  u->nodename[0] = '\0';
+  for (i = 0; release[i]; ++i) u->release[i] = release[i];
+  u->release[i] = '\0';
+  for (i = 0; version[i]; ++i) u->version[i] = version[i];
+  u->version[i] = '\0';
+  for (i = 0; machine[i]; ++i) u->machine[i] = machine[i];
+  u->machine[i] = '\0';
+  u->domainname[0] = '\0';
+}
+
+/* Linux (generic riscv64) open(2) flag bits -> newlib's BSD-derived bits,
+ * the wire format the HTIF host's open/openat handlers expect (see
+ * andes_ae350.c andesim_newlib_open_flags and the vsim mirror). The two
+ * ABIs assign completely different bit positions to O_CREAT/O_TRUNC/etc
+ * (only the low 2 access-mode bits agree) -- passing Linux bits through
+ * untranslated drops O_CREAT silently and fopen(path,"w") fails ENOENT.
+ * O_DIRECTORY/O_CLOEXEC have no newlib equivalent and are dropped: this
+ * relay has one host-side fd per guest fd and never execs, so neither
+ * bit changes observable behavior here. */
+static int linux_to_newlib_open_flags(int lf)
+{
+  int nf = lf & 0x3; /* O_RDONLY/WRONLY/RDWR: 0/1/2, identical in both */
+  if (lf & 0x400) nf |= 0x0008;  /* O_APPEND */
+  if (lf & 0x40)  nf |= 0x0200;  /* O_CREAT */
+  if (lf & 0x200) nf |= 0x0400;  /* O_TRUNC */
+  if (lf & 0x80)  nf |= 0x0800;  /* O_EXCL */
+  if (lf & 0x800) nf |= 0x4000;  /* O_NONBLOCK */
+  if (lf & 0x100) nf |= 0x8000;  /* O_NOCTTY */
+  return nf;
+}
+
+/* The HTIF host's stat/fstat/fstatat handlers only ever fill two fields
+ * of whatever buffer address they are given: st_mode (u32 at byte offset
+ * 4) and st_size (u64 at byte offset 16) -- a fixed micro-protocol, not a
+ * whole-struct bounce (see andes_ae350.c andesim_store_guest_stat). vlinux
+ * must translate those two fields into the app's actual glibc-shaped
+ * struct stat/statx, which use different offsets entirely. */
+static void host_stat_mode_size(size_t woff, unsigned int* mode,
+                                unsigned long* size)
+{
+  /* htif_win_load is u64-load-only and requires an 8-aligned woff (see
+   * htif_client.c: it dereferences a uint64_t* at WIN_DATA_VA+woff) --
+   * QEMU's byte-addressable MMIO model tolerates a misaligned sub-8-byte
+   * request silently, but the cycle-accurate RTL's real uncached-device
+   * bus logic faults on it (load access fault, mcause=5). Load the whole
+   * 24-byte aligned block in one 8-aligned call and extract st_mode
+   * (bytes 4..7) / st_size (bytes 16..23) locally instead. */
+  uint64_t raw[3];
+  htif_win_load(raw, woff, sizeof raw);
+  *mode = (unsigned int) (raw[0] >> 32); /* LE: byte 4..7 = upper 32 bits */
+  *size = raw[2];                        /* LE: byte 16..23, already u64 */
+}
+
+static void fill_stat_from_host(struct vlinux_stat* st, unsigned int mode,
+                                unsigned long size)
+{
+  for (size_t i = 0; i < sizeof(*st); ++i) ((char*) st)[i] = 0;
+  st->st_mode = mode;
+  st->st_size = (long) size;
+  st->st_nlink = 1;
+  st->st_blksize = 4096;
+  st->st_blocks = (long) ((size + 511) / 512);
+}
+
+static long sys_openat(int dirfd, const char* path, int flags, int mode)
+{
+  const int nflags = linux_to_newlib_open_flags(flags);
+  /* AT_FDCWD is openat's "resolve like open() would" case (POSIX): route
+   * it through VH_SYS_OPEN, which threads mode correctly. VH_SYS_OPENAT's
+   * host handler drops the mode argument entirely (its own arity -- see
+   * andes_ae350.c case 20), so a real dirfd-relative O_CREAT open (not
+   * exercised by any current fixture) is the one documented gap left by
+   * this relay, same "loud, low-severity, documented" tier as U2's
+   * staging-dir leak. */
+  if (dirfd == AT_FDCWD)
+    return htif_call_str(VH_SYS_OPEN, path, (uint64_t) nflags, (uint64_t) mode);
+  if (htif_win_store_str(0, path) == (size_t) -1) return -EINVAL;
+  return htif_syscall(VH_SYS_OPENAT, (uint64_t) dirfd, WIN_DATA_VA,
+                      (uint64_t) nflags, 0);
+}
+
+static long sys_pread64(int fd, void* buf, unsigned long count, long offset)
+{
+  if (fd <= 2) return 0; /* no positional reads on the console */
+  return htif_pread(fd, buf, count, offset);
+}
+
+static long sys_fstat(int fd, struct vlinux_stat* buf)
+{
+  long r = htif_syscall(VH_SYS_FSTAT, (uint64_t) fd, WIN_DATA_VA, 0, 0);
+  if (r == 0) {
+    unsigned int mode; unsigned long size;
+    host_stat_mode_size(0, &mode, &size);
+    fill_stat_from_host(buf, mode, size);
+  }
+  return r;
+}
+
+/* fstatat honors dirfd and AT_SYMLINK_NOFOLLOW natively on the host side
+ * (its own fstatat() call), so both forward as-is -- no AT_FDCWD special
+ * case needed here (unlike openat, this host handler already threads
+ * every argument fstatat's real ABI has). This is also where glibc's
+ * stat()/lstat() land: riscv64 has no bare stat/lstat syscalls. */
+static long sys_fstatat(int dirfd, const char* path, struct vlinux_stat* buf,
+                        int flags)
+{
+  size_t stoff = htif_win_store_str(0, path);
+  /* stoff+24: room for host_stat_mode_size's aligned scratch block right
+   * after the path string, same bound vplat's own _fstatat/_stat apply. */
+  if (stoff == (size_t) -1 || stoff + 24 > WIN_DATA_SIZE) return -EINVAL;
+  long r = htif_syscall(VH_SYS_FSTATAT, (uint64_t) dirfd, WIN_DATA_VA,
+                        WIN_DATA_VA + stoff, (uint64_t) flags);
+  if (r == 0) {
+    unsigned int mode; unsigned long size;
+    host_stat_mode_size(stoff, &mode, &size);
+    fill_stat_from_host(buf, mode, size);
+  }
+  return r;
+}
+
+/* statx: same host round trip as fstatat (mode+size only), translated
+ * into struct statx. stx_mask reports ONLY the fields actually filled
+ * (TYPE/MODE/NLINK/UID/GID/SIZE) -- per statx(2), a caller must not trust
+ * a field whose mask bit is clear, so this is the correct "basic mask"
+ * contract, not a shortcut: blksize/blocks are always-filled best-effort
+ * (real filesystems provide them unconditionally per the man page), while
+ * timestamps/ino stay zero and unclaimed since nothing here has them. */
+static long sys_statx(int dirfd, const char* path, int flags,
+                      struct vlinux_statx* buf)
+{
+  size_t stoff = htif_win_store_str(0, path);
+  if (stoff == (size_t) -1 || stoff + 24 > WIN_DATA_SIZE) return -EINVAL;
+  long r = htif_syscall(VH_SYS_FSTATAT, (uint64_t) dirfd, WIN_DATA_VA,
+                        WIN_DATA_VA + stoff, (uint64_t) flags);
+  if (r == 0) {
+    unsigned int mode; unsigned long size;
+    host_stat_mode_size(stoff, &mode, &size);
+    for (size_t i = 0; i < sizeof(*buf); ++i) ((char*) buf)[i] = 0;
+    buf->stx_mask = STATX_TYPE | STATX_MODE | STATX_NLINK | STATX_UID |
+                    STATX_GID | STATX_SIZE;
+    buf->stx_mode = (unsigned short) mode;
+    buf->stx_nlink = 1;
+    buf->stx_size = size;
+    buf->stx_blksize = 4096;
+    buf->stx_blocks = (size + 511) / 512;
+  }
+  return r;
+}
+
+/* faccessat(2) (syscall 48, distinct from the faccessat() library
+ * function) takes exactly 3 arguments -- (dirfd, path, mode), no flags --
+ * so regs[REG_A3] here is NOT a flags argument to honor; the libc wrapper
+ * implements AT_SYMLINK_NOFOLLOW/AT_EACCESS itself when needed, in
+ * userspace, without a 4th syscall argument. Always pass 0. */
+static long sys_faccessat(int dirfd, const char* path, int mode)
+{
+  size_t stoff = htif_win_store_str(0, path);
+  if (stoff == (size_t) -1) return -EINVAL;
+  return htif_syscall(VH_SYS_FACCESSAT, (uint64_t) dirfd, WIN_DATA_VA,
+                      (uint64_t) mode, 0);
+}
+
+/* getcwd(2): the host's VH_SYS_GETCWD returns the buffer's ADDRESS on
+ * success / 0 on failure (a char*-returning getcwd() convention, shared
+ * with vplat's own _getcwd), not the Linux syscall's "bytes written
+ * including NUL" convention -- translate by measuring the string vlinux
+ * just read back. */
+static long sys_getcwd(char* buf, unsigned long size)
+{
+  uint64_t n = size > WIN_DATA_SIZE ? WIN_DATA_SIZE : size;
+  intptr_t ret = htif_syscall(VH_SYS_GETCWD, WIN_DATA_VA, n, 0, 0);
+  if (ret == 0) return -ERANGE;
+  htif_win_load(buf, 0, n);
+  size_t len = 0;
+  while (len < n && buf[len]) ++len;
+  return (long) (len + 1);
+}
+
+/* sysinfo(2): totalram/freeram from mm.c's own manifest-supplied RAM
+ * size (freeram == totalram, an optimistic overestimate -- there is no
+ * cheap way to account for what mm.c's two arenas have already handed
+ * out, and callers use this for a rough sizing heuristic, not a
+ * correctness-critical value). Everything else (load averages, swap,
+ * shared/buffer/highmem, process count) has no meaning on a single-hart,
+ * single-process, no-swap target, so it is reported as zero/absent. */
+static void sys_sysinfo(struct vlinux_sysinfo* si)
+{
+  for (size_t i = 0; i < sizeof(*si); ++i) ((char*) si)[i] = 0;
+  si->totalram = mm_total_ram();
+  si->freeram = si->totalram;
+  si->procs = 1;
+  si->mem_unit = 1;
+}
+
+/* {sec, usec}, both u64 slots -- an 8-aligned, 16-byte (2x8) window load,
+ * compliant with htif_win_load's alignment contract (see U5's
+ * host_stat_mode_size comment). Mirrors vplat_syscalls.c's _gettimeofday. */
+static int host_gettimeofday(long* sec, long* usec)
+{
+  if (htif_syscall(VH_SYS_GETTIMEOFDAY, WIN_DATA_VA, 0, 0, 0) != 0) return -1;
+  uint64_t raw[2];
+  htif_win_load(raw, 0, sizeof raw);
+  *sec = (long) raw[0];
+  *usec = (long) raw[1];
+  return 0;
+}
+
+/* CLOCK_MONOTONIC has no dedicated host primitive -- only the wall clock
+ * VH_SYS_GETTIMEOFDAY exposes. Synthesize it as "elapsed time since this
+ * process's first monotonic query" (captured lazily, once): never goes
+ * backward under normal operation, same guarantee real CLOCK_MONOTONIC
+ * gives, at the cost of losing meaning across a host wall-clock step --
+ * acceptable here since there is no other clock source to build it from. */
+static long g_mono_base_sec = -1;
+static long g_mono_base_usec;
+
+static long sys_clock_gettime(int clk, struct vlinux_timespec* tp)
+{
+  long sec, usec;
+  if (host_gettimeofday(&sec, &usec) != 0) return -EINVAL;
+
+  if (clk == CLOCK_MONOTONIC) {
+    if (g_mono_base_sec < 0) {
+      g_mono_base_sec = sec;
+      g_mono_base_usec = usec;
+    }
+    sec -= g_mono_base_sec;
+    usec -= g_mono_base_usec;
+    if (usec < 0) {
+      usec += 1000000;
+      sec -= 1;
+    }
+  } else if (clk != CLOCK_REALTIME) {
+    return -EINVAL;
+  }
+
+  tp->tv_sec = sec;
+  tp->tv_nsec = usec * 1000;
+  return 0;
+}
+
+static long sys_clock_getres(int clk, struct vlinux_timespec* res)
+{
+  if (clk != CLOCK_REALTIME && clk != CLOCK_MONOTONIC) return -EINVAL;
+  if (res) {
+    res->tv_sec = 0;
+    res->tv_nsec = 1000; /* 1us: VH_SYS_GETTIMEOFDAY's real resolution */
+  }
+  return 0;
+}
+
+int handle_ecall(unsigned long* regs)
+{
+  const unsigned long nr = regs[REG_A7];
+  long ret = 0;
+
+  switch (nr) {
+    case SYS_write:
+      ret = _write((int) regs[REG_A0], (const void*) regs[REG_A1],
+                  (size_t) regs[REG_A2]);
+      break;
+    case SYS_writev:
+      ret = sys_writev((int) regs[REG_A0],
+                       (const struct vlinux_iovec*) regs[REG_A1],
+                       (int) regs[REG_A2]);
+      break;
+
+    case SYS_openat:
+      ret = sys_openat((int) regs[REG_A0], (const char*) regs[REG_A1],
+                       (int) regs[REG_A2], (int) regs[REG_A3]);
+      break;
+    case SYS_close:
+      ret = htif_syscall(VH_SYS_CLOSE, regs[REG_A0], 0, 0, 0);
+      break;
+    case SYS_read:
+      ret = _read((int) regs[REG_A0], (void*) regs[REG_A1],
+                  (size_t) regs[REG_A2]);
+      break;
+    case SYS_pread64:
+      ret = sys_pread64((int) regs[REG_A0], (void*) regs[REG_A1],
+                        (unsigned long) regs[REG_A2], (long) regs[REG_A3]);
+      break;
+    case SYS_lseek:
+      ret = htif_syscall(VH_SYS_LSEEK, regs[REG_A0], regs[REG_A1],
+                         regs[REG_A2], 0);
+      break;
+    case SYS_fstat:
+      ret = sys_fstat((int) regs[REG_A0], (struct vlinux_stat*) regs[REG_A1]);
+      break;
+    case SYS_fstatat:
+      ret = sys_fstatat((int) regs[REG_A0], (const char*) regs[REG_A1],
+                        (struct vlinux_stat*) regs[REG_A2], (int) regs[REG_A3]);
+      break;
+    case SYS_statx:
+      ret = sys_statx((int) regs[REG_A0], (const char*) regs[REG_A1],
+                      (int) regs[REG_A2], (struct vlinux_statx*) regs[REG_A4]);
+      break;
+    case SYS_faccessat:
+      ret = sys_faccessat((int) regs[REG_A0], (const char*) regs[REG_A1],
+                          (int) regs[REG_A2]);
+      break;
+    case SYS_getcwd:
+      ret = sys_getcwd((char*) regs[REG_A0], (unsigned long) regs[REG_A1]);
+      break;
+    case SYS_fadvise64:
+    case SYS_madvise:
+      ret = 0; /* access-pattern hints (readahead/willneed/dontneed, ...):
+                * everything is already eagerly resident, nothing to tune */
+      break;
+    case SYS_readlinkat:
+      ret = -EINVAL; /* no symlinks in this filesystem relay: never one */
+      break;
+    case SYS_getdents64:
+      ret = -ENOSYS; /* no directory-listing primitive on the HTIF window */
+      break;
+
+    case SYS_clock_gettime:
+      ret = sys_clock_gettime((int) regs[REG_A0],
+                              (struct vlinux_timespec*) regs[REG_A1]);
+      break;
+    case SYS_clock_getres:
+      ret = sys_clock_getres((int) regs[REG_A0],
+                             (struct vlinux_timespec*) regs[REG_A1]);
+      break;
+    case SYS_nanosleep:
+    case SYS_clock_nanosleep:
+      ret = 0; /* no timer exists: every sleep "completes" immediately,
+                * burning no sim time (ROADMAP_LINUX_RUNTIME.md U6) */
+      break;
+
+    case SYS_exit:
+    case SYS_exit_group:
+      _exit((int) regs[REG_A0]); /* noreturn */
+
+    case SYS_brk:
+      ret = sys_brk(regs[REG_A0]);
+      break;
+    case SYS_mmap:
+      ret = sys_mmap(regs[REG_A0], regs[REG_A1], (long) regs[REG_A2],
+                     (long) regs[REG_A3], (long) regs[REG_A4],
+                     (long) regs[REG_A5]);
+      break;
+    case SYS_munmap:
+      ret = sys_munmap(regs[REG_A0], regs[REG_A1]);
+      break;
+    case SYS_mprotect:
+      ret = sys_mprotect(regs[REG_A0], regs[REG_A1], (long) regs[REG_A2]);
+      break;
+    case SYS_mremap:
+      ret = sys_mremap(regs[REG_A0], regs[REG_A1], regs[REG_A2], regs[REG_A3]);
+      break;
+
+    case SYS_set_tid_address:
+      ret = 1; /* the fixed "tid" every getpid/gettid call also reports */
+      break;
+    case SYS_futex:
+      /* Single hart, single thread (ROADMAP_LINUX_RUNTIME.md: clone is
+       * -ENOSYS, apps run -t 1): no real contention can ever exist, so
+       * every op is answered 0 -- FUTEX_WAIT: "already available" (a
+       * spurious wake glibc's mutex/condvar loops are required by the
+       * futex(2) contract to tolerate and re-check, so this is spec-legal,
+       * not a shortcut); FUTEX_WAKE(_BITSET): "0 waiters woken" (there
+       * are never any real waiters to wake); FUTEX_LOCK_PI/TRYLOCK_PI/
+       * UNLOCK_PI: "success" (0 is their success code too). Without this,
+       * glibc's OWN internal locking (malloc arena, static-init guards --
+       * used pervasively even in a single-threaded process, not just for
+       * explicit threading) hits ENOSYS and __libc_fatal()s with "The
+       * futex facility returned an unexpected error code." before
+       * main() is ever reached. */
+      ret = 0;
+      break;
+    case SYS_set_robust_list:
+      ret = 0;
+      break;
+    case SYS_rseq:
+      ret = -ENOSYS; /* deliberate: restartable sequences, glibc falls back */
+      break;
+
+    case SYS_uname:
+      sys_uname((struct vlinux_utsname*) regs[REG_A0]);
+      ret = 0;
+      break;
+
+    case SYS_getpid:
+    case SYS_gettid:
+      ret = 1;
+      break;
+    case SYS_getuid:
+    case SYS_geteuid:
+    case SYS_getgid:
+    case SYS_getegid:
+      ret = 0;
+      break;
+
+    case SYS_sysinfo:
+      sys_sysinfo((struct vlinux_sysinfo*) regs[REG_A0]);
+      ret = 0;
+      break;
+
+    case SYS_prlimit64: {
+      /* {rlim_cur, rlim_max}, both u64 -- old_limit is regs[REG_A3]; report
+       * unlimited rather than modeling real per-resource limits. */
+      unsigned long* old_limit = (unsigned long*) regs[REG_A3];
+      if (old_limit) {
+        old_limit[0] = ~0ul; /* RLIM_INFINITY */
+        old_limit[1] = ~0ul;
+      }
+      ret = 0;
+      break;
+    }
+    case SYS_getrandom: {
+      unsigned char* buf = (unsigned char*) regs[REG_A0];
+      const unsigned long len = regs[REG_A1];
+      unsigned long seed;
+      asm volatile("csrr %0, mcycle" : "=r"(seed)); /* see stack.c: mcycle,
+                                                       * not rdcycle/rdtime */
+      for (unsigned long i = 0; i < len; ++i) {
+        seed = seed * 6364136223846793005ul + 1442695040888963407ul;
+        buf[i] = (unsigned char) (seed >> 33);
+      }
+      ret = (long) len;
+      break;
+    }
+
+    case SYS_sched_getaffinity: {
+      const unsigned long cpusetsize = regs[REG_A1];
+      unsigned char* mask = (unsigned char*) regs[REG_A2];
+      if (cpusetsize < 1) {
+        ret = -EINVAL;
+        break;
+      }
+      mask[0] = 0x1; /* 1 cpu, bit 0 */
+      for (unsigned long i = 1; i < cpusetsize; ++i) mask[i] = 0;
+      ret = (long) cpusetsize;
+      break;
+    }
+    case SYS_sched_yield:
+      ret = 0; /* nothing else to yield to (single-threaded) */
+      break;
+
+    case SYS_rt_sigaction:
+    case SYS_rt_sigprocmask:
+    case SYS_sigaltstack:
+      ret = 0; /* recorded nowhere: no signal delivery exists to honor them */
+      break;
+    case SYS_tgkill:
+      _exit(128 + (int) regs[REG_A2]); /* noreturn: a fatal signal to self */
+
+    case SYS_ioctl:
+      ret = -ENOTTY; /* every fd here is UART/SimControl, never a real tty */
+      break;
+    case SYS_fcntl:
+      ret = 0; /* basic: accept every fd-flag query/set as a no-op success */
+      break;
+
+    default:
+      if (!enosys_already_seen(nr)) printf("vlinux: ENOSYS %lu\n", nr);
+      ret = -ENOSYS;
+      break;
+  }
+
+  regs[REG_A0] = (unsigned long) ret;
+  regs[REG_MEPC] += 4; /* skip the ecall on return */
+  return 1;
+}

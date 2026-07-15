@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# U8 contract (ROADMAP_LINUX_RUNTIME.md): a real static-glibc llama.cpp
+# binary (llama-completion) generates real text from Bonsai-4B-Q1_0.gguf
+# under `--runtime linux` on the fast leg.
+#
+# Manual-tier (like tests/andes_sim/*): NOT part of scripts/run_e2e.sh's
+# automated sweep. Needs three things this script does not build itself:
+#   1. LINUX_TOOLCHAIN (config.env / env) -- the vendor static-glibc toolchain.
+#   2. A static riscv64 build of llama-completion at
+#      $LLAMA_COMPLETION_BIN (default: $LLAMA_CPP_DIR/build-rv64-static/bin/
+#      llama-completion) -- see docs/USER_GUIDE.md section 11 for the exact
+#      cmake recipe. Building it here would make an ordinary test run take
+#      many minutes; it is a one-time setup step, not a per-run cost.
+#   3. The Bonsai-4B-Q1_0.gguf model at $BONSAI_GGUF (default:
+#      $LLAMA_CPP_DIR/models/Bonsai-4B-Q1_0.gguf).
+# SKIPs cleanly if any of the three is missing.
+#
+# Measured on this host: model load ~93s, prompt eval + 4 tokens ~275s
+# total under QEMU's functional (not accelerated) RVV emulation -- real
+# matrix math on a real 4B-parameter model is slow here by design (fast
+# mode trades cycle accuracy for pure functional correctness, not speed).
+# -n 32 (the roadmap's own example) scales roughly linearly with token
+# count; 2400s gives ample headroom.
+#
+# --mem-size 2G (not the --runtime linux default of 1G): the model's own
+# mmap (572 MB) plus its KV cache buffer (576 MB at -c 512) exceeds 1G:
+# discovered by direct measurement, not assumed from the roadmap's
+# original (too optimistic) "1G covers it" estimate.
+#
+# Known gap (ROADMAP_LINUX_RUNTIME.md U4): glibc's exit() may crash in
+# its handler-list walk AFTER all real work (generation, perf stats) is
+# already complete and printed -- same documented, non-vlinux gap every
+# U4+ glibc test already accepts. This test checks for it explicitly so
+# a DIFFERENT failure still fails the test.
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+
+TC="${HYBRID_TOOLCHAIN:-$(cfg_val HYBRID_TOOLCHAIN)}"
+[ -n "$TC" ] || fail "HYBRID_TOOLCHAIN not set (env or config.env)"
+export HYBRID_TOOLCHAIN="$TC"
+
+LTC="${LINUX_TOOLCHAIN:-$(cfg_val LINUX_TOOLCHAIN)}"
+if [ -z "$LTC" ] || [ ! -x "$LTC/bin/riscv64-linux-gcc" ]; then
+  ok "SKIP: LINUX_TOOLCHAIN unset/unreachable (config.env) -- no static-glibc toolchain on this host"
+  exit 0
+fi
+
+LLAMA_DIR="${LLAMA_CPP_DIR:-$(cfg_val LLAMA_CPP_DIR)}"
+BIN="${LLAMA_COMPLETION_BIN:-$LLAMA_DIR/build-rv64-static/bin/llama-completion}"
+GGUF="${BONSAI_GGUF:-$LLAMA_DIR/models/Bonsai-4B-Q1_0.gguf}"
+if [ -z "$LLAMA_DIR" ] || [ ! -x "$BIN" ]; then
+  ok "SKIP: no static llama-completion at \$LLAMA_COMPLETION_BIN or \$LLAMA_CPP_DIR/build-rv64-static/bin/llama-completion (see docs/USER_GUIDE.md section 11 to build one)"
+  exit 0
+fi
+if [ ! -f "$GGUF" ]; then
+  ok "SKIP: no GGUF model at \$BONSAI_GGUF or \$LLAMA_CPP_DIR/models/Bonsai-4B-Q1_0.gguf"
+  exit 0
+fi
+
+bash "$ROOT/scripts/build_driver.sh" >/dev/null 2>&1 || fail "build_driver.sh failed"
+ANDESIM="$ROOT/build/andesim"
+[ -x "$ANDESIM" ] || fail "missing andesim binary: $ANDESIM"
+
+make -C "$ROOT/runtime/linux" >/dev/null || fail "vlinux build failed"
+[ -f "$ROOT/build/runtime/linux/vlinux.elf" ] || fail "missing vlinux.elf"
+
+out=$(cd "$ROOT" && timeout 2400 "$ANDESIM" run --mode fast --runtime linux --mem-size 2G \
+  "$BIN" -- -m "$GGUF" -no-cnv --prompt "The capital of France is" \
+  -n 32 -c 512 -t 1 2>&1); rc=$?
+
+printf '%s\n' "$out" | grep -qF "The capital of France is Paris" \
+  || fail "missing correct generated text 'The capital of France is Paris' in: $out"
+
+if [ "$rc" -eq 0 ]; then
+  ok "llama-completion: real Bonsai-4B text generation correct, clean exit"
+elif [ "$rc" -eq 2 ] && printf '%s\n' "$out" | grep -q 'mcause: 0x2'; then
+  ok "llama-completion: real Bonsai-4B text generation correct; exit() handler-list crash is the known, documented gap (see ROADMAP_LINUX_RUNTIME.md U4)"
+else
+  fail "exit $rc is neither clean (0) nor the known crash signature: $out"
+fi
