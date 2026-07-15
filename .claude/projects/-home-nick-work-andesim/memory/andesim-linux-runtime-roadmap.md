@@ -232,9 +232,69 @@ explicitly optional 27B stretch-goal track, not deleted.
   a data-size/timeout budget problem first, and confirm it FAST with a
   much-smaller diagnostic input before assuming a real bug or blindly
   bumping the timeout.
-- U8-U9: PLANNED. Note: U4's exit() gap does not block either on its own
-  critical path (neither needs glibc's exit() to complete cleanly), though
-  it should be fixed before claiming a real end-user acceptance milestone.
+- U8 (llama.cpp acceptance on fast leg): **DONE** 2026-07-15 - the primary
+  goal itself. Real static-glibc `llama-completion` correctly generates
+  "The capital of France is Paris." from Bonsai-4B-Q1_0.gguf under
+  `--runtime linux` fast, verified at both `-n 4` and the roadmap's own
+  `-n 32`. Full details in the roadmap's U8 DONE note (long - covers 5
+  distinct sub-findings). Highlights:
+  - **Argv threading** (U2/U3's deferred prerequisite, implemented as
+    direct U8 scope, not a separate feature): manifest v2 adds a flat
+    NUL-separated `argv_extra_buf`+count (64 args / 4096 bytes max);
+    driver/cmd_run.cpp's old "warn and drop -- args" became "thread
+    into stage_linux_runtime"; stack.c builds a real multi-entry argv[].
+    The one delicate part: the fixed auxv/envp/argv/argc block's size is
+    16-aligned only for ODD argc - true by COINCIDENCE for U1-U7's
+    argc==1 only. Fixed by computing block size from real argc + an
+    8-byte pad word when needed. Verified DIRECTLY with an even argc on
+    BOTH fast and cycle (not trusted from the math alone) - the
+    established "never trust an alignment change from fast alone" habit
+    ([[fast-leg-permissive-cycle-enforces-hw-contract]]) paid off again.
+  - **New syscalls, all found via the real binary** (`--help` then real
+    model), same closed-loop process as U4's riscv_hwprobe: `futex`(98)
+    - even at `-t 1`, glibc's OWN internal locking (malloc arena,
+    static-init guards) uses it pervasively, not just explicit
+    threading, contradicting the roadmap's own too-optimistic "-t 1:
+    uncontended mutexes never reach futex" note; answered `0`
+    unconditionally (spec-legal spurious-wake tolerance, safe because a
+    single-hart system can never have real contention). `sysinfo`(179),
+    `fadvise64`(223), `madvise`(233): straightforward, hint/no-op style.
+  - **A real bug from an unverified roadmap assumption**: U7's own
+    description said llama.cpp uses `MAP_PRIVATE` for its GGUF mmap;
+    the REAL source (`llama-mmap.cpp`) uses `MAP_SHARED`. Caught
+    immediately by running the real binary, not by re-reading roadmap
+    text more carefully - a concrete instance of "verify against source,
+    not against a prior design note." Fixed correctly (not permissively):
+    MAP_SHARED without PROT_WRITE is OBSERVABLY IDENTICAL to MAP_PRIVATE
+    for a mapping nothing ever writes through.
+  - **A genuine cross-repo change**: llama.cpp's async status logger
+    (`common/log.cpp`) unconditionally spawns a `std::thread` on the
+    FIRST log call - and the GENERATED COMPLETION TEXT ITSELF prints
+    through this same logger, not a separate path, so losing it was not
+    an option. Since `clone` is `ENOSYS` (real threading is the
+    roadmap's deliberate non-goal - a full cooperative scheduler would
+    be a wildly disproportionate scope expansion), the thread
+    constructor throws uncaught, crashing before main() runs. Root-caused
+    as a genuine llama.cpp robustness gap (crashing on a failed
+    PERFORMANCE OPTIMIZATION is bad on any platform), not a vlinux
+    issue - fixed with a small patch (full diff in
+    docs/USER_GUIDE.md section 11) making the logger fall back to
+    synchronous printing when thread creation fails. This patch lives in
+    `/home/nick/work/llama.cpp` (untracked by the andesim repo) -
+    anyone rebuilding from a fresh checkout must re-apply it.
+  - **Memory sizing**: the roadmap's own "1G covers it" estimate was
+    wrong (didn't account for the KV cache buffer, 576 MB at `-c 512`,
+    on top of the 572 MB model mmap) - found by an actual OOM failure,
+    not assumed. `--mem-size 2G -c 512` is the verified-working config.
+  - Perf data point (this host, functional QEMU, not cycle-accurate):
+    load ~93s, prompt eval ~165s/5 tokens, generation ~36.6s/token - a
+    real 4B model's RVV matmuls are slow under pure functional
+    emulation by design, which is exactly why U9 measures ONE kernel
+    iteration, not a whole token.
+- U9: PLANNED - the last step to the primary goal (hybrid ROI measurement
+  of an actual llama.cpp kernel). Note: U4's exit() gap does not block it
+  (doesn't need glibc's exit() to complete cleanly), though it should be
+  fixed before claiming a full end-user acceptance milestone.
 - U10, U11: PLANNED, explicitly optional/parallel, only needed if Bonsai-27B
   is revisited later.
 
@@ -250,5 +310,6 @@ sets `/goal` again or otherwise explicitly asks for continuous work.
 ## How to apply
 Read ROADMAP_LINUX_RUNTIME.md itself for the full feature table (description,
 input/output contract, key files, test, dependencies) before starting the next
-session's feature (currently U7) - this memory is a pointer/orientation, not a
-substitute for the roadmap doc, which is the source of truth for exact state.
+session's feature (currently U9, the last one - hybrid ROI wiring) - this
+memory is a pointer/orientation, not a substitute for the roadmap doc, which
+is the source of truth for exact state.
