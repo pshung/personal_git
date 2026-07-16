@@ -1,0 +1,331 @@
+// Unit tests for the andesim CLI parser (parse_cli).
+//
+// Plain assert-and-count harness (no doctest dependency on the driver side).
+// Exits non-zero if any check fails. Run by tests/andes_sim/test_andes_sim_f1.sh
+// and, later, the F5+ infra tests.
+#include <string>
+#include <vector>
+
+#include "cli.hpp"
+#include "test_check.hpp"
+
+using andes_sim::Cli;
+using andes_sim::parse_cli;
+
+int main() {
+  // Selection axes, space-separated form.
+  {
+    Cli c = parse_cli({"run", "--mode", "fast", "--engine",
+                       "vsim:ax45mpv_premium", "--trigger", "marker",
+                       "prog.elf"});
+    CHECK(c.error.empty());
+    CHECK(c.subcommand == "run");
+    CHECK(c.model == "fast");
+    CHECK(c.engine == "vsim:ax45mpv_premium");
+    CHECK(c.trigger == "marker");
+    CHECK(c.positional.size() == 1 && c.positional[0] == "prog.elf");
+    CHECK(c.passthrough.empty());
+  }
+
+  // Selection axes, --flag=value form.
+  {
+    Cli c = parse_cli({"run", "--mode=cycle", "--engine=vsim:x"});
+    CHECK(c.error.empty());
+    CHECK(c.model == "cycle");
+    CHECK(c.engine == "vsim:x");
+  }
+
+  // The `--` boundary: everything after it is verbatim passthrough, even
+  // tokens that look like framework flags (they must NOT be parsed).
+  {
+    Cli c = parse_cli({"run", "--mode", "fast", "prog.elf", "--", "-gdb",
+                       "tcp::1234", "-S", "--mode", "IGNORED"});
+    CHECK(c.error.empty());
+    CHECK(c.model == "fast");
+    CHECK(c.positional.size() == 1 && c.positional[0] == "prog.elf");
+    CHECK(c.passthrough.size() == 5);
+    CHECK(c.passthrough[0] == "-gdb");
+    CHECK(c.passthrough[1] == "tcp::1234");
+    CHECK(c.passthrough[4] == "IGNORED");
+  }
+
+  // A `--` with nothing after it still marks passthrough (empty argv).
+  {
+    Cli c = parse_cli({"run", "--mode", "fast", "--"});
+    CHECK(c.error.empty());
+    CHECK(c.passthrough.empty());
+  }
+
+  // Per-subcommand help.
+  {
+    Cli c = parse_cli({"run", "-h"});
+    CHECK(c.subcommand == "run");
+    CHECK(c.help);
+  }
+  {
+    Cli c = parse_cli({"list", "--help"});
+    CHECK(c.subcommand == "list");
+    CHECK(c.help);
+  }
+
+  // Top-level help: no subcommand.
+  {
+    Cli c = parse_cli({"-h"});
+    CHECK(c.subcommand.empty());
+    CHECK(c.help);
+  }
+
+  // list positional target.
+  {
+    Cli c = parse_cli({"list", "fixtures"});
+    CHECK(c.subcommand == "list");
+    CHECK(c.positional.size() == 1 && c.positional[0] == "fixtures");
+  }
+
+  // Hybrid pc-trigger boundaries (symbol + 0x address), space-separated form.
+  {
+    Cli c = parse_cli({"run", "--mode", "hybrid", "--trigger", "pc",
+                       "--pc-start", "main", "--pc-end", "0x80001234",
+                       "prog.elf"});
+    CHECK(c.error.empty());
+    CHECK(c.pc_start == "main");
+    CHECK(c.pc_end == "0x80001234");
+    CHECK(c.positional.size() == 1 && c.positional[0] == "prog.elf");
+  }
+
+  // Hybrid mem size; mixes space and =forms.
+  // --mmap-size is the retired spelling, kept as a hidden alias of --mem-size.
+  {
+    Cli c = parse_cli({"run", "--mode", "hybrid", "--trigger", "marker",
+                       "--mmap-size=64M", "prog.elf"});
+    CHECK(c.error.empty());
+    CHECK(c.mem_size == "64M");
+  }
+
+  // The icount/warmup knobs were removed: --qemu-icount / --vsim-icount /
+  // --vsim-warmup-icount are now unknown options.
+  {
+    Cli c = parse_cli({"run", "--mode", "hybrid", "--qemu-icount", "10",
+                       "prog.elf"});
+    CHECK(!c.error.empty());
+    Cli d = parse_cli({"run", "--mode", "hybrid", "--vsim-icount", "10",
+                       "prog.elf"});
+    CHECK(!d.error.empty());
+    Cli e = parse_cli({"run", "--mode", "hybrid", "--vsim-warmup-icount", "500",
+                       "prog.elf"});
+    CHECK(!e.error.empty());
+  }
+
+  // --what was a placeholder for a never-wired `build` subcommand: it parsed
+  // but no command read it, so it silently swallowed its value everywhere.
+  // Removed -- now an unknown option like any other.
+  {
+    Cli c = parse_cli({"run", "--mode", "fast", "--what", "driver", "prog.elf"});
+    CHECK(!c.error.empty());
+  }
+
+  // --mem-size is the documented spelling (works on every model).
+  {
+    Cli c = parse_cli({"run", "--mode", "fast", "--mem-size", "2G",
+                       "prog.elf"});
+    CHECK(c.error.empty());
+    CHECK(c.mem_size == "2G");
+  }
+
+  // --runtime linux selects the vlinux proxy-kernel payload
+  // (ROADMAP_LINUX_RUNTIME.md U2); default "" (bare-metal ELF, unchanged).
+  {
+    Cli c = parse_cli({"run", "--mode", "fast", "--runtime", "linux",
+                       "app.elf"});
+    CHECK(c.error.empty());
+    CHECK(c.runtime == "linux");
+    Cli d = parse_cli({"run", "--mode", "fast", "app.elf"});
+    CHECK(d.error.empty());
+    CHECK(d.runtime.empty());
+  }
+
+  // Absent hybrid flags stay empty -- cmd_run supplies the real defaults.
+  {
+    Cli c = parse_cli({"run", "--mode", "hybrid", "prog.elf"});
+    CHECK(c.error.empty());
+    CHECK(c.pc_start.empty());
+    CHECK(c.mem_size.empty());
+  }
+
+  // kanata/objdump pass-through flags parse like the rest (space + =form).
+  {
+    Cli c = parse_cli({"run", "--mode", "hybrid", "--kanata", "k.txt",
+                       "--objdump=o.txt", "prog.elf"});
+    CHECK(c.error.empty());
+    CHECK(c.kanata == "k.txt");
+    CHECK(c.objdump == "o.txt");
+  }
+
+  // --verify is a boolean (oracle differential verification), default off.
+  {
+    Cli c = parse_cli({"run", "--mode", "hybrid", "--verify", "prog.elf"});
+    CHECK(c.error.empty());
+    CHECK(c.verify);
+    CHECK(c.positional.size() == 1 && c.positional[0] == "prog.elf");
+    Cli d = parse_cli({"run", "--mode", "hybrid", "prog.elf"});
+    CHECK(!d.verify);
+  }
+
+  // --print-memmap is a boolean (print the hybrid guest memory map and
+  // exit), default off; the ELF stays optional for it (cmd_run's rule).
+  {
+    Cli c = parse_cli({"run", "--mode", "hybrid", "--print-memmap"});
+    CHECK(c.error.empty());
+    CHECK(c.print_memmap);
+    CHECK(c.positional.empty());
+    Cli d = parse_cli({"run", "--mode", "hybrid", "prog.elf"});
+    CHECK(!d.print_memmap);
+  }
+
+  // --gdb is a boolean, default off; valid on fast and cycle.
+  {
+    Cli c = parse_cli({"run", "--mode", "fast", "--gdb", "prog.elf"});
+    CHECK(c.error.empty());
+    CHECK(c.gdb);
+    CHECK(c.positional.size() == 1 && c.positional[0] == "prog.elf");
+    Cli d = parse_cli({"run", "--mode", "cycle", "prog.elf"});
+    CHECK(!d.gdb);
+  }
+
+  // `run` is the default command: a first token that is not a known
+  // subcommand parses exactly like `run ...` -- flag-first form.
+  {
+    Cli c = parse_cli({"--mode", "fast", "prog.elf"});
+    CHECK(c.error.empty());
+    CHECK(c.subcommand == "run");
+    CHECK(c.model == "fast");
+    CHECK(c.positional.size() == 1 && c.positional[0] == "prog.elf");
+  }
+
+  // ... and ELF-first form.
+  {
+    Cli c = parse_cli({"prog.elf", "--mode", "fast"});
+    CHECK(c.error.empty());
+    CHECK(c.subcommand == "run");
+    CHECK(c.model == "fast");
+    CHECK(c.positional.size() == 1 && c.positional[0] == "prog.elf");
+  }
+
+  // The implicit form still honors the `--` passthrough boundary.
+  {
+    Cli c = parse_cli({"--mode", "fast", "prog.elf", "--", "-S"});
+    CHECK(c.error.empty());
+    CHECK(c.subcommand == "run");
+    CHECK(c.passthrough.size() == 1 && c.passthrough[0] == "-S");
+  }
+
+  // Explicit subcommands are untouched by the default: `list`/`doctor`
+  // first tokens stay subcommands, not positionals.
+  {
+    Cli c = parse_cli({"doctor"});
+    CHECK(c.subcommand == "doctor");
+    CHECK(c.positional.empty());
+  }
+
+  // --log-level parses like the other value options (space + =form) and
+  // defaults to empty (cmd dispatch applies the real default, info).
+  {
+    Cli c = parse_cli({"run", "--mode", "fast", "--log-level", "1", "prog.elf"});
+    CHECK(c.error.empty());
+    CHECK(c.log_level == "1");
+    Cli d = parse_cli({"--log-level=4", "--mode", "fast", "prog.elf"});
+    CHECK(d.error.empty());
+    CHECK(d.log_level == "4");
+    CHECK(d.subcommand == "run");
+    Cli e = parse_cli({"run", "--mode", "fast", "prog.elf"});
+    CHECK(e.log_level.empty());
+  }
+
+  // --step-timeout-ms parses like the other value options and defaults to
+  // empty (cmd_run applies the real default, PlanOptions' 90000).
+  {
+    Cli c = parse_cli({"run", "--mode", "hybrid", "--step-timeout-ms", "300000", "prog.elf"});
+    CHECK(c.error.empty());
+    CHECK(c.step_timeout_ms == "300000");
+    Cli d = parse_cli({"--step-timeout-ms=5000", "--mode", "hybrid", "prog.elf"});
+    CHECK(d.error.empty());
+    CHECK(d.step_timeout_ms == "5000");
+    Cli e = parse_cli({"run", "--mode", "hybrid", "prog.elf"});
+    CHECK(e.step_timeout_ms.empty());
+  }
+
+  // Unknown option before `--` is an error.
+  {
+    Cli c = parse_cli({"run", "--bogus"});
+    CHECK(!c.error.empty());
+  }
+
+  // A selection flag with no value is an error.
+  {
+    Cli c = parse_cli({"run", "--mode"});
+    CHECK(!c.error.empty());
+  }
+
+  // --model was renamed to --mode (clean break): the old spelling no longer
+  // parses -- it falls through to the unknown-option error.
+  {
+    Cli c = parse_cli({"run", "--model", "fast", "prog.elf"});
+    CHECK(!c.error.empty());
+  }
+
+  // `profile` is a subcommand: it must NOT be swallowed by the default-run
+  // rule (which would make it run's ELF positional).
+  {
+    Cli c = parse_cli({"profile", "prog.elf"});
+    CHECK(c.error.empty());
+    CHECK(c.subcommand == "profile");
+    CHECK(c.positional.size() == 1 && c.positional[0] == "prog.elf");
+    // Report defaults: LLM report on, RVV filter on, values empty (the
+    // command applies limit=50 / min_iters=1).
+    CHECK(c.llm);
+    CHECK(c.optimize_rvv);
+    CHECK(!c.raw);
+    CHECK(!c.no_source);
+    CHECK(c.limit.empty() && c.min_iters.empty() && c.addr2line.empty());
+  }
+
+  // profile's report flags, all together, plus engine pick and passthrough.
+  {
+    Cli c = parse_cli({"profile", "--engine", "vsim:ax45mpv_premium",
+                       "--limit", "10", "--min-iters=5", "--raw", "--no-llm",
+                       "--no-optimize-rvv", "--no-source", "--addr2line",
+                       "a2l", "--objdump", "objd", "prog.elf", "--", "-icount",
+                       "shift=0"});
+    CHECK(c.error.empty());
+    CHECK(c.subcommand == "profile");
+    CHECK(c.engine == "vsim:ax45mpv_premium");
+    CHECK(c.limit == "10");
+    CHECK(c.min_iters == "5");
+    CHECK(c.raw);
+    CHECK(!c.llm);
+    CHECK(!c.optimize_rvv);
+    CHECK(c.no_source);
+    CHECK(c.addr2line == "a2l");
+    CHECK(c.objdump == "objd");
+    CHECK(c.positional.size() == 1 && c.positional[0] == "prog.elf");
+    CHECK(c.passthrough.size() == 2 && c.passthrough[0] == "-icount");
+  }
+
+  // The positive spellings re-enable what --no-* turned off.
+  {
+    Cli c = parse_cli({"profile", "--no-llm", "--llm", "--no-optimize-rvv",
+                       "--optimize-rvv", "prog.elf"});
+    CHECK(c.error.empty());
+    CHECK(c.llm);
+    CHECK(c.optimize_rvv);
+  }
+
+  // profile -h routes like every other subcommand.
+  {
+    Cli c = parse_cli({"profile", "--help"});
+    CHECK(c.subcommand == "profile");
+    CHECK(c.help);
+  }
+
+  return andes_sim::test::report("cli parse");
+}

@@ -1,0 +1,234 @@
+#include "process.hpp"
+
+#include <cerrno>
+#include <ctime>
+
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+namespace andes_sim {
+namespace {
+
+long now_ms() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+// In the just-forked child: replace the image with argv (argv[0] resolved via
+// PATH), or _exit(127) if exec fails. Never returns.
+[[noreturn]] void exec_or_die(const std::vector<std::string>& argv) {
+  std::vector<char*> cargv;
+  cargv.reserve(argv.size() + 1);
+  for (const std::string& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
+  cargv.push_back(nullptr);
+  execvp(cargv[0], cargv.data());
+  _exit(127);  // exec failed
+}
+
+// Reap `pid` and map its wait status to an exit code: the child's exit code,
+// 128+signal if it was signalled, or -1 otherwise.
+int wait_for_exit_code(pid_t pid) {
+  int status = 0;
+  waitpid(pid, &status, 0);
+  if (WIFEXITED(status)) return WEXITSTATUS(status);
+  if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+  return -1;
+}
+
+// fork + exec with inherited stdio.
+// When `wait` is true (the default) waits for the child and returns its exit
+// code, 128+signal if signalled, or -1 on failure. When `wait` is false
+// returns the child pid immediately without waiting (caller owns the child).
+// Backs exec_passthrough (run fast/cycle) and fork_background (no wait).
+int spawn_inherit(const std::vector<std::string>& argv, bool wait = true) {
+  if (argv.empty()) return -1;
+
+  pid_t pid = fork();
+  if (pid < 0) return -1;
+
+  if (pid == 0) exec_or_die(argv);  // child
+
+  if (!wait) return static_cast<int>(pid);
+  return wait_for_exit_code(pid);
+}
+
+}  // namespace
+
+RunResult run_process(const std::vector<std::string>& argv, int timeout_ms,
+                      bool relay_stderr) {
+  RunResult r;
+  if (argv.empty()) {
+    r.spawn_failed = true;
+    return r;
+  }
+
+  int fds[2];
+  if (pipe(fds) != 0) {
+    r.spawn_failed = true;
+    return r;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(fds[0]);
+    close(fds[1]);
+    r.spawn_failed = true;
+    return r;
+  }
+
+  if (pid == 0) {  // child
+    close(fds[0]);
+    dup2(fds[1], STDOUT_FILENO);
+    int devnull = open("/dev/null", O_RDWR);
+    if (devnull >= 0) {
+      dup2(devnull, STDIN_FILENO);
+      if (!relay_stderr) dup2(devnull, STDERR_FILENO);
+      if (devnull > 2) close(devnull);
+    }
+    close(fds[1]);
+    exec_or_die(argv);
+  }
+
+  // parent
+  close(fds[1]);
+  int rfd = fds[0];
+  const long deadline = now_ms() + timeout_ms;
+  char buf[4096];
+
+  while (true) {
+    long remaining = deadline - now_ms();
+    if (remaining < 0) remaining = 0;
+    struct pollfd pfd{rfd, POLLIN, 0};
+    int pr = poll(&pfd, 1, static_cast<int>(remaining));
+    if (pr < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    if (pr == 0) {  // timed out with no data ready
+      kill(pid, SIGKILL);
+      r.timed_out = true;
+      break;
+    }
+    if (pfd.revents & (POLLIN | POLLHUP | POLLERR)) {
+      ssize_t n = read(rfd, buf, sizeof(buf));
+      if (n > 0) {
+        r.out.append(buf, static_cast<size_t>(n));
+      } else if (n == 0) {
+        break;  // EOF: child closed stdout
+      } else {
+        if (errno == EINTR) continue;
+        break;
+      }
+    }
+    if (now_ms() >= deadline) {  // chatty child kept us past the deadline
+      kill(pid, SIGKILL);
+      r.timed_out = true;
+      break;
+    }
+  }
+
+  close(rfd);
+  int status = 0;
+  waitpid(pid, &status, 0);
+  // rc stays -1 (the default) when timed out or abnormally terminated.
+  if (!r.timed_out && WIFEXITED(status)) r.rc = WEXITSTATUS(status);
+  return r;
+}
+
+int exec_passthrough(const std::vector<std::string>& argv) {
+  return spawn_inherit(argv);
+}
+
+int fork_background(const std::vector<std::string>& argv) {
+  return spawn_inherit(argv, /*wait=*/false);
+}
+
+namespace {
+
+// Drain everything readable on `fd` into `buf`, delivering each completed
+// '\n'-terminated line (newline stripped) to on_line. Returns false at EOF /
+// error so the caller stops polling that stream.
+bool pump_stream(int fd, int stream, std::string& buf,
+                 const std::function<void(int, std::string_view)>& on_line) {
+  char rb[4096];
+  const ssize_t n = read(fd, rb, sizeof rb);
+  if (n == 0) return false;          // EOF: child closed this stream
+  if (n < 0) return errno == EINTR;  // transient -> keep; real error -> stop
+  buf.append(rb, static_cast<size_t>(n));
+  size_t nl;
+  while ((nl = buf.find('\n')) != std::string::npos) {
+    on_line(stream, std::string_view(buf.data(), nl));
+    buf.erase(0, nl + 1);
+  }
+  return true;
+}
+
+}  // namespace
+
+int run_line_filtered(
+    const std::vector<std::string>& argv,
+    const std::function<void(int, std::string_view)>& on_line) {
+  if (argv.empty()) return -1;
+
+  int out_fds[2], err_fds[2];
+  if (pipe(out_fds) != 0) return -1;
+  if (pipe(err_fds) != 0) {
+    close(out_fds[0]);
+    close(out_fds[1]);
+    return -1;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(out_fds[0]);
+    close(out_fds[1]);
+    close(err_fds[0]);
+    close(err_fds[1]);
+    return -1;
+  }
+
+  if (pid == 0) {  // child: stdout/stderr to the pipes, stdin inherited
+    close(out_fds[0]);
+    close(err_fds[0]);
+    dup2(out_fds[1], STDOUT_FILENO);
+    dup2(err_fds[1], STDERR_FILENO);
+    if (out_fds[1] > 2) close(out_fds[1]);
+    if (err_fds[1] > 2) close(err_fds[1]);
+    exec_or_die(argv);
+  }
+
+  // parent: poll both pipes, line-buffer each, until both hit EOF. No timeout --
+  // matches exec_passthrough (a cycle run can be arbitrarily long). The stream id
+  // is index+1 (0 -> stdout=1, 1 -> stderr=2); a closed stream's fd is set to -1,
+  // which poll() ignores (revents 0).
+  close(out_fds[1]);
+  close(err_fds[1]);
+  const int fd[2] = {out_fds[0], err_fds[0]};
+  std::string buf[2];
+  bool open_[2] = {true, true};
+
+  struct pollfd pfd[2] = {{fd[0], POLLIN, 0}, {fd[1], POLLIN, 0}};
+  while (open_[0] || open_[1]) {
+    for (int i = 0; i < 2; ++i) pfd[i].fd = open_[i] ? fd[i] : -1;
+    if (poll(pfd, 2, -1) < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    for (int i = 0; i < 2; ++i)
+      if (open_[i] && (pfd[i].revents & (POLLIN | POLLHUP | POLLERR)))
+        if (!pump_stream(fd[i], i + 1, buf[i], on_line)) open_[i] = false;
+  }
+  // Flush any final line that arrived without a trailing newline.
+  for (int i = 0; i < 2; ++i)
+    if (!buf[i].empty()) on_line(i + 1, buf[i]);
+
+  close(fd[0]);
+  close(fd[1]);
+  return wait_for_exit_code(pid);
+}
+
+}  // namespace andes_sim
