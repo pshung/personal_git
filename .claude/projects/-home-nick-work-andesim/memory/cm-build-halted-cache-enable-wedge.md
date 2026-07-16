@@ -21,8 +21,19 @@ Fixed 2026-07-16 (vsim_andesim 9be968a): ResumeDriver restores mcache_ctl via
 PB csrrw and ORs DC_COHEN when `Simulator::cache_coherent()` (from
 _NDS_CACHE_COHERENCE_SUPPORT) says CM build.
 
+SECOND manifestation, same root: a RUNNING hart with DC_EN=1 but COHEN=0 on a
+CM build corrupts data under D-cache EVICTION pressure - small demos pass,
+CoreMark validates CRC garbage in cycle mode (list 0x0834, matrix/state 0,
+~4k ticks). Fixed in andesim runtime crt0 (a9e77ef): bounded DC_COHEN join
+(1024-try COHSTA poll) before the D-cache enable - bounded because non-CM
+cores WARL-0 COHEN and QEMU permissively sticks COHEN without ever setting
+COHSTA (unbounded poll = boot hang).
+
 **Why:** QEMU never sets COHEN (models no CM), so the drained value is bare
-0x703; the restore must supply the coherence join itself.
+0x703; the restore must supply the coherence join itself. And a "passing"
+sweep can hide this: a corrupted CoreMark finishes in ~4k ticks and exits 0,
+so the run only fails AFTER the fix makes the real ROI outrun the 90s step
+timeout (raise --step-timeout-ms for big ROIs on ~3.5kHz engines).
 
 **How to apply:** when a NEW engine shows silent in-ROI output or aperture
 timeouts on hybrid only (cycle mode fine), check its config.inc for

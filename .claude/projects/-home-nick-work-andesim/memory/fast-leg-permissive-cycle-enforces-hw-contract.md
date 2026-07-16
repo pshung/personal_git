@@ -6,9 +6,10 @@ metadata:
   originSessionId: 5eeca9dc-9078-4a2c-9aec-f331d1142619
 ---
 
-Recurring bug class in the vlinux/hybrid work (6 occurrences across
-[[andesim-linux-runtime-roadmap]] U3, U4, U5, U9 x3, same root shape each
-time): code that violates a real RISC-V/hardware contract passes cleanly
+Recurring bug class in the vlinux/hybrid work (7 occurrences across
+[[andesim-linux-runtime-roadmap]] U3, U4, U5, U9 x3, ax46mpv_fpga_l3
+bring-up, same root shape each time): code that violates a real
+RISC-V/hardware contract passes cleanly
 on the **fast** leg (QEMU) because QEMU's functional model is permissive,
 then fails -- often confusingly, via a trap or a hang, not an obvious
 "wrong value" -- on the **cycle** leg (vsim, real RTL), or on **hybrid's
@@ -63,7 +64,35 @@ Concrete instances:
    STILL not sufficient when a sub-capability (here: FP-specific LMUL
    ceiling) exists only in the RTL's config, not in QEMU's CPU model at
    all.
-6. **Driver-internal timeout defaults sized for the wrong leg** (U9,
+6. **Compile-time ISA assumption not matched to a specific engine's real
+   Zc-extension subset** (llamacpp branch, ax46mpv_fpga_l3 bring-up): the
+   toolchain's default march (`rv64gc...`) sets the legacy monolithic MISA
+   `C` bit, which historically bundles compressed FP load/store (what the
+   modern spec calls Zcd/Zcf) in with plain integer compressed ops (Zca).
+   `ax45mpv`'s QEMU model sets the real `C` bit, so this was never wrong
+   there. `ax46mpv`'s QEMU model (and, per its own `--print-qemu-config`,
+   the REAL vsim RTL) sets only `Zca` -- explicitly NOT Zcd -- because this
+   engine variant implements Zcmp/Zcmt instead (RISC-V spec: Zcd and
+   Zcmp/Zcmt are mutually exclusive, same 16-bit encoding space). Ordinary
+   function prologues spilling callee-saved FP registers
+   (`ggml_cpu_init`, nothing ROI/vector-specific) emitted `c.fsdsp`,
+   illegal on this chip -- crashed immediately on hybrid's engine-synced
+   QEMU leg, before even reaching vsim. Root-caused via objdump on the
+   faulting `mtval` encoding + reading the QEMU `andes-ax46mpv` cpu type's
+   `misa_ext`/`ext_zca` fields in `target/riscv/cpu.c`, confirmed against
+   the real engine's `--print-qemu-config` output (ground truth for what
+   the RTL actually implements, NOT to be assumed from another engine in
+   the same family). Fixed at the BUILD level, not the source level: a
+   2-line CMake option (`GGML_RV_MARCH_LETTERS`/`GGML_RV_ZC_EXTRA` in
+   llama.cpp's `ggml/src/ggml-cpu/CMakeLists.txt`) lets the march string
+   drop the monolithic `c` and spell `zca_zcb_zcmp_zcmt` instead, matching
+   this engine's real ISA -- zero algorithm/kernel code touched, default
+   preserved for every other engine. **Lesson: never assume two engines in
+   the same silicon family (ax46mpv_advanced vs ax46mpv_fpga_l3) share the
+   same ISA subset -- always check the specific engine's own
+   `--print-qemu-config` (or `--describe`) for ground truth, especially for
+   the Zc-extension family where "C" is not one monolithic thing.**
+7. **Driver-internal timeout defaults sized for the wrong leg** (U9,
    adjacent but same underlying lesson: a value someone picked while only
    fast/small-fixture testing was in mind turns out too small once a
    REAL, large cycle-accurate computation is attempted): `PlanOptions`'

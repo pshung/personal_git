@@ -410,6 +410,36 @@ explicitly optional 27B stretch-goal track, not deleted.
   assertions were asserting the broken behavior and got corrected too.
   Confirmed against real llama-completion: 651 MB well-formed Kanata
   trace. See docs/llama_roi_howto.md sections 6-7.
+  **Second same-session addendum (2026-07-16), validated against a brand-new
+  ELEN=64 engine (`ax46mpv_fpga_l3`, VLEN=1024/DLEN=1024/ELEN=64, first
+  engine with a real L3 cache)**: the user built this engine specifically so
+  the ORIGINAL, upstream ggml vector code (no ELEN=32 workarounds) would run
+  correctly without patches -- confirmed true after reverting all 3 of U9's
+  ggml source patches (`git checkout HEAD --`) back to pristine upstream.
+  Two NEW, unrelated bugs surfaced and were fixed to get there (full
+  writeups in [[fast-leg-permissive-cycle-enforces-hw-contract]] instance 7
+  and the new [[new-engine-dormant-codepath-bugs]]):
+  (1) this engine's real ISA has Zca+Zcmp+Zcmt but NOT Zcd (compressed
+  double-FP load/store) -- confirmed via the engine's own
+  `--print-qemu-config`, unrelated to ELEN/vector width at all. Fixed at
+  the llama.cpp BUILD level (new `GGML_RV_MARCH_LETTERS`/`GGML_RV_ZC_EXTRA`
+  CMake knobs), not by touching any kernel/algorithm code -- consistent
+  with the user's explicit instruction this session that kernel-code
+  workarounds were unwanted once real matching hardware existed.
+  (2) a genuine vsim bug: `ax46mpv_cpu_cluster_subsystem.hpp`'s HVM
+  backdoor (`set_hvm`/`get_hvm`) only ever handled 1 bank, silently
+  overflowing into heap corruption on this, the first ax46mpv config with
+  `NDS_HVM_BANKS=2` -- fixed in the external `vsim_andesim` repo by porting
+  `ax45mpv_premium`'s already-correct 2-bank pattern in, then rebuilt via
+  `./build_vsim.sh` (the repo's own Docker/podman build).
+  Final confirmed result: **4476168 cycles** for the K=51 single-iteration
+  ROI (fewer than ax45mpv_premium's 6528953 for the SAME node -- the wider
+  VLEN=1024 does more work per vector instruction, as expected). This
+  engine's cycle-accurate leg is dramatically slower in WALL-CLOCK terms
+  than ax45mpv_premium's (~4424 Hz simulated-vs-real-time, several timeouts
+  needed before landing on a working `--step-timeout-ms`) -- budget
+  accordingly for any future measurement on this engine; a 90s/900s-scale
+  timeout that was fine for ax45mpv_premium is not automatically fine here.
 - U10, U11: PLANNED, explicitly optional/parallel, only needed if Bonsai-27B
   is revisited later.
 
