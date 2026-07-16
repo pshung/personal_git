@@ -1,0 +1,210 @@
+// Correctness harness: ggml_vec_dot_q1_0_q8_0 (dispatcher -> RVV kernel when
+// built with V) against ggml_vec_dot_q1_0_q8_0_generic (scalar reference).
+//
+// Primary gate: bit-exact float equality. The current RVV kernels perform the
+// same float operations in the same order as the reference, so any mismatch
+// is a logic bug, not rounding. A future kernel that reorders the float
+// accumulation must instead pass the normalized-error gate (NORM_ERR_MAX)
+// with the bit-exact gate relaxed - see README.
+//
+// Data domain matches ggml: q8 quants are in [-127,127] (ggml Q8_0 never
+// emits -128; vneg on int8 -128 wraps and would falsely diverge from the
+// scalar reference, which negates in 32-bit).
+//
+// --inject: flips one weight bit after taking a baseline and requires the
+// dispatcher result to change. Proves the harness can detect a broken kernel.
+
+#include "q1_0.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(__riscv_v)
+#include <riscv_vector.h>
+#endif
+
+#define NORM_ERR_MAX 1e-4
+
+static uint64_t rng_state = 0x243F6A8885A308D3ull;
+
+static uint64_t rng_next(void) {
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 7;
+    rng_state ^= rng_state << 17;
+    return rng_state;
+}
+
+static uint16_t rand_fp16(float lo, float hi) {
+    const float v = lo + (hi - lo) * ((rng_next() >> 11) * 0x1.0p-53f);
+    return lab_fp32_to_fp16(v);
+}
+
+static void fill_random(block_q1_0 * x, int nbx, block_q8_0 * y, int nby) {
+    for (int i = 0; i < nbx; ++i) {
+        x[i].d = rand_fp16(-2.0f, 2.0f);
+        for (int j = 0; j < QK1_0 / 8; ++j) {
+            x[i].qs[j] = (uint8_t)rng_next();
+        }
+    }
+    for (int i = 0; i < nby; ++i) {
+        y[i].d = rand_fp16(0.001f, 1.0f);
+        for (int j = 0; j < QK8_0; ++j) {
+            y[i].qs[j] = (int8_t)((int)(rng_next() % 255) - 127); // [-127,127]
+        }
+    }
+}
+
+// reference dot in double, plus sum of |terms| for error normalization
+static double ref_dot_double(const block_q1_0 * x, const block_q8_0 * y, int n, double * sum_abs) {
+    double sum = 0.0, sabs = 0.0;
+    for (int i = 0; i < n / QK1_0; ++i) {
+        const double d0 = (double)lab_fp16_to_fp32(x[i].d);
+        for (int k = 0; k < 4; ++k) {
+            const block_q8_0 * yb = &y[i * 4 + k];
+            const double d1 = (double)lab_fp16_to_fp32(yb->d);
+            long sumi = 0;
+            for (int j = 0; j < QK8_0; ++j) {
+                const int bit = (x[i].qs[k * 4 + j / 8] >> (j % 8)) & 1;
+                sumi += bit ? yb->qs[j] : -yb->qs[j];
+            }
+            sum  += d0 * d1 * (double)sumi;
+            sabs += fabs(d0 * d1 * (double)sumi);
+        }
+    }
+    *sum_abs = sabs;
+    return sum;
+}
+
+static uint32_t f32_bits(float f) {
+    uint32_t w;
+    memcpy(&w, &f, sizeof(w));
+    return w;
+}
+
+static int run_case(const block_q1_0 * x, const block_q8_0 * y, int n,
+                    const char * name, double * max_norm_err, uint32_t * checksum) {
+    float ref = INFINITY, got = INFINITY;
+    ggml_vec_dot_q1_0_q8_0_generic(n, &ref, 0, x, 0, y, 0, 1);
+    ggml_vec_dot_q1_0_q8_0        (n, &got, 0, x, 0, y, 0, 1);
+    *checksum ^= f32_bits(got);
+
+    double sum_abs = 0.0;
+    const double dref = ref_dot_double(x, y, n, &sum_abs);
+    const double norm_err = fabs((double)got - dref) / (sum_abs > 1e-30 ? sum_abs : 1e-30);
+    if (norm_err > *max_norm_err) {
+        *max_norm_err = norm_err;
+    }
+
+    int failed = 0;
+    if (f32_bits(ref) != f32_bits(got)) {
+        printf("FAIL %-12s n=%5d bit-exact: ref=%.9g (0x%08x) got=%.9g (0x%08x)\n",
+               name, n, (double)ref, f32_bits(ref), (double)got, f32_bits(got));
+        failed = 1;
+    }
+    if (norm_err > NORM_ERR_MAX) {
+        printf("FAIL %-12s n=%5d norm_err=%.3g vs double ref %.9g\n", name, n, norm_err, dref);
+        failed = 1;
+    }
+    return failed;
+}
+
+static int test_size(int n, int trials, uint32_t * checksum) {
+    const int nbx = n / QK1_0;
+    const int nby = n / QK8_0;
+    block_q1_0 * x = malloc((size_t)nbx * sizeof(block_q1_0));
+    block_q8_0 * y = malloc((size_t)nby * sizeof(block_q8_0));
+
+    int failed = 0;
+    double max_norm_err = 0.0;
+
+    for (int t = 0; t < trials; ++t) {
+        fill_random(x, nbx, y, nby);
+        failed += run_case(x, y, n, "random", &max_norm_err, checksum);
+    }
+
+    // edge cases
+    fill_random(x, nbx, y, nby);
+    for (int i = 0; i < nbx; ++i) memset(x[i].qs, 0x00, QK1_0 / 8);
+    failed += run_case(x, y, n, "bits=0x00", &max_norm_err, checksum);
+
+    for (int i = 0; i < nbx; ++i) memset(x[i].qs, 0xFF, QK1_0 / 8);
+    failed += run_case(x, y, n, "bits=0xFF", &max_norm_err, checksum);
+
+    fill_random(x, nbx, y, nby);
+    for (int i = 0; i < nby; ++i) memset(y[i].qs, 127, QK8_0);
+    failed += run_case(x, y, n, "q8=+127", &max_norm_err, checksum);
+
+    for (int i = 0; i < nby; ++i) memset(y[i].qs, -127, QK8_0);
+    failed += run_case(x, y, n, "q8=-127", &max_norm_err, checksum);
+
+    fill_random(x, nbx, y, nby);
+    for (int i = 0; i < nbx; ++i) x[i].d = 0;
+    failed += run_case(x, y, n, "d0=0", &max_norm_err, checksum);
+
+    printf("n=%5d: %3d cases, %s, max_norm_err=%.3g\n",
+           n, trials + 5, failed ? "FAIL" : "ok", max_norm_err);
+    free(x);
+    free(y);
+    return failed;
+}
+
+// prove the harness detects a wrong kernel: flip one weight bit, result must change
+static int test_inject(void) {
+    const int n = 512;
+    block_q1_0 x[512 / QK1_0];
+    block_q8_0 y[512 / QK8_0];
+    fill_random(x, 512 / QK1_0, y, 512 / QK8_0);
+
+    // make the target element's contribution unmissable
+    x[1].d = lab_fp32_to_fp16(1.0f);
+    y[1 * 4 + 2].d = lab_fp32_to_fp16(1.0f);
+    y[1 * 4 + 2].qs[13] = 100;
+
+    float base = 0, after = 0;
+    ggml_vec_dot_q1_0_q8_0(n, &base, 0, x, 0, y, 0, 1);
+
+    x[1].qs[2 * 4 + 13 / 8] ^= (uint8_t)(1u << (13 % 8)); // flip sign bit of element 13, group 2, block 1
+    ggml_vec_dot_q1_0_q8_0(n, &after, 0, x, 0, y, 0, 1);
+
+    if (f32_bits(base) == f32_bits(after)) {
+        printf("INJECT FAIL: flipped weight bit not detected (result unchanged: %.9g)\n", (double)base);
+        return 1;
+    }
+    printf("INJECT ok: flipped weight bit changed result %.9g -> %.9g (delta ~ %g, expect ~200)\n",
+           (double)base, (double)after, (double)after - (double)base);
+    return 0;
+}
+
+int main(int argc, char ** argv) {
+    // canary values for the fp16 conversion this harness depends on
+    if (lab_fp16_to_fp32(0x3C00) != 1.0f || lab_fp16_to_fp32(0xC000) != -2.0f ||
+        lab_fp16_to_fp32(0x7BFF) != 65504.0f || lab_fp32_to_fp16(1.0f) != 0x3C00 ||
+        lab_fp32_to_fp16(-2.0f) != 0xC000) {
+        printf("FAIL: fp16 conversion self-test\n");
+        return 1;
+    }
+
+#if defined(__riscv_v)
+    const size_t vlen_bits = __riscv_vlenb() * 8;
+    const char * path = vlen_bits >= 256 ? "vl256" : vlen_bits >= 128 ? "vl128" : "generic";
+    printf("build: RVV, VLEN=%zu bits -> dispatcher path: %s\n", vlen_bits, path);
+#else
+    printf("build: scalar (dispatcher == generic reference)\n");
+#endif
+
+    if (argc > 1 && strcmp(argv[1], "--inject") == 0) {
+        return test_inject();
+    }
+
+    const int sizes[] = {128, 256, 512, 1024, 4096, 5120, 8192};
+    int failed = 0;
+    uint32_t checksum = 0;
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+        failed += test_size(sizes[i], 50, &checksum);
+    }
+    printf("%s (result checksum 0x%08x - must match across host/QEMU at any VLEN)\n",
+           failed ? "FAILED" : "ALL PASS", checksum);
+    return failed ? 1 : 0;
+}
