@@ -1,0 +1,282 @@
+# Measuring one llama.cpp kernel iteration under andesim hybrid mode
+
+This is the companion doc USER_GUIDE.md section 11 points to: the exact
+patch that puts ROI markers around a matmul (or a short run of
+consecutive matmuls) inside llama.cpp, how the target was chosen, and
+the upstream `ggml` fixes a real build needs before it survives the
+cycle-accurate leg's ELEN=32 vector unit.
+
+Confirmed end to end:
+- 2026-07-16: single iteration (K=51, layer 7's V projection) --
+  **6528953 cycles**, stable across two independent hybrid runs.
+- 2026-07-16: two consecutive iterations (K=51..52, V then K
+  projection) -- **13040043 cycles** (~2x the single-iteration figure,
+  as expected for two similarly-sized matmuls back to back). See
+  section 6 for how to pick N.
+
+## 1. Why the marker goes in ggml's dispatch loop, not llama.cpp's model code
+
+`ggml` builds its WHOLE computation graph first (`ggml_mul_mat()` just
+appends a node), then executes it in one shot via a generic per-node
+dispatch loop (`ggml_graph_compute_thread` -> `ggml_compute_forward`, in
+`ggml/src/ggml-cpu/ggml-cpu.c`). Individual ops are not distinguishable
+at the call site (e.g. the per-layer forward-pass code in
+`src/models/qwen3.cpp` or similar) -- by the time any one op actually
+*runs*, you are inside this generic loop, looking at a `ggml_tensor*`
+with no easy way to tell "this is layer 7's V projection" apart from any
+other `GGML_OP_MUL_MAT` node without counting.
+
+So the marker patch counts nodes and fires on the K-th one:
+
+```c
+// ggml/src/ggml-cpu/ggml-cpu.c, inside ggml_compute_forward's switch:
+case GGML_OP_MUL_MAT:
+    {
+#if defined(__riscv) && defined(ANDESIM_ROI_MUL_MAT_K)
+        static int andesim_mul_mat_n = 0;
+        const bool andesim_roi = (++andesim_mul_mat_n == ANDESIM_ROI_MUL_MAT_K);
+        if (andesim_roi) andesim_ROI_begin();
+#endif
+        ggml_compute_forward_mul_mat(params, tensor);
+#if defined(__riscv) && defined(ANDESIM_ROI_MUL_MAT_K)
+        if (andesim_roi) andesim_ROI_end();
+#endif
+    } break;
+```
+
+Also add near the top of the file:
+
+```c
+#if defined(__riscv) && defined(ANDESIM_ROI_MUL_MAT_K)
+#include <andesim/ROI.h>
+#endif
+```
+
+`ANDESIM_ROI_MUL_MAT_K` is a build-time `-D`, not a source edit -- picking
+a different node to measure is a reconfigure, not a patch change (see
+section 3). Both markers are HINT NOPs (`andesim_ROI_begin()`/`_end()`),
+so this same binary still runs correctly, unmeasured, on any engine or on
+silicon when the counter never reaches K (or when `ANDESIM_ROI_MUL_MAT_K`
+is undefined -- the whole block compiles out).
+
+## 2. Counting the nodes
+
+Bonsai-4B (qwen3 architecture, 36 layers, 2560 embd) does 253 `MUL_MAT`
+calls per token: 36 layers x 7 matmuls (Q, V, K, O-projection, FFN gate,
+up, down -- confirmed via gdb breakpoint counting on a native x86 debug
+build, not assumed from the layer count alone) + 1 final `lm_head`.
+
+## 3. Picking K: smallest matmul, not the first one that compiles
+
+The obvious first pick is any early node -- K=50 lands on layer 7's Q
+projection (2560 -> 4096). It runs correctly (once the fixes in section 4
+are applied) but is too large a computation for the cycle-accurate leg to
+finish even inside a 900000ms (15 minute) `--step-timeout-ms` budget.
+
+Rather than guess a smaller K blindly, dump every node's operand shapes
+for one real forward pass on a **native x86 build** (fast, no simulator
+needed) with a throwaway diagnostic:
+
+```c
+// temporary -- not committed; add right before ggml_compute_forward_mul_mat(...):
+#if defined(ANDESIM_DUMP_MUL_MAT_SIZES)
+{
+    const struct ggml_tensor* s0 = tensor->src[0];
+    const struct ggml_tensor* s1 = tensor->src[1];
+    fprintf(stderr, "ANDESIM_MUL_MAT name=%s src0=%s[%lldx%lld] src1=[%lldx%lld]\n",
+            tensor->name, ggml_type_name(s0->type),
+            (long long) s0->ne[0], (long long) s0->ne[1],
+            (long long) s1->ne[0], (long long) s1->ne[1]);
+}
+#endif
+```
+
+```sh
+cmake -B build-host -DCMAKE_C_FLAGS="-DANDESIM_DUMP_MUL_MAT_SIZES"
+cmake --build build-host -j --target llama-completion
+./build-host/bin/llama-completion -m models/Bonsai-4B-Q1_0.gguf -no-cnv \
+  --prompt "The capital of France is" -n 1 -c 512 -t 1 2>&1 | grep ANDESIM_MUL_MAT
+```
+
+Result, per layer: Q/O-projection and the FFN gate/up/down matmuls are
+all 2560x4096..2560x9728 (the FFN matmuls are actually ~2.4x LARGER than
+Q, not smaller -- do not assume "later in the layer means smaller"). The
+K/V-projection (2560x1024, this model's grouped-query attention uses
+fewer KV heads than Q heads) is the smallest matmul shape anywhere in the
+architecture, ~4x fewer MACs than Q, ~9.6x fewer than the FFN matmuls,
+and there is nothing smaller available in a standard transformer layer
+(the `lm_head` is larger still: `2560 x vocab_size`).
+
+**Verified working value: `ANDESIM_ROI_MUL_MAT_K=51`** -- layer 7's V
+projection, the very next node after the original K=50 pick. Completes
+comfortably inside a 900000ms budget.
+
+If you retarget K, verify the object file actually recompiled with the
+new value before spending 10+ minutes on a run that might still be
+running the old K:
+
+```sh
+python3 -c "
+import json
+for e in json.load(open('build-rv64-static/compile_commands.json')):
+    if e['file'].endswith('ggml-cpu.c'):
+        print(e['command']); break
+" | grep -o 'ANDESIM_ROI_MUL_MAT_K=[0-9]*'
+```
+
+(A stale-ccache-or-incomplete-incremental-rebuild gotcha cost real time
+during this investigation: `compile_commands.json` showing the right flag
+is necessary but was, once, not sufficient -- the `.o` had not actually
+been regenerated. If a rebuild's *behavior* doesn't match what the
+*compile command* implies, `rm -f` the exact `.o` path under
+`build-rv64-static/ggml/src/CMakeFiles/ggml-cpu.dir/` and rebuild again
+before doubting the fix itself.)
+
+## 4. Four fixes a real build needs before the cycle-accurate leg accepts it
+
+Hybrid's QEMU leg is engine-synced (`elen=32`, from the accurate
+`-readconfig`) -- unlike fast mode's own hardcoded, unconstrained `-cpu
+andes-ax45mpv,vlen=512` string, it actually enforces the real engine's
+32-bit vector-element limit. A stock `GGML_RVV` build of `ggml` was
+written assuming `v` implies the RVV-spec-mandated ELEN>=64 minimum, so
+several code paths emit illegal 64-bit-element vector instructions this
+target cannot execute. All four were found the same way: run the real
+binary, catch the illegal-instruction trap (mcause=2), disassemble at the
+exact `mepc`, fix, repeat.
+
+1. **`ggml_vec_dot_f16`/`ggml_vec_dot_bf16`** (`ggml/src/ggml-cpu/vec.cpp`):
+   GCC auto-vectorizes their `double`-accumulated scalar fallback loop
+   (taken because this build has neither `__riscv_zvfh` nor
+   `__riscv_zvfbfwma`) into an illegal widening e64 reduce. Fix: add
+   `__attribute__((target("arch=rv64gc")))` to just these two function
+   definitions -- confirmed empirically that GCC's RISC-V port honors a
+   function-level `target` attribute for suppressing this (the `optimize`
+   attribute and `#pragma GCC push_options`/`optimize` do NOT work here --
+   tried both, objdump showed no change either time).
+
+2. **`ggml_vec_cvar_f32`/`ggml_vec_soft_max_f32`** (same file): use an
+   explicit `vfloat64m1_t` accumulator (`vfwredusum_vs_f32m2_f64m1`,
+   widening reduce). Every other architecture's branch in these same two
+   functions reduces in native f32 precision with a plain SIMD op, then
+   widens ONE scalar partial-sum per chunk to `double` in ordinary C --
+   the RISC-V branch was the only outlier, not a hardware requirement.
+   Fix: rewrite to match the sibling pattern (`vfredusum_vs_f32m2_f32m1`,
+   non-widening, then `sum += (ggml_float) partial` in scalar C). Zero e64,
+   same numerics every other build already computes.
+
+3. **`quantize_row_q8_0`/`quantize_row_q8_1`**
+   (`ggml/src/ggml-cpu/arch/riscv/quants.c`): hardcode `vfloat32m8_t`
+   (LMUL=8) for `vfabs`/`vfredmax`, unconditionally, unlike every other
+   quant kernel in the same file (which dispatch across
+   vl1024/vl512/vl256/vl128 variants). `ax45mpv_premium`'s vector FPU
+   datapath does not extend to LMUL=8 for floating-point ops specifically
+   (a plain integer `vle32.v` load at the same LMUL=8 executes fine
+   immediately before the float op faults -- this is FP-datapath-specific,
+   not a blanket LMUL cap; correlates with the engine's `isa-vl4` config
+   bit, though only vsim's RTL enforces it -- QEMU does not, which is why
+   this one surfaces on vsim rather than QEMU1, unlike fixes 1/2/4). Fix:
+   both functions now call their existing portable `_ref` scalar
+   implementations (`ggml/src/ggml-quants.c`, already used as the non-RVV
+   fallback everywhere) unconditionally -- this is activation
+   quantization, called once per token row before the (still fully
+   vectorized) dot-product loop reuses it, a trivial fraction of total
+   matmul cost.
+
+4. **Diagnostic-path gap, not a ggml bug**: `runtime/handler.c`'s trap
+   handler (shared by every andesim runtime, vplat and vlinux alike)
+   calls `fprintf` then `_exit()`; `_exit()` never flushes stdio, so on a
+   fully-buffered stderr (the vlinux syscall-backed stdio path) the whole
+   diagnostic was silently lost on every trap. Fixed with an
+   `fflush(stderr)` before `_exit()`, plus a raw `htif_uart_putc()`-based
+   emergency print of `mcause`/`mepc`/`mtval` before even attempting
+   `fprintf` (cheap insurance against a corrupted-state trap taking out
+   `fprintf` itself). This is what made fix 3 possible to diagnose in the
+   first place -- see `ROADMAP_LINUX_RUNTIME.md`'s U9 section for the full
+   trail.
+
+## 5. Reproducing the confirmed run
+
+```sh
+# in llama.cpp:
+cmake -B build-rv64-static \
+  -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF \
+  -DGGML_RV_ZFH=OFF -DGGML_RV_ZVFH=OFF -DGGML_CPU_REPACK=OFF \
+  -DCMAKE_C_FLAGS="-mext-zvlsseg -DANDESIM_ROI_MUL_MAT_K=51 -I /path/to/andesim/build/runtime/include" \
+  -DCMAKE_CXX_FLAGS="-mext-zvlsseg -DANDESIM_ROI_MUL_MAT_K=51 -I /path/to/andesim/build/runtime/include"
+cmake --build build-rv64-static -j --target llama-completion
+
+# in andesim:
+./andesim run --mode hybrid --trigger marker --runtime linux --mem-size 2000M \
+  --engine vsim:ax45mpv_premium --step-timeout-ms 900000 \
+  /path/to/llama.cpp/build-rv64-static/bin/llama-completion \
+  -- -m /path/to/models/Bonsai-4B-Q1_0.gguf -no-cnv \
+     --prompt "The capital of France is" -n 32 -c 512 -t 1
+```
+
+Expected: `[andesim] 6528953 cycles`, identical across repeat runs.
+
+## 6. Measuring N consecutive iterations
+
+For a few consecutive matmuls instead of just one, set `ANDESIM_ROI_MUL_MAT_N`
+alongside `ANDESIM_ROI_MUL_MAT_K` (both are build-time `-D`s -- no source
+change). The marker begins at node K and ends at node K+N-1, so N=1
+(the default when unset) is exactly the original single-iteration
+behavior:
+
+```sh
+cmake -B build-rv64-static ... \
+  -DCMAKE_C_FLAGS="... -DANDESIM_ROI_MUL_MAT_K=51 -DANDESIM_ROI_MUL_MAT_N=2 ..." \
+  -DCMAKE_CXX_FLAGS="... -DANDESIM_ROI_MUL_MAT_K=51 -DANDESIM_ROI_MUL_MAT_N=2 ..."
+cmake --build build-rv64-static -j --target llama-completion
+```
+
+Confirmed K=51..52 (V then K projection, both small): **13040043
+cycles**, ~2x the single-iteration figure as expected.
+
+**Keep N small.** The cycle-accurate leg runs at ~9 kHz; N=1 on the V
+projection alone already needs ~13 minutes of wall clock (hence
+`--step-timeout-ms 900000`+). Including one of the large matmuls (Q, O,
+or any FFN projection -- see section 3's size ranking) in the range
+multiplies the cost accordingly; a whole token (253 matmuls) is not
+practical this way. Pick a short, deliberately small run of the
+smallest-available matmuls, exactly like section 3 already argues for
+a single iteration.
+
+## 7. Dumping pipeline information (`--kanata`)
+
+`andesim run --mode hybrid --kanata <file>` (see USER_GUIDE.md section
+5.8) writes a Kanata-format pipeline trace of the ROI, viewable in
+[Konata](https://github.com/shioyadan/Konata):
+
+```sh
+./andesim run --mode hybrid --trigger marker --runtime linux --mem-size 2000M \
+  --engine vsim:ax45mpv_premium --step-timeout-ms 900000 \
+  --kanata /tmp/roi.kanata \
+  /path/to/llama.cpp/build-rv64-static/bin/llama-completion \
+  -- -m /path/to/models/Bonsai-4B-Q1_0.gguf -no-cnv \
+     --prompt "The capital of France is" -n 32 -c 512 -t 1
+```
+
+No source or build change needed beyond what section 5 already has --
+`--kanata` reads the same ROI markers the cycle measurement uses.
+Confirmed on the K=51 single-iteration build: a 651 MB, well-formed
+Kanata trace (`Kanata 0004` header, ~43.8M lines, event counts
+consistent with 6528953 cycles). The trace is large in proportion to
+the cycle count -- expect a correspondingly bigger file for a
+multi-iteration (N>1) ROI.
+
+**A real bug this surfaced, fixed as part of this work**: the driver's
+`vsim_extra_args()` (`driver/hybrid.cpp`) unconditionally appended a
+`--kanata-roi` flag alongside `--kanata` -- a flag that does not exist
+anywhere in vsim (confirmed against vsim's own `--help` and its full
+source tree), so every hybrid `--kanata` run failed immediately with
+`Unrecognized option: --kanata-roi` before this fix. Root cause: vsim's
+hybrid leg only ever executes the ROI in the first place (it resumes
+at the trigger boundary and exits on the matching trigger), so plain
+`--kanata` already produces exactly the "measured window only" trace
+USER_GUIDE.md section 5.8 describes -- no separate "roi" flag was ever
+needed on vsim's side. This had no automated-test coverage (the only
+place `--kanata-roi` appeared besides the driver's own code was a
+manually-gated block in `tests/e2e.sh` behind an unset-by-default
+`KANATA_FILE` env var), so the bug was latent until `--kanata` was
+actually exercised against a real vsim binary for the first time here.
