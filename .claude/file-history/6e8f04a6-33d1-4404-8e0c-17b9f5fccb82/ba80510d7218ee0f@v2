@@ -1,0 +1,163 @@
+#=========================================================================
+# crt0.S : Entry point for RISC-V user programs
+#=========================================================================
+
+#ifndef CRT0_MULTIPLE_HARTS
+#define CRT0_MULTIPLE_HARTS 0
+#endif
+
+#define mcache_ctl 0x7ca
+#define mmisc_ctl 0x7d0
+
+  .text
+  .global _start
+  .type   _start, @function
+_start:
+  # Enable icache
+  csrsi   mcache_ctl, 0x1
+
+  # Join the coherence domain before enabling the D-cache. On a
+  # coherence-manager core (NDS_CACHE_COHERENCE_SUPPORT, e.g. ax46mpv_fpga_l3)
+  # a non-coherent D-cache silently corrupts data under eviction pressure
+  # (CoreMark CRCs fail); the join is: set mcache_ctl.DC_COHEN (bit 19), wait
+  # for DC_COHSTA (bit 20). The runtime is one binary for EVERY engine, so the
+  # wait is BOUNDED: a core without a CM WARL-0s COHEN and COHSTA never sets
+  # (and QEMU is permissive: COHEN may stick with COHSTA still never set), so
+  # an unbounded poll would hang -- 1024 tries cost a few k cycles once at
+  # boot and CM hardware sets COHSTA in far fewer.
+  lui     a0, 0x80              # DC_COHEN (1 << 19)
+  csrs    mcache_ctl, a0
+  li      a2, 1024
+1:
+  csrr    a1, mcache_ctl
+  srli    a1, a1, 20            # DC_COHSTA
+  andi    a1, a1, 1
+  bnez    a1, 2f
+  addi    a2, a2, -1
+  bnez    a2, 1b
+2:
+  # Enable d-cache and hardware prefetch. Read mcache_ctl first: it keeps the
+  # IC/COHEN bits just set (and any WARL bits) instead of relying on 0x703
+  # covering them -- and nothing else defined a0 on the non-coherence path.
+  csrr    a0, mcache_ctl
+  ori     a0, a0, 0x703
+  csrw    mcache_ctl, a0
+
+  .weak   _stack
+  # Initialize stack pointer (if defined)
+  lla     a0, _stack
+  beqz    a0, 1f
+  mv      sp, a0
+
+#if CRT0_MULTIPLE_HARTS
+  csrr    a0, mhartid
+  slli    a0, a0, 12
+  sub     sp, sp, a0
+#endif
+
+  # Initialize global pointer
+.option push
+.option norelax
+1:lla gp, __global_pointer$
+.option pop
+
+#ifdef __nds_v5
+  csrr    a0, mmsc_cfg
+  bbc     a0, 3, 1f
+  la      a1, _ITB_BASE_
+  csrrw   x0, uitb, a1
+1:
+#if __riscv_xlen >= 64
+  bbc     a0, 52, 1f
+#else
+  bbc     a0, 31, 1f
+  csrr    a0, mmsc_cfg2
+  bbc     a0, 20, 1f
+#endif
+  csrr    a0, mrvarch_cfg
+  bbc     a0, 31, 1f
+  la      a0, __jvt_base$
+  csrw    jvt, a0
+#endif
+1:
+
+  # Set mstatus.fs to 1 (initial)
+  li      a0, (1 << 13)
+  csrs    mstatus, a0
+
+  # Set mstatus.vs to 1 (initial)
+  li      a0, (1 << 10)
+  csrs    mstatus, a0
+
+  # Enable unaligned memory access (mmisc_ctl.UNA)
+  li      a0, (1 << 6)
+  csrs    mmisc_ctl, a0
+
+#if CRT0_MULTIPLE_HARTS
+  csrr    a0, mhartid
+  beqz    a0, .Lclear_bss
+
+  li      a1, 0xa55a
+.Lother_hart_wait_loop:
+  ld      a0, other_hart_boot_flag
+  bne     a0, a1, .Lother_hart_wait_loop
+  j       .Lmain
+#else
+  csrr    a0, mhartid
+  beqz    a0, .Lclear_bss
+  li      a0, 0x01234571
+  li      a1, 0xe0080000
+  sw      a0, 0(a1)
+1:
+  j       1b
+#endif
+
+  # Clear the bss segment
+.Lclear_bss:
+  la      a0, _edata
+  la      a2, _end
+  sub     a2, a2, a0
+  li      a1, 0
+  call    memset
+
+
+#if CRT0_MULTIPLE_HARTS
+  li      a0, 0xa55a
+  lla     a1, other_hart_boot_flag
+  sd      a0, 0(a1)
+  fence
+#endif
+
+  # Trap vector first -- the direct call also extracts handler.o (and
+  # trap.o via m_trap_entry) from libandesim_runtime.a -- then the C/C++
+  # constructors: newlib's __libc_init_array walks .preinit_array and
+  # .init_array (bounds PROVIDEd by andesim.ld). A trap inside a
+  # constructor is therefore already caught.
+  call init_mtvec
+  call __libc_init_array
+
+.Lmain:
+  li      a0, 0
+  li      a1, 0
+  li      a2, 0
+  call    main
+
+  # C++ semantics: returning from main == exit(rc). newlib's exit runs
+  # atexit handlers + static destructors + stdio cleanup, then _exit
+  # terminates the simulation via SimControl as before.
+  call    exit
+
+.Lloop:
+  j       .Lloop
+
+  .size   _start, .-_start
+
+#if CRT0_MULTIPLE_HARTS
+  .data
+  .p2align 3
+  .global other_hart_boot_flag
+  .type   other_hart_boot_flag, @object
+other_hart_boot_flag:
+  .8byte 0
+  .size other_hart_boot_flag, . - other_hart_boot_flag
+#endif
