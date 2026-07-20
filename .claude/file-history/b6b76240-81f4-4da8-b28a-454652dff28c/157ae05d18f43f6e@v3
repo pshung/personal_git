@@ -1,0 +1,44 @@
+---
+name: q1_0-wide-vlen-repack-rowparallel
+description: "Decision to optimize Q1_0 matmul on wide VLEN (512-2048) via row-parallel Nx1 repack, not the q4_0_8x8 mmla-fold; recorded in opt_roadmap.md F4"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: b6b76240-81f4-4da8-b28a-454652dff28c
+---
+
+For wide VLEN (512/1024/2048) the Q1_0 dot kernel's per-32 `vwredsum`
+horizontal reduction wastes most lanes and gets relatively worse as VLEN
+grows. Fix = repack + ROW-PARALLEL `Nx1` layout (blocklen=1, like
+`ggml_gemv_q4_0_16x1_q8_0_generic` at repack.cpp:1370), NOT the `q4_0_8x8`
+mmla-fold. N weight rows in N lanes; K-reduction becomes a loop-carried
+vertical add per lane -> ZERO horizontal reductions.
+
+**Why:** Q1_0 weights are +-1, so the multiply collapses to a conditional
+add (`sumi = vsub_vx(sumi,y); sumi = vadd_vx_m(mask,sumi,2*y)` per column,
+int16 accum, 32*127<32767 safe). The 8x8 path's vwmul + vnsrl fold tree is
+pointless here (no dequant needed, and the fold IS a reduction).
+
+**How to apply:** fix N=64, adapt LMUL to vlenb so fp32 acc is full
+(VLEN=2048->m1, 1024->m2, 512->m4). Per-column vlm (128/block) is the main
+tuning cost. Full design + inner loop + sub-features F4a-F4d in
+`opt_roadmap.md` F4 (working tree, untracked). F4a = scalar reference +
+kernel-lab test (TDD oracle, HW-agnostic) is the first step.
+
+**ACE co-design (2026-07-20):** user confirmed int8 dot-product HW exists and
+wants custom ACE-RVV instructions (COPILOT), not stock xandesvdot. Template =
+their TQ1 ACE lab /local/nick/vsim-workspace/vsim-demo/ace-tq1 (unpack.ace:
+`v_w_mul_free_macc` multiply-free widening MAC + trit unpack; tq1.c does
+unpack -> macc -> ONE vwredsum/block because TQ1 pairs Q8_K 1-scale/256).
+Chosen instruction = **A `v_q1_rowdot`**: `{io vrf:4int result, in vrf:int
+activation, in vrf:uint signbits}`, per-lane 4-way sign-dot
+`result[lane]+=sum_i(bit_i?+act_i:-act_i)`, activation broadcast, weights
+1-bit from the Nx1 repack -> lanes=rows, NO reduction. Sign-bit analog of
+VD4DOTS, HW = conditional-negate add-tree (no multiplier). Alternatives: C
+`v_q1_sign_macc` (2int, single-row, keeps vwredsum), B `v_q1_unpack`+reuse
+mul_free_macc (min HW). Full design + .ace sketch + build order in
+opt_roadmap.md F6. Open: confirm COPILOT allows 4int in-lane reduce result
+(v_q_tq2_unpack suggests yes). Asked user path A/B/C + activation format
+2026-07-20; away, defaulting to A + keep per-32 Q8_0.
+
+Related: [[ace-tq1-standalone-kernel-lab]], [[andesim-llamacpp-hybrid-gaps]].
