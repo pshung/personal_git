@@ -1,0 +1,290 @@
+# RISC-V Kernel Optimization Roadmap (Bonsai Q1_0 / Ternary Q2_0)
+
+Target: llama.cpp CPU backend on Andes RISC-V (AX45MPV-class, RVV 1.0, VLEN=512).
+Baseline measured 2026-07-15 under Andes QEMU (VLEN=512, -t 8, noomp build):
+Bonsai-4B Q1_0 ~19-21 s/token, 8B ~34-38 s/token, 27B ~124 s/token.
+QEMU time tracks instruction count, not real latency - final numbers must come
+from FPGA/hardware runs.
+
+Rules for every feature below:
+- TDD: first add a correctness test comparing the new kernel against the
+  matching *_generic function on random data (test-quantize-fns style),
+  see it fail/pass, then optimize. Never commit a kernel without the test.
+- Benchmark gate: llama-bench on QEMU (instruction-count proxy) + FPGA run
+  (real latency) before/after. Keep per-feature commits separate.
+
+Status legend: TODO / IN-PROGRESS / DONE
+
+---
+
+## F0. CORRECTNESS: qwen35 (hybrid attention) produces garbage on rv64
+
+- Status: TODO - blocks all 27B work; fix before optimizing anything.
+- Description: Bonsai-27B (arch qwen35, ~75% linear attention) generates
+  incoherent text on rv64 QEMU while the same GGUF + prompt on x86 host
+  answers correctly ("The capital of France is Paris."). Bonsai-4B/8B
+  (plain qwen3) are coherent on rv64, and test-quantize-fns passes all 35
+  quant types under QEMU (Q1_0/Q8_0 kernels exonerated). Suspect: the
+  qwen35-only ops (delta-net / linear-attention recurrence, gating) in
+  their RVV or fp16 (zvfh) paths, or a shape-dependent kernel edge case
+  only the 27B tensor sizes hit.
+- Evidence: scratchpad logs bonsai27b_long.log (garbage, 16 tokens, exit 0),
+  host control run 2026-07-15 (correct, 10 t/s).
+- Diagnosis plan:
+  1. Rebuild rv64 with GGML_RVV=OFF (pure scalar); run 27B few tokens on
+     QEMU. Scalar correct -> bug is in an RVV kernel; scalar also broken ->
+     generic C op or fp16 ABI issue.
+  2. Bisect op-level with llama-eval-callback: dump intermediate tensors
+     host vs QEMU for one token, find first divergent op.
+  3. Fix the kernel; add the failing case to test-backend-ops shapes.
+- Key files:
+  - src/models/ (qwen35 graph construction)
+  - ggml/src/ggml-cpu/ops.cpp, vec.h (op implementations with __riscv_v/zvfh paths)
+  - ggml/src/ggml-cpu/arch/riscv/ (RVV kernels)
+- Dependencies: none. Everything 27B-related depends on this.
+
+---
+
+## F1. Q1_0 multi-row vec_dot (nrows = 2)
+
+- Status: TODO
+- Description: The Q1_0 dot kernel recomputes/reloads the same activations
+  for every weight row. Set `.nrows = 2` (later 4) so one call computes 2
+  output elements: load + negate activations once, per row only do mask
+  load (vlm) + vmerge + reduce. Expected ~1.5-2x on the dominant matmul path.
+- Key files:
+  - ggml/src/ggml-cpu/arch/riscv/quants.c:484-578 (vl256/vl128 kernels + dispatcher)
+  - ggml/src/ggml-cpu/ggml-cpu.c:227-232 (.nrows field of GGML_TYPE_Q1_0)
+- Dependencies: none. Best first step - small diff, big win.
+
+## F2. Q1_0 defer reductions + vector scale handling
+
+- Status: IN-PROGRESS (2026-07-16) - two candidate kernels implemented and
+  verified in kernel-lab/ (q1_0.c): vl512 = per-group vl=32 + group sums
+  packed into lanes via vslideup + vlse16 vector scales + one ordered
+  reduction per row (zero vector->scalar moves in the block loop; correct
+  for any VLEN >= 256); vl512w = same but vl=64 merges two groups (fewer
+  instructions, extra slideup/slidedown data movement). All-VLEN correctness
+  PASS. QEMU proxy on n=8192: vl256 57.5us, vl512w 64.9us, vl512 75.5us,
+  generic 430us - see measurement note below: QEMU TCG makes vector
+  instructions expensive and scalar ops ~free, so removing the 4 vmv.x.s +
+  ~12 scalar float ops per block READS AS A REGRESSION under QEMU. The
+  stall-removal benefit is only observable on vsim (rdcycle) or FPGA.
+  Decision gate: vsim shootout vl256 vs vl512 vs vl512w before paste-back
+  into ggml.
+- Description: Today each 32-element group ends with vwredsum + scalar
+  extract (vmv.x.s) + scalar fp16->fp32 + scalar FMA - the vector unit
+  stalls 4x per block. Change to: (a) load activation scales for several
+  blocks at once with strided load vlse16 (stride 34 = sizeof(block_q8_0)),
+  widen once with vfwcvt; (b) collect group sums into vector lanes and do
+  one vfmacc instead of 4 scalar FMAs; (c) unroll 2 blocks with two
+  independent accumulator chains to hide latency. Expected ~1.3-1.5x.
+- Key files:
+  - ggml/src/ggml-cpu/arch/riscv/quants.c:500-518 (inner loop)
+- Dependencies: independent of F1; combine after both proven.
+
+## F3. Q1_0 full-VLEN utilization
+
+- Status: IN-PROGRESS (2026-07-16) - finding from kernel-lab: because the
+  Q8_0 activations are NOT contiguous (34-byte block stride), filling a
+  512-bit register costs slide instructions (vl512w: 2 vslideup + 2
+  vslidedown per block) that cancel the saved vlm/vneg/vmerge. Wider vl
+  alone cannot win for this vec_dot shape; the width pays off only via
+  repack (F4, contiguous interleaved rows) or multi-row amortization (F1,
+  e.g. row A in lanes 0..31 / row B in lanes 32..63). Treat F3 as folded
+  into F1/F4 rather than a standalone feature.
+- Description: Kernel uses vl=32 at e8/LMUL=1, which fills only half a
+  VLEN=512 register (VLMAX=64). Process 64 weights per step (vlm of 64
+  mask bits) or a whole 128-weight block with e8m2. Scale application must
+  still respect the per-32 Q8_0 groups (pair with F2's vector-scale path).
+- Key files:
+  - ggml/src/ggml-cpu/arch/riscv/quants.c:484-521
+- Dependencies: F2 (vector scale handling makes wider vl practical).
+
+## F4. Q1_0 repack, ROW-PARALLEL Nx1 (the wide-VLEN win)
+
+- Status: TODO - largest expected win; supersedes F1-F3 for matmul.
+- Core decision (2026-07-20, wide-VLEN analysis): use the ROW-PARALLEL
+  `Nx1` layout (blocklen=1, like `ggml_gemv_q4_0_16x1_q8_0_generic`,
+  repack.cpp:1370), NOT the `q4_0_8x8` mmla-fold layout. Reason:
+  * The 8x8 path uses vwmul/vwmacc + a vnsrl reduction tree (repack.cpp
+    arch/riscv:161-177) - the multiplies exist to dequant 4-bit weights,
+    and the fold tree is a horizontal reduction that under-uses wide VLEN
+    (8 fp32 lanes, so 8/64 = 12% of a VLEN=2048 datapath). F3 already
+    proved horizontal reductions are the bottleneck; the fold tree is one.
+  * Q1_0 weights are +-1: the multiply collapses to a conditional add, and
+    the ONLY reason to reduce (per-32 Q8_0 scale) is handled at group
+    boundaries. Row-parallel keeps N rows in N lanes; the K-reduction
+    becomes a loop-carried VERTICAL add per lane -> ZERO horizontal
+    reductions in the whole kernel. This is the fix for VLEN 512-2048:
+    spend LMUL on rows (useful work), not on one row's reduction.
+- Layout `block_q1_0_Nx1` (N rows interleaved, per 128-col block, 18N bytes
+  = N * sizeof(block_q1_0), same total size):
+  * sign planes, column-major: for global col c in 0..127, N bits (one per
+    row) -> 16N bytes, loadable as a per-column N-bit mask (vlm).
+  * N fp16 weight scales (one d per row per 128-block) -> 2N bytes.
+- RVV gemv inner loop (per 128-block, N rows in lanes, no reductions):
+  ```
+  facc_block[N] = 0                                  // fp32, N lanes
+  for g in 0..3:                                     // 4 Q8_0 groups / 128
+      dy = fp16_to_fp32(a[g].d)                      // scalar (shared/rows)
+      sumi[N] = 0                                    // int16, 32*127<32767 ok
+      for c in 0..31:
+          y    = a[g].qs[c]                          // scalar int8
+          mask = vlm(sign plane col 32*g+c)          // N bits
+          sumi = vsub_vx(sumi, y)                    // -y on all lanes
+          sumi = vadd_vx_m(mask, sumi, 2*y)          // +2y where bit set => +-y
+      facc_block = vfmacc_vf(facc_block, dy, vfcvt(sumi))   // scalar dy
+  sumf[N] = vfmacc_vv(sumf, dx[N], facc_block)       // vector weight scale
+  // after K loop: store sumf[N] to N contiguous outputs
+  ```
+  ~3 ops/col (1 vlm + vsub_vx + vadd_vx_m), all N-wide; ~393 N-wide ops per
+  block-tile => ~6 ops/row/block at N=64 vs ~20 for single-row vec_dot, AND
+  full VLMAX, AND no reduction stalls. Per-column vlm (128/block) is the
+  main tuning point.
+- N and LMUL mapping (answers "larger LMUL" for wide VLEN): fix N=64, adapt
+  LMUL to vlenb at runtime so the fp32 accumulator is full: VLEN=2048->m1,
+  1024->m2, 512->m4 (all give 64 fp32 lanes). One repacked type; nc must be
+  a multiple of N=64 (typical hidden dims are; machinery handles remainder).
+- Sub-features (do in order):
+  * F4a - scalar reference `ggml_gemv_q1_0_16x1_q8_0_generic` +
+    `repack_q1_0_to_q1_0_Nx1` + kernel-lab test: bit-exact vs the existing
+    generic dot summed over N rows. HW-agnostic oracle, no deps. TDD RED here.
+  * F4b - RVV row-parallel gemv (loop above), N=64 LMUL-adaptive. Dep: F4a.
+  * F4c - gemm (M>1 prefill): interleave activation rows too
+    (ggml_quantize_mat_q8_0), reuse the accumulate with an M-tile. Dep: F4b.
+  * F4d - wire into ggml: traits table + extra-buffer type + remove
+    arch-fallback alias + pass test-quantize-fns / test-backend-ops. Dep: F4b.
+- Relationship to F6 (xandesvdot): F4b is Strategy A (base RVV, no
+  dot-product). F6 is Strategy B on the SAME repack layout - expand signs to
+  +-1 int8 once, let NDS.VD4DOTS do the K-reduction in-lane. They compose;
+  decision gate is a vsim A-vs-B shootout. Open question for user: is an
+  int8 dot-product (zvqdotq / xandesvdot) available on the target? If yes,
+  F6 may beat F4b; if no, F4b is the ceiling.
+- Key files:
+  - kernel-lab/ (F4a/F4b reference + test first, vsim shootout)
+  - ggml/src/ggml-cpu/repack.cpp (repack fn + traits dispatch, ~line 3200 /
+    3868 templates; 16x1 gemv reference at :1370)
+  - ggml/src/ggml-cpu/arch/riscv/repack.cpp (RVV microkernels; 8x8 at :114)
+  - ggml/src/ggml-cpu/repack.h (block<Q,N> types, gemv/gemm decls)
+  - ggml/src/ggml-cpu/arch-fallback.h:206+ (remove new symbols from fallback)
+- Dependencies: F4a is independent and is the best first step. F1-F3 are
+  now subsumed (F3's own note folds it into F4); prioritize F4a over them.
+
+## F5. Q2_0 (ternary) RISC-V RVV kernel - currently pure scalar
+
+- Status: TODO
+- Description: Ternary-Bonsai models use GGML_TYPE_Q2_0 (ggml.h:432). On
+  RISC-V it falls back to generic C (arch-fallback.h:209 aliases
+  ggml_vec_dot_q2_0_q8_0 to the scalar version in
+  ggml/src/ggml-cpu/quants.c:177). x86/ARM have optimized versions; RISC-V
+  has none - a ready-made gap. Structure mirrors the Q1_0 kernel: 2-bit
+  {-1,0,+1} weights can be handled with two masks + vmerge, or vrgather
+  lookup. Reference the TQ2_0 RVV kernel (riscv/quants.c:6300) for a
+  similar shape.
+- Key files:
+  - ggml/src/ggml-cpu/arch/riscv/quants.c (new kernel + dispatcher)
+  - ggml/src/ggml-cpu/arch-fallback.h:206-209 (remove q2_0 alias for riscv)
+- Dependencies: none - independent of F1-F4.
+
+## F6. Q1_0 ACE-RVV custom instruction co-design (COPILOT)
+
+- Status: TODO - design fixed 2026-07-20; user confirmed int8 dot-product
+  HW exists and wants to design custom ACE-RVV instructions (not just use
+  stock xandesvdot). Awaiting user pick of candidate A/B/C before csim work.
+- Toolchain / template: user's ACE lab at
+  /local/nick/vsim-workspace/vsim-demo/ace-tq1 (COPILOT 7.3, AX46MPV,
+  vlen=256 sim). unpack.ace already defines: `v_w_mul_free_macc`
+  (multiply-free widening MAC, weight in {-1,0,1}: result_2int += act_i8 (*)
+  weight_i8, no multiplier) and trit `unpack` insns. tq1.c dataflow =
+  unpack -> v_w_mul_free_macc -> ONE vwredsum/256-block -> one scale (works
+  because TQ1 pairs with Q8_K = 1 scale/256). Q1_0 pairs with 4x Q8_0 =
+  1 scale/32; that mismatch is what the ACE insn must erase.
+- Operand model (from unpack.ace): `rvv_insn N { operand = {io|in|out
+  vrf:{int|2int|4int|uint} ...}; vector_unit = elen; csim = %{..%};
+  latency = 1; }`. vrf:int=i8 lane, 2int/4int=widened i16/i32 result,
+  uint=packed bytes. v_q_tq2_unpack already returns 4int (i32) from a packed
+  byte -> in-lane widening + reading a packed bit-plane is in-idiom.
+- Candidates (precise I/O):
+  * A. `v_q1_rowdot` - ROW-PARALLEL K-way sign-dot, THE wide-VLEN optimum.
+    Pairs with F4 Nx1 repack: lanes = rows, activation broadcast (splat like
+    the q4_0_8x8 vmv_v_x_i64 trick), each lane holds one row's sign bits;
+    in-lane 4-way sign-dot, accumulate per row. NO reduction, full VLEN.
+      rvv_insn v_q1_rowdot {   // result[lane] += sum_{i<4}(bit_i? +act_i : -act_i)
+        operand = { io vrf:4int result, in vrf:int activation, in vrf:uint signbits };
+        vector_unit = elen; latency = 1; }
+    Sign-bit analog of NDS.VD4DOTS but weight stays 1-bit (8x less reg
+    traffic) and the multiplier is just a conditional-negate add-tree
+    (cheaper HW than v_w_mul_free_macc). RECOMMENDED.
+  * C. `v_q1_sign_macc` - fused single-row (stays in vec_dot shape). Element-
+    wise; still needs the per-32 vwredsum tail.
+      rvv_insn v_q1_sign_macc {   // result[j] += (bit_j? +act[j] : -act[j])
+        operand = { io vrf:2int result, in vrf:int activation, in vrf:uint signbits };
+        vector_unit = elen; latency = 1; }
+  * B. `v_q1_unpack` - minimal: bits -> +-1 int8 (mirror v_q_tq2_unpack),
+    then reuse existing v_w_mul_free_macc + vwredsum. Smallest new HW.
+- Decision (defaults if user stays away): pick A. Even the TQ1 one-reduce-
+  per-block under-fills a wide register (128/1024 lanes at VLEN=2048); only
+  row-parallel turns those lanes into output rows and removes the reduction.
+  A shares F4's exact Nx1 layout, so base-RVV (F4b) and ACE (this) run on
+  the same repacked weights -> direct vsim A/B shootout.
+- Activation format: keep per-32 Q8_0 for path A (row-parallel applies the 4
+  per-32 scales as 4 vector FMAs, still zero reduction, no accuracy loss).
+  Only paths B/C benefit from coarsening to 1 scale/128 (Q8_K-style, matches
+  Q1_0's block) to get a single reduce like TQ1 - costs a bit of activation
+  precision, needs a perplexity check.
+- Build/prototype order (after A is picked):
+  1. F4a scalar reference `ggml_gemv_q1_0_16x1_q8_0` + repack + kernel-lab
+     test (HW-agnostic oracle; validates the ACE csim too). TDD RED first.
+  2. Write v_q1_rowdot in a new q1.ace (copy unpack.ace header), csim the
+     4-way sign-dot; COPILOT-gen intrinsics.
+  3. kernel-lab gemv using ace_v_q1_rowdot on the Nx1 layout; bit-exact vs
+     F4a reference; rdcycle vs F4b (base RVV) on vsim.
+- Open question for user: does COPILOT allow a 4int (i32) result with the
+  in-lane 4-way reduction v_q1_rowdot needs (v_q_tq2_unpack suggests yes),
+  and reading the sign bit-plane as `vrf:uint`? If not, fall back to C
+  (2int element-wise) + external vwredsum.
+- Key files:
+  - /local/nick/vsim-workspace/vsim-demo/ace-tq1/*.ace (new q1.ace)
+  - kernel-lab/ (ACE gemv prototype + oracle)
+  - ggml/src/ggml-cpu/arch/riscv/{quants.c,repack.cpp} (ifdef ACE variant)
+  - ggml/src/ggml-cpu/CMakeLists.txt:438+ (march / ACE lib link, gated)
+- Dependencies: F4a (oracle) first; A shares F4's repack layout. Gate the
+  ACE build so the portable path still compiles (memory: -mext-zvlsseg
+  precedent for gated extensions).
+
+## F7. zicbop prefetch of next block
+
+- Status: TODO
+- Description: march already includes zicbop. Add prefetch.r for the next
+  block's qs (weights and activations) at the top of the block loop. Cheap;
+  only measurable on hardware (QEMU ignores prefetch hints).
+- Key files:
+  - ggml/src/ggml-cpu/arch/riscv/quants.c (block loop)
+- Dependencies: measure after F1-F3 land to avoid noise.
+
+---
+
+## Measurement setup (fixed for all features)
+
+- Correctness: new test vs *_generic, random tensors, tolerance 0 for
+  integer paths / 1 ulp for float accumulation order changes.
+- Standalone kernel lab: kernel-lab/ builds the Q1_0 kernels outside ggml
+  (make host / make rv64 / make asm). Bit-exact vs generic + double-ref
+  gate + --inject self-test + --bench; run under QEMU at vlen=512/256/128
+  via run-rv64-qemu.sh. Iterate kernels here first, then paste back into
+  ggml/src/ggml-cpu/arch/riscv/quants.c and re-verify with
+  test-quantize-fns.
+- QEMU proxy limits (measured 2026-07-16): qemu-user TCG cost is dominated
+  by per-vector-instruction helper overhead; scalar instructions are ~free
+  and pipeline stalls do not exist. It rewards fewer vector instructions
+  and punishes stall-removal restructures (F2-class) even when they should
+  win on hardware. Use QEMU only for correctness and rough instruction
+  counts; F2/F3-class decisions need vsim rdcycle (ace-tq1 flow) or FPGA.
+- QEMU proxy bench: ./run-rv64-qemu.sh llama-bench -m models/Bonsai-4B-Q1_0.gguf
+  -p 8 -n 4 -r 1 -t 8 (BIN_DIR=build-rv64-noomp/bin; llama-cli is unusable
+  under QEMU - embedded-server startup stalls; use llama-bench/llama-completion).
+- Hardware bench: FPGA flow (libnn-optimizer style), per-kernel ROI if full
+  token is too slow.
+- Models: models/Bonsai-{4B,8B,27B}-Q1_0.gguf, Ternary-Bonsai-4B-Q2_0.gguf
+  (download pending, F5).

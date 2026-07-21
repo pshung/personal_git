@@ -1,35 +1,31 @@
 ---
 name: andesim-llamacpp-hybrid-gaps
-description: "Verified gaps and working facts for running llama.cpp (Bonsai-27B target) on andesim hybrid mode - 2GiB RAM cap, no threads in toolchain, vplat runtime limits, ISA flag matrix"
+description: "llama.cpp on andesim hybrid: WORKING via vlinux runtime + marker-mode ROI on Bonsai-4B (K=51 cycle baselines); remaining caps (2GiB RAM, ELEN=32 patch set for premium) and engine build matrix"
 metadata: 
   node_type: memory
   type: project
-  originSessionId: b082ecbe-e020-4890-8524-5274ddbd4e9d
+  originSessionId: 047fa35b-69c2-4ca4-8695-5347e3e7a746
 ---
 
-Investigated 2026-07-15. Target: run llama.cpp with Bonsai-27B-Q1_0.gguf (3.8 GB, models/ dir) on andesim (/home/nick/work/andesim) hybrid mode. All facts below verified by probes on this machine, not just docs.
+Updated 2026-07-21 (originally 2026-07-15). Target switched Bonsai-27B -> Bonsai-4B-Q1_0 (572 MB): fits the 2 GiB cap, plain qwen3 (no qwen35 rv64 bug), and the full flow is CONFIRMED on it. Canonical recipe doc: /home/nick/work/andesim/docs/llama_roi_howto.md; roadmap: llama.cpp/opt_roadmap.md.
 
-**Hard blockers**
-- Guest RAM max 2 GiB: driver cap driver/cmd_run.cpp:395 (`max_program_mem_bytes()`, shm.cpp:91 kAe350DramWindowBytes); QEMU andes_ae350 refuses >2G ("Cannot model more than 2GB RAM"). Bonsai-27B needs ~4.5 GB (no-mmap weights 3.8G + KV + compute). Lifting it = QEMU machine + vsim RTL memory map + driver change.
-- Bare-metal toolchain /home/nick/nds64le-elf-newlib-v5d (GCC 14.3, riscv64-unknown-elf): libstdc++ built WITHOUT gthreads (std::mutex/std::thread/std::async do not exist - probe-verified compile error), newlib pthread.h has types but no functions. llama.cpp core then fails to COMPILE: ggml/src/ggml-threading.cpp (global std::mutex), src/llama-quant.cpp (std::thread), src/llama-model-loader.cpp (std::async), ggml-cpu.c (pthread_*). Fix = single-thread stubs + small llama.cpp patches; at n_threads=1 only mutex/cond no-ops are ever called.
+**State: WORKING end to end (2026-07-16, re-verified run started 2026-07-21)**
+- `andesim run --mode hybrid --trigger marker --runtime linux --mem-size 2000M --engine vsim:<e> --step-timeout-ms <big> build-rv64-static/bin/llama-completion -- -m models/Bonsai-4B-Q1_0.gguf -no-cnv --prompt "The capital of France is" -n 32 -c 512 -t 1`
+- ROI = MUL_MAT node K counted in ggml_compute_forward (patch in llama.cpp working tree, gated on -DANDESIM_ROI_MUL_MAT_K, HINT NOPs). K=51 = layer 7 V projection (2560x1024, smallest matmul; 4B has 253 MUL_MAT/token = 36x7+1). ANDESIM_ROI_MUL_MAT_N for K..K+N-1.
+- Baselines: ax45mpv_premium 6528953 cycles; fpga_l3 4476168; N=2 (V+K proj) 13040043 on premium. Repeat-stable.
+- Nothing executes after ROI end (no handback); vsim ~9 kHz -> K=51 is ~13 min wall on premium, needs --step-timeout-ms 14400000 on fpga_l3 (900000 not enough). --kanata works (651 MB trace for K=51).
 
-**vplat runtime gaps (runtime/)**
-- _sbrk has NO bounds check (vplat_syscalls.c:364, verified by disasm + live corruption: 8MB alloc silently smashed stack). Default _stack=0x700000 (7MB, andesim.ld:95, overridable -Wl,--defsym,_stack=...). Verified: _stack=0x1FF00000 + 256MB heap works on fast leg.
-- No clock_gettime/_times (only _gettimeofday, host wall clock - works, probe-verified). ggml_time_us uses clock_gettime(CLOCK_MONOTONIC) -> link failure; needs shim.
-- crt0.S calls main with argc=0/argv=NULL (crt0.S:131) - llama-cli style argv impossible; need custom driver against llama.h (examples/simple/simple.cpp uses core API only, no common lib).
-- stdin read returns EOF. HTIF file I/O: host-cwd paths, 1984 B/chunk, measured 26 MB/s on fast leg (3.8GB = ~2.5 min).
-- C++ WORKS: exceptions + global ctors + libstdc++ heap verified on fast leg (g++ -specs=andesim.specs).
+**The old "cannot compile" blocker is GONE**: solved by `--runtime linux` (vlinux) + Andes Linux glibc toolchain (config.env LINUX_TOOLCHAIN=/local/nick/SW_Release/build-ast542/build-toolchain/linux/nds64le-linux-glibc-v5d), static link. The bare-metal newlib no-gthreads facts below only apply to the vplat runtime path. llama.cpp needs common/log.cpp synchronous-fallback patch (worker thread creation fails on vlinux; in working tree, uncommitted).
 
-**ISA matching (engine vsim:ax45mpv_premium = VLEN512 DLEN512 ELEN32)**
-- Hybrid QEMU leg auto-synced to `-cpu andes-ax45mpv,vlen=512`, NO zfh/zvfh. RTL describe lists no zfh/zvfh either. ggml build must set GGML_RV_ZFH=OFF GGML_RV_ZVFH=OFF.
-- ELEN=32: no 64-bit vector elements. ggml repack.cpp uses __riscv_vsseg4e64 -> illegal; set GGML_CPU_REPACK=OFF.
-- Andes gcc gates segment intrinsics behind -mext-zvlsseg (ELF toolchain too, --target-help verified); ggml quants.c uses __riscv_vlseg2e32. See [[andes-toolchain-rvv-segment-flag]].
-- GOTCHA: `run --mode fast` standalone pins `-cpu andes-ax46mpv` (engine_registry.cpp:71) which has Zce NOT Zcd -> c.fld/c.fsdsp illegal; toolchain default multilib libc contains Zcd, so any FP printf crashes (probe-verified, mtval 0xa43e). Workaround: `-- -cpu andes-ax45mpv,vlen=512`. Hybrid leg unaffected.
+**llama.cpp working-tree mods (uncommitted, needed for this flow)**: ggml-cpu.c ROI marker patch; ggml-cpu/CMakeLists.txt GGML_RV_MARCH_LETTERS/GGML_RV_ZC_EXTRA vars; common/log.cpp sync logging.
 
-**Hybrid semantics**
-- Nothing executes after ROI end marker (no handback leg) - print results INSIDE the ROI (verified: printf inside ROI works on vsim leg) or use --verify.
-- Big images OK: 3.6MB-image fixture passed hybrid; bytes spanning the DLM overlay window 0x200000-0x207fff read back correctly in-ROI on RTL (feared shadow did not materialize).
-- vsim speed 5-50 kHz (docs/MRD.md:150, measured 8867 Hz in quickstart). Full token on 27B (~1-3G insns) = days -> ROI must be one kernel/op. Tiny models (~15M param) can do a full-token ROI.
-- q1_0 (GGML_TYPE_Q1_0=41) is upstream in this llama.cpp tree with an optimized riscv RVV dot kernel (commit 68380ae11).
+**Engine build matrix (build-rv64-static)**
+- Common: -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_RV_ZFH=OFF -DGGML_RV_ZVFH=OFF -DGGML_CPU_REPACK=OFF (stock repack uses vsseg4e64), C/CXX flags: -mext-zvlsseg -DANDESIM_ROI_MUL_MAT_K=51 -I <andesim>/build/runtime/include
+- vsim:ax46mpv_fpga_l3 (ELEN=64 VLEN=1024, real L3): pristine ggml + -DGGML_RV_MARCH_LETTERS=g -DGGML_RV_ZC_EXTRA=zca_zcb_zcmp_zcmt (has Zca/Zcmp/Zcmt NOT Zcd; default 'gc' march emits illegal c.fsdsp). CURRENT build-rv64-static config.
+- vsim:ax45mpv_premium (ELEN=32 VLEN=512, no zfh/zvfh): default march BUT needs 3 e64-removal ggml patches (llama_roi_howto.md section 4: vec.cpp f16/bf16 `target("arch=rv64gc")` attr; cvar/softmax f32-reduce rewrite; quantize_row_q8_0/1 -> _ref). NOT in tree today - re-apply before premium builds. Premium FP datapath also rejects LMUL=8 float ops (int m8 fine).
+- Engines are external prebuilts now: QEMU_BIN_DIR=/home/nick/work/qemu_andesim/build/qemu, VSIM_BIN_DIR=/home/nick/work/vsim_andesim/build (sim_ax45mpv_premium, sim_ax46mpv_fpga_l3, ...).
 
-**Recommended staging**: (0) port kit: pthread/gthread stubs + clock_gettime shim + custom main + Generic cmake toolchain file (LLAMA_BUILD_COMMON=OFF, GGML_OPENMP=OFF, find_package(Threads) needs CMAKE_THREAD_LIBS_INIT="" hint), prove on small model fast-leg; (1) Bonsai-27B kernel-ROI today within 2GB via one-layer micro-driver with extracted tensors; (2) andesim >2GB DRAM feature for full-model residency.
+**Still-true hard caps**
+- Guest RAM max 2 GiB (QEMU andes_ae350 + driver cap). 27B (~4.5 GB) blocked on this; 4B+KV fits in 2000M.
+- Bare-metal toolchain /home/nick/nds64le-elf-newlib-v5d has no gthreads/pthread funcs (vplat path only). vplat: _sbrk unbounded, no clock_gettime, argc=0, stdin EOF, HTIF ~26 MB/s. See [[andes-toolchain-rvv-segment-flag]] for -mext-zvlsseg.
+- Hybrid QEMU leg is engine-synced (real elen enforced); fast-mode standalone pins ax46mpv (Zce no Zcd) - use `-- -cpu andes-ax45mpv,vlen=512` there.
