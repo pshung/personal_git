@@ -1,0 +1,79 @@
+// Q1_0 rdcycle shootout, ace-tq1 style: tiny data, one measured call per
+// kernel, print cycles. Correctness already proven in llama.cpp/kernel-lab
+// (QEMU, all VLENs); here only a cheap smoke check (kernel2 vs kernel3).
+//
+//   [2] q1_0_dot_vl256  = ORIGINAL production kernel, called once per row
+//   [3] q1_0_gemv_64x1  = OPTIMIZED row-parallel kernel, one call = all rows
+//
+// Shape: nr=64 rows x n=512 cols (small on purpose - RTL sim ~4 kHz; the
+// per-row/per-block cycle ratio is what transfers to the full 2560x1024).
+#include "q1_0.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+static unsigned long rdcycle(void) {
+    unsigned long r;
+    asm volatile("fence rw, rw" ::: "memory");
+    asm volatile("csrr %0, mcycle" : "=r"(r));
+    return r;
+}
+
+#ifndef Q1_VLEN
+#define Q1_VLEN 512
+#endif
+
+#define GN  512                  // K (columns)
+#define GNR 64                   // rows = one brick group
+#define GNB (GN / QK1_0)         // blocks per row
+
+static block_q1_0      x[GNR * GNB];
+static block_q1_0_64x1 bricks[GNB];
+static block_q8_0      y[GN / QK8_0];
+static float out2[GNR], out3[GNR];
+
+// cheap deterministic bytes; all scales = fp16 1.0 (cycle count is
+// data-independent, so fancy random data buys nothing on the sim)
+static uint32_t lcg = 12345;
+static uint8_t next_byte(void) { lcg = lcg * 1103515245u + 12345u; return (uint8_t)(lcg >> 16); }
+
+int main(void) {
+    iprintf("q1_0 shootout: nr=%d n=%d (gemv built for VLEN=%d)\n", GNR, GN, Q1_VLEN);
+
+    for (int i = 0; i < GNR * GNB; ++i) {
+        x[i].d = 0x3C00; // 1.0
+        for (int j = 0; j < QK1_0 / 8; ++j) x[i].qs[j] = next_byte();
+    }
+    for (int i = 0; i < GN / QK8_0; ++i) {
+        y[i].d = 0x3C00;
+        for (int j = 0; j < QK8_0; ++j) y[i].qs[j] = (int8_t)(next_byte() % 255 - 127);
+    }
+    q1_0_repack_64x1(x, bricks, GNR, GN);
+
+    // measure: rep0 = cold caches, rep1 = warm
+    for (int rep = 0; rep < 2; ++rep) {
+        const unsigned long t0 = rdcycle();
+        for (int r = 0; r < GNR; ++r) {
+            q1_0_dot_vl256(GN, &out2[r], x + (size_t)r * GNB, y);
+        }
+        const unsigned long t1 = rdcycle();
+        q1_0_gemv_64x1(GN, out3, bricks, y, GNR);
+        const unsigned long t2 = rdcycle();
+
+        const unsigned long c2 = t1 - t0, c3 = t2 - t1;
+        iprintf("rep%d: [2] vl256 x%d rows: %lu cyc (%lu/row) | [3] gemv: %lu cyc (%lu/row) | speedup %lu.%02lux\n",
+                rep, GNR, c2, c2 / GNR, c3, c3 / GNR, c2 / c3, (c2 % c3) * 100ul / c3);
+    }
+
+    // smoke check: same answers (int part exact: scales are 1.0, sums < 2^15)
+    int failed = 0;
+    for (int r = 0; r < GNR; ++r) {
+        if (fabsf(out2[r] - out3[r]) > 0.5f) {
+            iprintf("FAIL row=%d [2]=%d [3]=%d\n", r, (int)out2[r], (int)out3[r]);
+            failed++;
+        }
+    }
+    iprintf(failed ? "FAILED (%d)\n" : "ALL PASS\n", failed);
+    return failed;
+}
