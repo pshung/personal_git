@@ -1,0 +1,151 @@
+// Baremetal Q1_0 kernel check + rdcycle shootout on sim_ax45mpv_premium
+// (VLEN=512, ELEN=32, no zfh/zvfh). q1_0.c / q1_0.h are copies of
+// /home/nick/work/llama.cpp/kernel-lab/ - edit there first, then re-copy.
+// RTL sim runs ~6 kHz: keep the workload tiny.
+//
+// A/B measured on the same repacked data, nr=64 rows x n=1024 cols (the K=51
+// V-projection block shape is 2560x1024; one 64-row strip of it):
+//   A = production path: per-row ggml_vec_dot_q1_0_q8_0_vl256 loop
+//   B = F4b row-parallel gemv_q1_0_64x1_q8_0 (dispatcher -> vl512 here)
+// Exit code = number of failed checks (0 = pass).
+#include "q1_0.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+#include <riscv_vector.h>
+
+static unsigned long rdcycle(void) {
+    unsigned long r;
+    asm volatile("csrr %0, mcycle" : "=r"(r));
+    return r;
+}
+
+// ---- data ------------------------------------------------------------------
+
+#define GN  1024                 // K (columns)
+#define GNR 64                   // rows = one brick group
+#define GNB (GN / QK1_0)         // 8 blocks per row
+
+static block_q1_0      x[GNR * GNB];
+static block_q8_0      y[GN / QK8_0];
+static block_q1_0_64x1 bricks[GNB];
+static float out_a[GNR], out_b[GNR];
+
+// small set for the scalar-oracle bit-exact check (scalar code is slow on RTL)
+#define SN  128
+#define SNB (SN / QK1_0)
+static block_q1_0      sx[GNR * SNB];
+static block_q8_0      sy[SN / QK8_0];
+static block_q1_0_64x1 sbricks[SNB];
+static float s_ref[GNR], s_got[GNR];
+
+static uint64_t rng_state = 0x243F6A8885A308D3ull;
+
+static uint64_t rng_next(void) {
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 7;
+    rng_state ^= rng_state << 17;
+    return rng_state;
+}
+
+static uint16_t rand_fp16(float lo, float hi) {
+    const float v = lo + (hi - lo) * ((rng_next() >> 11) * 0x1.0p-53f);
+    return lab_fp32_to_fp16(v);
+}
+
+static void fill_random(block_q1_0 * bx, int nbx, block_q8_0 * by, int nby) {
+    for (int i = 0; i < nbx; ++i) {
+        bx[i].d = rand_fp16(-2.0f, 2.0f);
+        for (int j = 0; j < QK1_0 / 8; ++j) {
+            bx[i].qs[j] = (uint8_t)rng_next();
+        }
+    }
+    for (int i = 0; i < nby; ++i) {
+        by[i].d = rand_fp16(0.001f, 1.0f);
+        for (int j = 0; j < QK8_0; ++j) {
+            by[i].qs[j] = (int8_t)((int)(rng_next() % 255) - 127); // [-127,127]
+        }
+    }
+}
+
+static uint32_t f32_bits(float f) {
+    uint32_t w;
+    memcpy(&w, &f, sizeof(w));
+    return w;
+}
+
+int main(void) {
+    printf("q1_0 rdcycle shootout: VLEN=%lu\n", (unsigned long)(__riscv_vlenb() * 8));
+
+    int failed = 0;
+
+    if (lab_fp16_to_fp32(0x3C00) != 1.0f || lab_fp16_to_fp32(0xC000) != -2.0f ||
+        lab_fp32_to_fp16(1.0f) != 0x3C00) {
+        printf("FAIL fp16 canary\n");
+        return 1;
+    }
+
+    // ---- correctness 1 (F4a oracle, small): repack+scalar gemv bit-exact ---
+    fill_random(sx, GNR * SNB, sy, SN / QK8_0);
+    repack_q1_0_to_q1_0_64x1(sx, sbricks, GNR, SN);
+    gemv_q1_0_64x1_q8_0_generic(SN, s_got, sbricks, sy, GNR);
+    for (int r = 0; r < GNR; ++r) {
+        ggml_vec_dot_q1_0_q8_0_generic(SN, &s_ref[r], 0, sx + (size_t)r * SNB, 0, sy, 0, 1);
+        if (f32_bits(s_ref[r]) != f32_bits(s_got[r])) {
+            if (failed < 3) {
+                printf("FAIL oracle row=%d ref=0x%08x got=0x%08x\n",
+                       r, (unsigned)f32_bits(s_ref[r]), (unsigned)f32_bits(s_got[r]));
+            }
+            failed++;
+        }
+    }
+    printf("oracle bit-exact (n=%d nr=%d): %s\n", SN, GNR, failed ? "FAIL" : "ok");
+
+    // ---- A/B data ----------------------------------------------------------
+    fill_random(x, GNR * GNB, y, GN / QK8_0);
+    repack_q1_0_to_q1_0_64x1(x, bricks, GNR, GN);
+
+    // warm-up (caches, first-touch) + correctness 2: B vs A, fma-fusion tol
+    for (int r = 0; r < GNR; ++r) {
+        ggml_vec_dot_q1_0_q8_0_vl256(GN, &out_a[r], x + (size_t)r * GNB, y);
+    }
+    gemv_q1_0_64x1_q8_0(GN, out_b, bricks, y, GNR);
+    for (int r = 0; r < GNR; ++r) {
+        const float d = fabsf(out_a[r] - out_b[r]);
+        if (d > 1e-3f * (fabsf(out_a[r]) + fabsf(out_b[r]) + 1.0f)) {
+            if (failed < 6) {
+                printf("FAIL a/b row=%d a=%f b=%f\n", r, (double)out_a[r], (double)out_b[r]);
+            }
+            failed++;
+        }
+    }
+    printf("a/b results match (n=%d nr=%d): %s\n", GN, GNR, failed ? "FAIL" : "ok");
+
+    // ---- rdcycle, 2 reps each, warm ---------------------------------------
+    for (int rep = 0; rep < 2; ++rep) {
+        const unsigned long t0 = rdcycle();
+        for (int r = 0; r < GNR; ++r) {
+            ggml_vec_dot_q1_0_q8_0_vl256(GN, &out_a[r], x + (size_t)r * GNB, y);
+        }
+        const unsigned long t1 = rdcycle();
+        gemv_q1_0_64x1_q8_0(GN, out_b, bricks, y, GNR);
+        const unsigned long t2 = rdcycle();
+
+        const unsigned long ca = t1 - t0, cb = t2 - t1;
+        printf("rep%d: A per-row vl256 %lu cyc (%lu/row) | B gemv_64x1 %lu cyc (%lu/row) | B/A %lu%%\n",
+               rep, ca, ca / GNR, cb, cb / GNR, cb * 100ul / ca);
+    }
+
+    // repack cost, for context (one-time per model load in real life)
+    {
+        const unsigned long t0 = rdcycle();
+        repack_q1_0_to_q1_0_64x1(x, bricks, GNR, GN);
+        const unsigned long t1 = rdcycle();
+        printf("repack %d rows x %d cols: %lu cyc (one-time)\n", GNR, GN, t1 - t0);
+    }
+
+    printf(failed ? "FAILED (%d)\n" : "ALL PASS\n", failed);
+    return failed;
+}

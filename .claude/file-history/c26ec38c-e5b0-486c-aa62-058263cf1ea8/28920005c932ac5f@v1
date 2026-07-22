@@ -1,0 +1,165 @@
+// Baremetal correctness check for the Q1_0 RVV kernels on sim_ax45mpv_premium
+// (VLEN=512, no zfh/zvfh). q1_0.c / q1_0.h are copies of
+// /home/nick/work/llama.cpp/kernel-lab/ - edit there first, then re-copy.
+// Slim harness: no argv (crt0 passes none), tiny sizes (RTL sim ~6 kHz).
+// Exit code = number of failed checks (0 = pass).
+#include "q1_0.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+#include <riscv_vector.h>
+
+#define NORM_ERR_MAX 1e-4
+#define N_MAX 512
+
+static block_q1_0 x[N_MAX / QK1_0];
+static block_q8_0 y[N_MAX / QK8_0];
+
+static uint64_t rng_state = 0x243F6A8885A308D3ull;
+
+static uint64_t rng_next(void) {
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 7;
+    rng_state ^= rng_state << 17;
+    return rng_state;
+}
+
+static uint16_t rand_fp16(float lo, float hi) {
+    const float v = lo + (hi - lo) * ((rng_next() >> 11) * 0x1.0p-53f);
+    return lab_fp32_to_fp16(v);
+}
+
+static void fill_random(int nbx, int nby) {
+    for (int i = 0; i < nbx; ++i) {
+        x[i].d = rand_fp16(-2.0f, 2.0f);
+        for (int j = 0; j < QK1_0 / 8; ++j) {
+            x[i].qs[j] = (uint8_t)rng_next();
+        }
+    }
+    for (int i = 0; i < nby; ++i) {
+        y[i].d = rand_fp16(0.001f, 1.0f);
+        for (int j = 0; j < QK8_0; ++j) {
+            y[i].qs[j] = (int8_t)((int)(rng_next() % 255) - 127); // [-127,127], never -128
+        }
+    }
+}
+
+static double ref_dot_double(int n, double * sum_abs) {
+    double sum = 0.0, sabs = 0.0;
+    for (int i = 0; i < n / QK1_0; ++i) {
+        const double d0 = (double)lab_fp16_to_fp32(x[i].d);
+        for (int k = 0; k < 4; ++k) {
+            const block_q8_0 * yb = &y[i * 4 + k];
+            const double d1 = (double)lab_fp16_to_fp32(yb->d);
+            long sumi = 0;
+            for (int j = 0; j < QK8_0; ++j) {
+                const int bit = (x[i].qs[k * 4 + j / 8] >> (j % 8)) & 1;
+                sumi += bit ? yb->qs[j] : -yb->qs[j];
+            }
+            sum  += d0 * d1 * (double)sumi;
+            sabs += fabs(d0 * d1 * (double)sumi);
+        }
+    }
+    *sum_abs = sabs;
+    return sum;
+}
+
+static uint32_t f32_bits(float f) {
+    uint32_t w;
+    memcpy(&w, &f, sizeof(w));
+    return w;
+}
+
+typedef void (*vec4_t)(int, float *, const void *, const void *);
+
+static void gen4(int n, float * s, const void * vx, const void * vy) {
+    ggml_vec_dot_q1_0_q8_0_generic(n, s, 0, vx, 0, vy, 0, 1);
+}
+static void disp4(int n, float * s, const void * vx, const void * vy) {
+    ggml_vec_dot_q1_0_q8_0(n, s, 0, vx, 0, vy, 0, 1);
+}
+
+static int check_case(int n, const char * name) {
+    float ref;
+    gen4(n, &ref, x, y);
+    double sabs = 0.0;
+    const double dref = ref_dot_double(n, &sabs);
+    const double norm = sabs > 1e-30 ? sabs : 1e-30;
+
+    static const struct { const char * nm; vec4_t fn; int bitexact; } ks[] = {
+        {"vl256",  ggml_vec_dot_q1_0_q8_0_vl256,  1},
+        {"vl128",  ggml_vec_dot_q1_0_q8_0_vl128,  1},
+        {"vl512",  ggml_vec_dot_q1_0_q8_0_vl512,  0},
+        {"vl512w", ggml_vec_dot_q1_0_q8_0_vl512w, 0},
+        {"disp",   disp4,                         0},
+    };
+
+    int failed = 0;
+    for (unsigned i = 0; i < sizeof(ks) / sizeof(ks[0]); ++i) {
+        float got;
+        ks[i].fn(n, &got, x, y);
+        if (ks[i].bitexact && f32_bits(got) != f32_bits(ref)) {
+            printf("FAIL %s %s n=%d bits ref=0x%08x got=0x%08x\n",
+                   ks[i].nm, name, n, (unsigned)f32_bits(ref), (unsigned)f32_bits(got));
+            failed++;
+        }
+        const double err = fabs((double)got - dref) / norm;
+        if (err > NORM_ERR_MAX) {
+            printf("FAIL %s %s n=%d norm_err=%g\n", ks[i].nm, name, n, err);
+            failed++;
+        }
+    }
+    return failed;
+}
+
+int main(void) {
+    printf("q1_0 rvv check: VLEN=%lu\n", (unsigned long)(__riscv_vlenb() * 8));
+
+    if (lab_fp16_to_fp32(0x3C00) != 1.0f || lab_fp16_to_fp32(0xC000) != -2.0f ||
+        lab_fp32_to_fp16(1.0f) != 0x3C00) {
+        printf("FAIL fp16 canary\n");
+        return 1;
+    }
+
+    int failed = 0;
+    const int sizes[2] = {128, 512};
+    for (int si = 0; si < 2; ++si) {
+        const int n = sizes[si];
+        const int nbx = n / QK1_0, nby = n / QK8_0;
+
+        for (int t = 0; t < 3; ++t) {
+            fill_random(nbx, nby);
+            failed += check_case(n, "random");
+        }
+        fill_random(nbx, nby);
+        for (int i = 0; i < nbx; ++i) memset(x[i].qs, 0x00, QK1_0 / 8);
+        failed += check_case(n, "bits0");
+        for (int i = 0; i < nbx; ++i) memset(x[i].qs, 0xFF, QK1_0 / 8);
+        failed += check_case(n, "bits1");
+        fill_random(nbx, nby);
+        for (int i = 0; i < nbx; ++i) x[i].d = 0;
+        failed += check_case(n, "d0=0");
+        printf("n=%d: 6 cases done\n", n);
+    }
+
+    // inject: flip one weight bit through the dispatcher, result must change
+    fill_random(N_MAX / QK1_0, N_MAX / QK8_0);
+    x[1].d = lab_fp32_to_fp16(1.0f);
+    y[1 * 4 + 2].d = lab_fp32_to_fp16(1.0f);
+    y[1 * 4 + 2].qs[13] = 100;
+    float base, after;
+    disp4(N_MAX, &base, x, y);
+    x[1].qs[2 * 4 + 13 / 8] ^= (uint8_t)(1u << (13 % 8));
+    disp4(N_MAX, &after, x, y);
+    if (f32_bits(base) == f32_bits(after)) {
+        printf("FAIL inject not detected\n");
+        failed++;
+    } else {
+        printf("inject ok (delta=%f)\n", (double)(after - base));
+    }
+
+    printf(failed ? "FAILED (%d)\n" : "ALL PASS\n", failed);
+    return failed;
+}

@@ -1,0 +1,401 @@
+// Correctness harness for the Q1_0 x Q8_0 vec_dot kernels.
+//
+// Two gates per case:
+// - bit-exact vs the scalar reference, for kernels that do the same float ops
+//   in the same order (generic, vl256, vl128). Build uses -ffp-contract=off
+//   so neither side gets FMA-fused.
+// - normalized error vs a double-precision reference < NORM_ERR_MAX, for
+//   kernels that reorder the float accumulation (none today; this is the
+//   gate the F4 row-parallel repack kernels will be judged by).
+//
+// Data domain matches ggml: q8 quants are in [-127,127] (ggml Q8_0 never
+// emits -128; vneg on int8 -128 wraps and would falsely diverge from the
+// scalar reference, which negates in 32-bit).
+//
+// --inject: flips one weight bit after taking a baseline and requires the
+// dispatcher result to change. Proves the harness can detect a broken kernel.
+//
+// This harness is correctness-only. Speed is measured on vsim/FPGA (rdcycle,
+// see vsim-demo/q1_0) - QEMU timing is misleading by design.
+
+#include "q1_0.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(__riscv_v_intrinsic)
+#include <riscv_vector.h>
+#endif
+
+#define NORM_ERR_MAX 1e-4
+
+static uint64_t rng_state = 0x243F6A8885A308D3ull;
+
+static uint64_t rng_next(void) {
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 7;
+    rng_state ^= rng_state << 17;
+    return rng_state;
+}
+
+static uint16_t rand_fp16(float lo, float hi) {
+    const float v = lo + (hi - lo) * ((rng_next() >> 11) * 0x1.0p-53f);
+    return lab_fp32_to_fp16(v);
+}
+
+static void fill_random(block_q1_0 * x, int nbx, block_q8_0 * y, int nby) {
+    for (int i = 0; i < nbx; ++i) {
+        x[i].d = rand_fp16(-2.0f, 2.0f);
+        for (int j = 0; j < QK1_0 / 8; ++j) {
+            x[i].qs[j] = (uint8_t)rng_next();
+        }
+    }
+    for (int i = 0; i < nby; ++i) {
+        y[i].d = rand_fp16(0.001f, 1.0f);
+        for (int j = 0; j < QK8_0; ++j) {
+            y[i].qs[j] = (int8_t)((int)(rng_next() % 255) - 127); // [-127,127]
+        }
+    }
+}
+
+// reference dot in double, plus sum of |terms| for error normalization
+static double ref_dot_double(const block_q1_0 * x, const block_q8_0 * y, int n, double * sum_abs) {
+    double sum = 0.0, sabs = 0.0;
+    for (int i = 0; i < n / QK1_0; ++i) {
+        const double d0 = (double)lab_fp16_to_fp32(x[i].d);
+        for (int k = 0; k < 4; ++k) {
+            const block_q8_0 * yb = &y[i * 4 + k];
+            const double d1 = (double)lab_fp16_to_fp32(yb->d);
+            long sumi = 0;
+            for (int j = 0; j < QK8_0; ++j) {
+                const int bit = (x[i].qs[k * 4 + j / 8] >> (j % 8)) & 1;
+                sumi += bit ? yb->qs[j] : -yb->qs[j];
+            }
+            sum  += d0 * d1 * (double)sumi;
+            sabs += fabs(d0 * d1 * (double)sumi);
+        }
+    }
+    *sum_abs = sabs;
+    return sum;
+}
+
+static uint32_t f32_bits(float f) {
+    uint32_t w;
+    memcpy(&w, &f, sizeof(w));
+    return w;
+}
+
+// ---- kernels under test ----------------------------------------------------
+
+typedef void (*vec_dot8_t)(int, float *, size_t, const void *, size_t, const void *, size_t, int);
+
+#if defined(__riscv_v_intrinsic)
+static void vl256_as8(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc) {
+    (void)bs; (void)bx; (void)by; (void)nrc;
+    ggml_vec_dot_q1_0_q8_0_vl256(n, s, vx, vy);
+}
+static void vl128_as8(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc) {
+    (void)bs; (void)bx; (void)by; (void)nrc;
+    ggml_vec_dot_q1_0_q8_0_vl128(n, s, vx, vy);
+}
+#endif
+
+struct kernel_ent {
+    const char * name;
+    vec_dot8_t   fn;
+    int          bitexact;   // 1: must match scalar reference bit-for-bit
+    size_t       min_vlen;   // runtime VLEN (bits) required, 0 = always
+    int          is_dispatcher;
+};
+
+static struct kernel_ent kernels[8];
+static int n_kernels = 0;
+
+static size_t runtime_vlen(void) {
+#if defined(__riscv_v_intrinsic)
+    return __riscv_vlenb() * 8;
+#else
+    return 0;
+#endif
+}
+
+static void init_kernels(void) {
+    // every path does the same float ops in the same order as the scalar
+    // reference, so the dispatcher is bit-exact at every VLEN
+    kernels[n_kernels++] = (struct kernel_ent){"dispatch", ggml_vec_dot_q1_0_q8_0, 1, 0, 1};
+#if defined(__riscv_v_intrinsic)
+    kernels[n_kernels++] = (struct kernel_ent){"vl256", vl256_as8, 1, 256, 0};
+    kernels[n_kernels++] = (struct kernel_ent){"vl128", vl128_as8, 1, 128, 0};
+#endif
+}
+
+// ---- correctness -----------------------------------------------------------
+
+static int run_case(const block_q1_0 * x, const block_q8_0 * y, int n,
+                    const char * name, double * max_norm_err, uint32_t * checksum) {
+    float ref = INFINITY;
+    ggml_vec_dot_q1_0_q8_0_generic(n, &ref, 0, x, 0, y, 0, 1);
+
+    double sum_abs = 0.0;
+    const double dref = ref_dot_double(x, y, n, &sum_abs);
+    const double norm = sum_abs > 1e-30 ? sum_abs : 1e-30;
+
+    const size_t vlen = runtime_vlen();
+    int failed = 0;
+
+    for (int ki = 0; ki < n_kernels; ++ki) {
+        const struct kernel_ent * k = &kernels[ki];
+        if (vlen < k->min_vlen) {
+            continue;
+        }
+        float got = INFINITY;
+        k->fn(n, &got, 0, x, 0, y, 0, 1);
+        if (k->is_dispatcher) {
+            *checksum ^= f32_bits(got);
+        }
+
+        if (k->bitexact && f32_bits(ref) != f32_bits(got)) {
+            printf("FAIL %-8s %-12s n=%5d bit-exact: ref=%.9g (0x%08x) got=%.9g (0x%08x)\n",
+                   k->name, name, n, (double)ref, f32_bits(ref), (double)got, f32_bits(got));
+            failed = 1;
+        }
+        const double norm_err = fabs((double)got - dref) / norm;
+        if (norm_err > *max_norm_err) {
+            *max_norm_err = norm_err;
+        }
+        if (norm_err > NORM_ERR_MAX) {
+            printf("FAIL %-8s %-12s n=%5d norm_err=%.3g vs double ref %.9g (got %.9g)\n",
+                   k->name, name, n, norm_err, dref, (double)got);
+            failed = 1;
+        }
+    }
+    return failed;
+}
+
+static int test_size(int n, int trials, uint32_t * checksum) {
+    const int nbx = n / QK1_0;
+    const int nby = n / QK8_0;
+    block_q1_0 * x = malloc((size_t)nbx * sizeof(block_q1_0));
+    block_q8_0 * y = malloc((size_t)nby * sizeof(block_q8_0));
+
+    int failed = 0;
+    double max_norm_err = 0.0;
+
+    for (int t = 0; t < trials; ++t) {
+        fill_random(x, nbx, y, nby);
+        failed += run_case(x, y, n, "random", &max_norm_err, checksum);
+    }
+
+    // edge cases
+    fill_random(x, nbx, y, nby);
+    for (int i = 0; i < nbx; ++i) memset(x[i].qs, 0x00, QK1_0 / 8);
+    failed += run_case(x, y, n, "bits=0x00", &max_norm_err, checksum);
+
+    for (int i = 0; i < nbx; ++i) memset(x[i].qs, 0xFF, QK1_0 / 8);
+    failed += run_case(x, y, n, "bits=0xFF", &max_norm_err, checksum);
+
+    fill_random(x, nbx, y, nby);
+    for (int i = 0; i < nby; ++i) memset(y[i].qs, 127, QK8_0);
+    failed += run_case(x, y, n, "q8=+127", &max_norm_err, checksum);
+
+    for (int i = 0; i < nby; ++i) memset(y[i].qs, -127, QK8_0);
+    failed += run_case(x, y, n, "q8=-127", &max_norm_err, checksum);
+
+    fill_random(x, nbx, y, nby);
+    for (int i = 0; i < nbx; ++i) x[i].d = 0;
+    failed += run_case(x, y, n, "d0=0", &max_norm_err, checksum);
+
+    printf("n=%5d: %3d cases x %d kernels, %s, max_norm_err=%.3g\n",
+           n, trials + 5, n_kernels, failed ? "FAIL" : "ok", max_norm_err);
+    free(x);
+    free(y);
+    return failed;
+}
+
+// ---- F4a/F4b: row-parallel repack + gemv -----------------------------------
+//
+// Gate 1 (F4a, bit-exact): repack + gemv_..._generic must reproduce, bit for
+// bit, what the per-row scalar vec_dot computes on the original row-major
+// weights (the scalar gemv keeps the reference float-op order).
+// Gate 2 (F4b, double-ref): the RVV gemv fuses mul+add (vfmacc), so per output
+// row: |got - double_ref| / sum|terms| < NORM_ERR_MAX.
+
+typedef void (*gemv_t)(int, float *, const void *, const void *, int);
+
+struct gemv_ent {
+    const char * name;
+    gemv_t       fn;
+    int          bitexact;   // 1: must equal the per-row vec_dot reference bit-for-bit
+    size_t       min_vlen;
+};
+
+static struct gemv_ent gemv_kernels[4];
+static int n_gemv = 0;
+
+static void init_gemv_kernels(void) {
+    const size_t vlen = runtime_vlen();
+    gemv_kernels[n_gemv++] = (struct gemv_ent){"gemv_ref",  gemv_q1_0_64x1_q8_0_generic, 1, 0};
+    // dispatcher routes to the reordering RVV kernels once VLEN >= 512
+    gemv_kernels[n_gemv++] = (struct gemv_ent){"gemv_dsp",  gemv_q1_0_64x1_q8_0, vlen < 512, 0};
+#if defined(__riscv_v_intrinsic)
+    gemv_kernels[n_gemv++] = (struct gemv_ent){"gemv_512",  gemv_q1_0_64x1_q8_0_vl512,  0, 512};
+    gemv_kernels[n_gemv++] = (struct gemv_ent){"gemv_1024", gemv_q1_0_64x1_q8_0_vl1024, 0, 1024};
+#endif
+}
+
+static int run_gemv_case(const block_q1_0 * x, const block_q8_0 * y, int n, int nr,
+                         const char * name, double * max_norm_err) {
+    const int nb = n / QK1_0;
+    const size_t vlen = runtime_vlen();
+    int failed = 0;
+    int nprint = 0;
+
+    // per-row references on the ORIGINAL row-major data
+    float  * expect = malloc((size_t)nr * sizeof(float));
+    double * dref   = malloc((size_t)nr * sizeof(double));
+    double * norm   = malloc((size_t)nr * sizeof(double));
+    for (int r = 0; r < nr; ++r) {
+        ggml_vec_dot_q1_0_q8_0_generic(n, &expect[r], 0, x + (size_t)r * nb, 0, y, 0, 1);
+        double sabs = 0.0;
+        dref[r] = ref_dot_double(x + (size_t)r * nb, y, n, &sabs);
+        norm[r] = sabs > 1e-30 ? sabs : 1e-30;
+    }
+
+    block_q1_0_64x1 * bricks = malloc((size_t)(nr / Q1_NX1_N) * nb * sizeof(block_q1_0_64x1));
+    repack_q1_0_to_q1_0_64x1(x, bricks, nr, n);
+
+    float * got = malloc((size_t)nr * sizeof(float));
+    for (int ki = 0; ki < n_gemv; ++ki) {
+        const struct gemv_ent * k = &gemv_kernels[ki];
+        if (vlen < k->min_vlen) {
+            continue;
+        }
+        memset(got, 0xAA, (size_t)nr * sizeof(float));
+        k->fn(n, got, bricks, y, nr);
+
+        for (int r = 0; r < nr; ++r) {
+            if (k->bitexact && f32_bits(expect[r]) != f32_bits(got[r])) {
+                if (nprint++ < 5) {
+                    printf("FAIL %-9s %-10s n=%5d nr=%3d row=%3d bit-exact: ref=%.9g (0x%08x) got=%.9g (0x%08x)\n",
+                           k->name, name, n, nr, r, (double)expect[r], f32_bits(expect[r]), (double)got[r], f32_bits(got[r]));
+                }
+                failed = 1;
+            }
+            const double norm_err = fabs((double)got[r] - dref[r]) / norm[r];
+            if (norm_err > *max_norm_err) {
+                *max_norm_err = norm_err;
+            }
+            if (norm_err > NORM_ERR_MAX) {
+                if (nprint++ < 5) {
+                    printf("FAIL %-9s %-10s n=%5d nr=%3d row=%3d norm_err=%.3g vs double ref %.9g (got %.9g)\n",
+                           k->name, name, n, nr, r, norm_err, dref[r], (double)got[r]);
+                }
+                failed = 1;
+            }
+        }
+    }
+
+    free(expect); free(dref); free(norm); free(bricks); free(got);
+    return failed;
+}
+
+static int test_repack_gemv(void) {
+    static const struct { int n, nr; } shapes[] = {
+        {128, 64}, {512, 128}, {1024, 64}, {256, 192},
+    };
+    const int trials = 10;
+    int failed = 0;
+    double max_norm_err = 0.0;
+
+    for (size_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); ++si) {
+        const int n = shapes[si].n, nr = shapes[si].nr;
+        const int nbx = nr * (n / QK1_0);
+        const int nby = n / QK8_0;
+        block_q1_0 * x = malloc((size_t)nbx * sizeof(block_q1_0));
+        block_q8_0 * y = malloc((size_t)nby * sizeof(block_q8_0));
+
+        int sf = 0;
+        for (int t = 0; t < trials; ++t) {
+            fill_random(x, nbx, y, nby);
+            sf += run_gemv_case(x, y, n, nr, "random", &max_norm_err);
+        }
+        // edges: all-plus / all-minus sign planes
+        fill_random(x, nbx, y, nby);
+        for (int i = 0; i < nbx; ++i) memset(x[i].qs, 0x00, QK1_0 / 8);
+        sf += run_gemv_case(x, y, n, nr, "bits=0x00", &max_norm_err);
+        for (int i = 0; i < nbx; ++i) memset(x[i].qs, 0xFF, QK1_0 / 8);
+        sf += run_gemv_case(x, y, n, nr, "bits=0xFF", &max_norm_err);
+
+        printf("gemv n=%5d nr=%3d: %3d cases x %d kernels, %s, max_norm_err=%.3g\n",
+               n, nr, trials + 2, n_gemv, sf ? "FAIL" : "ok", max_norm_err);
+        failed += sf;
+        free(x);
+        free(y);
+    }
+    return failed;
+}
+
+// prove the harness detects a wrong kernel: flip one weight bit, result must change
+static int test_inject(void) {
+    const int n = 512;
+    block_q1_0 x[512 / QK1_0];
+    block_q8_0 y[512 / QK8_0];
+    fill_random(x, 512 / QK1_0, y, 512 / QK8_0);
+
+    // make the target element's contribution unmissable
+    x[1].d = lab_fp32_to_fp16(1.0f);
+    y[1 * 4 + 2].d = lab_fp32_to_fp16(1.0f);
+    y[1 * 4 + 2].qs[13] = 100;
+
+    float base = 0, after = 0;
+    ggml_vec_dot_q1_0_q8_0(n, &base, 0, x, 0, y, 0, 1);
+
+    x[1].qs[2 * 4 + 13 / 8] ^= (uint8_t)(1u << (13 % 8)); // flip sign bit of element 13, group 2, block 1
+    ggml_vec_dot_q1_0_q8_0(n, &after, 0, x, 0, y, 0, 1);
+
+    if (f32_bits(base) == f32_bits(after)) {
+        printf("INJECT FAIL: flipped weight bit not detected (result unchanged: %.9g)\n", (double)base);
+        return 1;
+    }
+    printf("INJECT ok: flipped weight bit changed result %.9g -> %.9g (delta ~ %g, expect ~200)\n",
+           (double)base, (double)after, (double)after - (double)base);
+    return 0;
+}
+
+int main(int argc, char ** argv) {
+    // canary values for the fp16 conversion this harness depends on
+    if (lab_fp16_to_fp32(0x3C00) != 1.0f || lab_fp16_to_fp32(0xC000) != -2.0f ||
+        lab_fp16_to_fp32(0x7BFF) != 65504.0f || lab_fp32_to_fp16(1.0f) != 0x3C00 ||
+        lab_fp32_to_fp16(-2.0f) != 0xC000) {
+        printf("FAIL: fp16 conversion self-test\n");
+        return 1;
+    }
+
+    init_kernels();
+    init_gemv_kernels();
+
+#if defined(__riscv_v_intrinsic)
+    const size_t vlen_bits = runtime_vlen();
+    const char * path = vlen_bits >= 256 ? "vl256" : vlen_bits >= 128 ? "vl128" : "generic";
+    printf("build: RVV, VLEN=%zu bits -> dispatcher path: %s\n", vlen_bits, path);
+#else
+    printf("build: scalar (dispatcher == generic reference)\n");
+#endif
+
+    if (argc > 1 && strcmp(argv[1], "--inject") == 0) {
+        return test_inject();
+    }
+
+    const int sizes[] = {128, 256, 512, 1024, 4096, 5120, 8192};
+    int failed = 0;
+    uint32_t checksum = 0;
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+        failed += test_size(sizes[i], 50, &checksum);
+    }
+    failed += test_repack_gemv();
+    printf("%s (dispatcher checksum 0x%08x - comparable between runs taking the same dispatcher path)\n",
+           failed ? "FAILED" : "ALL PASS", checksum);
+    return failed ? 1 : 0;
+}

@@ -1,0 +1,217 @@
+#include "q1_0.h"
+
+#include <assert.h>
+#include <math.h>
+#include <string.h>
+
+#include <riscv_vector.h>
+
+// ---- exact fp16 <-> fp32, copied from ggml/src/ggml-impl.h ----------------
+
+static inline float fp32_from_bits(uint32_t w) {
+    float f;
+    memcpy(&f, &w, sizeof(f));
+    return f;
+}
+
+static inline uint32_t fp32_to_bits(float f) {
+    uint32_t w;
+    memcpy(&w, &f, sizeof(w));
+    return w;
+}
+
+float lab_fp16_to_fp32(uint16_t h) {
+    const uint32_t w = (uint32_t) h << 16;
+    const uint32_t sign = w & UINT32_C(0x80000000);
+    const uint32_t two_w = w + w;
+
+    const uint32_t exp_offset = UINT32_C(0xE0) << 23;
+    const float exp_scale = 0x1.0p-112f;
+    const float normalized_value = fp32_from_bits((two_w >> 4) + exp_offset) * exp_scale;
+
+    const uint32_t magic_mask = UINT32_C(126) << 23;
+    const float magic_bias = 0.5f;
+    const float denormalized_value = fp32_from_bits((two_w >> 17) | magic_mask) - magic_bias;
+
+    const uint32_t denormalized_cutoff = UINT32_C(1) << 27;
+    const uint32_t result = sign |
+        (two_w < denormalized_cutoff ? fp32_to_bits(denormalized_value) : fp32_to_bits(normalized_value));
+    return fp32_from_bits(result);
+}
+
+uint16_t lab_fp32_to_fp16(float f) {
+    const float scale_to_inf  = 0x1.0p+112f;
+    const float scale_to_zero = 0x1.0p-110f;
+    float base = (fabsf(f) * scale_to_inf) * scale_to_zero;
+
+    const uint32_t w = fp32_to_bits(f);
+    const uint32_t shl1_w = w + w;
+    const uint32_t sign = w & UINT32_C(0x80000000);
+    uint32_t bias = shl1_w & UINT32_C(0xFF000000);
+    if (bias < UINT32_C(0x71000000)) {
+        bias = UINT32_C(0x71000000);
+    }
+
+    base = fp32_from_bits((bias >> 1) + UINT32_C(0x07800000)) + base;
+    const uint32_t bits = fp32_to_bits(base);
+    const uint32_t exp_bits = (bits >> 13) & UINT32_C(0x00007C00);
+    const uint32_t mantissa_bits = bits & UINT32_C(0x00000FFF);
+    const uint32_t nonsign = exp_bits + mantissa_bits;
+    return (sign >> 16) | (shl1_w > UINT32_C(0xFF000000) ? UINT16_C(0x7E00) : nonsign);
+}
+
+// ---- 1. scalar reference (ggml quants.c generic, simplified signature) ----
+
+void q1_0_dot_scalar(int n, float * s, const block_q1_0 * x, const block_q8_0 * y) {
+    const int nb = n / QK1_0;
+    assert(n % QK1_0 == 0);
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = lab_fp16_to_fp32(x[i].d);
+
+        float sumi = 0.0f;
+
+        for (int k = 0; k < 4; k++) {
+            const block_q8_0 * yb = &y[i * 4 + k];
+            const float d1 = lab_fp16_to_fp32(yb->d);
+            int sumi_block = 0;
+
+            const uint8_t * bits = &x[i].qs[k * 4];
+            const int8_t  * qy   = yb->qs;
+
+            for (int b = 0; b < 4; ++b, qy += 8) {
+                const unsigned mask = bits[b];
+                sumi_block += ((mask & 0x01) ? qy[0] : -qy[0])
+                           +  ((mask & 0x02) ? qy[1] : -qy[1])
+                           +  ((mask & 0x04) ? qy[2] : -qy[2])
+                           +  ((mask & 0x08) ? qy[3] : -qy[3])
+                           +  ((mask & 0x10) ? qy[4] : -qy[4])
+                           +  ((mask & 0x20) ? qy[5] : -qy[5])
+                           +  ((mask & 0x40) ? qy[6] : -qy[6])
+                           +  ((mask & 0x80) ? qy[7] : -qy[7]);
+            }
+
+            sumi += d1 * (float)sumi_block;
+        }
+
+        sumf += d0 * sumi;
+    }
+
+    *s = sumf;
+}
+
+// ---- 2. original production kernel (arch/riscv quants.c vl256) ------------
+// per 32-group: vlm mask + vmerge(+-y) + vwredsum 32->1 + vmv.x.s + scalar FMA
+
+void q1_0_dot_vl256(int n, float * s, const block_q1_0 * x, const block_q8_0 * y) {
+    const int nb = n / QK1_0;
+    assert(n % QK1_0 == 0);
+
+    const size_t vl32 = __riscv_vsetvl_e8m1(32);
+    assert(vl32 == 32);
+
+    const vint16m1_t zero = __riscv_vmv_v_x_i16m1(0, 1);
+
+    float sumf = 0;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d0 = lab_fp16_to_fp32(x[ib].d);
+
+        float acc = 0;
+
+        for (int k = 0; k < 4; ++k) {
+            const block_q8_0 * yb = &y[ib * 4 + k];
+            const vbool8_t is_not_zero = __riscv_vlm_v_b8(x[ib].qs + 4 * k, vl32);
+
+            const vint8m1_t qy = __riscv_vle8_v_i8m1(yb->qs, vl32);
+            const vint8m1_t neg_qy = __riscv_vneg_v_i8m1(qy, vl32);
+            const vint8m1_t sy = __riscv_vmerge_vvm_i8m1(neg_qy, qy, is_not_zero, vl32);
+
+            const vint16m1_t red = __riscv_vwredsum_vs_i8m1_i16m1(sy, zero, vl32);
+            acc += lab_fp16_to_fp32(yb->d) * (float)__riscv_vmv_x_s_i16m1_i16(red);
+        }
+
+        sumf += d0 * acc;
+    }
+
+    *s = sumf;
+}
+
+// ---- one-time repack for kernel 3 -----------------------------------------
+
+void q1_0_repack_64x1(const block_q1_0 * src, block_q1_0_64x1 * dst, int nr, int n) {
+    const int nb = n / QK1_0;
+    assert(nr % Q1_NX1_N == 0);
+    assert(n % QK1_0 == 0);
+
+    memset(dst, 0, (size_t)(nr / Q1_NX1_N) * nb * sizeof(block_q1_0_64x1));
+
+    for (int r = 0; r < nr; ++r) {
+        const int g = r / Q1_NX1_N;
+        const int j = r % Q1_NX1_N;
+        for (int ib = 0; ib < nb; ++ib) {
+            const block_q1_0 * b = &src[(size_t)r * nb + ib];
+            block_q1_0_64x1 * o  = &dst[(size_t)g * nb + ib];
+            o->d[j] = b->d;
+            for (int c = 0; c < QK1_0; ++c) {
+                const uint8_t bit = (b->qs[c / 8] >> (c % 8)) & 1;
+                o->qs[c][j / 8] |= (uint8_t)(bit << (j % 8));
+            }
+        }
+    }
+}
+
+// ---- 3. optimized kernel: row-parallel gemv (VLEN=512: i16m2/f32m4) -------
+// lane j = row j's running dot. Per column: vlm + vsub_vx (-y) + masked
+// vadd_vx (+2y) => net +-y per lane. No vwredsum, no vmv.x.s, vl=64 always.
+
+// fp16 -> fp32 of the 64 row scales with integer ops (premium has no zfh/
+// zvfh): exact for normals/+-0, subnormals flush to 0 (never produced).
+static inline vfloat32m4_t expand_fp16_64(const ggml_half * p) {
+    const size_t vl = Q1_NX1_N;
+    const vuint16m2_t vh = __riscv_vle16_v_u16m2(p, vl);
+    const vuint32m4_t hz = __riscv_vzext_vf2_u32m4(vh, vl);
+    const vuint32m4_t sign = __riscv_vsll_vx_u32m4(__riscv_vand_vx_u32m4(hz, 0x8000, vl), 16, vl);
+    vuint32m4_t mag = __riscv_vadd_vx_u32m4(
+        __riscv_vsll_vx_u32m4(__riscv_vand_vx_u32m4(hz, 0x7FFF, vl), 13, vl),
+        (uint32_t)112 << 23, vl);
+    const vbool8_t ez = __riscv_vmseq_vx_u32m4_b8(__riscv_vand_vx_u32m4(hz, 0x7C00, vl), 0, vl);
+    mag = __riscv_vmerge_vxm_u32m4(mag, 0, ez, vl);
+    return __riscv_vreinterpret_v_u32m4_f32m4(__riscv_vor_vv_u32m4(sign, mag, vl));
+}
+
+void q1_0_gemv_64x1(int n, float * s, const block_q1_0_64x1 * bricks, const block_q8_0 * y, int nr) {
+    const int nb = n / QK1_0;
+    assert(n % QK1_0 == 0);
+    assert(nr % Q1_NX1_N == 0);
+    const size_t vl = Q1_NX1_N;
+
+    for (int g = 0; g < nr / Q1_NX1_N; ++g) {
+        const block_q1_0_64x1 * bx = bricks + (size_t)g * nb;
+
+        vfloat32m4_t sumf = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+
+        for (int ib = 0; ib < nb; ++ib) {
+            const vfloat32m4_t dx = expand_fp16_64(bx[ib].d);
+            vfloat32m4_t facc = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+
+            for (int k = 0; k < 4; ++k) {
+                const block_q8_0 * yb = &y[ib * 4 + k];
+                const float dy = lab_fp16_to_fp32(yb->d);
+
+                vint16m2_t sumi = __riscv_vmv_v_x_i16m2(0, vl);
+                for (int c = 0; c < QK8_0; ++c) {
+                    const int16_t yc = yb->qs[c];
+                    const vbool8_t sign = __riscv_vlm_v_b8(bx[ib].qs[k * QK8_0 + c], vl);
+                    sumi = __riscv_vsub_vx_i16m2(sumi, yc, vl);
+                    sumi = __riscv_vadd_vx_i16m2_mu(sign, sumi, sumi, (int16_t)(2 * yc), vl);
+                }
+                facc = __riscv_vfmacc_vf_f32m4(facc, dy, __riscv_vfwcvt_f_x_v_f32m4(sumi, vl), vl);
+            }
+            sumf = __riscv_vfmacc_vv_f32m4(sumf, dx, facc, vl);
+        }
+        __riscv_vse32_v_f32m4(s + (size_t)g * Q1_NX1_N, sumf, vl);
+    }
+}

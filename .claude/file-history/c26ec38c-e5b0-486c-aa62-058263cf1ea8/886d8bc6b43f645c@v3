@@ -1,0 +1,69 @@
+# kernel-lab: standalone Q1_0 kernel verification
+
+Extracts the Q1_0 x Q8_0 dot kernels out of ggml so one kernel can be built
+and verified in isolation, without building llama.cpp.
+
+## Files
+
+- `q1_0.h` / `q1_0.c` - the kernels:
+  - `ggml_vec_dot_q1_0_q8_0_generic` copied from `ggml/src/ggml-cpu/quants.c:127`
+  - `ggml_vec_dot_q1_0_q8_0` (+ `_vl256`, `_vl128`) copied from
+    `ggml/src/ggml-cpu/arch/riscv/quants.c:484` (`static` removed in the lab)
+  - F4a: `repack_q1_0_to_q1_0_64x1` (row-major blocks -> column-major 64-row
+    bricks) + `gemv_q1_0_64x1_q8_0_generic` scalar oracle (reference float-op
+    order -> bit-exact vs per-row vec_dot on the original data)
+  - F4b: `gemv_q1_0_64x1_q8_0` dispatcher + `_vl512` (i16m2/f32m4, premium)
+    and `_vl1024` (i16m1/f32m2, fpga_l3) row-parallel RVV gemv - 3 vector
+    ops per column, no reductions, no vector->scalar moves; per-row scales
+    expanded fp16->fp32 with integer bit math (no zfh/zvfh, premium-safe)
+  - fp16 conversion from `ggml/src/ggml-impl.h` (exact, table-free)
+  - (the F2 defer-reduction candidates `_vl512`/`_vl512w` lived here until
+    2026-07-22; removed - superseded by the F4 row-parallel repack)
+- `test_q1_0.c` - harness comparing every kernel vs the scalar reference;
+  `test_repack_gemv` gates F4a bit-exact and F4b by the double-ref bound;
+  `--bench` adds a K=51-shape (2560x1024) whole-GEMV proxy (QEMU caveat below)
+
+## Build and run
+
+```
+make host && ./test_q1_0_host            # x86: harness sanity (dispatcher==generic)
+./test_q1_0_host --inject                # prove the harness detects a broken kernel
+make rv64                                # cross build, static, RVV enabled
+../run-rv64-qemu.sh $PWD/test_q1_0_rv64  # QEMU, VLEN=512 (vl256 path)
+QEMU_CPU=andes-ax45mpv,vlen=256,zfh=true,zvfh=true ../run-rv64-qemu.sh $PWD/test_q1_0_rv64
+QEMU_CPU=andes-ax45mpv,vlen=128,zfh=true,zvfh=true ../run-rv64-qemu.sh $PWD/test_q1_0_rv64  # vl128 path
+../run-rv64-qemu.sh $PWD/test_q1_0_rv64 --bench   # per-kernel ns/row
+make asm                                 # q1_0_rv64.s for LMUL/vl inspection
+```
+
+`--bench` under QEMU is NOT latency: qemu-user TCG charges a big fixed cost
+per vector instruction, scalar instructions are nearly free, and pipeline
+stalls do not exist. Cycle decisions need vsim (rdcycle, see the ace-tq1
+flow) or FPGA; QEMU is for correctness.
+
+## What "verified" means
+
+1. **Bit-exact gate**: RVV result == scalar reference result, compared as raw
+   float bits, over random + edge data (all-0/all-1 sign bits, q8 saturated
+   +-127, zero scales) at sizes 128..8192. The current RVV kernels do the
+   same float ops in the same order as the reference, so 0 tolerance applies
+   (build uses `-ffp-contract=off` to keep both sides unfused).
+2. **Double-reference gate**: |result - double_ref| / sum(|terms|) < 1e-4.
+   This is the gate a future optimized kernel must pass when it reorders the
+   float accumulation (the F4 row-parallel repack kernels will) and
+   bit-exactness vs the reference no longer applies. The per-group integer
+   sums must still be exact.
+3. **Harness self-test** (`--inject`): flip one weight sign bit, require the
+   kernel result to change. A harness that passes a broken kernel is worse
+   than no harness.
+4. **Cross-platform checksum**: the PRNG is deterministic, so the final
+   result checksum must be identical on x86 host and QEMU at every VLEN.
+
+## Data domain constraints (match ggml, do not "fix")
+
+- `n % 128 == 0` (QK1_0); the ggml dispatcher guarantees this.
+- q8 quants in [-127, 127]: ggml Q8_0 quantization never emits -128.
+  The RVV kernel's `vneg` on int8 -128 would wrap to -128 while the scalar
+  reference negates in 32-bit; feeding -128 produces a false mismatch.
+- No NaN/Inf scales: real quantization never produces them, and NaN payload
+  propagation may differ between fp16 conversion implementations.
