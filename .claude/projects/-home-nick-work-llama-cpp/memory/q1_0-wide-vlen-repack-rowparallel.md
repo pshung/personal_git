@@ -62,6 +62,16 @@ L2 DISABLED, L3 2MB, MMU sv39. premium_full = VLEN/DLEN 512, FELEN 32, L1
 L1-resident. Both have HVM (vector local memory) at 0x90000000: fpga_l3
 8MB/2banks, premium_full 256KB/2banks+8subports.
 
+**premium_max engine (2026-07-23)**: premium RTL re-elaborated with
+ELEN=64 + FELEN=64 + PACKED_FP16=yes + D$ 8K->32K (ax45mpv_premium_max.cfg,
+config.yaml entry) - builds clean, probe_max (rv64gcv) 15/15 ok incl.
+vle64/vadd e64, vfadd f64, vfwcvt.f.f.v f16->f32 zvfh-encoding. So the
+premium package is NOT hard-limited to ELEN32; e64/fp16 are config knobs.
+Shootout on it (warm cyc/dot): RAM vl256 1045 / gemv 135 / gemm 75
+(32K D$ = 1.5x over 8K D$ on gemv; baseline unchanged -> vl256 is not
+D$-capacity-bound); HVM identical to premium_full (753/83/54) - HVM still
+beats even 32K D$ for the vlm stream.
+
 **HVM A/B MEASURED 2026-07-23** (hvm.h = ace-tq1 malloc_hvm ported
 printf-free, CSR 0xFD1 base / 0xFD0[7:0] log2 size; -DQ1_HVM=1 puts ALL
 data in HVM; warm cyc/dot): premium_full vl256 1049->753 / gemv 206->83
