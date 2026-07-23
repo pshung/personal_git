@@ -1,0 +1,105 @@
+// Q1_0 rdcycle shootout (ace-tq1 style).
+//
+//   [2] q1_0_dot_vl256  = ORIGINAL production kernel, called once per row
+//   [3] q1_0_gemv_64x1  = OPTIMIZED row-parallel kernel, one call = all rows
+//
+// Shape: nr=64 rows x n=512 cols (one 64-row strip of the 2560x1024 matmul).
+// Correctness is proven in llama.cpp/kernel-lab (QEMU, all VLENs); here a
+// cheap smoke check + cycles. Exit code 0 = pass.
+//
+// Output is raw _write only - NO stdio. vsim's fpga_l3 engine services the
+// console MMIO but not the sim_control syscalls stdio init needs (fstat),
+// so any printf-family call hangs there. QEMU (-mvh) serves _write too.
+#include "q1_0.h"
+
+#include <math.h>
+
+static unsigned long rdcycle(void) {
+    unsigned long r;
+    asm volatile("fence rw, rw" ::: "memory");
+    asm volatile("csrr %0, mcycle" : "=r"(r));
+    return r;
+}
+
+// ---- printf-free console ---------------------------------------------------
+extern long _write(int fd, const void * buf, unsigned long count);
+
+static void say(const char * s) {
+    unsigned long n = 0;
+    while (s[n]) n++;
+    _write(1, s, n);
+}
+
+static void sayn(unsigned long v) {   // decimal
+    char b[21];
+    int i = 20;
+    do { b[--i] = (char)('0' + v % 10); v /= 10; } while (v);
+    _write(1, b + i, (unsigned long)(20 - i));
+}
+
+#ifndef Q1_VLEN
+#define Q1_VLEN 512
+#endif
+
+#define GN  512                  // K (columns)
+#define GNR 64                   // rows = one brick group
+#define GNB (GN / QK1_0)         // blocks per row
+
+static block_q1_0      x[GNR * GNB];
+static block_q1_0_64x1 bricks[GNB];
+static block_q8_0      y[GN / QK8_0];
+static float out2[GNR], out3[GNR];
+
+// cheap deterministic bytes; all scales = fp16 1.0 (cycle count is
+// data-independent, so fancy random data buys nothing here)
+static uint32_t lcg = 12345;
+static uint8_t next_byte(void) { lcg = lcg * 1103515245u + 12345u; return (uint8_t)(lcg >> 16); }
+
+int main(void) {
+    say("q1_0 shootout: nr=64 n=512, gemv built for VLEN=");
+    sayn(Q1_VLEN);
+    say("\n");
+
+    for (int i = 0; i < GNR * GNB; ++i) {
+        x[i].d = 0x3C00; // 1.0
+        for (int j = 0; j < QK1_0 / 8; ++j) x[i].qs[j] = next_byte();
+    }
+    for (int i = 0; i < GN / QK8_0; ++i) {
+        y[i].d = 0x3C00;
+        for (int j = 0; j < QK8_0; ++j) y[i].qs[j] = (int8_t)(next_byte() % 255 - 127);
+    }
+    q1_0_repack_64x1(x, bricks, GNR, GN);
+    say("data ready\n");
+
+    // measure: rep0 = cold caches, rep1 = warm
+    for (int rep = 0; rep < 2; ++rep) {
+        const unsigned long t0 = rdcycle();
+        for (int r = 0; r < GNR; ++r) {
+            q1_0_dot_vl256(GN, &out2[r], x + (size_t)r * GNB, y);
+        }
+        const unsigned long t1 = rdcycle();
+        q1_0_gemv_64x1(GN, out3, bricks, y, GNR);
+        const unsigned long t2 = rdcycle();
+
+        const unsigned long c2 = t1 - t0, c3 = t2 - t1;
+        say("rep"); sayn((unsigned long)rep);
+        say(": [2] vl256 x64 rows: "); sayn(c2); say(" cyc ("); sayn(c2 / GNR);
+        say("/row) | [3] gemv: "); sayn(c3); say(" cyc ("); sayn(c3 / GNR);
+        say("/row) | speedup x100: "); sayn(c2 * 100ul / c3);
+        say("\n");
+    }
+
+    // smoke check: same answers (integer part exact: scales are 1.0)
+    int failed = 0;
+    for (int r = 0; r < GNR; ++r) {
+        if (fabsf(out2[r] - out3[r]) > 0.5f) {
+            say("FAIL row "); sayn((unsigned long)r);
+            say(": [2]="); sayn((unsigned long)(long)out2[r]);
+            say(" [3]="); sayn((unsigned long)(long)out3[r]);
+            say("\n");
+            failed++;
+        }
+    }
+    say(failed ? "FAILED\n" : "ALL PASS\n");
+    return failed;
+}
