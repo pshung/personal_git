@@ -1,0 +1,833 @@
+# Q1_0 on RISC-V RVV: how the kernel works today, and how to make it faster
+
+A teaching document. It walks from the current kernel, to standard-RVV
+speedups for wide VLEN (512/1024) using large LMUL, to a custom ACE-RVV
+instruction that beats plain RVV. Simple English, lots of pictures.
+
+Companion docs:
+- `quant_packing.md` - how Q1_0/Q2_0/TQ1_0/TQ2_0 bits are packed.
+- `opt_roadmap.md` - the feature list (F1..F7) this tutorial explains the "why" of.
+
+Source of truth (read 2026-07-21):
+- scalar dot: `ggml/src/ggml-cpu/quants.c:127`
+- RVV dot (production): `ggml/src/ggml-cpu/arch/riscv/quants.c:484` (`_vl256`), `:523` (`_vl128`), `:563` (dispatcher)
+- repack GEMV reference to copy: `ggml/src/ggml-cpu/repack.cpp:1370` (`ggml_gemv_q4_0_16x1_q8_0_generic`)
+
+---
+
+## 0. What you will learn
+
+1. What a Q1_0 matmul actually computes.
+2. How today's RVV kernel does it (line by line), and the one trick that makes
+   it cheap: Q1_0 weights are pure sign bits.
+3. **The core problem**: the kernel ends every 32 elements with a *horizontal
+   reduction* plus a scalar stall. That is wasteful at **every** VLEN, 256
+   included. On VLEN=512/1024 idle lanes stack on top, so the wider the
+   machine, the worse it gets.
+4. Why "just use a bigger vl / bigger LMUL" does **not** fix it for the vec_dot
+   shape (tried as roadmap F2, then removed).
+5. **The real fix (your idea)**: repack N weight rows side by side, so lanes =
+   rows. The K-reduction becomes a vertical add. Zero horizontal reductions,
+   100% lane use, and *now* large LMUL pays off.
+6. **The next level**: a custom ACE-RVV instruction (`v_q1_rowdot`) that folds
+   the whole sign-dot into one op and beats optimized standard RVV.
+7. How to prove each step is really faster (QEMU lies; vsim/FPGA is truth).
+
+---
+
+## 1. What a Q1_0 matmul computes
+
+A matmul row is one dot product: `out = sum over K of (weight_k * activation_k)`.
+
+**Weights (Q1_0)** are stored 128 to a block, 18 bytes per block:
+
+```c
+typedef struct { ggml_half d; uint8_t qs[16]; } block_q1_0;  // 2 + 16 = 18 bytes
+```
+
+- `d` is one fp16 scale for the whole 128-element block.
+- `qs` is 128 sign bits (16 bytes). Bit = 1 means `+d`, bit = 0 means `-d`.
+- There is no zero. Every weight is `+d` or `-d`.
+
+**Activations (Q8_0)** are int8 with an fp16 scale, 32 to a block:
+
+```c
+typedef struct { ggml_half d; int8_t qs[32]; } block_q8_0;   // 34 bytes, 32 values
+```
+
+One Q1_0 block (128 weights) lines up with **4** Q8_0 blocks (4 x 32 = 128).
+Important: the Q8_0 scale changes every 32 elements. Remember this - it is the
+reason the kernel reduces 4 times per block.
+
+**The sign trick** (why Q1_0 is special). A weight is `+d` or `-d`, so:
+
+```
+dot = sum_k  (bit_k ? +d : -d) * y_k
+    = d * sum_k (bit_k ? +y_k : -y_k)          // pull the scale out
+```
+
+No multiply is needed for the weight. Just **pick +y or -y per element**, then
+sum. That "pick" is a mask select. That "sum" is the expensive part later.
+
+---
+
+## 2. How the current RVV kernel works
+
+### 2.1 The one idea that makes it cheap
+
+The 16 sign bytes are already a valid **RVV mask register image**. RISC-V lays
+out mask bit `i` at byte `i/8`, bit `i%8` - LSB first. Q1_0 packs bits the exact
+same way (`quant_packing.md` section 3.1). So the kernel loads the signs with
+`vlm.v` and needs **zero unpack work**.
+
+### 2.2 The inner loop (`_vl256`, `arch/riscv/quants.c:484`)
+
+For each 128-block, for each of the 4 groups of 32:
+
+```c
+const vbool8_t  is_not_zero = __riscv_vlm_v_b8(x[ib].qs + 4*k, 32);   // 32 sign bits -> mask
+const vint8m1_t qy     = __riscv_vle8_v_i8m1(yb->qs, 32);             // 32 int8 activations
+const vint8m1_t neg_qy = __riscv_vneg_v_i8m1(qy, 32);                 // -y
+const vint8m1_t sy     = __riscv_vmerge_vvm_i8m1(neg_qy, qy, is_not_zero, 32); // bit ? +y : -y
+const vint16m1_t red   = __riscv_vwredsum_vs_i8m1_i16m1(sy, zero, 32);// HORIZONTAL sum -> 1 int16
+acc += GGML_CPU_FP16_TO_FP32(yb->d) * (float)__riscv_vmv_x_s_i16m1_i16(red); // scale, scalar FMA
+```
+
+Read it as five steps:
+
+```
+1. vlm      load 32 sign bits as a mask         (cheap)
+2. vle8     load 32 activations                 (cheap)
+3. vneg     make -y                             (cheap)
+4. vmerge   choose +y where bit=1, -y where bit=0
+5. vwredsum ADD ALL 32 LANES INTO ONE NUMBER    <-- the problem
+   then: pull that one number to a scalar (vmv.x.s), convert the fp16
+   activation scale, and do a scalar float multiply-add.
+```
+
+Steps 1-4 are full-width vector work. Step 5 throws almost all of it away: it
+squashes 32 lanes down to a single value, then leaves the vector unit idle while
+3 scalar instructions run (extract, fp16->fp32, FMA). This happens **4 times per
+128-block**.
+
+`_vl128` is the same code with `LMUL=2` used only to *reach* 32 lanes on a small
+VLEN=128 machine. The whole kernel is built around "get exactly 32 lanes, one
+Q8_0 group." It never tries to fill a wide register.
+
+### 2.2b How the two scales multiply
+
+The real values behind the codes:
+
+```
+real weight     w_k = +-d0        (d0 = x[ib].d,  ONE per 128-block)
+real activation a_k = dy_g * q_k  (q_k = int8 code, dy_g = y scale, changes every 32; g = k/32)
+```
+
+Both scales are constant factors, so they can be pulled out of the sum - but
+**how far** differs. `d0` is the same for all 128 weights -> pull it all the
+way out, multiply once per block. `dy_g` changes every 32 -> it can only leave
+its own group, multiply once per group:
+
+```
+dot = SUM_k w_k * a_k
+    = d0 * [ SUM_g  dy_g * ( SUM_c +-q_c ) ]
+      ^^          ^^^^       ^^^^^^^^^^^
+      outer,      inner,     pure integer sum (exact)
+      1x/block    1x/group
+```
+
+Map it to the code above:
+
+```c
+red  = vwredsum(+-qy);                     // SUM +-q : integer, no scale yet
+acc += FP16_TO_FP32(yb->d) * (float)red;   // inner:  * dy_g, once per group
+...
+sumf += d0 * acc;                          // outer:  * d0,  once per block
+```
+
+Order: integer-sum first -> multiply activation scale -> multiply weight scale
+last. The integer part is exact, and the float multiplies are minimal: 4 `dy`
++ 1 `d0` per 128-block instead of 128.
+
+### 2.3 The dispatcher hides a trap for wide machines
+
+```c
+if      (vlen_bits >= 256) ggml_vec_dot_q1_0_q8_0_vl256(...);  // <-- 512 AND 1024 land here
+else if (vlen_bits >= 128) ggml_vec_dot_q1_0_q8_0_vl128(...);
+else                        ggml_vec_dot_q1_0_q8_0_generic(...);
+```
+
+A VLEN=1024 machine runs the **same** `_vl256` code as a VLEN=256 machine. It
+still asks for vl=32. See the next section for what that costs.
+
+---
+
+## 3. The core problem: the reduction wastes every VLEN; wide VLEN adds idle lanes
+
+`_vl256` uses `vsetvl_e8m1(32)` - it always processes **32 lanes**. But the
+machine may have far more. With `e8` (8-bit elements), `LMUL=1`:
+
+```
+VLMAX (how many int8 lanes fit) = VLEN / 8
+
+VLEN=256 :  VLMAX = 32   ->  kernel fills 32/32  = 100%  (fill is fine; the reduction below still wastes)
+VLEN=512 :  VLMAX = 64   ->  kernel uses 32/64  =  50%
+VLEN=1024:  VLMAX = 128  ->  kernel uses 32/128 =  25%
+```
+
+Picture the vector register on a VLEN=1024 machine during the merge step:
+
+```
+lanes:  [ y0 y1 y2 ... y31 |  0  0  0 ... 0 (96 idle lanes) ]
+         \___ real work __/  \____ paying for silicon that does nothing ____/
+```
+
+Then `vwredsum` collapses even those 32 useful lanes into **one** number:
+
+```
+[ s0 s1 s2 ... s31 ]  --vwredsum-->  [ (s0+s1+...+s31) ]   (31 of 32 lanes discarded)
+```
+
+Two separate losses stack up:
+- **Fill loss** (512/1024 only): only 32 of VLMAX lanes carry data.
+- **Reduction loss** (every VLEN, 256 too): the horizontal add is a tree that
+  ends in 1 useful lane - 31 of 32 results are thrown away.
+
+There is also a stall every group (again at every VLEN): `vmv.x.s` -> scalar
+fp16 convert -> scalar FMA. The vector pipe waits on scalars 4 times per block.
+
+What "waits" means - and it is NOT a data dependency. Group g+1's vector
+instructions never read `acc`; dataflow-wise they could run ahead freely. The
+block is **in-order issue** (AX45MPV): the scalar convert/FMA stall waiting
+for `vmv.x.s`'s data, and an in-order pipe cannot let younger instructions
+pass a stalled one. So g+1's `vlm`/`vle8`, sitting *behind* the scalar tail in
+program order, wait too - and the vector unit runs dry:
+
+```
+program order:  ... vwredsum(g) vmv.x.s(g) fcvt fmadd | vlm(g+1) vle8(g+1) ...
+                                           ^^^^ stalls on vmv.x.s data
+                                                        ^^^ no dependency, but
+                                                            cannot overtake
+
+time ------------------------------------------------------------>
+vector: [work g1] .idle. [work g2] .idle. [work g3] .idle. [work g4] .idle.
+scalar: ......... [tail g1] ..... [tail g2] ..... [tail g3] ..... [tail g4]
+```
+
+Caveats, to be honest about the size of this effect:
+- An out-of-order core would hide most of it.
+- A compiler can partly hide it in-order too, by scheduling g+1's vector loads
+  before g's scalar tail. Limits: the vector->scalar sync cost of `vmv.x.s`
+  itself, and the WAR hazard on the reduction register (no renaming - needs
+  unrolling). Doing this rewrite completely by hand was the "defer the
+  reductions" attempt (section 4).
+- Even fully hidden, the ~3 scalar ops per group still eat dual-issue slots,
+  and the 4 serial FMAs through `acc` remain a long dependency chain.
+
+How much really stalls is a microarchitecture question (queue depth, crossing
+cost, issue pairing) - unanswerable from code, which is exactly why section 7
+demands vsim cycles and why stall-removal alone is only a modest win even in
+the best case.
+
+So VLEN=256 is *not* "no waste" - it only avoids the fill loss:
+
+```
+VLEN=256 :  reduction loss + scalar stall
+VLEN=512 :  reduction loss + scalar stall + 50% idle lanes
+VLEN=1024:  reduction loss + scalar stall + 75% idle lanes
+```
+
+And it gets *relatively worse* as VLEN grows: a 4x wider machine gives 0x extra
+speed here. This is the whole reason wide VLEN needs a different plan - and why
+the section 5 repack also helps VLEN=256: it removes the reduction and the
+stall, which exist at every width.
+
+---
+
+## 4. Standard-RVV attempt #1: defer the reductions (roadmap F2 - tried, removed)
+
+First reflex: keep the shape, just stop stalling. This was tried as roadmap F2
+(kernels `_vl512`/`_vl512w`, lived in `kernel-lab/` until 2026-07-22, since
+deleted). The idea:
+
+- pack the 4 group sums into lanes 0..3 of one vector with tiny `vslideup`s,
+- load all 4 activation scales at once with a strided `vlse16` (stride 34),
+- keep the float accumulation in 4 vector lanes and do **one** ordered
+  reduction at the very end of the row (not one per group).
+
+Result: the per-group scalar tail (`vmv.x.s` + scalar fp16 + scalar FMA) is
+gone. Good. **But** it still does 4 `vwredsum` per block and still fills only 32
+lanes. It removes the *stall*, not the *waste*.
+
+Measured (2026-07-16): under QEMU it read as a **regression** (57.5us vl256 vs
+75.5us vl512 at n=8192). That is a QEMU artifact - qemu-user TCG charges a big
+fixed cost per vector instruction and treats scalar ops and stalls as free, so
+it punishes exactly this kind of restructure. Even in the best case it would
+have been a modest win, not the wide-VLEN win, because the horizontal
+reduction is still there - which is why it was removed in favor of F4.
+
+**Conclusion.** For the vec_dot shape (1 weight row x 1 activation row) you
+cannot escape the horizontal reduction, and you cannot fill a wide register
+either: Q8_0's 34-byte block stride means the int8 data is contiguous only
+inside one 32-group, so a wide load across groups costs slides that cancel the
+saved work (roadmap F3). **Widening vl alone cannot win here.** You must change
+the shape.
+
+---
+
+## 5. The real fix: row-parallel repack (roadmap F4) - your idea
+
+### 5.1 The key mental flip
+
+Ask: *what should go in the lanes?*
+
+- Today: lanes hold **one row's K elements**, and we reduce them. Reduction is
+  the enemy.
+- New idea: lanes hold **N different rows**, one row per lane. A matmul computes
+  many outputs anyway (one per weight row). Put N rows in N lanes and compute N
+  outputs at once.
+
+Now walk column by column. At column `c` the activation `y_c` is a single
+number, shared by every row. Broadcast it to all lanes. Each lane holds *its own
+row's* sign bit for column `c`. Update:
+
+```
+sumi[lane] += (bit[lane] ? +y_c : -y_c)
+```
+
+This is a **vertical** operation. Lane `j` accumulates row `j`'s running dot
+product. After all K columns, lane `j` already holds the finished dot for row
+`j`. **No horizontal reduction anywhere.** Store N contiguous outputs.
+
+Tiny worked example (4 rows, 4 columns, signs `+` = bit 1, `-` = bit 0):
+
+```
+signs:  row0:  + - + +          y = [2, 5, 1, 3]
+        row1:  - - + -
+        row2:  + + - +          answers: row0 = +2 -5 +1 +3 =  1
+        row3:  - + + +                   row1 = -2 -5 +1 -3 = -9
+                                         row2 = +2 +5 -1 +3 =  9
+                                         row3 = -2 +5 +1 +3 =  7
+
+OLD way: lanes = row0's terms [+2 -5 +1 +3] -> squash 4 lanes into 1 number.
+         Repeat per row. The squash is the reduction (section 3's waste).
+
+NEW way: lane j = row j's running sum. Walk columns:
+
+                          lane0(row0) lane1(row1) lane2(row2) lane3(row3)
+start                     [    0          0           0           0     ]
+col0, y=2, signs(+,-,+,-) [   +2         -2          +2          -2     ]
+col1, y=5, signs(-,-,+,+) [   -3         -7          +7          +3     ]
+col2, y=1, signs(+,+,-,+) [   -2         -6          +6          +4     ]
+col3, y=3, signs(+,-,+,+) [    1         -9          +9          +7     ]
+                             ^^^ all 4 answers DONE at once. Just store.
+```
+
+No squash ever happened; each lane quietly grew its own sum. And nothing was
+handed to the scalar worker, so there is no waiting either.
+
+Picture on VLEN=1024 with N=64 rows in the lanes:
+
+```
+column c:   y_c is one scalar, broadcast to all lanes
+            mask = 64 sign bits (row 0..63, all for column c)
+
+lane:     row0   row1   row2  ...  row63
+sumi  += (+/-y) (+/-y) (+/-y) ... (+/-y)     <- every lane does useful work
+
+after K columns:  [ dot(row0) dot(row1) ... dot(row63) ]  -> store 64 outputs
+                   no reduction, no wasted lanes
+```
+
+Compare the two utilization stories directly:
+
+```
+vec_dot (today):   fill 32/128 lanes, then reduce 32 -> 1   (waste on top of waste)
+row-parallel:      fill 64/64 lanes (pick N=lanes), never reduce   (all useful)
+```
+
+The K-loop reduction did not disappear - it turned into a loop-carried vertical
+add, one accumulator per lane. That is the trick.
+
+### 5.2 The repack layout `block_q1_0_Nx1`
+
+The new loop needs "column `c`'s N sign bits, one per row" as ONE mask load.
+But `block_q1_0` stores bits row by row, so those N bits are scattered across
+N different blocks. Repack fixes that. **No new data is made** - we take N
+rows' blocks and re-order their bytes, like a matrix transpose:
+
+```
+BEFORE (row by row, N blocks):          AFTER (one repacked group):
+row0:  d0  [row0's 128 bits]            d0 d1 ... d(N-1)      <- all scales together
+row1:  d1  [row1's 128 bits]            col0:   N bits (row0..rowN-1 at col 0)
+...                                     col1:   N bits
+rowN-1:d.. [rowN-1's 128 bits]          ...
+                                        col127: N bits        <- one vlm each
+```
+
+The tiny 4-row example above, in memory form:
+
+```
+before:  d0,[1011]  d1,[0110]  d2,[1100]  d3,[0011]     (each row's bits)
+after :  d0 d1 d2 d3, col0:[1010] col1:[0110] col2:[1101] col3:[1001]
+                            ^ row0..row3's bit at col0, now adjacent
+```
+
+Byte accounting (per 128-col block, N rows):
+
+- Sign planes: 128 columns x N bits = 16N bytes (`vlm` reads N/8 bytes per column).
+- Scales: N fp16, one per row (each row still has exactly one `d`). 2N bytes.
+- Total 18N bytes = N x `sizeof(block_q1_0)`. Same bytes, same count, new order.
+
+At N=64 that is `d[64]` (128 bytes) + `qs[128][8]` (128 columns x 64 bits =
+8 bytes per column), total 64 x 18 = 1152 bytes per "brick".
+
+Where the two numbers come from - they have different origins:
+
+- **128 columns**: fixed by the Q1_0 format itself (`qs[16]` = 128 bits per
+  scale). Not our choice.
+- **N=64 rows**: our choice, from hardware lane count (section 5.4).
+
+A whole weight matrix becomes a grid of bricks. Example: the "K=51" matmul.
+(K=51 = MUL_MAT node number 51 out of 253 in one Bonsai-4B token step - our
+in-model cycle-measurement window, chosen because it is the smallest matmul:
+layer 7's V projection, weights 2560x1024. Details in section 7.) Its grid:
+
+```
+                    1024 columns
+               |-128-|-128-| ... |-128-|    1024/128 = 8 blocks  (format's cut)
+        - 64   |brick|brick|     |brick|
+  2560  - 64   |brick|brick|     |brick|    2560/64 = 40 groups  (our cut)
+  rows  - ...  |     |     |     |     |
+```
+
+The GEMV eats one horizontal strip of 8 bricks -> 64 outputs; 40 strips
+finish all 2560 outputs.
+
+This mirrors `ggml_gemv_q4_0_16x1_q8_0_generic` (`repack.cpp:1370`,
+`blocklen=1`, 16 columns interleaved). Copy its structure, not the `q4_0_8x8`
+mmla path - that path exists to *dequant 4-bit weights* with `vwmul` and then
+folds with a `vnsrl` tree, and that fold is itself a horizontal reduction. Q1_0
+needs neither a multiply (weights are +-1) nor a fold.
+
+### 5.3 The inner loop (base RVV, from `opt_roadmap.md` F4)
+
+```
+sumf[N] = 0                                        // fp32, one lane per row, held across K
+for each 128-block:
+    facc_block[N] = 0                              // fp32, N lanes
+    for g in 0..3:                                 // 4 Q8_0 groups per 128
+        dy = fp16_to_fp32(a[g].d)                  // scalar activation scale (shared by all rows)
+        sumi[N] = 0                                // int16 lanes; 32*127 < 32767, safe
+        for c in 0..31:
+            y    = a[g].qs[c]                       // scalar int8 activation
+            mask = vlm(sign plane, column 32*g+c)   // N bits, one per row
+            sumi = vsub_vx(sumi, y)                 // every lane: += -y
+            sumi = vadd_vx_m(mask, sumi, 2*y)       // masked lanes: += 2y  => net +y
+        facc_block = vfmacc_vf(facc_block, dy, vfcvt(sumi))  // apply per-32 activation scale
+    sumf = vfmacc_vv(sumf, dx[N], facc_block)       // dx[N] = N per-row weight scales (vector)
+// after K: store sumf[N] to N contiguous outputs
+```
+
+Two lines carry the sign trick. For a lane with bit=0: `-y`. For bit=1:
+`-y + 2y = +y`. So `vsub_vx` then masked `vadd_vx` gives `+y` or `-y` per lane
+with no `vneg`, no `vmerge`, no reduction.
+
+Note the scale math is the exact two-level structure of section 2.2b, just
+vectorized: inner `dy_g` once per group (`vfmacc_vf`, `dy` stays scalar, 64
+lanes multiplied together), outer weight scale once per block (`vfmacc_vv` -
+`d0` is now `dx[N]`, a vector of 64 per-row scales, since each row has its
+own). No accuracy loss, activations stay plain Q8_0. And every type is
+e8/e16/e32: **ELEN=32-clean**, which matters for the premium engine (ELEN=32,
+no 64-bit vector elements).
+
+The same loop as real intrinsics. This is the VLEN=1024 instantiation (N=64:
+int16 = m1, fp32 = m2). Built 2026-07-22 as `gemv_q1_0_64x1_q8_0_vl1024` in
+`kernel-lab/q1_0.c` (plus a `_vl512` i16m2/f32m4 twin for premium), verified
+against the F4a scalar oracle at every VLEN:
+
+```c
+// 64 outputs at once: s[j] = dot(weight row j, y), j = 0..63.  n = K.
+// vx = repacked bricks from 5.2: per block, ggml_half d[64]; uint8_t qs[128][8].
+void gemv_q1_0_64x1_q8_0(int n, float * s, const void * vx, const block_q8_0 * y) {
+    const int nb = n / 128;
+    const uint8_t * p = (const uint8_t *) vx;   // walks the repacked bytes in order
+    const size_t vl = 64;                       // N = 64 lanes, always full
+
+    vfloat32m2_t sumf = __riscv_vfmv_v_f_f32m2(0.0f, vl);  // lane j = row j's answer
+
+    for (int ib = 0; ib < nb; ib++) {
+        // 64 per-row weight scales: fp16 -> fp32, into 64 lanes
+        vfloat16m1_t dxh = __riscv_vle16_v_f16m1((const _Float16 *) p, vl);
+        vfloat32m2_t dx  = __riscv_vfwcvt_f_f_v_f32m2(dxh, vl);
+        p += 64 * 2;
+
+        vfloat32m2_t facc = __riscv_vfmv_v_f_f32m2(0.0f, vl);  // this block's dots
+
+        for (int g = 0; g < 4; g++) {                    // 4 q8_0 groups of 32 cols
+            const block_q8_0 * yb = &y[4*ib + g];
+            const float dy = GGML_CPU_FP16_TO_FP32(yb->d);   // scalar, shared by rows
+
+            vint16m1_t sumi = __riscv_vmv_v_x_i16m1(0, vl);  // 64 running sums
+
+            for (int c = 0; c < 32; c++) {
+                const int16_t yc = yb->qs[c];            // ONE activation (scalar)
+
+                // column c's 64 sign bits -> mask (this is why we repacked)
+                vbool16_t sign = __riscv_vlm_v_b16(p, vl);
+                p += 8;                                  // 64 bits = 8 bytes
+
+                sumi = __riscv_vsub_vx_i16m1(sumi, yc, vl);                  // all: -y
+                sumi = __riscv_vadd_vx_i16m1_mu(sign, sumi, sumi, 2*yc, vl); // bit=1: +2y
+            }
+
+            // facc += dy * sumi   (64 lanes at once; dy stays scalar)
+            facc = __riscv_vfmacc_vf_f32m2(facc,
+                       dy, __riscv_vfwcvt_f_x_v_f32m2(sumi, vl), vl);
+        }
+
+        sumf = __riscv_vfmacc_vv_f32m2(sumf, dx, facc, vl);  // apply row scales
+    }
+
+    __riscv_vse32_v_f32m2(s, sumf, vl);   // store 64 finished outputs
+}
+```
+
+Check it against section 3's problems: there is **no `vwredsum`** (the K-sum
+lives inside `sumi`'s lanes, one per row), **no `vmv.x.s`, no scalar FMA**
+(nothing crosses vector -> scalar; the scalar reads `yb->qs[c]` and `yb->d` go
+scalar -> vector only and depend on no vector result, so they load ahead), and
+`vl` is 64 on every instruction (all lanes always useful). On VLEN=512
+(premium) the same structure uses `i16m2`/`f32m4` types (`vbool8_t` mask);
+only the type suffixes change - dispatch on `vlenb` like today's `_vl256`/`_vl128`.
+
+### 5.4 Now "large LMUL" finally pays off
+
+Fix **N = 64 rows**. Pick LMUL so the fp32 accumulator (`sumf[N]`) is exactly
+full:
+
+```
+VLEN=2048 -> LMUL m1   (2048/32 = 64 fp32 lanes)
+VLEN=1024 -> LMUL m2   (fpga_l3 engine)
+VLEN=512  -> LMUL m4   (premium engine; also FP-LMUL=8 is banned there, m4 is the safe max)
+```
+
+This is the answer to "can large LMUL help?" - **yes, but only after the
+repack.** In `_vl256`, big LMUL just pads a 32-lane reduction with idle lanes.
+In the row-parallel layout, big LMUL holds *more rows* = more finished outputs
+per instruction. LMUL is spent on useful work, not on one row's reduction.
+
+Why N=64 and not 128 (VLEN=1024 "has 128 lanes", right?). Three reasons:
+
+1. **Count lanes with the biggest element, not the smallest.** "128 lanes" is
+   for e8. Each row's running state is int16 (`sumi`) and fp32 (`sumf`), and
+   fp32 is the binding one: VLEN=1024 at m1 has only 1024/32 = 32 fp32 lanes.
+   N=64 already needs fp32 m2; N=128 would need fp32 m4 - and **m8 on VLEN=512**.
+2. **One N must work on every engine.** N is baked into the repacked weight
+   bytes (repack once, run anywhere). Premium rejects fp32 LMUL=8, so VLEN=512
+   caps fp32 at m4 = 64 lanes. N=64 is the largest portable N.
+3. **N=128 adds no speed on VLEN=1024 anyway.** An m2 op is not wider hardware;
+   it is the same 1024-bit datapath doing 2 passes. Per column:
+   `N=64: 2 ops x 1 pass = 2 passes / 64 rows` vs
+   `N=128: 2 ops x 2 passes = 4 passes / 128 rows` - same rows per cycle.
+   Doubling N only trims loop overhead, while fp32 m4 doubles register
+   pressure (8 register-group names left) and reason 2 kills it regardless.
+
+Cost per row: ~3 N-wide ops per column (`vlm` + `vsub_vx` + masked `vadd_vx`) ->
+about **6 ops/row/block at N=64**, versus ~20 for the single-row vec_dot, at full
+VLMAX, with zero reduction stalls. The per-column `vlm` (128 per block) is the
+main thing to tune.
+
+### 5.5 GEMV vs GEMM
+
+M = how many tokens the activation carries.
+
+- **GEMV** (M=1, matrix x vector): **decode** - generating text one token at a
+  time. Each step multiplies the weights with ONE activation vector `y`. That
+  is exactly the loop above, and the K=51 benchmark shape.
+- **GEMM** (M>1, matrix x matrix): **prefill** - reading the whole prompt at
+  once. M tokens (say 100) all need the same weights, so the activation is a
+  matrix with M rows, and the output is M rows too.
+
+You could just call the GEMV M times. The reason GEMM gets its own kernel
+(F4c): the expensive part of the inner loop is the per-column `vlm` mask load.
+With M tokens, load the mask ONCE and use it M times, one accumulator set per
+token:
+
+```
+column c:   mask = vlm(qs[c])              <- 1 weight load ...
+            sumi0 += (mask ? +y0_c : -y0_c)   token 0
+            sumi1 += (mask ? +y1_c : -y1_c)   token 1        <- ... M uses
+            ...
+```
+
+The weight-load cost is divided by M. For this to be cheap, the M tokens'
+values at column `c` must sit next to each other in memory - so the
+activations get re-ordered too (`ggml_quantize_mat_q8_0`): the same transpose
+idea as the 5.2 weight repack, applied to the activation side. That is all
+"interleave the activation rows" means. (The vsim lab version skips the
+interleave and just keeps M pointers - 4 scalar byte loads per column are
+cheap enough to prove the point; the interleave belongs to the ggml wiring.)
+
+Do it in this order (F4a..F4d): scalar reference + `repack_q1_0_to_q1_0_Nx1` +
+kernel-lab bit-exact test **first** (TDD RED), then the RVV GEMV, then GEMM,
+then wire into ggml traits. The scalar reference is the hardware-agnostic oracle
+for everything after it (including the ACE version).
+
+### 5.6 F4c GEMM: how it was built, and the measured numbers
+
+Everything lives in the standalone lab
+`/local/nick/vsim-workspace/vsim-demo/q1_0/` (ace-tq1 style, no llama build
+needed). Four kernels, all checked against each other in `main.c`:
+
+1. `q1_0_dot_scalar` - the judge
+2. `q1_0_dot_vl256`  - original production kernel ([2] in the output)
+3. `q1_0_gemv_64x1`  - F4b row-parallel GEMV ([3])
+4. `q1_0_gemm_64x1`  - F4c GEMM, new ([4])
+
+**The kernel shape** (VLEN=1024 build, M-tile = 4 tokens; `q1_0.c`):
+
+```
+for each 64-row brick group:
+  sumf0..3 = 0                          // one f32 acc per token
+  for each q1_0 block (128 cols):
+    dx = expand_fp16_64(brick.d)        // 64 row scales, integer bit math
+    facc0..3 = 0
+    for each q8_0 group k (32 cols):
+      sumi0..3 = 0                      // one i16 acc per token
+      for c in 0..31:                   // THE hot loop
+        mask = vlm(qs[k*32+c])          // 1 mask load ...
+        sumi0 -= y0[c]; sumi0 += 2*y0[c] where mask   // token 0
+        sumi1 -= y1[c]; sumi1 += 2*y1[c] where mask   // token 1
+        sumi2 ...; sumi3 ...                          // ... 4 users
+      facc_t += dy_t * tofloat(sumi_t)  // per token: vsext+vfcvt+vfmacc.vf
+    sumf_t += dx * facc_t               // vfmacc.vv
+  store sumf0..3
+```
+
+Cost per column = 1 `vlm` (+ its address math) shared by everyone, plus
+(2 int vector ops + 1 scalar byte load) per token. GEMV pays the `vlm` for
+every token; GEMM divides it by the M-tile.
+
+**M-tile size is a register budget, not a choice:**
+
+```
+VLEN=1024: sumi i16m1 x4=4  facc f32m2 x4=8  sumf f32m2 x4=8  dx+cvt m2=4  ~25/32 -> tile 4
+VLEN=512 : sumi i16m2 x2=4  facc f32m4 x2=8  sumf f32m4 x2=8  dx+cvt m4=8  ~29/32 -> tile 2
+```
+
+At VLEN=512 the f32 accumulators are m4 (4 registers each); 4 tokens would
+need ~40 registers. Both builds were objdump-checked: zero vector spills.
+
+**How it was verified** (the section 7 ladder, in order):
+
+1. TDD RED: `q1_0_gemm_64x1` as a return-zeros stub -> harness compares [4]
+   against [2] per element -> 256 FAIL lines on QEMU. Proves the test bites.
+2. GREEN: real kernel -> Andes QEMU (`-mvh` ELF) at VLEN=512 AND 1024 ->
+   ALL PASS. QEMU is correctness-only; its cycle counts are TCG noise.
+3. Cycles: same sources re-linked with the vsim BSP, `csrr mcycle` around
+   each kernel, rep0 = cold caches, rep1 = warm.
+
+**Results - CANONICAL TABLE** (RTL `rdcycle`, nr=64 rows x n=512 cols x M=4
+tokens, cycles per output element, warm rep, every run ends ALL PASS;
+engines = fpga_l3 + premium_max, the tuned premium):
+
+```
+engine        VLEN  M-tile  data   [2] vl256   [3] gemv x4   [4] gemm   gemm vs vl256
+fpga_l3       1024    4     RAM       840          126           40         21.0x
+fpga_l3       1024    4     HVM       785           92           37         21.2x
+premium_max    512    2     RAM      1045          135           75         13.9x
+premium_max    512    2     HVM       753           83           54         13.9x
+```
+
+Best chain - stock kernel on RAM (today's production path) vs repacked gemm
+on HVM: **fpga_l3 840/37 = 22.7x, premium_max 1045/54 = 19.4x**.
+(History: premium_full, the as-delivered FELEN=32 + 8KB-D$ config, measured
+RAM 1049/206/109 - its 8KB D$ was the bottleneck; HVM numbers are identical
+to premium_max since HVM bypasses the D$ entirely.)
+
+Engines are the `vsim_andesim` builds in `/home/nick/work/vsim_andesim/build/`;
+their RTL parameters (from `vsim_andesim/data/configs/*.cfg`):
+
+```
+engine                     VLEN  DLEN  FELEN  L1 I$ / D$     L2 cache   L3 cache
+sim_ax46mpv_fpga_l3        1024  1024   64    32K/32K 4-way  DISABLED   2MB  <- enabled
+sim_ax45mpv_premium_full    512   512   32    64K/ 8K 4-way  32KB       none
+sim_ax45mpv_premium_max     512   512   64    64K/32K 4-way  32KB       none
+```
+
+premium_max = the same premium RTL re-elaborated with everything we wished
+for: ELEN 32->64 (e64 loads/stores legal), FELEN 64, packed-FP16 vector,
+D$ 8K->32K. It builds, and probe_max (rv64gcv) passes 15/15 incl. e64, f64
+and a zvfh-encoded f16->f32 widen - premium is NOT hard-limited to ELEN32,
+those were config choices. Shootout there (warm): RAM gemv 135 / gemm 75
+cyc/dot (the bigger D$ buys 1.5x over premium_full's 8KB), HVM numbers
+identical (753/83/54) - HVM does not care about D$ size, and still wins.
+
+- FELEN=32 on premium_full = vector FP up to fp32 only - exactly what this
+  zve32f kernel needs. Careful: `sim_ax45mpv_premium` (no `_full`) is
+  FELEN=0 = NO vector FP at all, every `vf*` traps; always use `_full`.
+- Both engines have HVM (Andes high-bandwidth vector memory,
+  `NDS_HVM_SUPPORT=1`, base `0x90000000` on both - right above the
+  0x8fffffff RAM cap): fpga_l3 = 8MB, 2 banks; premium_full = 256KB,
+  2 banks + 8 subports.
+
+**RAM vs HVM (how).** `hvm.h` ports ace-tq1's `malloc_hvm` printf-free
+(CSR `0xFD1` = base, `0xFD0[7:0]` = log2 size, bump allocator); build with
+`-DQ1_HVM=1` (`make run-hvm` / `run-1024-hvm`) and ALL data - x, bricks, y,
+outputs, for every kernel - moves to HVM. Numbers are in the canonical
+table above. What the A/B taught us:
+
+- D$ size only helps the repack kernels: going 8K -> 32K D$ (premium_full
+  -> premium_max) took gemv 206 -> 135 and gemm 109 -> 75, but baseline
+  vl256 did not move (1049 -> 1045) - its bottleneck is the reduction
+  latency chain, not cache capacity.
+- HVM does not care about D$ size at all (premium_full HVM == premium_max
+  HVM exactly), and it still beats a 32KB D$ for the `vlm` stream
+  (gemv 83 vs 135) because it bypasses the cache path entirely.
+- HVM latency is deterministic: rep0 == rep1 on every HVM run (no cache
+  warm-up), which also makes numbers easier to compare.
+- Sizing reminder: premium's 256KB HVM fits a 64-row strip of the K=51
+  layer (18KB) easily; fpga_l3's 8MB fits the whole 2560x1024 weight
+  (576KB repacked) with room to spare.
+- Cache note: the lab's static data (x + bricks + y + outputs ~ 47KB, of
+  which the actually-hot warm set is ~15KB) fits fpga_l3's 32KB D$, so its
+  warm rep runs L1-resident and its misses would go D$ -> L3 directly
+  (no L2). On premium_full the D$ is only 8KB, so even the warm rep leans
+  on the 32KB L2 - part of why its per-dot numbers trail fpga_l3 beyond
+  the DLEN 512-vs-1024 gap. (premium_full also has ILM 1MB / DLM 32KB
+  local memories; fpga_l3 has 32K/32K.)
+
+Each run simulates ~1M cycles in ~3 minutes (4-6 kHz). Re-run:
+`make run` (premium_full) / `make run-1024` (fpga_l3) in the lab dir.
+
+**Reading the numbers:**
+
+- The gemm gain tracks the tile width exactly: mask shared by 4 -> 3.1x over
+  gemv, shared by 2 -> 1.9x. So prefill profits from wide VLEN twice:
+  more rows per lane AND a wider M-tile.
+- The baseline [2] does not care about M (same kernel called M*nr times), so
+  per-token decode keeps the F4b 6.0-6.6x, and prefill now gets 9.6-20.5x.
+- gemv per dot is a touch worse here than in the M=1 run (206 vs 174 on
+  premium_full, 127 vs 125 on fpga_l3): 4 separate calls keep more
+  activation/output data in flight. The gemm numbers absorb that too.
+
+---
+
+## 6. Beating standard RVV: a custom ACE-RVV instruction (roadmap F6)
+
+Even the good base-RVV kernel spends ~3 vector ops per column. Your hardware has
+int8 dot-product units (NDS.VD4DOTS family). The ACE idea: fold the whole
+sign-dot into **one** custom instruction, on the *same* Nx1 repack layout.
+
+### 6.1 The instruction: `v_q1_rowdot` (candidate A, recommended)
+
+```
+rvv_insn v_q1_rowdot {          // result[lane] += sum_{i<4} (bit_i ? +act_i : -act_i)
+    operand = { io vrf:4int result, in vrf:int activation, in vrf:uint signbits };
+    vector_unit = elen; latency = 1;
+}
+```
+
+Per lane (= per row) it does a **4-way sign-dot**: take 4 activations and 4 sign
+bits, add or subtract each, accumulate into the lane's i32 result. So one
+instruction advances **4 columns** across all N lanes.
+
+```
+base RVV:        3 vector ops  advance 1 column  across N lanes
+v_q1_rowdot:     1 vector op   advances 4 columns across N lanes   -> ~4x fewer hot-path insns
+```
+
+Why it is cheap in hardware:
+- It is the sign-bit analog of `NDS.VD4DOTS`, but the weight is **1 bit**, not 8.
+  That is 8x less register traffic for weights.
+- The "multiply" is just conditional-negate into an add-tree. No real
+  multiplier - cheaper than even the multiply-free MAC (`v_w_mul_free_macc`)
+  used in your TQ1 ACE lab.
+- Row-parallel means no reduction inside the instruction and full VLEN outside
+  it - the same reasons the base kernel wins, now with 4x denser columns.
+
+### 6.2 Why the same layout matters
+
+`v_q1_rowdot` consumes the **exact F4 Nx1 repack**. So:
+- Base RVV (F4b) and ACE (F6) run on the *same* repacked weights.
+- You get a clean, direct A/B cycle shootout on vsim: same data, same shape,
+  only the inner instruction differs. That is the honest way to prove "ACE beats
+  optimized RVV."
+
+### 6.3 The design menu (already narrowed to A)
+
+- **A. `v_q1_rowdot`** - row-parallel 4-way sign-dot. Wide-VLEN optimum. Pick this.
+- **C. `v_q1_sign_macc`** - single-row, element-wise (`2int` result). Still needs
+  an external `vwredsum` tail. Fallback if COPILOT cannot do an in-lane 4-way
+  reduce.
+- **B. `v_q1_unpack`** - just expand sign bits to +-1 int8, then reuse the
+  existing MAC. Smallest new hardware, smallest win.
+
+Open question to settle in COPILOT before RTL: does it allow a `4int` (i32)
+result produced by an in-lane 4-way reduction, and reading the sign bit-plane as
+`vrf:uint`? Your `v_q_tq2_unpack` (returns i32 from a packed byte) suggests yes.
+If not, fall back to C.
+
+Toolchain and template: your TQ1 ACE lab at
+`/local/nick/vsim-workspace/vsim-demo/ace-tq1` (COPILOT 7.3, `unpack.ace`
+header, csim, `rdcycle`). Copy `unpack.ace`'s header into a new `q1.ace`.
+
+---
+
+## 7. How to prove each step (the measurement ladder)
+
+Order matters. QEMU is for correctness only; it actively misleads on speed.
+
+1. **Correctness (host + QEMU).** New kernel vs `*_generic`, random + edge data,
+   in `kernel-lab/`. Bit-exact for integer paths; double-reference gate
+   (`|res - dbl| / sum|terms| < 1e-4`) once float accumulation is reordered.
+   `--inject` self-test proves the harness can catch a broken kernel.
+   *QEMU speed numbers are not real* - TCG charges per vector instruction and
+   makes stalls free, so it favors `_vl256` and punishes F4-style restructures
+   (this artifact is what buried F2, section 4).
+
+2. **Real cycles, in-model: andesim hybrid marker ROI, K=51.** This is THE gate.
+   K=51 = layer 7 V projection (2560x1024 GEMV) - exactly the shape F4
+   accelerates. Numbers to beat:
+   - `ax45mpv_premium` (VLEN=512, ELEN=32): **6528953** cycles
+   - `ax46mpv_fpga_l3` (VLEN=1024, ELEN=64): **4476168** cycles
+   Full recipe in `opt_roadmap.md` "Measurement setup" and
+   `/home/nick/work/andesim/docs/llama_roi_howto.md`.
+
+3. **Real cycles, standalone: ace-tq1 `rdcycle` flow.** For kernel-lab-only
+   shootouts (F4b vs F6) without a full llama build. The **only** path for ACE
+   custom instructions.
+
+4. **FPGA**: final full-token latency.
+
+TDD rule (from your CLAUDE.md): before optimizing, write the failing correctness
+test against `*_generic` and see it fail for the right reason. Never commit a
+kernel without its test.
+
+---
+
+## 8. Recommended order of attack
+
+```
+F4a  scalar reference ggml_gemv_q1_0_16x1_q8_0 + repack_q1_0_to_q1_0_Nx1
+     + kernel-lab bit-exact test           <- TDD oracle, HW-agnostic, no deps. DO FIRST.
+        |
+        +--> F4b  base-RVV row-parallel GEMV (section 5), N=64, LMUL-adaptive
+        |         gate: K=51 ROI on premium + fpga_l3 vs the numbers above
+        |
+        +--> F6   ACE v_q1_rowdot on the SAME Nx1 layout (section 6)
+                  gate: A/B cycle shootout F4b vs F6 (vsim rdcycle)
+```
+
+F4a is the fork: it validates both the base-RVV kernel and the ACE csim against
+one oracle. Everything else hangs off it. A small quick win if F4 stalls: F1
+(nrows=2 multi-row vec_dot) - but it does not solve the wide-VLEN utilization
+problem the way the repack does. (F2, defer reductions, was tried and removed -
+section 4.)
+
+**One-line summary.** Today's kernel reduces 32 lanes to 1 four times per block,
+so wide VLEN mostly idles. Repack N rows into N lanes so the reduction becomes a
+vertical add - that is where large LMUL and wide VLEN finally turn into speed -
+then replace the 3-op-per-column inner loop with one `v_q1_rowdot` ACE
+instruction to beat optimized RVV.
