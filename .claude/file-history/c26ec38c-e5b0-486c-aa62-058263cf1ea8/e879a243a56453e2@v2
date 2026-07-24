@@ -1,0 +1,52 @@
+#pragma once
+
+// HVM (Andes high-bandwidth vector memory) placement helpers for the Q1_0
+// repack path (opt_roadmap F4: weights-in-HVM).
+//
+// The hot Q1_0 gemv/gemm loop is almost pure load (per-column vlm sign-plane
+// stream), so it is very sensitive to the weight memory path. Streaming a
+// repacked weight from L3 is what caps the in-model K=51 speedup. Relocating
+// that weight into HVM -- a banked local memory at CSR 0xFD1, deterministic
+// latency, D-cache bypass -- lets the kernel read it with no cache misses.
+//
+// This header exposes two pure, host-testable primitives (bump allocator +
+// name selector) and, on RISC-V only, the CSR window discovery. The stateful
+// per-process allocator lives in repack.cpp (single caller, single instance).
+
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+// Bump-allocate `size` bytes at the next `align`-aligned offset in the
+// half-open window [*off, end). On success advances *off past the block and
+// returns the aligned pointer; on overflow (or address wrap) leaves *off
+// untouched and returns NULL. Pure arithmetic -- no target state, host
+// testable. `align` must be a power of two.
+static inline void * ggml_hvm_bump(uint64_t * off, uint64_t end, size_t size, size_t align) {
+    const uint64_t aligned = (*off + (align - 1)) & ~(uint64_t) (align - 1);
+    const uint64_t next    = aligned + size;
+    if (next > end || next < aligned) {  // past the window, or 64-bit wrap
+        return NULL;
+    }
+    *off = next;
+    return (void *) (uintptr_t) aligned;
+}
+
+// Relocate this tensor to HVM iff `selector` is non-empty and a substring of
+// `name`. Empty/NULL selector => feature off; NULL name => no match. Substring
+// (not exact) so a selector like "attn_v" can target every layer's V weight,
+// bounded by the HVM window via the bump allocator.
+static inline int ggml_hvm_selected(const char * name, const char * selector) {
+    if (!selector || !selector[0] || !name) {
+        return 0;
+    }
+    return strstr(name, selector) != NULL;
+}
+
+// --- target-only: HVM window discovery via Andes CSRs ---
+//   NDS_MHVMB    (0xFD1) = HVM base address
+//   NDS_MHVM_CFG (0xFD0) bits [7:0] = log2(HVM size in bytes)
+#if defined(__riscv)
+static inline uint64_t ggml_hvm_csr_cfg(void)  { uint64_t v; __asm__ volatile("csrr %0, 0xFD0" : "=r"(v)); return v; }
+static inline uint64_t ggml_hvm_csr_base(void) { uint64_t v; __asm__ volatile("csrr %0, 0xFD1" : "=r"(v)); return v; }
+#endif
