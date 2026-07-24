@@ -100,4 +100,16 @@ opt_roadmap.md F6. Open: confirm COPILOT allows 4int in-lane reduce result
 (v_q_tq2_unpack suggests yes). Asked user path A/B/C + activation format
 2026-07-20; away, defaulting to A + keep per-32 Q8_0.
 
+**F4d DONE 2026-07-24**: ggml wiring merged on llama.cpp branch q1_0-rvv-opt
+(block_q1_0x64 + generic + RVV vlenb-dispatch kernels + dispatch gate
+Q1_0/riscv_v/VLEN>=512/rows%64; test tests/test-repack-q1_0.cpp, bit-exact
+at QEMU 512+1024; e64+zvfh REPACK blockers fixed; ROI counter moved before
+extra-dispatch in ggml-cpu.c or repacked matmuls shift K).
+**K=51 in-model fpga_l3: 4,476,168 -> 2,144,755 = 2.09x** (vs lab 6.6x:
+weights 576KB stream from L3, scalar activation quantize, node overhead).
+Next levers: weights-in-HVM, RVV e32 activation quantize, prefill M-tiles.
+premium_max K=51 BLOCKED: ax45 hybrid resume can't halt hart (PLDM
+0xE6800000 fetches unserved in vsim_andesim ax45 wrapper; ax46 fine) -
+vsim_andesim work, engine cfg is innocent.
+
 Related: [[ace-tq1-standalone-kernel-lab]], [[andesim-llamacpp-hybrid-gaps]].
