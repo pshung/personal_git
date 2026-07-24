@@ -106,8 +106,33 @@ Q1_0/riscv_v/VLEN>=512/rows%64; test tests/test-repack-q1_0.cpp, bit-exact
 at QEMU 512+1024; e64+zvfh REPACK blockers fixed; ROI counter moved before
 extra-dispatch in ggml-cpu.c or repacked matmuls shift K).
 **K=51 in-model fpga_l3: 4,476,168 -> 2,144,755 = 2.09x** (vs lab 6.6x:
-weights 576KB stream from L3, scalar activation quantize, node overhead).
-Next levers: weights-in-HVM, RVV e32 activation quantize, prefill M-tiles.
+gap is memory-bound - K=51 weight is 360KB/row-strip 9KB, NOT 576KB/18KB as
+earlier docs say; streams from L3 since fpga_l3 L1 is 32K/L2 off; secondary =
+scalar activation quantize, node overhead). Next levers: weights-in-HVM, RVV
+e32 activation quantize, prefill M-tiles.
+
+**weights-in-HVM IMPLEMENTED 2026-07-24 (measurement PENDING)** on branch
+q1_0-rvv-opt. Agents confirmed: (1) repack buft = ONE big alloc for all Q1_0
+repack tensors, tensor->data is absolute ptr, kernel reads src0->data -> can
+redirect per-tensor at load; injection = set_tensor BEFORE ->repack(), point
+tensor->data at HVM so repack writes sign-planes straight in (zero extra copy).
+(2) hybrid QEMU fast-leg (machine andes_ae350) backs 0x90000000 as writable
+RAM (memory_region_init_ram, hvm_size_pow_2 from cfg: fpga_l3 8MiB/23,
+premium 256KiB/18); load-time HVM writes captured via plugin
+drain_lm_sidecar (qemu_plugin_read_memory_hwaddr) -> state-*.bin.hvm ->
+vsim --hvm backdoor set_hvm(). CSR 0xFD1/0xFD0 discovery works in guest.
+Files: NEW ggml/src/ggml-cpu/hvm.h (pure ggml_hvm_bump + ggml_hvm_selected,
+target-only CSR readers); repack.cpp set_tensor redirect (env GGML_Q1_HVM or
+-DGGML_Q1_HVM_NAME=attn_v, substring; file-static ggml_hvm_alloc bump 64-align
+NULL-on-overflow); ggml-cpu.c ROI print `[roi] MUL_MAT #K src0=name [nxn]`;
+NEW tests/test-hvm-place.cpp (host RED->GREEN, pure logic). Run harness:
+NEW run-k51-hvm.sh (build w/ define + andesim fpga_l3 K=51). SELF-CHECK in
+FAST leg: `[q1-hvm] blk.7.attn_v.weight ... -> HVM` + `[roi] ... src0=
+blk.7.attn_v.weight` both must appear before the ~hours RTL leg. Goal < 2.14M.
+BLOCKER for me: Andes glibc toolchain on /local/nick/SW_Release is fuse-sshfs
+(atcnsqa16) - execve intermittently EPERMs/hangs from Claude's container even
+with sandbox off (the .gnu backend runs standalone but gcc-driver spawning
+cc1/as flakes); build+run must go through the user's host shell via `!`.
 premium_max K=51 BLOCKED: ax45 hybrid resume can't halt hart (PLDM
 0xE6800000 fetches unserved in vsim_andesim ax45 wrapper; ax46 fine) -
 vsim_andesim work, engine cfg is innocent.
