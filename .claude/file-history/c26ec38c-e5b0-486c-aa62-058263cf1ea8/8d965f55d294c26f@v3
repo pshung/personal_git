@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Build + measure the Q1_0 weights-in-HVM K=51 ROI on andesim (opt_roadmap F4).
+#
+# What it does: relocates the measured MUL_MAT's Q1_0 weight into HVM (banked
+# local memory, D-cache bypass) so the repack gemv reads HVM instead of
+# streaming the sign-planes from L3 -- the thing that caps the in-model speedup.
+#
+#   Reference pristine (no repack):        4,476,168 cycles
+#   Baseline to beat (repack, RAM/L3):     2,144,755 cycles   <- current
+#   This run (repack, weight in HVM):      ???  (goal: < 2,144,755)
+#
+# The measured node's weight is selected by name substring via a compile-time
+# define (guaranteed to reach the guest; env GGML_Q1_HVM overrides at runtime).
+# Selector "attn_v" matches blk.<layer>.attn_v.weight; the bump allocator caps
+# at the 8 MiB HVM window, so early layers (incl. the K=51 layer 7) land in HVM.
+#
+# SELF-CHECK: during the FAST (QEMU) leg -- fast, before the multi-hour RTL leg
+# -- these two lines MUST appear, confirming the right tensor went to HVM:
+#     [q1-hvm] blk.7.attn_v.weight [<n> x <n>] -> HVM 0x9....  (<bytes> B)
+#     [roi] MUL_MAT #51 src0=blk.7.attn_v.weight [<n> x <n>]
+# If they don't, the weight is NOT in HVM -- abort and re-check before burning
+# hours in the cycle-accurate leg.
+#
+# Run this on the HOST shell (the Andes glibc toolchain + sim live on the
+# /local/nick/SW_Release fuse-sshfs mount, which needs reliable exec).
+set -euo pipefail
+
+LLAMA=${LLAMA:-/home/nick/work/llama.cpp}
+ANDESIM=${ANDESIM:-/home/nick/work/andesim}
+BUILD=${BUILD:-$LLAMA/build-rv64-static}
+MODEL=${MODEL:-$LLAMA/models/Bonsai-4B-Q1_0.gguf}
+ENGINE=${ENGINE:-vsim:ax46mpv_fpga_l3}  # cfg name, not the sim_-prefixed binary
+SELECTOR=${SELECTOR:-attn_v}                 # substring of the target weight name
+ROI_K=${ROI_K:-51}
+STEP_TIMEOUT_MS=${STEP_TIMEOUT_MS:-14400000}  # fpga_l3 K=51 is ~hours
+ANDES_INC=${ANDES_INC:-$ANDESIM/build/runtime/include}
+
+FLAGS="-mext-zvlsseg -DANDESIM_ROI_MUL_MAT_K=$ROI_K -DGGML_Q1_HVM_NAME=$SELECTOR -I $ANDES_INC"
+
+echo "== configure + build llama-completion (selector=$SELECTOR, K=$ROI_K) =="
+cmake -S "$LLAMA" -B "$BUILD" -DCMAKE_C_FLAGS="$FLAGS" -DCMAKE_CXX_FLAGS="$FLAGS"
+cmake --build "$BUILD" --target llama-completion -j
+
+echo "== run K=$ROI_K ROI on $ENGINE (watch for the two SELF-CHECK lines) =="
+cd "$ANDESIM"
+./andesim run --mode hybrid --trigger marker --runtime linux --mem-size 2000M \
+    --engine "$ENGINE" --step-timeout-ms "$STEP_TIMEOUT_MS" \
+    "$BUILD/bin/llama-completion" -- \
+    -m "$MODEL" -no-cnv --prompt "The capital of France is" -n 32 -c 512 -t 1
