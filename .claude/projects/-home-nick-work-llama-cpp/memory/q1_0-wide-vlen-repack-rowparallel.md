@@ -145,4 +145,25 @@ andesim guest-RAM mmap goes to /dev/shm (also tmpfs) - clean
 HVM-related. premium_max K=51 still BLOCKED: ax45 hybrid resume can't halt hart
 (PLDM 0xE6800000 unserved in vsim_andesim ax45 wrapper; ax46 fine).
 
+**F5 SW-prefetch DONE 2026-07-27 (no HVM, user dropped HVM)**: repack gemv
+weight stream (bx[l], block_q1_0x64 = 2176B = 34 cache lines, walked
+sequentially) is load-bound because this core's HW prefetch is shallow
+(NDS_L3C_PFP_LINE_NUM=0, D$ 4 entries). Added __builtin_prefetch of block
+l+Q1_PREFETCH_DIST at top of both gemv l-loops in arch/riscv/repack.cpp
+(helper q1_prefetch_block). Needs -DGGML_RV_ZICBOP=ON (else __builtin_prefetch
+is a nop; gcc14.2 emits real prefetch.r under -march=..._zicbop; added to
+build.sh). K=51 fpga_l3 VLEN1024 cycle-accurate: baseline 2,144,213 -> DIST=1
+**1,391,650 (1.54x, BEST)** / DIST=2 1,430,534 (1.50x) / DIST=4 1,506,429
+(1.42x) -> more lookahead is WORSE (one 34-line block ahead already hides
+L3/DRAM latency, further adds MSHR/cache pressure). Default set DIST=1.
+Bit-exact (qemu fast: prefetch vs baseline byte-identical text; prefetch.r is
+architecturally a no-op hint). UNLIKE HVM (fit only ~1.4% of weights) this
+generalizes to ALL Q1_0 matmuls -> broad whole-decode win. vs pristine 3.22x.
+Measurement: each K=51 run ~18-40min (RTL leg ~2M cyc at few kHz, machine
+shared w/ other users' sim_ax46mpv jobs); cycle count is contention-independent
+so ran DIST variants concurrently. UNCOMMITTED (harness: commit only when user
+asks). NOT yet done: gemm/prefill prefetch, fold config into roadmap+tutorial.
+ax46mpv_fpga_l3 cache cfg: I$/D$ 32K 4-way 64B line, NO L2, L3 2MB 4-bank
+16-way 512b, BIU 512b, VLSU_MSHR 16 / L3_NXACT 16, HVM 8MB@0x90000000.
+
 Related: [[ace-tq1-standalone-kernel-lab]], [[andesim-llamacpp-hybrid-gaps]].
