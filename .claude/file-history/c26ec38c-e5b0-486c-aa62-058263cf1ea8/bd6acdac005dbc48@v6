@@ -1,0 +1,167 @@
+# Reproduce: Q1_0 weight-stream prefetch K=51 speedup (1.54x, no HVM) + correctness
+
+A step-by-step runbook to rebuild, re-measure, and re-verify the headline
+result: on the K=51 MUL_MAT node (Bonsai-4B layer-7 V projection, 2560x1024),
+adding one software `prefetch.r` of the next weight block to the row-parallel
+Q1_0 repack gemv kernel runs **1.54x** faster than the same kernel without it,
+and produces **bit-identical** output. This is pure software - no HVM, no
+hardware change. (The older weights-in-HVM experiment is in the appendix; it is
+superseded because HVM held only ~1.4% of the weights, while prefetch helps
+every Q1_0 matmul.)
+
+## 0. Result to reproduce
+
+Engine `ax46mpv_fpga_l3` (VLEN 1024, ELEN 64), cycle-accurate (vsim RTL),
+K=51 marker ROI. All rows keep the weights in RAM.
+
+| Configuration                          | K=51 cycles | vs baseline | vs pristine |
+|----------------------------------------|-------------|-------------|-------------|
+| pristine (no repack, per-row vec_dot)  | 4,476,168   | 0.47x       | 1.00x       |
+| baseline (repack, prefetch OFF)        | 2,144,213   | 1.00x       | 2.09x       |
+| **prefetch (repack + prefetch DIST=1)**| **1,391,650**| **1.54x**  | **3.22x**   |
+
+The two wins stack and are independent: repack fixes the compute (no idle lanes
+at wide VLEN), prefetch fixes the memory (the weight stream no longer stalls on
+L3/DRAM misses).
+
+Prefetch is a **decode (gemv)** optimization. The gemm (prefill) path is also
+prefetched but barely benefits - on a pure-gemm node (nrows=4) it is only
+1,696,704 -> 1,649,275 = **1.03x**, because gemm reuses each weight block across
+the M-tile of 4 activations and is already close to compute-bound (section 3b).
+
+Correctness: the prefetch and baseline binaries, both VLEN 1024, greedy, same
+prompt, generate byte-identical text (prefetch.r is a pure hint).
+
+## 1. Reference environment
+
+These are the paths this runbook was captured on. Override via the env vars.
+
+```
+LLAMA=${LLAMA:-/home/nick/work/llama.cpp}          # this repo (branch q1_0-rvv-opt)
+ANDESIM=${ANDESIM:-/home/nick/work/andesim}        # andesim driver (branch llamacpp)
+VSIM=${VSIM:-/home/nick/work/vsim_andesim}         # holds build/sim_ax46mpv_fpga_l3
+TC=${TC:-/local/nick/SW_Release/build-ast542/build-toolchain/linux/nds64le-linux-glibc-v5d}
+MODEL=${MODEL:-$LLAMA/models/Bonsai-4B-Q1_0.gguf}  # 572 MB Q1_0 GGUF
+ENGINE=vsim:ax46mpv_fpga_l3                          # VLEN 1024, ELEN 64
+```
+
+Build the andesim driver once (host-only, no cross toolchain):
+```
+export TMPDIR=/home/nick/tmp        # see gotcha in section 5
+cd $ANDESIM && bash scripts/build_driver.sh
+ls $VSIM/build/sim_ax46mpv_fpga_l3  # the vsim engine binary must already exist
+```
+
+## 2. Build the RISC-V binaries
+
+Just run the build script in the repo root:
+```
+bash build.sh                     # pristine + baseline + prefetch (static)
+bash build.sh baseline prefetch   # only the A/B pair
+```
+Override paths via env `LLAMA` / `ANDESIM` / `TC`. `build.sh` bakes in the
+settings that MUST be right (else the guest crashes or the numbers are wrong):
+`-static` (vlinux has no dynamic loader; see section 5), `-DGGML_CPU_REPACK` as
+a top-level `-D` (it is a CMake `option()`), and `-DGGML_RV_ZICBOP=ON` so
+`__builtin_prefetch` emits a real `prefetch.r` (without it, it compiles to a
+nop). The prefetch distance is the only difference between the two builds:
+`baseline` uses `-DQ1_PREFETCH_DIST=0` (off), `prefetch` uses `=1` (shipped).
+
+## 3. Measure cycles (hybrid, K=51 ROI) -- the 1.54x
+
+For each binary, run the hybrid marker measurement. The vsim RTL leg measures
+the single K=51 node and prints one cycle figure. This is slow (the RTL leg
+runs at a few kHz); budget minutes per run.
+
+```
+bash measure.sh                    # pristine baseline prefetch
+# expect  pristine 4476168 | baseline 2144213 | prefetch 1391650 cycles
+```
+Each run prints, before the cycle line, a self-check identifying the node and
+its row count:
+```
+[roi] MUL_MAT #51 src0=blk.7.attn_v.weight [2560 x 1024] nrows=2
+```
+Speedup = 2,144,213 / 1,391,650 = 1.54x (prefetch vs baseline);
+4,476,168 / 1,391,650 = 3.22x (vs pristine).
+
+`nrows=2` here is because the K=51 ROI lands in llama.cpp's warmup forward pass
+(2 tokens), which is pure gemv - exactly the decode case prefetch targets.
+
+## 3b. Measure the gemm (prefill) path -- the 1.03x
+
+To exercise the gemm path you need a node with `nrows > 3`. Use `--no-warmup`
+so the ROI reaches the real prefill, and a 4-token prompt so `nrows=4` (one
+M-tile, pure gemm, no gemv remainder):
+```
+PROMPT="The capital of France" WARMUP=--no-warmup bash measure.sh baseline prefetch
+# expect  baseline 1696704 | prefetch 1649275 cycles  (1.03x)
+```
+The `[roi]` line will show `nrows=4`. The small gain confirms gemm is not
+memory-starved: it reuses each weight block across 4 activations.
+
+## 4. Verify correctness (fast mode, bit-exact) -- minutes, no RTL
+
+```
+bash verify.sh     # runs bin-prefetch and bin-baseline under --mode fast, diffs the output
+```
+Both must print the same continuation, e.g.:
+```
+The capital of France is Paris. Paris is the capital of France. Paris is the capital of France.
+```
+Identical output with prefetch on vs off => the hint changed nothing; the
+1,391,650-cycle figure is on a bit-exact-correct kernel.
+
+## 5. Gotchas
+
+- **/tmp inode exhaustion.** `/tmp` here is a tmpfs whose *inode* cap (1M) is
+  shared machine-wide and often saturated -- `df -h /tmp` shows free space but
+  `df -i /tmp` shows 100%. gcc temp files and tool output then fail with
+  ENOSPC even though space is free. Fix: `export TMPDIR=/home/nick/tmp` (ext4,
+  millions of free inodes) for every build and andesim run.
+- **A fully static binary is REQUIRED** (`-DCMAKE_EXE_LINKER_FLAGS=-static`
+  plus `-DLLAMA_CURL=OFF` and `-DBUILD_SHARED_LIBS=OFF`, all in `build.sh`).
+  `andesim --runtime linux` boots a bare ELF under a proxy kernel with NO
+  dynamic loader, so a dynamically-linked `llama-completion` jumps to garbage
+  at startup (`mcause=0x1`, `mepc=0xffff...fe`, or the hybrid QEMU leg exiting 1
+  instead of 200). Verify with `readelf -d bin`: no `NEEDED` entries.
+- **zicbop is NOT on by default.** `-DGGML_RV_ZICBOP=ON` is required for the
+  prefetch to emit any instruction; without it `__builtin_prefetch` is a nop
+  and `baseline` == `prefetch`. Confirm with
+  `riscv64-linux-objdump -d <build>/.../arch/riscv/repack.cpp.o | grep -c prefetch`
+  (baseline = 0, prefetch = 4: two gemv + two gemm sites).
+- **The ROI defaults to the warmup pass.** The K=51 marker counts every
+  MUL_MAT from process start; the first full forward pass is llama.cpp's warmup
+  (nrows=2). Pass `--no-warmup` (as in 3b) to measure the real prefill node.
+  The prompt's token count then sets `nrows`, which selects gemm (>=4) vs gemv.
+- **andesim guest-RAM mmap** lands in `/dev/shm` (also tmpfs). If it fills,
+  `rm -f /dev/shm/hsim-shm.*` between runs.
+- **Toolchain on sshfs.** `$TC` lives on a fuse-sshfs mount; the driver
+  `riscv64-linux-gcc` is a wrapper that execs `...-gcc.gnu`. Builds work through
+  it; if a single compile flakes, retry (the mount is occasionally slow).
+- **Shared machine.** Other users' `sim_ax46mpv*` jobs contend for cores, so
+  wall-clock per run varies (~18-40 min). The measured *cycle count* is
+  deterministic and contention-independent, so you can run variants concurrently.
+
+## 6. What each number proves
+
+- 4,476,168 -> 2,144,213 (2.09x): the row-parallel repack kernel removes the
+  per-32 `vwredsum` horizontal reduction that wastes lanes at wide VLEN.
+- 2,144,213 -> 1,391,650 (1.54x): with the kernel now load-bound, one
+  `prefetch.r` of the next weight block hides the L3/DRAM miss latency (this
+  core's HW prefetcher is shallow: `NDS_L3C_PFP_LINE_NUM=0`, D$ 4 entries).
+- 4,476,168 -> 1,391,650 (3.22x): the two combined, on a bit-exact kernel.
+- gemm 1,696,704 -> 1,649,275 (1.03x): prefetch barely helps prefill because
+  gemm reuses each weight across the M-tile -> it is compute-bound, not
+  memory-bound. Prefetch is a decode optimization.
+
+## Appendix: weights-in-HVM (superseded)
+
+An earlier experiment relocated the K=51 weights into Andes HVM (banked local
+memory at 0x90000000), giving 2,144,755 -> 946,460 = 2.27x over repack (4.73x
+over pristine) on that single node. It was dropped because HVM maxes at 256 MiB
+of address space and, at the fpga_l3 8 MiB size, held only ~1.4% of the 560 MB
+of Q1_0 weights - so it does not generalize, whereas prefetch helps every
+matmul. To reproduce it: `bash build.sh hvm` (adds `-DGGML_Q1_HVM_NAME=attn_v`)
+and measure `bin-hvm`; the andesim `--mode fast` HVM backing is described in
+opt_roadmap.md F4.
