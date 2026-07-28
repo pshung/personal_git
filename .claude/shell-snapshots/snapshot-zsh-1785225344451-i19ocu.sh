@@ -8370,4 +8370,28 @@ function grep {
     (exec -a ugrep "$_cc_bin" -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclude-dir=.bzr --exclude-dir=.jj --exclude-dir=.sl ${1+"$@"})
   fi
 }
+# Shadow pkill to refuse patterns matching the CLI process
+unalias pkill 2>/dev/null || true
+function pkill {
+  if [ -n "${CLAUDE_PID:-}" ] && [ -r "/proc/${CLAUDE_PID}/comm" ]; then
+    local _cc_skip="" _cc_a
+    local -a _cc_probe=()
+    for _cc_a in ${1+"$@"}; do
+      if [ -n "$_cc_skip" ]; then _cc_skip=""; continue; fi
+      case "$_cc_a" in
+        --signal) _cc_skip=1 ;;
+        --signal=*|-e|--echo) ;;
+        -[0-9]*) ;;
+        -[PUGOF]?*) _cc_probe+=("$_cc_a") ;;
+        -[ABCDEFGHIJKLMNOPQRSTUVWXYZ][ABCDEFGHIJKLMNOPQRSTUVWXYZ0-9]*) ;;
+        *) _cc_probe+=("$_cc_a") ;;
+      esac
+    done
+    if command pgrep ${_cc_probe[@]+"${_cc_probe[@]}"} 2>/dev/null | command grep -qx "${CLAUDE_PID}"; then
+      printf 'pkill: refusing to run — this pattern matches the Claude CLI process (PID %s). Narrow the pattern, or target your own children with `pkill -P $$ ...`.\n' "${CLAUDE_PID}" >&2
+      return 1
+    fi
+  fi
+  command pkill ${1+"$@"}
+}
 export PATH=/home/nick/.nvm/versions/node/v22.5.1/bin:/home/nick/.pyenv/shims:/home/nick/.pyenv/bin:/home/nick/.nix-profile/bin/:/home/nick/.python_venv/bin/:/home/nick/myusr/bin:/home/nick/myusr/local/bin:/home/nick/mybin/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/bin/vendor_perl:/home/nick/myTool/arcanist/bin:/usr/share:/home/nick/.cargo/bin/:/home/nick/.local/bin:/home/nick/.fzf/bin:/home/nick/.claude/plugins/cache/claude-plugins-official/ralph-loop/1.0.0/bin
