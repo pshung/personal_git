@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Build the RISC-V llama-completion binaries for the Q1_0 prefetch reproduce
+# runbook (q1_0_hvm_reproduce.md): pristine / baseline / prefetch (+ optional hvm).
+#   pristine = upstream kernel, no repack
+#   baseline = repack row-parallel kernel, prefetch OFF (Q1_PREFETCH_DIST=0)
+#   prefetch = repack + weight-stream prefetch, the shipped kernel (DIST=1)
+#   hvm      = repack + weights-in-HVM (older experiment, now superseded)
+#
+#   bash build.sh                    # pristine baseline prefetch
+#   bash build.sh prefetch           # just the shipped kernel
+#   bash build.sh baseline prefetch  # the prefetch A/B pair
+#
+# Override paths via env: LLAMA, ANDESIM, TC.
+set -e
+export TMPDIR=${TMPDIR:-/home/nick/tmp}   # /tmp inodes are exhausted -> ENOSPC without this
+LLAMA=${LLAMA:-/home/nick/work/llama.cpp}
+ANDESIM=${ANDESIM:-/home/nick/work/andesim}
+TC=${TC:-/local/nick/SW_Release/build-ast542/build-toolchain/linux/nds64le-linux-glibc-v5d}
+
+# Which MUL_MAT node the ROI brackets. Compile-time because andesim's linux
+# runtime hands the guest an EMPTY envp (runtime/linux/stack.h), so the
+# GGML_ROI_MUL_MAT_K env override never reaches the guest -- one binary per
+# measured node. Bonsai-4B layer 7 (see q1_0_hvm_reproduce.md shape table):
+#   50 attn_q  51 attn_v  52 attn_k  53 attn_output  54 ffn_gate  55 ffn_up
+#   56 ffn_down                                       253 result_output
+# K=51 keeps the original unsuffixed artifact names; anything else appends -k<K>.
+ROI_K=${ROI_K:-51}
+SUF=""; [ "$ROI_K" = 51 ] || SUF="-k$ROI_K"
+
+# The settings that MUST be right (else the guest crashes / baseline is wrong):
+#   -static                : vlinux proxy kernel has no dynamic loader
+#   -DGGML_CPU_REPACK      : a CMake option(), passed as a top-level -D (NOT in *_FLAGS)
+#   -DGGML_RV_ZICBOP=ON    : lets __builtin_prefetch emit prefetch.r for the Q1_0
+#                            gemv weight-stream prefetch (Q1_PREFETCH_DIST, 1.54x on K=51)
+#   -DQ1_PREFETCH_DIST=N   : prefetch lookahead in blocks; 0 = off (baseline), 1 = shipped
+#   -DGGML_Q1_HVM_NAME     : HVM redirect selector; only on the HVM build
+cfg() {  # $1 build dir   $2 repack toggle   $3 extra defines (DIST / HVM selector, or "")
+  local FL="$3 -mext-zvlsseg -DANDESIM_ROI_MUL_MAT_K=$ROI_K -I $ANDESIM/build/runtime/include"
+  cmake -S "$LLAMA" -B "$1" \
+    -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=riscv64 \
+    -DCMAKE_C_COMPILER="$TC/bin/riscv64-linux-gcc" \
+    -DCMAKE_CXX_COMPILER="$TC/bin/riscv64-linux-g++" \
+    -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_RV_ZFH=OFF -DGGML_RV_ZVFH=OFF \
+    -DGGML_RV_MARCH_LETTERS=g -DGGML_RV_ZC_EXTRA=zca_zcb_zcmp_zcmt \
+    -DGGML_RV_ZICBOP=ON \
+    -DGGML_CCACHE=OFF -DLLAMA_CURL=OFF -DCMAKE_EXE_LINKER_FLAGS=-static \
+    $2 -DCMAKE_C_FLAGS="$FL" -DCMAKE_CXX_FLAGS="$FL"
+  cmake --build "$1" --target llama-completion -j"$(nproc)"
+}
+
+build_one() {  # $1 = pristine | baseline | prefetch | hvm
+  case "$1" in
+    pristine) cfg "$LLAMA/b-pristine$SUF" "-DGGML_CPU_REPACK=OFF" "" ;;
+    baseline) cfg "$LLAMA/b-baseline$SUF" "-DGGML_CPU_REPACK=ON"  "-DQ1_PREFETCH_DIST=0" ;;
+    prefetch) cfg "$LLAMA/b-prefetch$SUF" "-DGGML_CPU_REPACK=ON"  "-DQ1_PREFETCH_DIST=1" ;;
+    hvm)      cfg "$LLAMA/b-hvm$SUF"      "-DGGML_CPU_REPACK=ON"  "-DGGML_Q1_HVM_NAME=attn_v" ;;
+    *) echo "unknown target '$1' (want pristine|baseline|prefetch|hvm)" >&2; exit 1 ;;
+  esac
+  cp "$LLAMA/b-$1$SUF/bin/llama-completion" "$LLAMA/bin-$1$SUF"
+  echo "built: $LLAMA/bin-$1$SUF (ROI MUL_MAT #$ROI_K)"
+}
+
+for t in ${*:-pristine baseline prefetch}; do build_one "$t"; done
