@@ -1,0 +1,62 @@
+# Standalone build of the Q1_0 vec_dot kernels + correctness harness.
+# TC/MARCH default to the Andes toolchain used by build-rv64* (see memory /
+# opt_roadmap.md). Override: make rv64 TC=... MARCH=...
+
+TC    ?= /local/nick/SW_Release/build-ast542/build-toolchain/linux/nds64le-linux-glibc-v5d/bin
+RVCC  ?= $(TC)/riscv64-linux-gcc
+# zicbop is required for F5: without it GCC drops __builtin_prefetch silently
+MARCH ?= rv64gcv_zfh_zvfh_zicbop_zihintpause
+
+# F5 prefetch distance in bricks, 0 = off. Sweep: make rv64 PFDIST=2 (rebuild
+# from clean, or touch q1_0.c - make cannot see the value change).
+PFDIST ?= 1
+
+# -ffp-contract=off: forbid FMA fusion so scalar reference and RVV kernel
+# round identically -> bit-exact comparison is meaningful
+CFLAGS ?= -O2 -Wall -Wextra -ffp-contract=off
+DEFS    = -DQ1_PREFETCH_DIST=$(PFDIST)
+
+SRC = q1_0.c test_q1_0.c q1_0.h
+
+all: host rv64
+
+host: test_q1_0_host
+test_q1_0_host: $(SRC)
+	gcc $(CFLAGS) $(DEFS) q1_0.c test_q1_0.c -o $@ -lm
+
+rv64: test_q1_0_rv64
+test_q1_0_rv64: $(SRC)
+	$(RVCC) $(CFLAGS) $(DEFS) -march=$(MARCH) -mabi=lp64d -static q1_0.c test_q1_0.c -o $@ -lm
+
+# inspect generated vector code (LMUL, vl, spills)
+asm: q1_0_rv64.s
+q1_0_rv64.s: q1_0.c q1_0.h
+	$(RVCC) $(CFLAGS) $(DEFS) -march=$(MARCH) -mabi=lp64d -S q1_0.c -o $@
+
+# F5 codegen gate. The prefetch fails silently in two ways: zicbop missing from
+# MARCH, or the helper left out of line - it has no observable side effect, so
+# ipa-pure-const marks it pure and DCE deletes every call. Both cost the whole
+# optimization without a single warning, so check the emitted instructions.
+# The _nopf twin must stay prefetch-free or the A/B in test_prefetch_is_pure
+# and in the vsim cycle harness compares a kernel against itself.
+check-pf: q1_0_rv64.s
+	@rc=0; \
+	for f in gemv_q1_0_64x1_q8_0_vl512 gemv_q1_0_64x1_q8_0_vl1024; do \
+	    pf=`awk -v F="$${f}:"      'BEGIN{c=0} $$0==F{i=1;next} i&&/prefetch\./{c++} i&&/\.size/{i=0} END{print c}' $<`; \
+	    np=`awk -v F="$${f}_nopf:" 'BEGIN{c=0} $$0==F{i=1;next} i&&/prefetch\./{c++} i&&/\.size/{i=0} END{print c}' $<`; \
+	    echo "  $$f: prefetch.r x$$pf, _nopf twin: x$$np"; \
+	    if [ $(PFDIST) -gt 0 ] && [ $$pf -eq 0 ]; then echo "  FAIL: PFDIST=$(PFDIST) but $$f emits no prefetch"; rc=1; fi; \
+	    if [ $(PFDIST) -eq 0 ] && [ $$pf -ne 0 ]; then echo "  FAIL: PFDIST=0 but $$f still prefetches"; rc=1; fi; \
+	    if [ $$np -ne 0 ]; then echo "  FAIL: prefetch leaked into $${f}_nopf"; rc=1; fi; \
+	done; \
+	if [ $$rc -ne 0 ]; then exit 1; fi; \
+	echo "check-pf ok (PFDIST=$(PFDIST))"
+
+run-host: host
+	./test_q1_0_host
+	./test_q1_0_host --inject
+
+clean:
+	rm -f test_q1_0_host test_q1_0_rv64 q1_0_rv64.s
+
+.PHONY: all host rv64 asm check-pf run-host clean

@@ -1,0 +1,91 @@
+# kernel-lab: standalone Q1_0 kernel verification
+
+Extracts the Q1_0 x Q8_0 dot kernels out of ggml so one kernel can be built
+and verified in isolation, without building llama.cpp.
+
+## Files
+
+- `q1_0.h` / `q1_0.c` - the kernels:
+  - `ggml_vec_dot_q1_0_q8_0_generic` copied from `ggml/src/ggml-cpu/quants.c:127`
+  - `ggml_vec_dot_q1_0_q8_0` (+ `_vl256`, `_vl128`) copied from
+    `ggml/src/ggml-cpu/arch/riscv/quants.c:484` (`static` removed in the lab)
+  - F4a: `repack_q1_0_to_q1_0_64x1` (row-major blocks -> column-major 64-row
+    bricks) + `gemv_q1_0_64x1_q8_0_generic` scalar oracle (reference float-op
+    order -> bit-exact vs per-row vec_dot on the original data)
+  - F4b: `gemv_q1_0_64x1_q8_0` dispatcher + `_vl512` (i16m2/f32m4, premium)
+    and `_vl1024` (i16m1/f32m2, fpga_l3) row-parallel RVV gemv - 3 vector
+    ops per column, no reductions, no vector->scalar moves; per-row scales
+    expanded fp16->fp32 with integer bit math (no zfh/zvfh, premium-safe)
+  - F5: `q1_prefetch_brick` - SW prefetch of the brick `Q1_PREFETCH_DIST`
+    blocks ahead (18 cache lines each), copied from `q1_prefetch_block` in
+    `ggml/src/ggml-cpu/arch/riscv/repack.cpp:1731`. Each gemv exists twice:
+    `_vl512`/`_vl1024` prefetch at the build distance, `_vl512_nopf`/
+    `_vl1024_nopf` are the same kernel with the prefetch compiled out, so one
+    binary can A/B correctness and cycles on the same cache state
+  - fp16 conversion from `ggml/src/ggml-impl.h` (exact, table-free)
+  - (the F2 defer-reduction candidates `_vl512`/`_vl512w` lived here until
+    2026-07-22; removed - superseded by the F4 row-parallel repack)
+- `test_q1_0.c` - correctness harness comparing every kernel vs the scalar
+  reference; `test_repack_gemv` gates F4a bit-exact and F4b by the double-ref
+  bound. Correctness only - cycles come from vsim (`vsim-demo/q1_0` rdcycle)
+
+## Build and run
+
+```
+make host && ./test_q1_0_host            # x86: harness sanity (dispatcher==generic)
+./test_q1_0_host --inject                # prove the harness detects a broken kernel
+make rv64                                # cross build, static, RVV enabled
+../run-rv64-qemu.sh $PWD/test_q1_0_rv64  # QEMU, VLEN=512 (vl256 path)
+QEMU_CPU=andes-ax45mpv,vlen=256,zfh=true,zvfh=true ../run-rv64-qemu.sh $PWD/test_q1_0_rv64
+QEMU_CPU=andes-ax45mpv,vlen=128,zfh=true,zvfh=true ../run-rv64-qemu.sh $PWD/test_q1_0_rv64  # vl128 path
+make asm                                 # q1_0_rv64.s for LMUL/vl inspection
+make check-pf                            # F5: prove prefetch.r is really emitted
+make clean && make rv64 check-pf PFDIST=2   # sweep the prefetch distance (0 = off)
+```
+
+`PFDIST` is not tracked by make, so change it only after `make clean` (or
+`touch q1_0.c`), otherwise you re-run the old binary.
+
+QEMU is for correctness only: qemu-user TCG charges a big fixed cost per
+vector instruction, scalar instructions are nearly free, and pipeline stalls
+do not exist - any timing it reports is misleading. Cycle decisions come from
+vsim rdcycle (`/local/nick/vsim-workspace/vsim-demo/q1_0`, copies of these
+kernels + mcycle A/B harness) or FPGA.
+
+## What "verified" means
+
+1. **Bit-exact gate**: RVV result == scalar reference result, compared as raw
+   float bits, over random + edge data (all-0/all-1 sign bits, q8 saturated
+   +-127, zero scales) at sizes 128..8192. The current RVV kernels do the
+   same float ops in the same order as the reference, so 0 tolerance applies
+   (build uses `-ffp-contract=off` to keep both sides unfused).
+2. **Double-reference gate**: |result - double_ref| / sum(|terms|) < 1e-4.
+   This is the gate a future optimized kernel must pass when it reorders the
+   float accumulation (the F4 row-parallel repack kernels will) and
+   bit-exactness vs the reference no longer applies. The per-group integer
+   sums must still be exact.
+3. **Harness self-test** (`--inject`): flip one weight sign bit, require the
+   kernel result to change. A harness that passes a broken kernel is worse
+   than no harness.
+4. **Cross-platform checksum**: the PRNG is deterministic, so the final
+   result checksum must be identical on x86 host and QEMU at every VLEN.
+5. **Prefetch is a pure hint** (`test_prefetch_is_pure`): every gemv must
+   return rows bit-identical to its `_nopf` twin, at any `PFDIST`, including
+   `nb <= dist` where the `t < nb` guard must suppress every prefetch.
+6. **Prefetch codegen gate** (`make check-pf`): the optimization can vanish
+   with no warning in two ways - `zicbop` missing from `MARCH`, or the helper
+   left out of line, because a prefetch has no observable side effect so
+   `ipa-pure-const` marks the helper pure and DCE deletes every call. Gate 5
+   passes happily either way (a deleted prefetch changes no result), so the
+   only real check is counting `prefetch.r` in the emitted code. This is why
+   `q1_prefetch_brick` is `always_inline` - measured, not decorative: without
+   it GCC 14.2 at -O2 emits zero prefetches here.
+
+## Data domain constraints (match ggml, do not "fix")
+
+- `n % 128 == 0` (QK1_0); the ggml dispatcher guarantees this.
+- q8 quants in [-127, 127]: ggml Q8_0 quantization never emits -128.
+  The RVV kernel's `vneg` on int8 -128 would wrap to -128 while the scalar
+  reference negates in 32-bit; feeding -128 produces a false mismatch.
+- No NaN/Inf scales: real quantization never produces them, and NaN payload
+  propagation may differ between fp16 conversion implementations.
