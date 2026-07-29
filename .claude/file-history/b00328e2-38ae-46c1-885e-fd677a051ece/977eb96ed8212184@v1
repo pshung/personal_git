@@ -1,0 +1,132 @@
+// Unit tests for the pure cores of `--runtime linux` manifest staging (U2,
+// ROADMAP_LINUX_RUNTIME.md): the .manifest blob serializer, the objcopy argv
+// builder, and make_temp_dir (a tiny fs helper the staging orchestrator uses).
+//
+// stage_linux_runtime itself (real copy + objcopy spawn) needs a built
+// vlinux.elf + toolchain, so it is exercised at the shell level by
+// tests/andes_sim/test_andes_sim_runtime_linux.sh; this file stays pure/fast.
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "../runtime/linux/manifest.h"
+#include "manifest.hpp"
+#include "tempdir.hpp"
+#include "test_check.hpp"
+
+using namespace andes_sim;
+using andes_sim::test::check_eq;
+
+int main() {
+  // build_manifest_blob: byte-exact struct vlinux_manifest layout, the ABI
+  // vlinux's own main.c reads (runtime/linux/manifest.h is the one source of
+  // truth both sides include).
+  {
+    std::string err;
+    std::vector<uint8_t> blob =
+        build_manifest_blob("/abs/path/app.elf", 1073741824ull, {}, err);
+    CHECK(err.empty());
+    CHECK(blob.size() == sizeof(vlinux_manifest));
+    vlinux_manifest m{};
+    std::memcpy(&m, blob.data(), sizeof(m));
+    CHECK(m.magic == VLINUX_MANIFEST_MAGIC);
+    CHECK(m.version == VLINUX_MANIFEST_VERSION);
+    CHECK(m.mem_size == 1073741824ull);
+    CHECK(std::string(m.app_path) == "/abs/path/app.elf");
+    CHECK(m.argv_extra_count == 0);
+    CHECK(m.argv_extra_len == 0);
+  }
+
+  // An app path that does not fit the fixed 256-byte field is an error, not
+  // a silent truncation (the wire format has no length prefix to recover
+  // from a cut string).
+  {
+    std::string err;
+    const std::string huge(300, 'x');
+    std::vector<uint8_t> blob = build_manifest_blob(huge, 0, {}, err);
+    CHECK(blob.empty());
+    CHECK(!err.empty());
+  }
+
+  // A path that exactly fills the field (255 chars + implicit NUL = 256) is
+  // still fine; 256 chars (no room for the NUL) is not.
+  {
+    std::string err;
+    const std::string exact(255, 'y');
+    std::vector<uint8_t> blob = build_manifest_blob(exact, 0, {}, err);
+    CHECK(err.empty());
+    CHECK(blob.size() == sizeof(vlinux_manifest));
+
+    std::string err2;
+    const std::string one_over(256, 'y');
+    CHECK(build_manifest_blob(one_over, 0, {}, err2).empty());
+    CHECK(!err2.empty());
+  }
+
+  // Extra argv (U8, "-- -m model.gguf -t 1"): argv[0] stays app_path;
+  // argv[1..] threads through as a flat NUL-separated buffer + count, the
+  // ABI stack.c's build_initial_stack walks to build the app's real argv[].
+  {
+    std::string err;
+    std::vector<uint8_t> blob =
+        build_manifest_blob("/abs/path/llama-completion", 1073741824ull,
+                            {"-m", "model.gguf", "-t", "1"}, err);
+    CHECK(err.empty());
+    CHECK(blob.size() == sizeof(vlinux_manifest));
+    vlinux_manifest m{};
+    std::memcpy(&m, blob.data(), sizeof(m));
+    CHECK(m.argv_extra_count == 4);
+    const char* p = m.argv_extra_buf;
+    CHECK(std::string(p) == "-m");
+    p += std::strlen(p) + 1;
+    CHECK(std::string(p) == "model.gguf");
+    p += std::strlen(p) + 1;
+    CHECK(std::string(p) == "-t");
+    p += std::strlen(p) + 1;
+    CHECK(std::string(p) == "1");
+    p += std::strlen(p) + 1;
+    CHECK(m.argv_extra_len == static_cast<uint32_t>(p - m.argv_extra_buf));
+  }
+
+  // More extra args than VLINUX_MANIFEST_ARGV_MAX_COUNT, or args whose
+  // encoded bytes overflow VLINUX_MANIFEST_ARGV_BYTES, are errors -- same
+  // no-silent-truncation discipline as the app_path overflow case above.
+  {
+    std::string err;
+    const std::vector<std::string> too_many(VLINUX_MANIFEST_ARGV_MAX_COUNT + 1,
+                                            "x");
+    CHECK(build_manifest_blob("/a", 0, too_many, err).empty());
+    CHECK(!err.empty());
+  }
+  {
+    std::string err;
+    const std::vector<std::string> huge_arg = {
+        std::string(VLINUX_MANIFEST_ARGV_BYTES, 'z')};
+    CHECK(build_manifest_blob("/a", 0, huge_arg, err).empty());
+    CHECK(!err.empty());
+  }
+
+  // manifest_objcopy_argv: the exact --update-section invocation staged into
+  // vlinux-run.elf.
+  {
+    std::vector<std::string> argv =
+        manifest_objcopy_argv("/tc/bin/riscv64-unknown-elf-objcopy",
+                              "/wd/manifest.bin", "/wd/vlinux-run.elf");
+    check_eq(argv,
+             {"/tc/bin/riscv64-unknown-elf-objcopy", "--update-section",
+              ".manifest=/wd/manifest.bin", "/wd/vlinux-run.elf"},
+             "objcopy argv");
+  }
+
+  // make_temp_dir: a fresh, existing directory; two calls never collide.
+  {
+    std::string d1 = make_temp_dir("andesim-linux-test");
+    CHECK(!d1.empty());
+    std::string d2 = make_temp_dir("andesim-linux-test");
+    CHECK(!d2.empty());
+    CHECK(d1 != d2);
+  }
+
+  return andes_sim::test::report("manifest");
+}

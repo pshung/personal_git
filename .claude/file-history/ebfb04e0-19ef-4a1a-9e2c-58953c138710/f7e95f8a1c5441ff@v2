@@ -1,0 +1,178 @@
+// Integration test for the Q1_0 64x1 CPU repack path (opt_roadmap F4d).
+//
+// Runs the same MUL_MAT twice: weights in the default CPU buffer (per-row
+// vec_dot path) and weights in the CPU extra "repack" buffer type (row-
+// parallel 64x1 gemv/gemm). The two results must agree.
+//
+// On platforms where the repack type is never selected for Q1_0 (non-RISC-V,
+// or VLEN < 512) the test prints SKIP and exits 0.
+
+#include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <random>
+#include <vector>
+
+static double nmse(const float * ref, const float * v, size_t n) {
+    double err = 0.0, den = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double d = (double) ref[i] - (double) v[i];
+        err += d * d;
+        den += (double) ref[i] * (double) ref[i];
+    }
+    return den > 0.0 ? err / den : err;
+}
+
+// one MUL_MAT: w[K,N] (Q1_0, bytes qw) x act[K,M] -> out[N*M]
+// weights live in weight_buft; returns false if the op is not supported with
+// weights in that buffer type (caller decides whether that means SKIP)
+static bool run_case(ggml_backend_t backend, ggml_backend_dev_t dev,
+                     ggml_backend_buffer_type_t weight_buft,
+                     int K, int N, int M,
+                     const void * qw, size_t qw_size,
+                     const float * act, float * out) {
+    const size_t ctx_size = 8 * ggml_tensor_overhead() + ggml_graph_overhead();
+
+    ggml_init_params ipw = { ggml_tensor_overhead() * 2, NULL, true };
+    ggml_context * ctx_w = ggml_init(ipw);
+    ggml_tensor *  w     = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q1_0, K, N);
+
+    ggml_init_params ipg = { ctx_size, NULL, true };
+    ggml_context * ctx_g = ggml_init(ipg);
+    ggml_tensor *  x     = ggml_new_tensor_2d(ctx_g, GGML_TYPE_F32, K, M);
+    ggml_tensor *  y     = ggml_mul_mat(ctx_g, w, x);
+    ggml_cgraph *  gf    = ggml_new_graph(ctx_g);
+    ggml_build_forward_expand(gf, y);
+
+    ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, weight_buft);
+    ggml_backend_buffer_t buf_g =
+        ggml_backend_alloc_ctx_tensors_from_buft(ctx_g, ggml_backend_get_default_buffer_type(backend));
+    GGML_ASSERT(buf_w != NULL && buf_g != NULL);
+
+    const bool supported = ggml_backend_dev_supports_op(dev, y);
+    if (supported) {
+        GGML_ASSERT(qw_size == ggml_nbytes(w));
+        ggml_backend_tensor_set(w, qw, 0, qw_size);
+        ggml_backend_tensor_set(x, act, 0, ggml_nbytes(x));
+        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(y, out, 0, sizeof(float) * (size_t) N * M);
+    }
+
+    ggml_backend_buffer_free(buf_w);
+    ggml_backend_buffer_free(buf_g);
+    ggml_free(ctx_g);
+    ggml_free(ctx_w);
+    return supported;
+}
+
+int main(void) {
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    GGML_ASSERT(dev != NULL);
+    ggml_backend_t backend = ggml_backend_dev_init(dev, NULL);
+    GGML_ASSERT(backend != NULL);
+
+    // the repack buffer type comes from the CPU backend's extra-bufts list
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto get_extra_bufts =
+        (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    GGML_ASSERT(get_extra_bufts != NULL);
+    ggml_backend_buffer_type_t * extra = get_extra_bufts(dev);
+
+    // Weight sign patterns. RANDOM alone cannot tell you WHICH permutation of
+    // the sign planes the repack produced - it only tells you writer and reader
+    // agree. COLS/ROWS/DIAG are structured so a transposed or mis-strided plane
+    // gives a visibly different result: COLS depends only on the column index,
+    // ROWS only on the row index, DIAG on both. Q1_0 keeps the sign of the
+    // input float, so setting +-1.0f sets the stored bit directly.
+    enum pattern { RANDOM, ALLPOS, ALLNEG, COLS, ROWS, DIAG };
+    static const char * pname[] = { "random", "all+1", "all-1", "by-col", "by-row", "diag" };
+
+    struct shape { int K, N, M; pattern p; };
+    const shape cases[] = {
+        {  512,  128, 1, RANDOM },  // decode: gemv only
+        {  512,  128, 6, RANDOM },  // prefill: gemm x4 tile + gemv tail of 2
+        { 1024,   64, 4, RANDOM },  // pure gemm, single row tile
+        {  512,  128, 2, RANDOM },  // nrows=2: exactly what the K=50..56 ROI runs
+        { 2560, 1024, 2, RANDOM },  // the real blk.7.attn_v shape, decode
+        {  128,   64, 1, RANDOM },  // minimum: one 128-col block, one row tile
+        {  512,  128, 1, ALLPOS },  // every sign bit 1
+        {  512,  128, 1, ALLNEG },  // every sign bit 0
+        {  512,  128, 1, COLS   },  // sign is a function of the column only
+        {  512,  128, 1, ROWS   },  // sign is a function of the row only
+        {  512,  128, 2, DIAG   },  // sign depends on both, nrows=2
+    };
+
+    std::mt19937 rng(1234);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    int n_run = 0, n_fail = 0;
+
+    for (const shape & s : cases) {
+        std::vector<float> wf((size_t) s.K * s.N);
+        std::vector<float> act((size_t) s.K * s.M);
+        for (int j = 0; j < s.N; ++j) {
+            for (int c = 0; c < s.K; ++c) {
+                float v;
+                switch (s.p) {
+                    case ALLPOS: v =  1.0f; break;
+                    case ALLNEG: v = -1.0f; break;
+                    case COLS:   v = (c % 3 == 0)      ?  1.0f : -1.0f; break;
+                    case ROWS:   v = (j % 5 == 0)      ?  1.0f : -1.0f; break;
+                    case DIAG:   v = (c % 7 == j % 7)  ?  1.0f : -1.0f; break;
+                    default:     v = dist(rng); break;
+                }
+                wf[(size_t) j * s.K + c] = v;
+            }
+        }
+        for (float & v : act) v = dist(rng);
+
+        std::vector<uint8_t> qw(ggml_row_size(GGML_TYPE_Q1_0, s.K) * s.N);
+        ggml_quantize_chunk(GGML_TYPE_Q1_0, wf.data(), qw.data(), 0, s.N, s.K, NULL);
+
+        std::vector<float> out_ref((size_t) s.N * s.M, 0.0f);
+        std::vector<float> out_rep((size_t) s.N * s.M, 0.0f);
+
+        const bool ok_ref = run_case(backend, dev, ggml_backend_get_default_buffer_type(backend),
+                                     s.K, s.N, s.M, qw.data(), qw.size(), act.data(), out_ref.data());
+        GGML_ASSERT(ok_ref);
+
+        // try every extra buffer type; the repack one accepts the op only
+        // when the 64x1 kernel is actually selected for this platform
+        bool tried = false;
+        for (ggml_backend_buffer_type_t * bt = extra; bt && *bt; ++bt) {
+            if (!run_case(backend, dev, *bt, s.K, s.N, s.M, qw.data(), qw.size(), act.data(), out_rep.data())) {
+                continue;
+            }
+            tried = true;
+            const double e = nmse(out_ref.data(), out_rep.data(), out_ref.size());
+            const bool   fail = !(e < 1e-6);
+            printf("%-14s K=%-5d N=%-4d M=%-2d %-7s nmse=%.3e  %s\n",
+                   ggml_backend_buft_name(*bt), s.K, s.N, s.M, pname[s.p], e, fail ? "FAIL" : "OK");
+            if (fail) {
+                for (int i = 0; i < 5; ++i) {
+                    printf("  [%d] ref=%f repack=%f\n", i, out_ref[i], out_rep[i]);
+                }
+                n_fail++;
+            }
+            n_run++;
+        }
+        if (!tried) {
+            printf("K=%-5d N=%-4d M=%-2d %-7s: no extra buffer type takes Q1_0 here - SKIP\n",
+                   s.K, s.N, s.M, pname[s.p]);
+        }
+    }
+
+    ggml_backend_free(backend);
+
+    if (n_run == 0) {
+        printf("repack path never selected on this platform - SKIP\n");
+        return 0;
+    }
+    printf("%d/%d repack cases passed\n", n_run - n_fail, n_run);
+    return n_fail == 0 ? 0 : 1;
+}
