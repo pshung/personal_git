@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: ebfb04e0-19ef-4a1a-9e2c-58953c138710
-  modified: 2026-07-29T05:06:41.189Z
+  modified: 2026-07-29T12:52:23.369Z
 ---
 
 `nds.vd4dots.vv` (XAndesVDot) is a STOCK Andes vendor instruction, not custom ACE.
@@ -42,11 +42,44 @@ then ggml), both now have comments in the source:
    ld/st (EEW=8 has no alignment rule). Amortized over the nc/64 row tiles, <1%.
 
 MEASURED in-model (andesim hybrid marker ROI, vsim:ax46mpv_fpga_l3, Bonsai-4B,
-nrows=2 gemv), d4 vs the shipped repack+prefetch kernel, ALL 7 layer-7 nodes:
-  attn_q 3.15 | attn_v 3.04 | attn_k 3.04 | attn_output 3.09 |
-  ffn_gate 3.16 | ffn_up 3.16 | ffn_down 3.03 | LAYER TOTAL 3.11x
-  (52,752,463 -> 16,957,871 cycles). K=51 vs pristine upstream = 9.79x.
-Shape-invariant across a 9.5x range of node sizes, like the prefetch win.
+nrows=2 gemv), ALL 7 layer-7 nodes x ALL 3 kernels:
+  LAYER 7 TOTAL  pristine 178,647,490 -> prefetch 52,752,463 -> d4 16,957,871
+                 d4 vs prefetch 3.11x | d4 vs pristine 10.54x
+  per node, d4 vs prefetch 3.03-3.16x; d4 vs pristine 9.79-11.45x.
+  Shape-invariant across a 9.5x range of node sizes, like the prefetch win.
+  ffn_down (K=9728, longest reduction dim) is the outlier both ways: prefetch
+  helps it most (3.77x) and d4 least (3.03x) -> best combined 11.45x.
+  CROSS-CHECK: this sweep's prefetch/pristine per-layer = 3.386x reproduces the
+  3.39x from the independent F7 sweep, so the two sessions agree.
+  GOTCHA: measure.sh's default 4h per-leg timeout is too short for pristine
+  ffn_down (49.0M cycles ~3.9h) - it exits 1 with an empty grep. TIMEOUT=28800000.
+
+COMPUTE / MEMORY SPLIT after F8 - the number to plan hardware against
+(K=51 attn_v; `bash build.sh d4-nopf` and `d4-hvm`):
+  d4 prefetch OFF 588,771 | d4+prefetch 457,092 | d4+prefetch+HVM 328,865
+  HVM removes essentially all memory wait, so 328,865 is the INSTRUCTION-ISSUE
+  FLOOR (~92K instrs -> 3.6 cyc/instr ~= the m2-at-DLEN-1024 issue limit):
+    72% instruction issue (no memory fix touches this) / 28% residual stall.
+  The un-prefetched kernel's total stall splits almost exactly in half:
+  prefetch hides 131,679 (51%), HVM the other 128,227 (49%).
+  So HVM is still worth 1.39x AFTER all software work (13.61x vs pristine) -
+  do NOT claim memory is "done". But the big pot is compute: F6-A (1-bit weight
+  operand, drops the vmerge and cuts weight reg traffic 8x) attacks the 72% and
+  stacks with HVM (~2.8x combined if compute doubles).
+  CAVEAT: attn_v's 360 KB working set FITS fpga_l3's 2 MB L3. A 27B ffn_down is
+  12 MB where L3 is useless, so the memory fraction there is likely well above
+  28% and HVM worth more than 1.39x. The missing datum for any big-local-memory
+  decision is d4-hvm on K=56.
+
+27B (Bonsai-27B-Q1_0, qwen35) sizing for HVM discussions: 3.52 GiB of Q1_0.
+  ffn_down/gate/up 765 MB each = 63.6% | attn_qkv 337 | attn_gate + ssm_out 202
+  each | output + token_embd 170 each | 64 layers, only 16 with real attention,
+  48 linear/SSM. ALL tensors pass the repack gate (rows%64==0), unlike the 4B
+  whose LM head is the tied token_embd [2560, 151669], rows%64=53 -> FAILS the
+  gate and still runs pristine vec_dot (~26% of an optimized decode pass).
+  KV cache is cheap because 48/64 layers are linear: 64 KB/token ->
+  512 MB @ 8K ctx, 2 GB @ 32K, 16 GB @ the model's 262K max.
+  27B is untestable today: F0 (qwen35 garbage on rv64) + andesim's 2 GiB cap.
 
 The in-model 3.04x BEATS the standalone lab's 2.52x, and the reason is MEMORY,
 not math: the old kernel issues one 8-byte vlm per column (128 per block), the
