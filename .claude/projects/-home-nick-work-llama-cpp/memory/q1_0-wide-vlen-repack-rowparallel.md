@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: b6b76240-81f4-4da8-b28a-454652dff28c
-  modified: 2026-07-28T16:41:07.580Z
+  modified: 2026-07-28T23:58:16.502Z
 ---
 
 For wide VLEN (512/1024/2048) the Q1_0 dot kernel's per-32 `vwredsum`
@@ -237,5 +237,36 @@ index) and shifted code layout, worth -0.17% on the K=51 re-measure
 Node map came from `GGML_SCHED_DEBUG=2 build-host/bin/llama-completion ... -v`
 (host graph dump, 253 MUL_MAT/graph); RTL rate ~11 kHz solo, ~1.4 kHz with 8
 concurrent sims (cycle counts contention-independent, so run them in parallel).
+
+**DPREF_EN A/B MEASURED 2026-07-29 - Zicbop prefetch.r is NOT gated by
+mcache_ctl.DPREF_EN.** Andes mcache_ctl (0x7CA) bits (RTL tree
+vsim_andesim/build-utest/Vax46mpv_fpga_l3/andes_vip/patterns/samples/include/core_v5.h:246+):
+0x001 IC_EN, 0x002 DC_EN, 0x100 CCTL_SUEN, 0x200 IPREF_EN, 0x400 DPREF_EN,
+0x800 IC_FIRST_WORD, 0x1000 DC_FIRST_WORD, 0x80000 DC_COHEN, 0x100000 DC_COHSTA.
+andesim/runtime/crt0.S:43 `ori a0,a0,0x703` sets IC_EN|DC_EN|CCTL_SUEN|IPREF_EN|
+DPREF_EN, and runtime/linux/Makefile:52 links that same crt0.o into the vlinux
+proxy kernel, so --runtime linux gets it too; ResumeDriver transports mcache_ctl
+across the QEMU->vsim handoff (else the ROI runs uncached, cycles inflate
+severalfold). Measured mcache_ctl in-guest = 0x181f03 (app runs M-mode, csrc
+sticks; -> 0x181b03 clearing only bit 10).
+K=51 attn_v: baseline 2144213 (DPREF on) vs 2143018 (off) = -0.06%; prefetch
+1389236 vs 1393744 = +0.32%. BOTH null (noise floor: 0.17% code-layout, 0.28-0.50%
+layer replication). So (a) SW prefetch.r survives DPREF_EN=0 untouched - the bit
+gates only the HW auto-prefetcher; (b) the HW prefetcher contributes NOTHING to
+this weight stream either way, which is why SW prefetch had so much room.
+STILL OPEN: which cache level prefetch.r fills. This A/B only killed the
+"DPREF_EN gates it" hypothesis. To settle it use mhpmevent/mhpmcounter for L1 D$
+miss/refill inside the ROI, prefetch on vs off.
+Probe = llama.cpp opt-in -DANDESIM_ROI_CLEAR_DPREF in the ggml-cpu.c ROI block
+(prints mcache_ctl before/after - mandatory, a WARL'd bit would void the A/B
+silently) + build.sh targets prefetch-nodpref / baseline-nodpref. andesim
+untouched.
+LAYER INDEPENDENCE 2026-07-29: attn_v at layer 0 / 7 / 35 (ROI_K 2 / 51 / 247):
+baseline 2155026 / 2144213 / 2151225 (0.50% spread), prefetch 1387806 / 1389236 /
+1385343 (0.28%), ratio 1.553 / 1.544 / 1.553. Position in the graph does not
+matter -> the layer-7 shape table represents all 36 layers.
+Also settled: __builtin_prefetch's locality arg is IGNORED on RISC-V (verified by
+codegen: (p,0,0) and (p,0,3) both emit plain `prefetch.r`; only rw picks
+prefetch.r vs prefetch.w). Zicbop has no level selector.
 
 Related: [[ace-tq1-standalone-kernel-lab]], [[andesim-llamacpp-hybrid-gaps]].
