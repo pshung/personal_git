@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: b6b76240-81f4-4da8-b28a-454652dff28c
-  modified: 2026-07-29T02:26:57.092Z
+  modified: 2026-07-29T06:06:24.943Z
 ---
 
 For wide VLEN (512/1024/2048) the Q1_0 dot kernel's per-32 `vwredsum`
@@ -272,14 +272,26 @@ prefetch.r vs prefetch.w). Zicbop has no level selector.
 **CROSS-MODEL CHECK 2026-07-29 (Bonsai-8B, same ROI_K=51 binaries)**: node #51 on
 8B is also blk.7.attn_v but [4096 x 1024] (4B is [2560 x 1024]), nrows=2, so the
 SAME bin-baseline/bin-prefetch measure a 1.6x larger K with nothing else changed.
-fpga_l3 VLEN=1024: baseline **3,475,147** -> prefetch **2,218,540** = **1.567x**
-(4B same node: 2,144,213 -> 1,391,650 = 1.541x).
-Work grows 1.600x (4,194,304 / 2,621,440 elems) but cycles grow baseline 1.621x
-(slightly SUPER-linear) vs prefetch 1.594x (slightly SUB-linear). Per elem per
-activation: baseline 0.4090 -> 0.4143 (+1.3%), prefetch 0.2655 -> 0.2645 (-0.4%,
-inside the 0.2608-0.2650 shape-sweep band). So bigger K exposes MORE latency
-without prefetch and slightly less with it -> **prefetch's advantage grows with K**,
-which is why 1.541x -> 1.567x. No cache-capacity or TLB cliff at 8B scale.
+fpga_l3 VLEN=1024: baseline **3,475,147** -> prefetch **2,218,540** = **1.567x**.
 8B needs `--no-mmap` + `--mem-size 2097148K` - see [[andesim-llamacpp-hybrid-gaps]].
+
+METHODOLOGY WARNING (cost a wrong conclusion, then caught): a REBUILD of the same
+source drifts ~0.37% from the recorded value (K=51 prefetch: recorded 1,389,236 ->
+rebuilt-today 1,384,130, verified as pure binary/code-layout drift because the two
+ENGINES gave bit-identical counts, see [[andesim-llamacpp-hybrid-gaps]]). That
+drift is LARGER than the cross-model scaling effect being measured, so mixing an
+old-record 4B number with a fresh 8B number produces a fake conclusion.
+- WRONG (mixed binaries, retracted): "prefetch is sub-linear, its advantage grows
+  with K, 1.541x -> 1.567x".
+- RIGHT (both from today's binaries): 4B 1,384,130 -> 8B 2,218,540 = 1.6028x vs
+  work 1.600x = **linear to +0.19%**. Per elem per activation 0.2640 -> 0.2645.
+  So the prefetch kernel's cost is FLAT across models too, extending the
+  within-4B shape-invariance (0.2608-0.2650) to a different model and a 1.6x
+  larger K. No cache-capacity or TLB cliff at 8B scale.
+- baseline's 1.621x (super-linear, per-elem 0.4090 -> 0.4143) still rests on the
+  OLD-binary 4B 2,144,213, so up to ~0.4% of that +1.3% could be drift. To close
+  it, re-measure 4B K=51 with today's bin-baseline.
+RULE: for any A/B or scaling claim, measure every point with binaries from ONE
+build session; never compare a fresh run against a number recorded earlier.
 
 Related: [[ace-tq1-standalone-kernel-lab]], [[andesim-llamacpp-hybrid-gaps]].

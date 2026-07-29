@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 047fa35b-69c2-4ca4-8695-5347e3e7a746
-  modified: 2026-07-29T02:26:44.500Z
+  modified: 2026-07-29T06:06:50.101Z
 ---
 
 Updated 2026-07-21 (originally 2026-07-15). Target switched Bonsai-27B -> Bonsai-4B-Q1_0 (572 MB): fits the 2 GiB cap, plain qwen3 (no qwen35 rv64 bug), and the full flow is CONFIRMED on it. Canonical recipe doc: /home/nick/work/andesim/docs/llama_roi_howto.md; roadmap: llama.cpp/opt_roadmap.md.
@@ -49,6 +49,38 @@ Exit codes: a SUCCESSFUL fast-mode run returns **2** (the generic vlinux exit tr
 at RAM-top; mepc tracks --mem-size: 0x7cfffdc2 at 2000M, 0x7ffffdd2 at 2G). hybrid
 returns 0 because nothing runs after the ROI. So exit code is NOT a success signal
 in either mode - grep the output. Wall clock: 8B fast mode 8 tokens = ~23 min.
+
+**BIU/L3C address width widened to 39 on ax46mpv_fpga_l3, 2026-07-29 - and it is
+TIMING-NEUTRAL.** Motivation: reaching QEMU's DRAM_EXT window needs >32-bit
+physical addresses (see the andesim ROADMAP_LINUX_RUNTIME.md U10 rewrite).
+- `data/configs/ax46mpv_fpga_l3.cfg`: `NDS_BIU_ADDR_WIDTH` and
+  `NDS_L3C_ADDR_WIDTH` 32 -> 39, rebuilt via `./build_vsim.sh` (incremental:
+  only this engine re-verilates, the other 6 configs are untouched so ninja
+  skips them). Old binary preserved as
+  `build/sim_ax46mpv_fpga_l3.biu32-backup`.
+- Value RULES (`external/ax46mpv_advanced/config_tools/nds-softcore-config`):
+  :6435 `NDS_L3C_ADDR_WIDTH value {32 37 38 39 52 59 64}` is an ENUM - 36 is
+  rejected ("ERROR: 36 is not a valid option value of L3-Cache Address Width");
+  :4363-4368 `NDS_BIU_ADDR_WIDTH` is free `textinput` 32-64, tool default 39.
+- The config tool AUTO-WIDENS 6 dependent widths (all +7): STLB_RAM_DW 60->67,
+  STLB_DATA_RAM_DW 30->37, ICACHE_TAG_RAM_DW 30->37, DCACHE_TAG_RAM_DW 32->39,
+  CM_SNP_RAM_DW 21->28, L3C_TAG_RAM_DW 18->25. So NEVER hand-patch config.inc
+  or a single cfg line - narrow TLB/cache tags would silently truncate
+  addresses. Always regenerate (the standalone step is
+  `NDS_HOME=<tree> tclsh <tree>/config_tools/nds-softcore-config --load <cfg> --generate`).
+- **TIMING NEUTRAL, PROVEN**: same bin-prefetch, 4B K=51 node, BIU=39 engine
+  1,384,130 cycles vs BIU=32 backup engine 1,384,130 - bit-identical, not
+  "close". Expected: tag-RAM WIDTH does not change cache sets/ways or TLB entry
+  count. Controlled A/B done by staging the backup in its own dir and pointing
+  `VSIM_BIN_DIR` at it (driver/engine_registry.cpp:186 honours that env).
+  Consequence: every cycle number recorded on the old engine stays comparable.
+- STILL UNVERIFIED: whether the widened core actually ISSUES a >32-bit address.
+  `--print-memmap` CANNOT answer it - it prints the SystemC/TLM region table and
+  happily accepted `--shared-mem-base 0x800000000` even on the BIU=32 engine
+  (identical output before and after the rebuild). A real load/store up there
+  needs vlinux to place its arenas at a non-zero ram_base = roadmap U10d, so
+  U10f's "does the RTL address it" gate is BLOCKED ON U10d, not only on the
+  engine rebuild.
 
 **Still-true hard caps**
 - Guest RAM max 2 GiB (QEMU andes_ae350 + driver cap). 27B (~4.5 GB) blocked on this; 4B+KV fits in 2000M.
