@@ -1,0 +1,214 @@
+// Q1_0 rdcycle shootout (ace-tq1 style).
+//
+//   [2] q1_0_dot_vl256  = ORIGINAL production kernel, called once per row per
+//                         activation (M*nr calls)
+//   [3] q1_0_gemv_64x1  = OPTIMIZED row-parallel GEMV, called once per
+//                         activation (masks re-loaded M times)
+//   [4] q1_0_gemm_64x1  = GEMM: all M activations in one call, each sign mask
+//                         loaded once and reused
+//
+// Shape: nr=64 rows x n=512 cols x M=4 activations (a 4-token step of the
+// 2560x1024 matmul). Correctness is proven in llama.cpp/kernel-lab (QEMU,
+// all VLENs); here a cheap smoke check + cycles. Exit code 0 = pass.
+//
+// Build with -DQ1_HVM=1 to put ALL data (x, bricks, y, outputs) in the HVM
+// vector memory (CSR-discovered, see hvm.h) instead of cached RAM - same
+// kernels, same checks, only the allocation moves.
+//
+// Output is raw _write only - NO stdio. vsim's fpga_l3 engine services the
+// console MMIO but not the sim_control syscalls stdio init needs (fstat),
+// so any printf-family call hangs there. QEMU (-mvh) serves _write too.
+#include "q1_0.h"
+
+#include <math.h>
+
+#ifndef Q1_HVM
+#define Q1_HVM 0
+#endif
+
+#if Q1_HVM
+#include "hvm.h"
+#endif
+
+static unsigned long rdcycle(void) {
+    unsigned long r;
+    asm volatile("fence rw, rw" ::: "memory");
+    #if defined(Q1_LINUX)
+    static unsigned long fake = 1000;   // no mcycle in U-mode; keep divisors non-zero
+    r = (fake += 100000);
+#else
+    asm volatile("csrr %0, mcycle" : "=r"(r));
+#endif
+    return r;
+}
+
+// ---- printf-free console ---------------------------------------------------
+extern long _write(int fd, const void * buf, unsigned long count);
+
+static void say(const char * s) {
+    unsigned long n = 0;
+    while (s[n]) n++;
+    _write(1, s, n);
+}
+
+static void sayn(unsigned long v) {   // decimal
+    char b[21];
+    int i = 20;
+    do { b[--i] = (char)('0' + v % 10); v /= 10; } while (v);
+    _write(1, b + i, (unsigned long)(20 - i));
+}
+
+static void sayx(unsigned long v) {   // hex
+    char b[17];
+    int i = 16;
+    do { b[--i] = "0123456789abcdef"[v & 15]; v >>= 4; } while (v);
+    say("0x"); _write(1, b + i, (unsigned long)(16 - i));
+}
+
+#ifndef Q1_VLEN
+#define Q1_VLEN 512
+#endif
+
+#define GN  512                  // K (columns)
+#define GNR 64                   // rows = one brick group
+#define GM  4                    // activation rows (tokens)
+#define GNB (GN / QK1_0)         // q1 blocks per weight row
+#define GYB (GN / QK8_0)         // q8 blocks per activation row
+
+// all kernel data behind pointers so one build flag moves it RAM <-> HVM;
+// out rows: out[m * GNR + r]
+static block_q1_0      * x;
+static block_q1_0_64x1 * bricks;
+static block_q1_0_64d4 * bricks_d4;
+static block_q8_0      * y;
+static float * out2, * out3, * out4, * out5, * out6, * out7, * out8;
+
+#if !Q1_HVM
+static block_q1_0      x_mem[GNR * GNB];
+static block_q1_0_64x1 bricks_mem[GNB];
+static block_q1_0_64d4 bricks_d4_mem[GNB];
+static block_q8_0      y_mem[GM * GYB];
+static int8_t          ya_mem[GM * GN] __attribute__((aligned(64)));
+static float           o2_mem[GM * GNR], o3_mem[GM * GNR], o4_mem[GM * GNR], o5_mem[GM * GNR], o6_mem[GM * GNR], o7_mem[GM * GNR], o8_mem[GM * GNR];
+#endif
+
+static int place_data(void) {
+#if Q1_HVM
+    x         = malloc_hvm(sizeof(block_q1_0)      * GNR * GNB, 64);
+    bricks    = malloc_hvm(sizeof(block_q1_0_64x1) * GNB,       64);
+    bricks_d4 = malloc_hvm(sizeof(block_q1_0_64d4) * GNB,       64);
+    y         = malloc_hvm(sizeof(block_q8_0)      * GM * GYB,  64);
+    out2   = malloc_hvm(sizeof(float) * GM * GNR, 64);
+    out3   = malloc_hvm(sizeof(float) * GM * GNR, 64);
+    out4   = malloc_hvm(sizeof(float) * GM * GNR, 64);
+    out5   = malloc_hvm(sizeof(float) * GM * GNR, 64);
+    out6   = malloc_hvm(sizeof(float) * GM * GNR, 64);
+    out7   = malloc_hvm(sizeof(float) * GM * GNR, 64);
+    out8   = malloc_hvm(sizeof(float) * GM * GNR, 64);
+    if (!x || !bricks || !bricks_d4 || !y || !out2 || !out3 || !out4 || !out5 || !out6 || !out7 || !out8) return 1;
+    say("data in HVM: base "); sayx(hvm_csr_base());
+    say(" size "); sayn(1ul << (hvm_csr_cfg() & 0xFF)); say(" B\n");
+#else
+    x = x_mem; bricks = bricks_mem; bricks_d4 = bricks_d4_mem; y = y_mem;
+    out2 = o2_mem; out3 = o3_mem; out4 = o4_mem; out5 = o5_mem; out6 = o6_mem; out7 = o7_mem; out8 = o8_mem;
+    say("data in RAM (cached)\n");
+#endif
+    return 0;
+}
+
+// cheap deterministic bytes; all scales = fp16 1.0 (cycle count is
+// data-independent, so fancy random data buys nothing here)
+static uint32_t lcg = 12345;
+static uint8_t next_byte(void) { lcg = lcg * 1103515245u + 12345u; return (uint8_t)(lcg >> 16); }
+
+int main(void) {
+    say("q1_0 shootout: nr=64 n=512 M=4, built for VLEN=");
+    sayn(Q1_VLEN);
+    say("\n");
+    if (place_data()) { say("HVM overflow\n"); return 2; }
+
+    for (int i = 0; i < GNR * GNB; ++i) {
+        x[i].d = 0x3C00; // 1.0
+        for (int j = 0; j < QK1_0 / 8; ++j) x[i].qs[j] = next_byte();
+    }
+    for (int i = 0; i < GM * GYB; ++i) {
+        y[i].d = 0x3C00;
+        for (int j = 0; j < QK8_0; ++j) y[i].qs[j] = (int8_t)(next_byte() % 255 - 127);
+    }
+    for (int m = 0; m < GM; ++m) {
+        for (int b = 0; b < GYB; ++b) {
+            for (int j = 0; j < QK8_0; ++j) ya_mem[m * GN + b * QK8_0 + j] = y[m * GYB + b].qs[j];
+        }
+    }
+    q1_0_repack_64x1(x, bricks, GNR, GN);
+    q1_0_repack_64d4(x, bricks_d4, GNR, GN);
+    say("data ready\n");
+
+    // measure: rep0 = cold caches, rep1 = warm
+    for (int rep = 0; rep < 2; ++rep) {
+        const unsigned long t0 = rdcycle();
+        for (int m = 0; m < GM; ++m) {
+            for (int r = 0; r < GNR; ++r) {
+                q1_0_dot_vl256(GN, &out2[m * GNR + r], x + (size_t)r * GNB, y + (size_t)m * GYB);
+            }
+        }
+        const unsigned long t1 = rdcycle();
+        for (int m = 0; m < GM; ++m) {
+            q1_0_gemv_64x1(GN, out3 + m * GNR, bricks, y + (size_t)m * GYB, GNR);
+        }
+        const unsigned long t2 = rdcycle();
+        q1_0_gemm_64x1(GN, GM, out4, bricks, y, GNR);
+        const unsigned long t3 = rdcycle();
+        for (int m = 0; m < GM; ++m) {
+            q1_0_gemv_64d4_v3(GN, out5 + m * GNR, bricks_d4, y + (size_t)m * GYB, ya_mem + m * GN, GNR);
+        }
+        const unsigned long t4 = rdcycle();
+        for (int m = 0; m < GM; ++m) {
+            q1_0_gemv_64d4_nodot(GN, out6 + m * GNR, bricks_d4, y + (size_t)m * GYB, ya_mem + m * GN, GNR);
+        }
+        const unsigned long t5 = rdcycle();
+        const unsigned long t6 = t5, t7 = t5;
+
+        const unsigned long c2 = t1 - t0, c3 = t2 - t1, c4 = t3 - t2, c5 = t4 - t3, c6 = t5 - t4, c7 = t6 - t5, c8 = t7 - t6;
+        const unsigned long nd = GM * GNR;   // output elements
+        say("rep"); sayn((unsigned long)rep);
+        say(": [2] vl256 x256: "); sayn(c2); say(" cyc ("); sayn(c2 / nd);
+        say("/dot) | [3] gemv x4: "); sayn(c3); say(" cyc ("); sayn(c3 / nd);
+        say("/dot) | [4] gemm: "); sayn(c4); say(" cyc ("); sayn(c4 / nd);
+        say("/dot) | [5] d4v3 (lw bcast) x4: "); sayn(c5); say(" cyc ("); sayn(c5 / nd);
+        say("/dot) | [6] d4 nodot x4: "); sayn(c6); say(" cyc ("); sayn(c6 / nd);
+                say("/dot)\n  speedup x100: gemm vs vl256: "); sayn(c2 * 100ul / c4);
+        say(" | gemm vs gemv: "); sayn(c3 * 100ul / c4);
+        say(" | gemv vs gemv_d4: "); sayn(c3 * 100ul / c5);
+        say(" | gemv vs gemv_d4v2: "); sayn(c3 * 100ul / c6);
+        say("\n");
+    }
+
+    // smoke check: same answers (integer part exact: scales are 1.0)
+    int failed = 0;
+    for (int m = 0; m < GM; ++m) {
+        for (int r = 0; r < GNR; ++r) {
+            if (fabsf(out2[m * GNR + r] - out3[m * GNR + r]) > 0.5f) {
+                say("FAIL gemv m"); sayn((unsigned long)m);
+                say(" row "); sayn((unsigned long)r); say("\n");
+                failed++;
+            }
+            if (fabsf(out2[m * GNR + r] - out4[m * GNR + r]) > 0.5f) {
+                say("FAIL gemm m"); sayn((unsigned long)m);
+                say(" row "); sayn((unsigned long)r); say("\n");
+                failed++;
+            }
+            if (fabsf(out2[m * GNR + r] - out5[m * GNR + r]) > 0.5f) {
+                if (failed < 4) {
+                    say("FAIL d4v3 m"); sayn((unsigned long)m);
+                    say(" row "); sayn((unsigned long)r);
+                    say(" want "); sayn((unsigned long)(long)out2[m * GNR + r]);
+                    say(" got "); sayn((unsigned long)(long)out5[m * GNR + r]); say("\n");
+                }
+                failed++;
+            }
+        }
+    }
+    say(failed ? "FAILED\n" : "ALL PASS\n");
+    return failed;
+}

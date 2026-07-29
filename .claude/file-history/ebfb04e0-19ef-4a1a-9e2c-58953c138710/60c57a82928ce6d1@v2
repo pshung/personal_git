@@ -1,0 +1,285 @@
+// Kernel 5: row-parallel Q1_0 gemv built on nds.vd4dots.vv (XAndesVDot).
+//
+// nds.vd4dots.vv vd, vs1, vs2 with vtype e32: for every i32 lane,
+//   vd[lane] += sum_{k=0..3} vs1[4*lane+k] * vs2[4*lane+k]   (int8 x int8)
+// Verified on QEMU -cpu andes-ax45mpv. GCC 14.2 has no intrinsic for it, so
+// it goes in as inline asm; GCC re-emits its own vsetvli afterwards, so the
+// asm may set vtype freely.
+//
+// Layout difference vs kernel 3: a lane must hold 4 consecutive columns of
+// ONE row, so the sign plane is grouped 4 columns at a time (see q1_0.h).
+
+#include "q1_0.h"
+
+#include <assert.h>
+#include <string.h>
+
+#include <riscv_vector.h>
+
+#ifndef Q1_VLEN
+#define Q1_VLEN 512
+#endif
+
+void q1_0_repack_64d4(const block_q1_0 * src, block_q1_0_64d4 * dst, int nr, int n) {
+    const int nb = n / QK1_0;
+    assert(nr % Q1_NX1_N == 0);
+    assert(n % QK1_0 == 0);
+
+    memset(dst, 0, (size_t)(nr / Q1_NX1_N) * nb * sizeof(block_q1_0_64d4));
+
+    for (int r = 0; r < nr; ++r) {
+        const int g = r / Q1_NX1_N;
+        const int j = r % Q1_NX1_N;
+        for (int ib = 0; ib < nb; ++ib) {
+            const block_q1_0 * b = &src[(size_t)r * nb + ib];
+            block_q1_0_64d4  * o = &dst[(size_t)g * nb + ib];
+            o->d[j] = b->d;
+            for (int c = 0; c < QK1_0; ++c) {
+                const uint8_t bit = (b->qs[c / 8] >> (c % 8)) & 1;
+                const int idx = 4 * j + (c % 4);            // bit slot in the plane
+                o->qs[c / 4][idx / 8] |= (uint8_t)(bit << (idx % 8));
+            }
+        }
+    }
+}
+
+#if Q1_VLEN >= 1024
+
+// e32,m2 at VLEN=1024 = 64 lanes = exactly the 64 rows.
+static inline vint32m2_t vd4dots_m2(vint32m2_t acc, vint8m2_t w, vint8m2_t a) {
+    asm volatile("vsetvli t0, zero, e32, m2, ta, ma\n\t"
+                 "nds.vd4dots.vv %0, %1, %2"
+                 : "+vr"(acc) : "vr"(w), "vr"(a) : "t0");
+    return acc;
+}
+
+static inline vfloat32m2_t d4_expand_fp16_64(const ggml_half * p) {
+    const size_t vl = Q1_NX1_N;
+    const vuint16m1_t vh = __riscv_vle16_v_u16m1(p, vl);
+    const vuint32m2_t hz = __riscv_vzext_vf2_u32m2(vh, vl);
+    const vuint32m2_t sign = __riscv_vsll_vx_u32m2(__riscv_vand_vx_u32m2(hz, 0x8000, vl), 16, vl);
+    vuint32m2_t mag = __riscv_vadd_vx_u32m2(
+        __riscv_vsll_vx_u32m2(__riscv_vand_vx_u32m2(hz, 0x7FFF, vl), 13, vl),
+        (uint32_t)112 << 23, vl);
+    const vbool16_t ez = __riscv_vmseq_vx_u32m2_b16(__riscv_vand_vx_u32m2(hz, 0x7C00, vl), 0, vl);
+    mag = __riscv_vmerge_vxm_u32m2(mag, 0, ez, vl);
+    return __riscv_vreinterpret_v_u32m2_f32m2(__riscv_vor_vv_u32m2(sign, mag, vl));
+}
+
+void q1_0_gemv_64d4(int n, float * s, const block_q1_0_64d4 * bricks, const block_q8_0 * y, const int8_t * ya, int nr) {
+    const int nb = n / QK1_0;
+    assert(n % QK1_0 == 0);
+    assert(nr % Q1_NX1_N == 0);
+
+    const size_t vl32 = Q1_NX1_N;        // i32 lanes  = rows
+    const size_t vl8  = Q1_NX1_N * 4;    // i8 lanes   = rows x 4 columns
+
+    const vint8m2_t vneg1 = __riscv_vmv_v_x_i8m2(-1, vl8);
+
+    for (int g = 0; g < nr / Q1_NX1_N; ++g) {
+        const block_q1_0_64d4 * bx = bricks + (size_t)g * nb;
+
+        vfloat32m2_t sumf = __riscv_vfmv_v_f_f32m2(0.0f, vl32);
+
+        for (int ib = 0; ib < nb; ++ib) {
+            const vfloat32m2_t dx = d4_expand_fp16_64(bx[ib].d);
+            vfloat32m2_t facc = __riscv_vfmv_v_f_f32m2(0.0f, vl32);
+
+            for (int k = 0; k < 4; ++k) {
+                const block_q8_0 * yb = &y[ib * 4 + k];
+                const float dy = lab_fp16_to_fp32(yb->d);
+
+                const uint32_t * aw = (const uint32_t *)(ya + (ib * 4 + k) * QK8_0);
+                vint32m2_t acc = __riscv_vmv_v_x_i32m2(0, vl32);
+                for (int c = 0; c < QK8_0; c += 4) {
+                    // 4 activations, same in every lane (aligned -> no misaligned trap)
+                    const vint8m2_t a =
+                        __riscv_vreinterpret_v_i32m2_i8m2(__riscv_vmv_v_x_i32m2((int32_t)aw[c / 4], vl32));
+                    const vbool4_t m  = __riscv_vlm_v_b4(bx[ib].qs[k * (QK8_0 / 4) + c / 4], vl8);
+                    const vint8m2_t w = __riscv_vmerge_vxm_i8m2(vneg1, 1, m, vl8);
+                    acc = vd4dots_m2(acc, w, a);
+                }
+                facc = __riscv_vfmacc_vf_f32m2(facc, dy, __riscv_vfcvt_f_x_v_f32m2(acc, vl32), vl32);
+            }
+            sumf = __riscv_vfmacc_vv_f32m2(sumf, dx, facc, vl32);
+        }
+        __riscv_vse32_v_f32m2(s + (size_t)g * Q1_NX1_N, sumf, vl32);
+    }
+}
+
+// ---- v2: one asm block per 16 columns -------------------------------------
+// v1 pays 4 vsetvli per 4 columns (GCC flips e8 <-> e32 around every step) and
+// chains all 8 dots of a group through one accumulator. v2 does the four
+// mask+merge steps in e8, flips once, then the four dots in e32, and splits
+// the dots over two accumulators. Internal registers are fixed and clobbered;
+// the accumulators stay compiler-allocated so they live across the block loop.
+//   v0 mask | v2 -1 | v4,v6,v8,v10 weights | v12,v14,v16,v18 activations
+#define D4_TILE16(acc0, acc1, planes, acts)                                \
+    asm volatile(                                                          \
+        "vsetvli t0, zero, e8, m2, ta, ma\n\t"                             \
+        "mv      t1, %2\n\t"                                               \
+        "vmv.v.i v2, -1\n\t"                                               \
+        "vlm.v   v0, (t1)\n\t"                                             \
+        "vmerge.vim v4, v2, 1, v0\n\t"                                     \
+        "addi    t1, t1, 32\n\t"                                           \
+        "vlm.v   v0, (t1)\n\t"                                             \
+        "vmerge.vim v6, v2, 1, v0\n\t"                                     \
+        "addi    t1, t1, 32\n\t"                                           \
+        "vlm.v   v0, (t1)\n\t"                                             \
+        "vmerge.vim v8, v2, 1, v0\n\t"                                     \
+        "addi    t1, t1, 32\n\t"                                           \
+        "vlm.v   v0, (t1)\n\t"                                             \
+        "vmerge.vim v10, v2, 1, v0\n\t"                                    \
+        "vsetvli t0, zero, e32, m2, ta, ma\n\t"                            \
+        "mv      t2, %3\n\t"                                               \
+        "vlse32.v v12, (t2), zero\n\t"                                     \
+        "addi    t2, t2, 4\n\t"                                            \
+        "vlse32.v v14, (t2), zero\n\t"                                     \
+        "addi    t2, t2, 4\n\t"                                            \
+        "vlse32.v v16, (t2), zero\n\t"                                     \
+        "addi    t2, t2, 4\n\t"                                            \
+        "vlse32.v v18, (t2), zero\n\t"                                     \
+        "nds.vd4dots.vv %0, v4,  v12\n\t"                                  \
+        "nds.vd4dots.vv %1, v6,  v14\n\t"                                  \
+        "nds.vd4dots.vv %0, v8,  v16\n\t"                                  \
+        "nds.vd4dots.vv %1, v10, v18"                                      \
+        : "+vr"(acc0), "+vr"(acc1)                                         \
+        : "r"(planes), "r"(acts)                                           \
+        : "t0", "t1", "t2",                                                \
+          "v0", "v2", "v4", "v6", "v8", "v10", "v12", "v14", "v16", "v18")
+
+void q1_0_gemv_64d4_v2(int n, float * s, const block_q1_0_64d4 * bricks, const block_q8_0 * y, const int8_t * ya, int nr) {
+    const int nb = n / QK1_0;
+    assert(n % QK1_0 == 0);
+    assert(nr % Q1_NX1_N == 0);
+
+    const size_t vl32 = Q1_NX1_N;
+
+    for (int g = 0; g < nr / Q1_NX1_N; ++g) {
+        const block_q1_0_64d4 * bx = bricks + (size_t)g * nb;
+
+        vfloat32m2_t sumf = __riscv_vfmv_v_f_f32m2(0.0f, vl32);
+
+        for (int ib = 0; ib < nb; ++ib) {
+            const vfloat32m2_t dx = d4_expand_fp16_64(bx[ib].d);
+            vfloat32m2_t facc = __riscv_vfmv_v_f_f32m2(0.0f, vl32);
+
+            for (int k = 0; k < 4; ++k) {
+                const block_q8_0 * yb = &y[ib * 4 + k];
+                const float dy = lab_fp16_to_fp32(yb->d);
+
+                const int8_t * aq = ya + (ib * 4 + k) * QK8_0;
+                vint32m2_t acc0 = __riscv_vmv_v_x_i32m2(0, vl32);
+                vint32m2_t acc1 = acc0;
+                D4_TILE16(acc0, acc1, &bx[ib].qs[k * (QK8_0 / 4)][0],     aq);
+                D4_TILE16(acc0, acc1, &bx[ib].qs[k * (QK8_0 / 4) + 4][0], aq + 16);
+
+                const vint32m2_t acc = __riscv_vadd_vv_i32m2(acc0, acc1, vl32);
+                facc = __riscv_vfmacc_vf_f32m2(facc, dy, __riscv_vfcvt_f_x_v_f32m2(acc, vl32), vl32);
+            }
+            sumf = __riscv_vfmacc_vv_f32m2(sumf, dx, facc, vl32);
+        }
+        __riscv_vse32_v_f32m2(s + (size_t)g * Q1_NX1_N, sumf, vl32);
+    }
+}
+
+// ---- isolation legs: which of the four shared ops costs the cycles? --------
+// v2 and v1 differ 3.4x in instruction count but run at the same speed, so the
+// cost sits in what they share per 4 columns: vlm, vmerge, the activation
+// broadcast, and the dot itself. v3 swaps the strided broadcast for lw+vmv.v.x;
+// nodot additionally replaces the dot with a plain vadd (WRONG results, timing
+// only). v2-v3 = broadcast cost, v3-nodot = nds.vd4dots cost.
+#define D4_TILE16_BC(DOT0, DOT1, DOT2, DOT3, acc0, acc1, planes, acts)     \
+    asm volatile(                                                          \
+        "vsetvli t0, zero, e8, m2, ta, ma\n\t"                             \
+        "mv      t1, %2\n\t"                                               \
+        "vmv.v.i v2, -1\n\t"                                               \
+        "vlm.v   v0, (t1)\n\t"                                             \
+        "vmerge.vim v4, v2, 1, v0\n\t"                                     \
+        "addi    t1, t1, 32\n\t"                                           \
+        "vlm.v   v0, (t1)\n\t"                                             \
+        "vmerge.vim v6, v2, 1, v0\n\t"                                     \
+        "addi    t1, t1, 32\n\t"                                           \
+        "vlm.v   v0, (t1)\n\t"                                             \
+        "vmerge.vim v8, v2, 1, v0\n\t"                                     \
+        "addi    t1, t1, 32\n\t"                                           \
+        "vlm.v   v0, (t1)\n\t"                                             \
+        "vmerge.vim v10, v2, 1, v0\n\t"                                    \
+        "vsetvli t0, zero, e32, m2, ta, ma\n\t"                            \
+        "lw      t3, 0(%3)\n\t"                                            \
+        "vmv.v.x v12, t3\n\t"                                              \
+        "lw      t3, 4(%3)\n\t"                                            \
+        "vmv.v.x v14, t3\n\t"                                              \
+        "lw      t3, 8(%3)\n\t"                                            \
+        "vmv.v.x v16, t3\n\t"                                              \
+        "lw      t3, 12(%3)\n\t"                                           \
+        "vmv.v.x v18, t3\n\t"                                              \
+        DOT0 DOT1 DOT2 DOT3                                                \
+        : "+vr"(acc0), "+vr"(acc1)                                         \
+        : "r"(planes), "r"(acts)                                           \
+        : "t0", "t1", "t3",                                                \
+          "v0", "v2", "v4", "v6", "v8", "v10", "v12", "v14", "v16", "v18")
+
+#define D4_REAL0 "nds.vd4dots.vv %0, v4,  v12\n\t"
+#define D4_REAL1 "nds.vd4dots.vv %1, v6,  v14\n\t"
+#define D4_REAL2 "nds.vd4dots.vv %0, v8,  v16\n\t"
+#define D4_REAL3 "nds.vd4dots.vv %1, v10, v18"
+#define D4_FAKE0 "vadd.vv %0, %0, v4\n\t"
+#define D4_FAKE1 "vadd.vv %1, %1, v6\n\t"
+#define D4_FAKE2 "vadd.vv %0, %0, v8\n\t"
+#define D4_FAKE3 "vadd.vv %1, %1, v10"
+
+#define D4_BODY(NAME, T0, T1, T2, T3)                                                        \
+void NAME(int n, float * s, const block_q1_0_64d4 * bricks, const block_q8_0 * y,            \
+          const int8_t * ya, int nr) {                                                       \
+    const int nb = n / QK1_0;                                                                \
+    const size_t vl32 = Q1_NX1_N;                                                            \
+    for (int g = 0; g < nr / Q1_NX1_N; ++g) {                                                \
+        const block_q1_0_64d4 * bx = bricks + (size_t)g * nb;                                \
+        vfloat32m2_t sumf = __riscv_vfmv_v_f_f32m2(0.0f, vl32);                              \
+        for (int ib = 0; ib < nb; ++ib) {                                                    \
+            const vfloat32m2_t dx = d4_expand_fp16_64(bx[ib].d);                             \
+            vfloat32m2_t facc = __riscv_vfmv_v_f_f32m2(0.0f, vl32);                          \
+            for (int k = 0; k < 4; ++k) {                                                    \
+                const block_q8_0 * yb = &y[ib * 4 + k];                                      \
+                const float dy = lab_fp16_to_fp32(yb->d);                                    \
+                const int8_t * aq = ya + (ib * 4 + k) * QK8_0;                               \
+                vint32m2_t acc0 = __riscv_vmv_v_x_i32m2(0, vl32);                            \
+                vint32m2_t acc1 = acc0;                                                      \
+                D4_TILE16_BC(T0, T1, T2, T3, acc0, acc1, &bx[ib].qs[k * (QK8_0/4)][0], aq);  \
+                D4_TILE16_BC(T0, T1, T2, T3, acc0, acc1,                                     \
+                             &bx[ib].qs[k * (QK8_0/4) + 4][0], aq + 16);                     \
+                const vint32m2_t acc = __riscv_vadd_vv_i32m2(acc0, acc1, vl32);              \
+                facc = __riscv_vfmacc_vf_f32m2(facc, dy,                                     \
+                           __riscv_vfcvt_f_x_v_f32m2(acc, vl32), vl32);                      \
+            }                                                                                \
+            sumf = __riscv_vfmacc_vv_f32m2(sumf, dx, facc, vl32);                            \
+        }                                                                                    \
+        __riscv_vse32_v_f32m2(s + (size_t)g * Q1_NX1_N, sumf, vl32);                         \
+    }                                                                                        \
+}
+
+D4_BODY(q1_0_gemv_64d4_v3,    D4_REAL0, D4_REAL1, D4_REAL2, D4_REAL3)
+D4_BODY(q1_0_gemv_64d4_nodot, D4_FAKE0, D4_FAKE1, D4_FAKE2, D4_FAKE3)
+
+#else
+
+void q1_0_gemv_64d4(int n, float * s, const block_q1_0_64d4 * bricks, const block_q8_0 * y, const int8_t * ya, int nr) {
+    (void)bricks; (void)y; (void)ya; (void)n;
+    for (int i = 0; i < nr; ++i) s[i] = 0.0f;   // VLEN=512 needs m4 lanes; not built
+}
+
+void q1_0_gemv_64d4_v2(int n, float * s, const block_q1_0_64d4 * bricks, const block_q8_0 * y, const int8_t * ya, int nr) {
+    q1_0_gemv_64d4(n, s, bricks, y, nr);
+}
+
+#endif
+
+#if Q1_VLEN < 1024
+void q1_0_gemv_64d4_v3(int n, float * s, const block_q1_0_64d4 * bricks, const block_q8_0 * y, const int8_t * ya, int nr) {
+    q1_0_gemv_64d4(n, s, bricks, y, ya, nr);
+}
+void q1_0_gemv_64d4_nodot(int n, float * s, const block_q1_0_64d4 * bricks, const block_q8_0 * y, const int8_t * ya, int nr) {
+    q1_0_gemv_64d4(n, s, bricks, y, ya, nr);
+}
+#endif
