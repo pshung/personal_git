@@ -1,11 +1,11 @@
 ---
 name: xandesvdot-nds-vd4dots-usable
-description: "XAndesVDot (nds.vd4dots.vv) is stock, not ACE - shipped in llama.cpp as the Q1_D4 Q1_0 gemv, 3.11x over repack+prefetch across all 7 layer-7 nodes; the two codegen traps that hide the win"
+description: "XAndesVDot (nds.vd4dots.vv) is stock, not ACE - shipped in llama.cpp as the Q1_D4 Q1_0 gemv AND gemm, 3.11x decode / 1.8-2.0x prefill over repack+prefetch; the codegen traps that hide the win and the vsetvli churn that is left"
 metadata: 
   node_type: memory
   type: project
   originSessionId: ebfb04e0-19ef-4a1a-9e2c-58953c138710
-  modified: 2026-07-29T12:52:23.369Z
+  modified: 2026-07-31T08:14:58.135Z
 ---
 
 `nds.vd4dots.vv` (XAndesVDot) is a STOCK Andes vendor instruction, not custom ACE.
@@ -87,12 +87,45 @@ d4 kernel one 32-byte vlm per 4 columns (32 per block) - same bytes, a quarter
 of the load ops. A cache-resident lab strip cannot show this; only the in-model
 ROI can. Generalize: measure kernel restructures in-model, not just in the lab.
 
-Still open: GEMM/prefill is on the generic C fallback under Q1_D4 (the layout is
-a whole-binary switch). VLEN=512/premium needs the e32/m4 shape and is blocked
-on the ax45 hybrid halt bug. Unexplored vendor ops in fpga_l3's ISA string:
-nds.vqmacc.*, nds.vln8.v / nds.vle4.v sub-int loads, nds.vfpmadb/t.vf,
-nds.vfwcvt.f.b.v.
+GEMM/PREFILL DONE 2026-07-31 (`q1_gemm_64d4_vl1024`), nrows=4 pure-gemm nodes:
+  K=51 attn_v   pristine 8,875,248 -> prefetch 1,651,949 -> d4   931,754  1.77x
+  K=56 ffn_down          -         -> prefetch 13,474,132 -> d4 6,636,852 2.03x
+THE RESULT THAT MATTERS FOR PLANNING: prefill and decode now converge on the
+same instruction-issue floor. cyc/MAC, decode gemv vs prefill gemm:
+  repack+prefetch  0.2650 vs 0.1576 (gemm 1.68x better - weight reuse across
+                                     the M-tile of 4 was hiding memory stall)
+  + nds.vd4dots    0.0872 vs 0.0889 (SAME - no stall left for reuse to hide)
+So prefill's smaller ratio is a better starting point, not a weaker kernel.
+ffn_down is the exception that proves it: 3.5 MB misses fpga_l3's 2 MB L3, so
+reuse still buys traffic and its d4 gemm IS 1.29x better per MAC than the d4
+gemv -> 2.03x. Corollary: the gemm ratio is NOT shape-invariant (unlike the
+gemv's 3.03-3.16x); it tracks whether the tensor fits L3.
+Activation side is the only new problem: x4 stores qs[c*4+m] but the dot wants
+row m's 4 consecutive columns as one u32. De-interleave the row tile once with
+vnsrl (u32 -> 2x u16 -> 4x u8), <1% - do NOT use vlse8/segment loads (see trap
+1). Legal because block_q8_0x4 keeps qs 4-byte aligned, the opposite of trap 2.
+e32/m2 has no register left for a per-row facc, so fold the activation scale
+into dx: sum_l dx*(sum_k da*acc) == sum_l sum_k (dx*da)*acc.
+
+NEXT LEVER (F9), measured from the O3 asm - per nds.vd4dots issued:
+  gemv 80 instrs / 8 dots = 10.0, 40% of them vsetvli
+  gemm 36 instrs / 4 dots =  9.0, 28% of them vsetvli
+GCC treats the asm as a vtype killer and re-emits vsetvli before the next
+vmv.v.x, so no two dots ever share one. Widen the asm block: in the gemm the 4
+dots of a column quad differ only in the activation register, so one
+`vsetvli + 4x nds.vd4dots` is 36 -> ~26 instrs (1.38x). Costs 4 live i8m2
+instead of 1 - check for spills, 2-at-a-time is the safe fallback.
+Also still open: VLEN=512/premium needs the e32/m4 shape, blocked on the ax45
+hybrid halt bug. 5 of 7 layer-7 nodes unmeasured for prefill. Unexplored vendor
+ops in fpga_l3's ISA string: nds.vqmacc.*, nds.vln8.v / nds.vle4.v sub-int
+loads, nds.vfpmadb/t.vf, nds.vfwcvt.f.b.v.
 
 Lab: `/local/nick/vsim-workspace/vsim-demo/q1_0_d4/` (rdcycle shootout).
 ggml: repack.h `q1_0x64_sign_bit` (the one layout authority),
-arch/riscv/repack.cpp `q1_gemv_64d4_vl1024`, `bash build.sh d4`.
+arch/riscv/repack.cpp `q1_gemv_64d4_vl1024` + `q1_gemm_64d4_vl1024`,
+`bash build.sh d4`. GATE: `./check-vd4dots.sh` - counts nds.vd4dots (0 = that
+path silently fell back to generic and is 3x slow), prefetch.r, and vlse*, per
+KERNEL not per entry point (the d4 kernels stay out of line, which is why
+check-prefetch.sh reads 0 on a d4 build and cannot guard them).
+Prefill measurement recipe: `PROMPT="The capital of France" WARMUP=--no-warmup
+bash measure.sh <target>` gives nrows=4, a pure gemm node.
