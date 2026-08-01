@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: ebfb04e0-19ef-4a1a-9e2c-58953c138710
-  modified: 2026-07-31T08:14:58.135Z
+  modified: 2026-08-01T13:49:30.082Z
 ---
 
 `nds.vd4dots.vv` (XAndesVDot) is a STOCK Andes vendor instruction, not custom ACE.
@@ -33,9 +33,10 @@ Availability - all three legs of the loop already have it, nothing to build:
 TWO CODEGEN TRAPS. Both silently cost the whole win, both bit you twice (lab
 then ggml), both now have comments in the source:
 1. `vlse32.v vd,(rs1),zero` (stride-0 broadcast) is element-serial on this core
-   - 18x slower. GCC contracts "load a word, splat it" into exactly that. Fix:
-   pin the word in a GPR with an empty `asm("" : "+r"(w))` first, so it stays
-   lw + vmv.v.x. GATE IT: disassemble the gemv kernel, want 8 vmv.v.x, 0 vlse32.
+   - 18x slower. GCC contracts "load a word, splat it" into exactly that. The
+   old fix was an `asm("" : "+r"(w))` barrier; since F9 the broadcast is written
+   by hand inside the dot's asm block, so the contraction is impossible and
+   q1_bcast_act4 is gone. GATE IT anyway: ./check-vd4dots.sh counts vlse*, want 0.
 2. The core faults on a MISALIGNED 32-bit VECTOR element load, and `block_q8_0`
    puts qs at offset 2, so every other q8 group is 2 mod 4. Fix: restage the
    activation quants once per gemv call into an alloca'd buffer via vector BYTE
@@ -54,12 +55,14 @@ nrows=2 gemv), ALL 7 layer-7 nodes x ALL 3 kernels:
   GOTCHA: measure.sh's default 4h per-leg timeout is too short for pristine
   ffn_down (49.0M cycles ~3.9h) - it exits 1 with an empty grep. TIMEOUT=28800000.
 
-COMPUTE / MEMORY SPLIT after F8 - the number to plan hardware against
+COMPUTE / MEMORY SPLIT after F8 - **the "floor" here was WRONG, see F9 below**
 (K=51 attn_v; `bash build.sh d4-nopf` and `d4-hvm`):
   d4 prefetch OFF 588,771 | d4+prefetch 457,092 | d4+prefetch+HVM 328,865
-  HVM removes essentially all memory wait, so 328,865 is the INSTRUCTION-ISSUE
-  FLOOR (~92K instrs -> 3.6 cyc/instr ~= the m2-at-DLEN-1024 issue limit):
-    72% instruction issue (no memory fix touches this) / 28% residual stall.
+  I called 328,865 the INSTRUCTION-ISSUE FLOOR and split it 72% issue / 28%
+  stall. It was not a floor - it was an instruction count. F9 removed
+  instructions and reached 362,799 with NO HVM, and F9+HVM was never measured.
+  The split below is still the right SHAPE (memory is not done) but the
+  absolute numbers are F8-era. Re-measure before quoting.
   The un-prefetched kernel's total stall splits almost exactly in half:
   prefetch hides 131,679 (51%), HVM the other 128,227 (49%).
   So HVM is still worth 1.39x AFTER all software work (13.61x vs pristine) -
@@ -90,8 +93,8 @@ ROI can. Generalize: measure kernel restructures in-model, not just in the lab.
 GEMM/PREFILL DONE 2026-07-31 (`q1_gemm_64d4_vl1024`), nrows=4 pure-gemm nodes:
   K=51 attn_v   pristine 8,875,248 -> prefetch 1,651,949 -> d4   931,754  1.77x
   K=56 ffn_down          -         -> prefetch 13,474,132 -> d4 6,636,852 2.03x
-THE RESULT THAT MATTERS FOR PLANNING: prefill and decode now converge on the
-same instruction-issue floor. cyc/MAC, decode gemv vs prefill gemm:
+AT F8 prefill and decode converged on the same cost per MAC (F9 then split
+them apart again - see below). cyc/MAC, decode gemv vs prefill gemm:
   repack+prefetch  0.2650 vs 0.1576 (gemm 1.68x better - weight reuse across
                                      the M-tile of 4 was hiding memory stall)
   + nds.vd4dots    0.0872 vs 0.0889 (SAME - no stall left for reuse to hide)
@@ -107,14 +110,33 @@ vnsrl (u32 -> 2x u16 -> 4x u8), <1% - do NOT use vlse8/segment loads (see trap
 e32/m2 has no register left for a per-row facc, so fold the activation scale
 into dx: sum_l dx*(sum_k da*acc) == sum_l sum_k (dx*da)*acc.
 
-NEXT LEVER (F9), measured from the O3 asm - per nds.vd4dots issued:
-  gemv 80 instrs / 8 dots = 10.0, 40% of them vsetvli
-  gemm 36 instrs / 4 dots =  9.0, 28% of them vsetvli
-GCC treats the asm as a vtype killer and re-emits vsetvli before the next
-vmv.v.x, so no two dots ever share one. Widen the asm block: in the gemm the 4
-dots of a column quad differ only in the activation register, so one
-`vsetvli + 4x nds.vd4dots` is 36 -> ~26 instrs (1.38x). Costs 4 live i8m2
-instead of 1 - check for spills, 2-at-a-time is the safe fallback.
+F9 DONE 2026-08-01 - killed the vtype churn. The kernels ping-pong between the
+byte view (vlm, vmerge) and the 32-bit view (vmv.v.x, dot); each flip costs a
+vsetvli, 4 per dot in the gemv = 40% of the inner loop.
+  FIX: put everything at e32 inside ONE asm block, broadcasts included, so GCC
+  only sees e8 work. Grouping the widths in SOURCE is NOT enough - the
+  scheduler re-interleaves (only got 4.00 -> 2.00). Also kills the vlse32 trap
+  by construction (activations come in as uint32 GPRs, vmv.v.x written by hand).
+  DID NOT WORK: 4 scratch activation regs instead of 2 (no spills, 4.5% WORSE)
+  -> producer-consumer distance is not the gemm's limiter.
+  static: vsetvli/dot gemv 4.00->0.94 gemm 2.00->0.52
+          instrs/dot   gemv 10.0->7.90 gemm 9.00->4.13
+  MEASURED  K=51 decode  457,092 -> 362,799 (1.26x, 12.34x vs pristine)
+            K=51 prefill 931,754 -> 818,314 (1.14x, 10.85x vs pristine)
+            K=56 prefill 6,636,852 -> 5,683,029 (1.17x)
+DECODE AND PREFILL ARE NOW BOUND BY DIFFERENT THINGS - cycles per issued instr:
+  gemv 2.23 -> 2.24 unchanged = purely issue bound, F9 converted instruction
+       savings 1:1 into cycles. So F8's "instruction-issue floor" 328,865
+       (measured WITH HVM) was never a floor, it was an instruction count -
+       F9 beat it at 362,799 with no HVM. Do not quote that floor again.
+  gemm 2.53 -> 4.84 nearly doubled = NOT issue bound. Its 4.13 instrs/dot
+       should cost ~9.2 cyc at the gemv's rate; it costs 20.0, so ~11 cyc/dot
+       is stall. Cutting instructions further will NOT help prefill.
+  Both now sit at 17.7 (gemv) / 20.0 (gemm) cycles per nds.vd4dots.vv, close
+  enough to suspect the instruction's own m2 throughput - NOT established.
+  UNRUN EXPERIMENT that settles it: d4-nopf and d4-hvm on the PREFILL node
+  (targets exist, ~25 min). HVM moves it -> memory, fix in software. Neither
+  moves it -> the dot rate, prefill is done until the ISA changes.
 Also still open: VLEN=512/premium needs the e32/m4 shape, blocked on the ax45
 hybrid halt bug. 5 of 7 layer-7 nodes unmeasured for prefill. Unexplored vendor
 ops in fpga_l3's ISA string: nds.vqmacc.*, nds.vln8.v / nds.vle4.v sub-int
