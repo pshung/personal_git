@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# Codegen gate for the Q1_D4 kernels (ggml-cpu/arch/riscv/repack.cpp).
+#
+# Two things this catches that no result test can:
+#
+#  1. A path silently falls back. Q1_D4 changes the sign-plane order AND the
+#     kernel; if gemv or gemm never got a vd4dots kernel it still returns
+#     correct numbers through the generic C path, just ~3x slower. Counting
+#     nds.vd4dots is the only way to see which one is really on the
+#     instruction. (This was real: gemm ran generic for the whole F8 sweep.)
+#
+#  2. The F5 weight prefetch is dead-code eliminated. Same trap as
+#     check-prefetch.sh guards, but that script counts per ENTRY point and the
+#     d4 kernels stay out of line, so it reads 0 there and cannot be used on a
+#     d4 build. Counted here instead, in the kernel body.
+#
+#  3. vtype churn (F9) creeps back. The kernels alternate between the byte
+#     view (vlm, vmerge) and the 32-bit view (vmv.v.x, the dot), and every
+#     alternation costs a vsetvli that does no arithmetic - 4 per dot in the
+#     original gemv, 40% of its inner loop. The fix (batch by element width,
+#     several dots per asm block) is invisible to every result test. Measured
+#     as vsetvli between the FIRST and LAST dot, per dot gap, so the prologue
+#     and the fp16-scale expansion do not pollute it. Budget: at most 1.
+#
+#  4. The activation broadcast collapses into vlse32.v vd,(rs1),zero. A
+#     stride-0 strided load is element-serial on this core - 18x slower than
+#     lw + vmv.v.x - and GCC contracts "load a word, splat it" into exactly
+#     that whenever the value is not pinned in a GPR first (q1_bcast_act4).
+#     Results are identical, so only the assembly shows it.
+#
+# The kernels are file-static, so each is checked in its own body; if the
+# compiler inlined it away the entry point is checked instead. A kernel with
+# no label and no inlined copy has been dead-code eliminated, which is exactly
+# the "fell back to generic" failure.
+#
+# Reuses an existing CMake build's compile line for that one TU, so -march,
+# -O level and includes are never duplicated here.
+#
+# Usage: ./check-vd4dots.sh [build-dir]      env: BUILD, OLEVELS
+set -e
+LLAMA=$(cd "$(dirname "$0")" && pwd)
+BUILD=${1:-${BUILD:-b-d4}}
+OLEVELS=${OLEVELS:-"O2 O3 Os"}
+SRC=$LLAMA/ggml/src/ggml-cpu/arch/riscv/repack.cpp
+# "<kernel static fn> <entry point it inlines into>"
+KERNELS="q1_gemv_64d4_vl1024:ggml_gemv_q1_0_64x1_q8_0 q1_gemm_64d4_vl1024:ggml_gemm_q1_0_64x1_q8_0"
+
+CC_DB=$LLAMA/$BUILD/compile_commands.json
+[ -f "$CC_DB" ] || { echo "no $CC_DB (build it with bash build.sh d4)"; exit 1; }
+
+ENTRY=$(python3 - "$CC_DB" <<'EOF'
+import json, sys
+for d in json.load(open(sys.argv[1])):
+    if d['file'].endswith('arch/riscv/repack.cpp'):
+        print(d['directory']); print(d['command']); break
+else:
+    sys.exit('arch/riscv/repack.cpp not in compile_commands.json')
+EOF
+)
+CC_DIR=$(printf '%s' "$ENTRY" | head -1)
+CC_CMD=$(printf '%s' "$ENTRY" | tail -1)
+
+case "$CC_CMD" in
+    *xandesvdot*) ;;
+    *) echo "$BUILD is not an XAndesVDot build (-march has no xandesvdot)"; exit 1 ;;
+esac
+case "$CC_CMD" in
+    *-DQ1_D4=1*) ;;
+    *) echo "$BUILD is not a Q1_D4 build"; exit 1 ;;
+esac
+# a deliberate DIST=0 build (b-d4-nopf) has no prefetch to find
+WANT_PF=1
+case "$CC_CMD" in *-DQ1_PREFETCH_DIST=0*) WANT_PF=0 ;; esac
+
+OUT=$LLAMA/$BUILD/vd4dots-check
+mkdir -p "$OUT"
+echo "build $BUILD, source $SRC"
+
+rc=0
+
+# label of function $1 in $2: the plain name, or its C++ static mangling
+label_of() {
+    awk -v N="$1" '/^[A-Za-z_].*:$/ {
+        s = substr($0, 1, length($0)-1)
+        if (s == N || (s ~ /^_ZL[0-9]+/ && index(s, N) > 0)) { print s; exit }
+    }' "$2"
+}
+
+# count instructions matching $2 inside the body of label $1 in file $3
+count_in() {
+    awk -v F="$1:" -v P="$2" 'BEGIN{c=0} $0==F{i=1;next} i&&$0~P{c++} i&&/[.]size/{i=0} END{print c}' "$3"
+}
+
+# "<vsetvli between first and last dot> <dot gaps>" for label $1 in file $2
+vset_span() {
+    awk -v F="$1:" 'BEGIN{d=0;v=0;last=0}
+        $0==F{i=1;next} i&&/[.]size/{i=0}
+        i&&/nds[.]vd4dots/{d++; if(d==1)on=1; last=v}
+        i&&on&&/vset[a-z]*vli/{v++}
+        END{print last, (d>1?d-1:0)}' "$2"
+}
+
+# $1 = label, $2 = -O level to force ("" = keep the build's own)
+check_variant() {
+    asm=$OUT/repack-$1.s
+    cmd=$CC_CMD
+    [ -n "$2" ] && cmd=$(printf '%s' "$cmd" | sed -E "s/ -O[0-9sgz]+ / -$2 /")
+    cmd=$(printf '%s' "$cmd" | sed -E "s#-o [^ ]+[.]o #-S -o $asm #")
+    ( cd "$CC_DIR" && eval "$cmd" )
+
+    line="  $1:"
+    for ke in $KERNELS; do
+        kern=${ke%%:*}
+        sym=$(label_of "$kern" "$asm")
+        [ -n "$sym" ] || sym=${ke##*:}          # inlined into the entry point
+        dot=$(count_in "$sym" 'nds[.]vd4dots' "$asm")
+        lse=$(count_in "$sym" 'vlse[0-9]+[.]v' "$asm")
+        pf=$(count_in  "$sym" 'prefetch[.]'   "$asm")
+        set -- $(vset_span "$sym" "$asm")
+        vs=$1; gaps=$2
+        line="$line  $kern=dot$dot/pf$pf/lse$lse/vset$vs:$gaps"
+        [ "$gaps" -gt 0 ] && [ "$vs" -gt "$gaps" ] && { line="$line(VTYPE-CHURN)"; rc=1; }
+        [ "$dot" -eq 0 ] && { line="$line(NO-DOT)"; rc=1; }
+        [ "$pf"  -eq 0 ] && [ "$WANT_PF" = 1 ] && { line="$line(NO-PREFETCH)"; rc=1; }
+        [ "$lse" -gt 0 ] && { line="$line(STRIDED)"; rc=1; }
+    done
+    echo "$line"
+}
+
+check_variant "as-built" ""
+for o in $OLEVELS; do check_variant "-$o" "$o"; done
+
+if [ $rc -ne 0 ]; then
+    echo "FAIL: NO-DOT       = that kernel is not on nds.vd4dots (generic C fallback)."
+    echo "      NO-PREFETCH  = ipa-pure-const + DCE ate q1_prefetch_block;"
+    echo "                     check always_inline on it and zicbop in -march."
+    echo "      VTYPE-CHURN  = more than one vsetvli per dot in the steady state"
+    echo "                     (F9). Batch the e8 work and the e32 work, and put"
+    echo "                     several dots in one asm block."
+    echo "      STRIDED      = the activation broadcast became vlse32.v ...,zero;"
+    echo "                     check the asm(\"\" : \"+r\"(w)) barrier in q1_bcast_act4."
+    exit 1
+fi
+echo "PASS: gemv and gemm both use nds.vd4dots, prefetch, no strided load, at ($OLEVELS)"

@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Hybrid K=51 ROI cycle measurement for the prefetch reproduce runbook
+# (q1_0_hvm_reproduce.md). Prints, per binary, the [roi] self-check line
+# (now including nrows) and the [andesim] <N> cycles figure for the K=51 node.
+#
+#   bash measure.sh                     # pristine baseline prefetch (gemv/decode node)
+#   bash measure.sh baseline prefetch   # just the prefetch A/B
+#   PROMPT="The capital of France" WARMUP=--no-warmup bash measure.sh baseline prefetch
+#                                       # pure-gemm node (nrows=4): measures the gemm path
+#
+# GEMV (decode) node = the warmup forward pass, nrows=2. Expected K=51 cycles:
+#   pristine 4,476,168 -> baseline 2,144,213 -> prefetch 1,391,650
+#   (prefetch = 1.54x vs baseline, 3.22x vs pristine)
+# GEMM (prefill) node = --no-warmup + a 4-token prompt, nrows=4 (pure gemm):
+#   baseline 1,696,704 -> prefetch 1,649,275 (only 1.03x - gemm reuses each
+#   weight block across the M-tile of 4, so it is ~compute-bound, little to hide)
+#   pristine 8,875,248 -> prefetch 1,651,949 -> d4 931,754 -> d4+F9 818,314
+#   (10.85x over pristine). K=56 ffn_down: prefetch 13,474,132 -> d4 6,636,852
+#   -> d4+F9 5,683,029. d4 beats prefetch by more on ffn_down (2.03x vs 1.77x)
+#   because 3.5 MB does not fit the 2 MB L3, so weight reuse still buys memory
+#   traffic there.
+#   Decode for comparison: pristine 4,476,673 -> prefetch 1,389,236 ->
+#   d4 457,092 -> d4+F9 362,799 (12.34x over pristine).
+#
+#
+# Other shapes: the measured node is compile-time (see build.sh ROI_K), so a
+# shape sweep passes the suffixed binaries, e.g.
+#   bash measure.sh pristine-k54 baseline-k54 prefetch-k54   # blk.7.ffn_gate
+# Bonsai-4B has 6 distinct Q1_0 shapes; layer 7 covers all of them at
+# ROI_K = 50 attn_q / 51 attn_v / 52 attn_k / 53 attn_output / 54 ffn_gate /
+# 55 ffn_up / 56 ffn_down. Cost scales with rows*K, so ffn_* is ~9.5x the
+# attn_v node -> raise TIMEOUT for those.
+#
+# Slow: the RTL leg runs at a few kHz -> minutes per binary. Override via env
+# LLAMA / ANDESIM / MODEL / ENGINE / PROMPT / WARMUP / TIMEOUT.
+set -e
+export TMPDIR=${TMPDIR:-/home/nick/tmp}
+LLAMA=${LLAMA:-/home/nick/work/llama.cpp}
+ANDESIM=${ANDESIM:-/home/nick/work/andesim}
+MODEL=${MODEL:-$LLAMA/models/Bonsai-4B-Q1_0.gguf}
+ENGINE=${ENGINE:-vsim:ax46mpv_fpga_l3}
+PROMPT=${PROMPT:-The capital of France is}
+WARMUP=${WARMUP:-}
+TIMEOUT=${TIMEOUT:-14400000}   # hybrid per-leg spawn timeout, ms (4h)
+
+for b in ${*:-pristine baseline prefetch}; do
+  echo "=== $b ==="
+  ( cd "$ANDESIM" && ./andesim run --mode hybrid --trigger marker --runtime linux \
+      --mem-size 2000M --engine "$ENGINE" --step-timeout-ms "$TIMEOUT" \
+      "$LLAMA/bin-$b" -- -m "$MODEL" -no-cnv $WARMUP --prompt "$PROMPT" \
+      -n 32 -c 512 -t 1 ) 2>&1 | grep -E '\[roi\]|\[andesim\] .*cycles'
+done
