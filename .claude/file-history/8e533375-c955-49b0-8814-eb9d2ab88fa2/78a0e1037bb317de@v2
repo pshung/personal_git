@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Give every stage one visible idea and put the rest behind a disclosure.
+
+A stage used to show up to 19 blocks at once: the summary, the figure, the
+assembly, the instruction tallies, the byte layouts and three side cards, all
+at the same level.  Now a stage shows what changed, the picture, and the
+number; the assembly and the layouts sit in <details> the reader can open.
+"""
+import pathlib, re, sys
+
+SRC = pathlib.Path(__file__).parent / "q1_page.src.html"
+s = SRC.read_text()
+
+# --- structure helpers ------------------------------------------------------
+
+CONTAINER = {"div", "ul", "ol", "details", "table", "figure"}
+INLINE = {"p", "h3", "h2"}
+
+
+def match_close(body, pos, tag):
+    """Walk to the close that matches an already-opened tag."""
+    pat = re.compile(r"</?%s\b[^>]*?(/?)>" % tag)
+    depth = 1
+    while depth:
+        m = pat.search(body, pos)
+        if not m:
+            sys.exit("unclosed <%s>" % tag)
+        depth += -1 if m.group(0).startswith("</") else (0 if m.group(1) else 1)
+        pos = m.end()
+    return pos
+
+
+def children(body, indent=4):
+    """Top-level elements at this indent. Preformatted .ops text also starts
+    lines with spaces, so only real block tags count and nesting is matched."""
+    out, pad, i = [], "\n" + " " * indent + "<", 0
+    while True:
+        j = body.find(pad, i)
+        if j < 0:
+            return out
+        m = re.match(r"\n\s*<(\w+)([^>]*?)(/?)>", body[j:])
+        if not m or (m.group(1) not in CONTAINER and m.group(1) not in INLINE):
+            i = j + 1
+            continue
+        tag = m.group(1)
+        if m.group(3) == "/":
+            end = j + m.end()
+        elif tag in CONTAINER:
+            end = match_close(body, j + m.end(), tag)
+        else:
+            end = body.index("</%s>" % tag, j + m.end()) + len(tag) + 3
+        cls = re.search(r'class="([^"]*)"', m.group(2))
+        out.append({"tag": tag, "cls": cls.group(1) if cls else "",
+                    "start": j + 1, "end": end, "text": body[j + 1:end]})
+        i = end
+
+
+def section(name):
+    m = re.search(r'<section class="sec" id="%s">.*?\n</section>' % name, s, re.S)
+    if not m:
+        sys.exit("section %s not found" % name)
+    return m.group(0), m.start(), m.end()
+
+
+def details(summary, blocks, indent=4):
+    pad = " " * indent
+    inner = "\n".join(re.sub(r"^", "  ", b, flags=re.M) for b in blocks)
+    return ('%s<details class="more">\n%s  <summary>%s</summary>\n%s\n%s</details>'
+            % (pad, pad, summary, inner, pad))
+
+
+def rebuild(name, plan):
+    """plan: list of ("keep", cls) or ("hide", summary, [cls, ...])."""
+    global s
+    body, a, b = section(name)
+    kids = children(body)
+    by_cls = {}
+    for k in kids:
+        by_cls.setdefault(k["cls"], []).append(k)
+        if k["cls"] != k["tag"]:
+            by_cls.setdefault(k["tag"], []).append(k)
+
+    def take(key, why):
+        got = by_cls.get(key)
+        while got and got[0]["start"] in used:
+            got.pop(0)
+        if not got:
+            sys.exit("%s: nothing left matching %r for %s" % (name, key, why))
+        k = got.pop(0)
+        used.add(k["start"])
+        return k
+    used, pieces = set(), []
+    for step in plan:
+        if step[0] == "keep":
+            pieces.append(take(step[1], "keep")["text"])
+        else:
+            _, summary, classes = step
+            pieces.append(details(summary, [take(c, summary)["text"] for c in classes]))
+    left = [k["cls"] for k in kids if k["start"] not in used]
+    if left:
+        sys.exit("%s: unplaced children %r" % (name, left))
+    head = body[:kids[0]["start"]]
+    new = head + "\n".join(pieces) + "\n  </div>\n</section>"
+    s = s[:a] + new + s[b:]
+    hidden = sum(len(st[2]) for st in plan if st[0] == "hide")
+    print("  %-8s %d blocks visible, %d moved into %d disclosure(s)"
+          % (name, sum(1 for st in plan if st[0] == "keep"), hidden,
+             sum(1 for st in plan if st[0] == "hide")))
+
+
+# --- split the two-panel rows so the figure stays out in the open ----------
+
+def split_panels(name, keep_first_as, hide_summary):
+    """`panels wide-left` holds [figure panel, detail panel]. Separate them."""
+    global s
+    body, a, b = section(name)
+    row = next(k for k in children(body) if k["cls"] == "panels wide-left")
+    panels = children(row["text"], indent=6)
+    if len(panels) != 2:
+        sys.exit("%s: expected 2 panels, got %d" % (name, len(panels)))
+    fig = '    <div class="%s">\n%s\n    </div>' % (keep_first_as, panels[0]["text"])
+    det = details(hide_summary, [panels[1]["text"]])
+    s = s[:a] + body[:row["start"]] + fig + "\n" + det + body[row["end"]:] + s[b:]
+    print("  %-8s figure kept visible, its side panel moved into a disclosure" % name)
+
+
+print("splitting the figure rows:")
+split_panels("s01", "panels figure-row", "The inner loop, instruction by instruction")
+split_panels("s02", "panels figure-row", "The inner loop, instruction by instruction")
+
+print("\ngrouping each stage:")
+rebuild("s01", [
+    ("keep", "stage-head"), ("keep", "prose"), ("keep", "panels figure-row"),
+    ("keep", "more"), ("keep", "pull"),
+])
+rebuild("s02", [
+    ("keep", "stage-head"), ("keep", "beats"), ("keep", "prose"),
+    ("keep", "panels figure-row"),
+    ("hide", "The repacked block, byte by byte", ["panels"]),
+    ("keep", "more"),
+    ("hide", "Two constraints this creates", ["cards"]),
+    ("keep", "nextup"),
+])
+rebuild("s03", [
+    ("keep", "stage-head"), ("keep", "beats"),
+    ("hide", "Why the hardware cannot do it, and how far ahead to ask",
+     ["panels two"]),
+    ("keep", "nextup"),
+])
+rebuild("s04", [
+    ("keep", "stage-head"), ("keep", "beats"), ("keep", "prose"), ("keep", "ops"),
+    ("keep", "prose"), ("keep", "panels"),
+    ("hide", "The permuted layout, byte by byte, and the inner loop",
+     ["panels wide-left"]),
+    ("hide", "How gemv and gemm tile the same instruction",
+     ["h3", "prose", "panels two", "cards c2"]),
+    ("keep", "nextup"),
+])
+rebuild("s05", [
+    ("keep", "stage-head"), ("keep", "beats"), ("keep", "prose"),
+    ("hide", "The loop before and after, and the static counts",
+     ["panels two", "tablewrap"]),
+    ("keep", "pull"),
+])
+rebuild("machine", [
+    ("keep", "sec-head"),
+    ("hide", "Core and model, in full", ["panels two"]),
+    ("keep", "prose"),
+    ("hide", "What decode and prefill each ask of it", ["panels two", "cap"]),
+])
+
+SRC.write_text(s)
+print("\n%d bytes" % len(s))
