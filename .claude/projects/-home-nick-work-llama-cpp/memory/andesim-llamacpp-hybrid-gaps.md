@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 047fa35b-69c2-4ca4-8695-5347e3e7a746
-  modified: 2026-08-04T09:16:36.461Z
+  modified: 2026-08-04T20:05:47.372Z
 ---
 
 Updated 2026-07-21 (originally 2026-07-15). Target switched Bonsai-27B -> Bonsai-4B-Q1_0 (572 MB): fits the 2 GiB cap, plain qwen3 (no qwen35 rv64 bug), and the full flow is CONFIRMED on it. Canonical recipe doc: /home/nick/work/andesim/docs/llama_roi_howto.md; roadmap: llama.cpp/opt_roadmap.md.
@@ -89,6 +89,21 @@ physical addresses (see the andesim ROADMAP_LINUX_RUNTIME.md U10 rewrite).
   needs vlinux to place its arenas at a non-zero ram_base = roadmap U10d, so
   U10f's "does the RTL address it" gate is BLOCKED ON U10d, not only on the
   engine rebuild.
+
+**27B UNLOCKED (2026-08-05)**: U10b/U10e/U10f DONE (committed: andesim 5c134e5,
+1edb88d, 9d10a6d; vsim_andesim e874381). Fast+linux and hybrid now address up
+to 16G via ram_base 0x8_00000000 (legacy <=2G layouts bit-identical; alias
+region in vsim main.cpp for the low window; cross-window comparisons carry
+~0.3% layout noise, gate-3 4B K=51: 362,799 legacy vs 361,930 at 3G). FIRST
+27B hybrid measurement: `--mem-size 6G --no-mmap` (mmap+repack would exceed
+6G, same math as 8B), K=51 on qwen35 = blk.6.attn_gate [5120 x 6144] nrows=2,
+bin-d4 -> **4,578,346 cycles** (0.146 cyc/elem, d4 kernel band). F0 (qwen35
+rv64 garbage) bisected via 3-way eval-callback (host/scalar/RVV qemu-user):
+prefill logits FINE on all; injection is DECODE-path FLASH_ATTN_EXT at
+qwen35-27B's head_dim=256 (Q{256,1,24}, K{256,256,4}); zvfh-gated intrinsics
+compile out in no-zvfh builds yet garbage persists -> suspect Andes GCC RVV
+AUTOVECTORIZATION of the kernel's scalar loops; -fno-tree-vectorize probe
+build pending at session end.
 
 **Still-true hard caps**
 - Guest RAM max 2 GiB (QEMU andes_ae350 + driver cap). 27B (~4.5 GB) blocked on this; 4B+KV fits in 2000M.
