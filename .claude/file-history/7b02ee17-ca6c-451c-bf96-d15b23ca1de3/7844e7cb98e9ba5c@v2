@@ -1,0 +1,127 @@
+# Running Bonsai-8B on andesim hybrid: 2 flags, 0 rebuilds, 11.23x
+
+2026-08-04, engine `vsim:ax46mpv_fpga_l3` (VLEN 1024, ELEN 64, real L3 RTL).
+The 4B flow extends to the 8B model with two flags and no rebuild, and the
+Q1_0 optimization chain gives **7,278,168 -> 648,246 cycles = 11.23x** on the
+K=51 node (layer 7 V projection, `blk.7.attn_v.weight [4096 x 1024]`, nrows=2).
+
+## Part 1 - what must change to run the 8B model
+
+The 4B recipe carries over unchanged: same four binaries, same engine, same
+ROI marker at K=51. The model file is a runtime argument. Only two flags are
+new, and both exist because the 8B model presses against the 2 GiB guest RAM
+window.
+
+- **`--mem-size 2097148K`** (andesim flag). The exact hybrid maximum:
+  2 GiB minus the 4 KiB hybrid scratch area. Hybrid mode rejects `2G`
+  outright (only fast mode accepts it), so this literal value is required.
+- **`--no-mmap`** (llama.cpp flag). On RISC-V the Q1_0 repack buffer type
+  accepts these tensors, so with mmap the 1,099 MiB file mapping AND the
+  931 MiB repack buffer are both resident at load time. Together with the
+  other buffers that exceeds the window. `--no-mmap` drops the mapping;
+  everything else fits with 565 MiB to spare.
+
+Guest RAM demand at load, drawn to scale (1 char = 64 MiB):
+
+```
+              0    512  1024 1536 2048 = the 2 GiB window
+              |----|----|----|----|
+default (mmap) MMMMMMMMMMMMMMMMMRRRRRRRRRRRRRRROOOOOOOOO   2,582 MiB: FAILS, 534 over
+with --no-mmap RRRRRRRRRRRRRRROOOOOOOOO                    1,483 MiB: fits, 565 free
+              |----|----|----|----|
+M = file mapping 1,099   R = repack buffer 931
+O = other 552 (non-repacked weights 168 + KV cache 72 at -c 512 + compute 312)
+```
+
+Removing the file mapping is the whole fix: the repacked copy is the one the
+kernels read, so the mapping was pure duplication.
+
+The full command (the two 8B flags are the only changes vs 4B):
+
+```bash
+cd ~/work/andesim
+TMPDIR=~/tmp ./andesim run --mode hybrid --trigger marker --runtime linux \
+  --mem-size 2097148K --engine vsim:ax46mpv_fpga_l3 --step-timeout-ms 14400000 \
+  ~/work/llama.cpp/bin-d4 -- \
+  -m ~/work/llama.cpp/models/Bonsai-8B-Q1_0.gguf \
+  --no-mmap -no-cnv --prompt 'The capital of France is' -n 32 -c 512 -t 1
+```
+
+<details>
+<summary>Why the binaries need no rebuild</summary>
+
+The ROI marker counts MUL_MAT nodes, not shapes. Bonsai-8B is the same qwen3
+architecture as 4B (36 layers, 253 MUL_MAT per token), so compiled-in K=51
+lands on the same node: the layer-7 V projection. Only its shape grows,
+2560x1024 -> 4096x1024. Each run self-reports the node, so this is checked,
+not assumed:
+
+```
+[roi] MUL_MAT #51 src0=blk.7.attn_v.weight [4096 x 1024] nrows=2
+```
+
+The repack gate also passes untouched: 1024 output rows, 1024 mod 64 = 0.
+
+</details>
+
+## Part 2 - speedup on the 8B node
+
+Same optimization chain as 4B, measured on the K=51 node (RTL cycles).
+Every stage keeps output bit-exact.
+
+RTL cycles, drawn to scale (1 char = 150k cycles):
+
+```
+pristine   #################################################  7,278,168   1.00x
+repack     #######################                            3,475,147   2.09x
++prefetch  ###############                                    2,218,540   3.28x
++vd4dots   ####                                                 648,246  11.23x
+```
+
+| build          | cycles    | step  | total speedup | 4B total (ref) |
+|----------------|-----------|-------|---------------|----------------|
+| pristine       | 7,278,168 | -     | 1.00x         | 1.00x          |
+| repack         | 3,475,147 | 2.09x | 2.09x         | 2.09x          |
+| + prefetch     | 2,218,540 | 1.57x | 3.28x         | 3.23x          |
+| + vd4dots (F9) | 648,246   | 3.42x | **11.23x**    | 12.34x         |
+
+The chain transfers to 8B almost exactly. Repack and prefetch cost the same
+cycles per element as on 4B - the prefetch stage lands at 0.264 cyc/elem/act,
+inside the 0.261-0.265 band measured across all five 4B shapes - so their 8B
+cycle counts are simply 1.6x the 4B counts, which is the element ratio
+(4096/2560). The vd4dots stage is the one place the models differ: 0.155 vs
+0.138 cyc/elem (+12%), which accounts for the whole 11.23x-vs-12.34x gap.
+
+<details>
+<summary>Per-element comparison, 8B vs 4B</summary>
+
+| build          | 8B cyc/elem | 4B cyc/elem | delta  |
+|----------------|-------------|-------------|--------|
+| pristine       | 1.735       | 1.707       | +1.6%  |
+| repack         | 0.829       | 0.818       | +1.3%  |
+| + prefetch     | 0.529       | 0.528       | +0.2%  |
+| + vd4dots (F9) | 0.155       | 0.138       | +11.7% |
+
+Elements per node: 8B 4096x1024, 4B 2560x1024; nrows=2 in both, so
+per-activation numbers are these values halved.
+
+</details>
+
+<details>
+<summary>Appendix - run environment and verification</summary>
+
+- **Model**: `Bonsai-8B-Q1_0.gguf`, 1.16 GB - qwen3, 36 layers, n_embd 4096,
+  n_head_kv 8.
+- **Builds**: `bin-pristine` (REPACK=OFF), `bin-baseline` (REPACK=ON, PF=0),
+  `bin-prefetch` (PF=1), `bin-d4` (PF=1, Q1_D4=1, includes the F9 vsetvli
+  batching).
+- **Success check**: read the output, not the exit code - a good run prints
+  the `[roi]` node self-check followed by `[andesim] <N> cycles`.
+- **Reproducibility**: vsim is deterministic; these node counts are
+  repeat-stable.
+- **Throughput tip**: runs are independent (per-run temp dirs and shm files),
+  so the four measurements ran in parallel; the slowest (pristine, ~7.3M RTL
+  cycles) sets the wall time.
+- **Logs**: `~/tmp/8b-runs/8b-hybrid-{pristine,baseline,prefetch,d4}-k51.log`
+
+</details>
