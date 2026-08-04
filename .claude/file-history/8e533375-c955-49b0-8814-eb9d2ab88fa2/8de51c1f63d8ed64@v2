@@ -1,0 +1,608 @@
+#!/usr/bin/env python3
+"""One 8x8 worked example, and every figure drawn from it.
+
+The real kernel is 64 rows x 128 columns.  Shrink it to 8 x 8 and every
+number fits on the screen, but nothing about the problem changes: the
+baseline layout forces a horizontal reduction per output, and the repacked
+layout does not.  Numbers here are computed, never typed, so a figure
+cannot disagree with the arithmetic it illustrates.
+"""
+
+# --- ground truth -----------------------------------------------------------
+
+BITS = [                                  # 1 -> weight +1, 0 -> weight -1
+    [1, 0, 1, 1, 0, 1, 0, 0],
+    [0, 0, 1, 0, 1, 1, 1, 0],
+    [1, 1, 0, 1, 1, 0, 1, 1],
+    [0, 1, 1, 0, 0, 0, 1, 1],
+    [1, 1, 1, 0, 1, 0, 0, 1],
+    [0, 1, 0, 1, 1, 1, 0, 0],
+    [1, 0, 0, 1, 0, 1, 1, 0],
+    [0, 0, 1, 1, 1, 0, 1, 1],
+]
+X = [3, -1, 4, 1, -5, 9, 2, -6]           # int8 activations, one per column
+N = 8
+
+
+def w(r, c):
+    return 1 if BITS[r][c] else -1
+
+
+def term(r, c):
+    """What column c contributes to row r: +x[c] or -x[c]."""
+    return X[c] * w(r, c)
+
+
+def y_ref():
+    return [sum(term(r, c) for c in range(N)) for r in range(N)]
+
+
+def row_major_bytes():
+    """Byte r holds row r.  Bit c of that byte is column c (bit 0 first)."""
+    return [sum(BITS[r][c] << c for c in range(N)) for r in range(N)]
+
+
+def plane_major_bytes():
+    """Byte c holds column c.  Bit r of that byte is row r (bit 0 first)."""
+    return [sum(BITS[r][c] << r for r in range(N)) for c in range(N)]
+
+
+def d4_plane_bytes(group):
+    """4 bytes = 8 nibbles.  Nibble r is row r's four columns 4g..4g+3."""
+    out = [0, 0, 0, 0]
+    for r in range(N):
+        for k in range(4):
+            if BITS[r][4 * group + k]:
+                idx = 4 * r + k
+                out[idx // 8] |= 1 << (idx % 8)
+    return out
+
+
+def reduction_tree(r):
+    """The serial pairwise sum vwredsum has to walk: 8 -> 4 -> 2 -> 1."""
+    level = [term(r, c) for c in range(N)]
+    levels = [level]
+    while len(level) > 1:
+        level = [level[i] + level[i + 1] for i in range(0, len(level), 2)]
+        levels.append(level)
+    return levels
+
+
+def running_acc():
+    """table[r][c] = row r's accumulator after column c has been folded in."""
+    table = []
+    for r in range(N):
+        acc, row = 0, []
+        for c in range(N):
+            acc += term(r, c)
+            row.append(acc)
+        table.append(row)
+    return table
+
+
+def d4_partials(group):
+    """What one nds.vd4dots.vv retires: four columns for every row at once."""
+    return [sum(term(r, 4 * group + k) for k in range(4)) for r in range(N)]
+
+
+def bitstring(byte):
+    """Bit 0 first -- the order vlm.v hands bits to lanes."""
+    return "".join(str((byte >> i) & 1) for i in range(N))
+
+
+# --- svg helpers ------------------------------------------------------------
+
+MONO = 'font-family="var(--f-mono)"'
+DISP = 'font-family="var(--f-display)"'
+
+
+def esc(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def txt(x, y, s, size=12, fill="var(--ink)", anchor="middle", font=MONO, weight=None,
+        extra=""):
+    wt = ' font-weight="%s"' % weight if weight else ""
+    return ('<text x="%g" y="%g" %s font-size="%g" fill="%s" text-anchor="%s"%s%s>%s</text>'
+            % (x, y, font, size, fill, anchor, wt, extra, esc(s)))
+
+
+def rect(x, y, w, h, fill="none", stroke="var(--rule)", rx=3, sw=1, extra=""):
+    return ('<rect x="%g" y="%g" width="%g" height="%g" rx="%g" fill="%s" '
+            'stroke="%s" stroke-width="%g"%s/>' % (x, y, w, h, rx, fill, stroke, sw, extra))
+
+
+def line(x1, y1, x2, y2, stroke="var(--rule)", sw=1, extra=""):
+    return ('<path d="M%g %gL%g %g" stroke="%s" stroke-width="%g" fill="none"%s/>'
+            % (x1, y1, x2, y2, stroke, sw, extra))
+
+
+def arrow(x1, y1, x2, y2, stroke="var(--muted)", sw=1.4):
+    """Straight arrow with a solid head, drawn as a path (no marker defs)."""
+    import math
+    a = math.atan2(y2 - y1, x2 - x1)
+    hl, hw = 7.0, 3.6
+    bx, by = x2 - hl * math.cos(a), y2 - hl * math.sin(a)
+    p1 = (bx - hw * math.sin(a) * -1, by + hw * math.cos(a) * -1)
+    p2 = (bx + hw * math.sin(a) * -1, by - hw * math.cos(a) * -1)
+    return (line(x1, y1, bx, by, stroke, sw)
+            + '<path d="M%g %gL%g %gL%g %gZ" fill="%s"/>'
+              % (x2, y2, p1[0], p1[1], p2[0], p2[1], stroke))
+
+
+def cell(x, y, w, h, label, kind, size=13, rx=3):
+    """kind: p = weight +1, m = weight -1, n = neutral, hi = emphasised."""
+    fills = {"p": "var(--plus)", "m": "var(--minus)", "n": "var(--surface-2)",
+             "hi": "var(--surface)", "acc": "var(--code-bg)"}
+    inks = {"p": "var(--on-fill)", "m": "var(--on-fill)", "n": "var(--ink)",
+            "hi": "var(--ink)", "acc": "var(--ink)"}
+    strokes = {"p": "none", "m": "none", "n": "var(--rule-2)", "hi": "var(--ink)",
+               "acc": "var(--rule-2)"}
+    sw = 1.6 if kind == "hi" else 1
+    return (rect(x, y, w, h, fills[kind], strokes[kind], rx, sw)
+            + txt(x + w / 2, y + h / 2 + size * 0.36, label, size, inks[kind]))
+
+
+def svg(w, h, body, cls="fig"):
+    return ('<svg class="%s" viewBox="0 0 %g %g" width="%g" height="%g" '
+            'role="img" preserveAspectRatio="xMidYMid meet">%s</svg>'
+            % (cls, w, h, w, h, body))
+
+
+# --- figure 1: the whole problem, to scale ----------------------------------
+
+def fig_matrix():
+    CW, CH = 40, 32
+    X0, Y0 = 92, 96
+    p = []
+    p.append(txt(X0 + 4 * CW, 24, "activations x  --  one int8 per column", 11.5,
+                 "var(--muted)", font=DISP, weight=700))
+    for c in range(N):
+        p.append(cell(X0 + c * CW + 3, 34, CW - 6, 26, str(X[c]), "acc", 13))
+    for c in range(N):
+        p.append(txt(X0 + c * CW + CW / 2, 78, "c%d" % c, 10.5, "var(--muted)"))
+    p.append(txt(46, 78, "weights W", 10.5, "var(--muted)", font=DISP, weight=700))
+    for r in range(N):
+        yy = Y0 + r * CH
+        p.append(txt(84, yy + CH / 2 + 4, "row %d" % r, 11, "var(--ink-2)", anchor="end"))
+        for c in range(N):
+            k = "p" if BITS[r][c] else "m"
+            p.append(cell(X0 + c * CW + 1.5, yy + 1.5, CW - 3, CH - 3,
+                          "+1" if BITS[r][c] else "-1", k, 12))
+    gw = N * CW
+    p.append(txt(X0 + gw + 34, Y0 - 18, "y = W x", 11.5, "var(--muted)", font=DISP,
+                 weight=700))
+    for r, v in enumerate(y_ref()):
+        yy = Y0 + r * CH
+        p.append(arrow(X0 + gw + 6, yy + CH / 2, X0 + gw + 20, yy + CH / 2))
+        p.append(cell(X0 + gw + 24, yy + 1.5, 46, CH - 3, str(v), "hi" if r in (0, 2) else "acc", 13))
+    return svg(X0 + gw + 82, Y0 + N * CH + 12, "".join(p))
+
+
+# --- figure 2: the baseline step, with the reduction drawn out --------------
+
+def fig_baseline():
+    LW, LH = 52, 30
+    X0 = 152
+    rows = []
+    p = []
+    rm = row_major_bytes()
+
+    def lane_row(y, label, sub, vals, kinds, size=12.5):
+        p.append(txt(X0 - 12, y + LH / 2 + 4, label, 12, "var(--ink)", anchor="end",
+                     weight=600))
+        if sub:
+            p.append(txt(X0 - 12, y + LH / 2 + 18, sub, 10, "var(--muted)", anchor="end",
+                         font=DISP))
+        for i, v in enumerate(vals):
+            p.append(cell(X0 + i * LW + 2, y, LW - 4, LH, v, kinds[i], size))
+
+    p.append(txt(X0 - 12, 26, "in memory", 12, "var(--ink)", anchor="end", weight=600))
+    p.append(txt(X0 - 12, 40, "one byte per row", 10, "var(--muted)", anchor="end",
+                 font=DISP))
+    for i, b in enumerate(rm):
+        k = "hi" if i == 0 else "acc"
+        p.append(cell(X0 + i * LW + 2, 12, LW - 4, LH, "0x%02X" % b, k, 12.5))
+        p.append(txt(X0 + i * LW + LW / 2, 56, "row %d" % i, 9.5,
+                     "var(--ink)" if i == 0 else "var(--muted)"))
+    p.append(arrow(X0 + LW / 2, 62, X0 + LW / 2, 86, "var(--ink)", 1.4))
+    p.append(txt(X0 + LW + 10, 76, "vlm.v v0, qs[0]", 11, "var(--ink)", anchor="start"))
+
+    y1 = 116
+    lane_row(y1, "v0  mask", "bit 0 first", list(bitstring(rm[0])),
+             ["p" if BITS[0][c] else "m" for c in range(N)])
+    lane_row(y1 + 46, "v8  activations", "vle8.v", [str(v) for v in X], ["acc"] * N)
+    lane_row(y1 + 92, "v10 = +x or -x", "vmerge.vvm",
+             ["%+d" % term(0, c) for c in range(N)],
+             ["p" if BITS[0][c] else "m" for c in range(N)])
+
+    p.append(txt(X0 - 12, y1 + 6, "lane", 10, "var(--muted)", anchor="end", font=DISP))
+    for c in range(N):
+        p.append(txt(X0 + c * LW + LW / 2, y1 - 6, str(c), 10, "var(--muted)"))
+    p.append(txt(X0 + N * LW - 4, y1 - 24, "lane c holds COLUMN c of row 0", 11.5,
+                "var(--minus)", anchor="end", font=DISP, weight=700))
+
+    # the reduction tree
+    ty = y1 + 138
+    levels = reduction_tree(0)
+    p.append(txt(X0 - 12, ty + 20, "vwredsum", 12, "var(--plus)", anchor="end",
+                 weight=600))
+    p.append(txt(X0 - 12, ty + 34, "3 serial steps", 10, "var(--muted)", anchor="end",
+                 font=DISP))
+    p.append(txt(X0 - 12, ty + 46, "7 at VLEN=1024", 10, "var(--muted)", anchor="end",
+                 font=DISP))
+    prev_centres = [X0 + c * LW + LW / 2 for c in range(N)]
+    prev_y = y1 + 92 + LH
+    for li, level in enumerate(levels[1:], start=1):
+        yy = ty + (li - 1) * 46
+        w = LW * (2 ** li)
+        centres = []
+        for i, v in enumerate(level):
+            cx = X0 + i * w + w / 2
+            centres.append(cx)
+            p.append(line(prev_centres[2 * i], prev_y, prev_centres[2 * i], yy - 8,
+                          "var(--rule)", 1))
+            p.append(line(prev_centres[2 * i + 1], prev_y, prev_centres[2 * i + 1],
+                          yy - 8, "var(--rule)", 1))
+            p.append(line(prev_centres[2 * i], yy - 8, prev_centres[2 * i + 1], yy - 8,
+                          "var(--rule)", 1))
+            p.append(line(cx, yy - 8, cx, yy, "var(--rule)", 1))
+            last = li == len(levels) - 1
+            p.append(cell(cx - 26, yy, 52, 28, str(v), "hi" if last else "acc",
+                          13.5 if last else 12.5))
+        prev_centres, prev_y = centres, yy + 28
+    fy = ty + (len(levels) - 2) * 46
+    p.append(arrow(X0 + N * LW / 2 + 32, fy + 14, X0 + N * LW / 2 + 74, fy + 14,
+                   "var(--ink)", 1.4))
+    p.append(txt(X0 + N * LW / 2 + 80, fy + 18, "y[0] = 27", 13, "var(--ink)",
+                 anchor="start", weight=600))
+    p.append(txt(X0 + N * LW / 2 + 80, fy + 34, "ONE number.", 10.5, "var(--plus)",
+                 anchor="start", font=DISP, weight=700))
+    p.append(txt(X0 + N * LW / 2 + 80, fy + 47, "Now do it 7 more times.", 10.5,
+                 "var(--muted)", anchor="start", font=DISP))
+    return svg(X0 + N * LW + 60, fy + 62, "".join(p))
+
+
+# --- figure 3: the same 64 bits, two byte orders ----------------------------
+
+def fig_permute():
+    BW, BH = 76, 34
+    X0 = 132
+    TRACE = [(2, 5), (6, 1)]             # (row, column) bits we follow across
+    COL = ["var(--plus)", "var(--good)"]
+    p = []
+    rm, pm = row_major_bytes(), plane_major_bytes()
+
+    def strip(y, label, sub, vals, tag, marks):
+        """marks: [(byte, bit)] to open a bit lens for.  Returns lens x centres."""
+        hot = {b for b, _ in marks}
+        p.append(txt(X0 - 16, y + 14, label, 12.5, "var(--ink)", anchor="end",
+                     weight=600))
+        p.append(txt(X0 - 16, y + 30, sub, 10.5, "var(--muted)", anchor="end", font=DISP))
+        for i, b in enumerate(vals):
+            p.append(cell(X0 + i * BW + 2, y, BW - 4, BH, "0x%02X" % b,
+                          "hi" if i in hot else "acc", 13))
+            p.append(txt(X0 + i * BW + BW / 2, y + BH + 14, tag % i, 10,
+                         "var(--ink)" if i in hot else "var(--muted)"))
+        out = []
+        for n, (byte, bit) in enumerate(marks):
+            bx = X0 + byte * BW
+            p.append(rect(bx + 2, y + BH + 21, BW - 4, 17, "var(--surface-2)",
+                          COL[n], 3, 1.2))
+            for k, ch in enumerate(bitstring(vals[byte])):
+                cx = bx + 5 + (BW - 10) * (k + 0.5) / N
+                p.append(txt(cx, y + BH + 33.5, ch, 9.5,
+                             COL[n] if k == bit else "var(--muted)",
+                             weight=700 if k == bit else None))
+            out.append(bx + 5 + (BW - 10) * (bit + 0.5) / N)
+        return out
+
+    W = X0 + N * BW + 40
+    p.append(txt(W / 2, 20, "the repack: the bit at row r, column c moves from "
+                 "byte r bit c  to  byte c bit r", 12.5, "var(--ink)", font=DISP,
+                 weight=700))
+    top = strip(40, "row-major", "as the file stores it", rm, "row %d", TRACE)
+    bot = strip(216, "plane-major", "as the kernel wants it", pm, "col %d",
+                [(c, r) for r, c in TRACE])
+    for n, (r, c) in enumerate(TRACE):
+        p.append(txt(top[n], 128, "W[row %d][col %d] = %+d" % (r, c, w(r, c)), 10.5,
+                     COL[n], font=DISP, weight=700))
+        p.append(arrow(top[n], 138, bot[n], 206, COL[n], 1.7))
+        p.append(txt(bot[n], 306, "same bit, byte %d bit %d" % (c, r), 10.5, COL[n],
+                     font=DISP, weight=700))
+    p.append(txt(W / 2, 336, "Same 64 bits, same 8 bytes. Nothing added, nothing "
+                 "dropped -- the two arrows cross because this is a transpose.", 12,
+                 "var(--ink-2)", font=DISP))
+    return svg(W, 352, "".join(p))
+
+
+# --- figure 4: the repacked step, and eight of them ------------------------
+
+def fig_repacked_step():
+    LW, LH = 52, 30
+    X0 = 152
+    p = []
+    pm = plane_major_bytes()
+    p.append(txt(X0 - 12, 26, "in memory", 12, "var(--ink)", anchor="end", weight=600))
+    p.append(txt(X0 - 12, 40, "one byte per column", 10, "var(--muted)", anchor="end",
+                 font=DISP))
+    for i, b in enumerate(pm):
+        k = "hi" if i == 0 else "acc"
+        p.append(cell(X0 + i * LW + 2, 12, LW - 4, LH, "0x%02X" % b, k, 12.5))
+        p.append(txt(X0 + i * LW + LW / 2, 56, "col %d" % i, 9.5,
+                     "var(--ink)" if i == 0 else "var(--muted)"))
+    p.append(arrow(X0 + LW / 2, 62, X0 + LW / 2, 84, "var(--ink)", 1.4))
+    p.append(txt(X0 + LW / 2 + 10, 78, "vlm.v v0, plane[0]", 11, "var(--ink)",
+                 anchor="start"))
+
+    y1 = 118
+    for c in range(N):
+        p.append(txt(X0 + c * LW + LW / 2, y1 - 6, str(c), 10, "var(--muted)"))
+    p.append(txt(X0 + N * LW / 2, y1 - 22, "lane j holds ROW j, all eight at once", 11,
+                 "var(--good)", font=DISP, weight=700))
+    p.append(txt(X0 - 12, y1 + 6, "lane", 10, "var(--muted)", anchor="end", font=DISP))
+
+    p.append(txt(X0 - 12, y1 + LH / 2 + 4, "v0  mask", 12, "var(--ink)", anchor="end",
+                 weight=600))
+    p.append(txt(X0 - 12, y1 + LH / 2 + 18, "column 0 of every row", 10, "var(--muted)",
+                 anchor="end", font=DISP))
+    for j in range(N):
+        p.append(cell(X0 + j * LW + 2, y1, LW - 4, LH, str(BITS[j][0]),
+                      "p" if BITS[j][0] else "m", 12.5))
+
+    y2 = y1 + 52
+    p.append(txt(X0 - 12, y2 + 18, "x[0] = 3", 12, "var(--ink)", anchor="end",
+                 weight=600))
+    p.append(txt(X0 - 12, y2 + 32, "a scalar, not a vector", 10, "var(--muted)",
+                 anchor="end", font=DISP))
+    p.append(rect(X0 + 2, y2, N * LW - 4, 26, "var(--code-bg)", "var(--rule-2)", 3))
+    p.append(txt(X0 + N * LW / 2, y2 + 17,
+                 "vsub.vx acc, acc, x0   then   vadd.vx acc, acc, 2*x0, v0.t", 11.5,
+                 "var(--ink-2)"))
+
+    y3 = y2 + 44
+    p.append(txt(X0 - 12, y3 + LH / 2 + 4, "acc", 12, "var(--ink)", anchor="end",
+                 weight=600))
+    p.append(txt(X0 - 12, y3 + LH / 2 + 18, "after column 0", 10, "var(--muted)",
+                 anchor="end", font=DISP))
+    for j in range(N):
+        p.append(cell(X0 + j * LW + 2, y3, LW - 4, LH, "%+d" % term(j, 0),
+                      "p" if BITS[j][0] else "m", 12.5))
+    for j in range(N):
+        p.append(txt(X0 + j * LW + LW / 2, y3 + LH + 14, "row %d" % j, 9.5,
+                     "var(--muted)"))
+    y4 = y3 + LH + 32
+    p.append(rect(X0 + 2, y4, N * LW - 4, 30, "none", "var(--good)", 4, 1.4))
+    p.append(txt(X0 + N * LW / 2, y4 + 20,
+                 "8 outputs advanced by one instruction pair. No reduction anywhere.",
+                 11.5, "var(--good)", font=DISP, weight=700))
+    return svg(X0 + N * LW + 40, y4 + 44, "".join(p))
+
+
+def fig_running_table():
+    CW, CH = 56, 27
+    X0, Y0 = 96, 66
+    p = []
+    tab = running_acc()
+    p.append(txt(X0 + N * CW / 2, 20, "the accumulator after each column -- all "
+                 "8 lanes move together, left to right", 11.5, "var(--muted)",
+                 font=DISP, weight=700))
+    for c in range(N):
+        p.append(txt(X0 + c * CW + CW / 2, 50, "c%d" % c, 10.5,
+                     "var(--plus)" if c == 3 else "var(--muted)",
+                     weight=700 if c == 3 else None))
+    p.append(rect(X0 + 3 * CW + 1, 56, CW, N * CH + 8, "none", "var(--plus)", 4, 1.3))
+    p.append(rect(X0 + 7 * CW + 1, 56, CW, N * CH + 8, "none", "var(--good)", 4, 1.6))
+    for r in range(N):
+        yy = Y0 + r * CH
+        p.append(txt(X0 - 10, yy + 18, "row %d" % r, 11, "var(--ink-2)", anchor="end"))
+        for c in range(N):
+            last = c == N - 1
+            p.append(cell(X0 + c * CW + 2, yy + 2, CW - 4, CH - 4, str(tab[r][c]),
+                          "hi" if last else "acc", 12.5 if last else 12))
+        p.append(txt(X0 + N * CW + 14, yy + 18, "= y[%d]" % r, 10.5, "var(--good)",
+                     anchor="start", font=DISP, weight=700))
+    p.append(txt(X0 + 3 * CW + CW / 2, Y0 + N * CH + 26, "one nds.vd4dots.vv",
+                 10.5, "var(--plus)", font=DISP, weight=700))
+    p.append(txt(X0 + 3 * CW + CW / 2, Y0 + N * CH + 39, "jumps straight to here",
+                 10, "var(--muted)", font=DISP))
+    return svg(X0 + N * CW + 76, Y0 + N * CH + 52, "".join(p))
+
+
+# --- figure 5: four columns in one instruction ------------------------------
+
+def fig_vd4dots():
+    LH, BW, GAP = 28, 24, 10
+    GW = BW * 4 + GAP                    # one 32-bit lane = 4 bytes
+    X0 = 172
+    W = X0 + N * GW + 30
+    p = []
+    nib = d4_plane_bytes(0)
+
+    def lane_axis(y, label, sub):
+        p.append(txt(X0 - 14, y + LH / 2 + 3, label, 12, "var(--ink)", anchor="end",
+                     weight=600))
+        p.append(txt(X0 - 14, y + LH / 2 + 17, sub, 10, "var(--muted)", anchor="end",
+                     font=DISP))
+
+    def quad(x, y, vals, kinds):
+        p.append(rect(x - 2, y - 3, BW * 4 + 4, LH + 6, "none", "var(--rule)", 4))
+        for k in range(4):
+            p.append(cell(x + k * BW + 1, y, BW - 2, LH, vals[k], kinds[k], 10.5, rx=2))
+
+    # memory: each byte covers exactly the two lanes it feeds
+    p.append(txt(X0 - 14, 22, "in memory", 12, "var(--ink)", anchor="end", weight=600))
+    p.append(txt(X0 - 14, 36, "4 bytes, 8 nibbles", 10, "var(--muted)", anchor="end",
+                 font=DISP))
+    for i, b in enumerate(nib):
+        p.append(cell(X0 + i * 2 * GW + 2, 8, 2 * GW - 4 - GAP, 28, "0x%02X" % b,
+                      "hi", 12.5))
+        p.append(txt(X0 + i * 2 * GW + GW - GAP / 2, 50, "rows %d-%d" % (2 * i, 2 * i + 1),
+                     10, "var(--muted)"))
+    p.append(txt(X0 - 14, 50, "one nibble per row", 10, "var(--muted)", anchor="end",
+                 font=DISP))
+
+    y1 = 92
+    for j in range(N):
+        p.append(txt(X0 + j * GW + (GW - GAP) / 2, y1 - 10, "lane %d = row %d" % (j, j),
+                     9.5, "var(--muted)"))
+    lane_axis(y1, "v12 weights", "one i32 lane = 4 bytes")
+    for j in range(N):
+        quad(X0 + j * GW, y1, ["+1" if BITS[j][k] else "-1" for k in range(4)],
+             ["p" if BITS[j][k] else "m" for k in range(4)])
+
+    y2 = y1 + 58
+    lane_axis(y2, "v16 activations", "the same 4 quants everywhere")
+    for j in range(N):
+        quad(X0 + j * GW, y2, [str(X[k]) for k in range(4)], ["acc"] * 4)
+
+    y3 = y2 + 50
+    p.append(rect(X0 - 2, y3, N * GW - GAP + 4, 28, "var(--code-bg)", "var(--plus)",
+                  4, 1.3))
+    p.append(txt(X0 + (N * GW - GAP) / 2, y3 + 18,
+                 "nds.vd4dots.vv v8, v12, v16   --   8 lanes x 4 columns = 32 MACs "
+                 "in one instruction", 11.5, "var(--ink)"))
+
+    y4 = y3 + 46
+    lane_axis(y4, "v8 accumulator", "i32, one row per lane")
+    for j, v in enumerate(d4_partials(0)):
+        p.append(cell(X0 + j * GW, y4, GW - GAP, LH, str(v), "hi", 13))
+    p.append(txt(X0 + (N * GW - GAP) / 2, y4 + LH + 24,
+                 "identical to column c3 of the table above -- four steps folded "
+                 "into one", 12, "var(--good)", font=DISP, weight=700))
+    return svg(W, y4 + LH + 40, "".join(p))
+
+
+def render_all():
+    return "".join([fig_matrix(), fig_baseline(), fig_permute(), fig_repacked_step(),
+                    fig_running_table(), fig_vd4dots()])
+
+
+# --- the page section -------------------------------------------------------
+
+def figbox(fig, label, right, cap, wide=True):
+    return ('<div class="figbox%s">\n<div class="panel-label"><span>%s</span>'
+            '<span class="r">%s</span></div>\n<div class="figframe">%s</div>\n'
+            '<p class="cap">%s</p>\n</div>\n'
+            % (" wide" if wide else "", label, right, fig, cap))
+
+
+def section():
+    y = y_ref()
+    terms = " ".join("%+d" % term(0, c) for c in range(N))
+    return """<!-- ============ WORKED EXAMPLE ============ -->
+<section class="sec" id="example">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="eyebrow">Before the stages</p>
+      <h2>The same problem at 8 x 8, small enough to check by hand</h2>
+      <div class="prose">
+        <p>
+          The real tile is 64 rows by 128 columns, which is too big to draw. So here is the
+          identical problem shrunk to <strong>8 rows by 8 columns</strong>. Every number in
+          the figures below is real arithmetic, not an illustration: you can add them up
+          yourself, and each layout has to reach the same answer.
+        </p>
+      </div>
+    </div>
+
+%s
+    <h3 style="margin-top:2.8rem">The problem: one output is spread across eight lanes</h3>
+    <div class="prose" style="margin-top:.6rem">
+      <p>
+        The file stores <strong>one row per byte</strong>. So one mask load fills the lanes
+        with one row's eight columns. The eight products are all correct - but they sit in
+        eight different lanes, and <code>y[0]</code> is their <em>sum</em>. Adding numbers
+        that live in different lanes is a <strong>horizontal reduction</strong>, and it is
+        serial.
+      </p>
+    </div>
+
+%s
+    <h3 style="margin-top:2.8rem">The fix: store the matrix by column, not by row</h3>
+    <div class="prose" style="margin-top:.6rem">
+      <p>
+        Write the same 64 bits into the same 8 bytes in a different order. Byte <em>c</em>
+        now holds <strong>column c</strong>: its bit <em>r</em> is row <em>r</em>. That is
+        the entire repack. No weight is added, dropped or changed.
+      </p>
+    </div>
+
+%s
+%s
+%s
+    <h3 style="margin-top:2.8rem">Then fold four columns into one instruction</h3>
+    <div class="prose" style="margin-top:.6rem">
+      <p>
+        Permute once more so each lane's <strong>four bytes</strong> are that row's next four
+        columns. Now the core's own 4-way dot product does in one instruction what the loop
+        above took four steps to do.
+      </p>
+    </div>
+
+%s
+    <div class="pull">
+      <p>
+        None of this changed the arithmetic. <code>y</code> is <code>%s</code> in every
+        figure. The same 64 bits in a different order turned a sum <strong>across lanes</strong>
+        into a sum <strong>along the loop</strong>, and that is the whole optimization.
+      </p>
+    </div>
+
+    <p class="nextup"><b>Now at real size</b>
+      64 rows instead of 8, 128 columns instead of 8, and a machine with 128 lanes instead of
+      8. The five stages that follow are this same picture, measured.
+    </p>
+  </div>
+</section>
+""" % (
+        figbox(fig_matrix(), "The example",
+               "y = W x, 8 rows x 8 columns",
+               "Weights are one bit each: <b>set means +1, clear means -1</b>, so the kernel "
+               "never multiplies by a weight - it only <b>adds or subtracts</b> the "
+               "activation. Row 0 is <code>%s</code>, which is <b>%d</b>. "
+               "Check any row you like; these are the numbers every figure below has to "
+               "reproduce." % (terms, y[0]), wide=False),
+        figbox(fig_baseline(), "Stage 01 layout, one step",
+               "lane = column",
+               "Three problems, all caused by the layout. The reduction is <b>serial</b>: 3 "
+               "steps here, 7 on the real 128-lane machine. It yields <b>one</b> output, so "
+               "the other 7 rows have not started. And only 8 of the machine's 128 lanes were "
+               "ever busy."),
+        figbox(fig_permute(), "The repack",
+               "same 8 bytes, permuted",
+               "Follow either traced bit. It never changes value - only its address changes. "
+               "The two arrows cross because a transpose is exactly what this is."),
+        figbox(fig_repacked_step(), "Stage 02 layout, one step",
+               "lane = row",
+               "Lane <em>j</em> is now output row <em>j</em>, and it stays row <em>j</em> for "
+               "the whole loop. Folding column <em>c</em> into the accumulator is a plain "
+               "<b>vertical add inside each lane</b>: no lane ever has to look at another "
+               "lane."),
+        figbox(fig_running_table(), "Eight steps of that loop",
+               "the accumulator, column by column",
+               "The last column is <b>%s</b> - the same y as the first figure, reached with "
+               "<b>zero horizontal reductions</b>. That is the 2.09x in stage 02."
+               % ", ".join(str(v) for v in y)),
+        figbox(fig_vd4dots(), "Stage 04 layout, one instruction",
+               "lane = row, 4 bytes = 4 columns",
+               "At real size this is the lucky part: 64 i32 lanes is 64 rows, and the same "
+               "register group seen as bytes is 64 rows x 4 columns. The instruction's operand "
+               "shape and the repacked tile are the same object."),
+        ", ".join(str(v) for v in y),
+    )
+
+
+if __name__ == "__main__":
+    import pathlib, sys
+    figs = {"matrix": fig_matrix(), "baseline": fig_baseline(),
+            "permute": fig_permute(), "step": fig_repacked_step(),
+            "table": fig_running_table(), "d4": fig_vd4dots()}
+    out = pathlib.Path(__file__).parent / "figs.json"
+    import json
+    out.write_text(json.dumps(figs))
+    print("y      =", y_ref())
+    print("rows   =", ["0x%02X" % b for b in row_major_bytes()])
+    print("planes =", ["0x%02X" % b for b in plane_major_bytes()])
+    print("d4 g0  =", ["0x%02X" % b for b in d4_plane_bytes(0)], d4_partials(0))
+    print("wrote", out, sum(len(v) for v in figs.values()), "bytes of svg")
