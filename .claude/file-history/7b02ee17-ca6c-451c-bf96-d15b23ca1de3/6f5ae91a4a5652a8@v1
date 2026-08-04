@@ -1,0 +1,177 @@
+// See memmap.hpp for the region-selection rules and provenance.
+#include "memmap.hpp"
+
+#include <cstdio>
+#include <cstdlib>
+
+#include "hybrid/state_abi.h"  // HYBRID_V_SCRATCH_BYTES
+
+namespace andes_sim {
+namespace {
+
+// AE350 platform constants shared by BOTH engines (QEMU andes_ae350.c memmap
+// table; vsim src/platform/memory_map.h). The print-memmap contract test
+// cross-checks these against the engine's own dump.
+constexpr uint64_t kSimControlBase = 0xe0080000;
+constexpr uint64_t kSimControlSize = 0x1000;
+constexpr uint64_t kUart2Base = 0xf0300000;
+constexpr uint64_t kUart2Size = 0x100000;
+
+// Strip one trailing '\r' (the cfg may come from a CRLF-writing engine) and
+// surrounding spaces/tabs.
+std::string trim(const std::string& s) {
+  size_t b = s.find_first_not_of(" \t\r");
+  if (b == std::string::npos) return "";
+  size_t e = s.find_last_not_of(" \t\r");
+  return s.substr(b, e - b + 1);
+}
+
+// `key = "value"` -> value (quotes optional); "" when the line is not `key = ...`.
+std::string ini_value(const std::string& line, const char* key) {
+  const std::string t = trim(line);
+  const std::string pfx = std::string(key);
+  if (t.compare(0, pfx.size(), pfx) != 0) return "";
+  size_t i = pfx.size();
+  while (i < t.size() && (t[i] == ' ' || t[i] == '\t')) ++i;
+  if (i >= t.size() || t[i] != '=') return "";
+  ++i;
+  while (i < t.size() && (t[i] == ' ' || t[i] == '\t')) ++i;
+  std::string v = t.substr(i);
+  if (v.size() >= 2 && v.front() == '"' && v.back() == '"')
+    v = v.substr(1, v.size() - 2);
+  return v;
+}
+
+}  // namespace
+
+std::map<std::string, std::string> qemu_cfg_soc_props(
+    const std::string& cfg_text) {
+  std::map<std::string, std::string> out;
+  // Each [global] block carries driver/property/value lines (any order per
+  // QEMU's -readconfig grammar; the engine emits driver first). Collect the
+  // triple per block; commit it when the block ends or the text does.
+  std::string drv, prop, val;
+  bool have_val = false;
+  auto commit = [&] {
+    if (drv == "riscv.andes.ae350.soc" && !prop.empty() && have_val)
+      out[prop] = val;
+    drv.clear();
+    prop.clear();
+    val.clear();
+    have_val = false;
+  };
+  size_t pos = 0;
+  while (pos <= cfg_text.size()) {
+    const size_t nl = cfg_text.find('\n', pos);
+    const std::string line =
+        cfg_text.substr(pos, nl == std::string::npos ? nl : nl - pos);
+    const std::string t = trim(line);
+    if (t == "[global]") {
+      commit();
+    } else if (std::string v = ini_value(line, "driver"); !v.empty()) {
+      drv = v;
+    } else if (std::string v = ini_value(line, "property"); !v.empty()) {
+      prop = v;
+    } else if (std::string v = ini_value(line, "value"); !v.empty()) {
+      val = v;
+      have_val = true;
+    }
+    if (nl == std::string::npos) break;
+    pos = nl + 1;
+  }
+  commit();
+  return out;
+}
+
+MemmapResult hybrid_memmap(const EngineDescriptor& eng, long long mem_size,
+                           const std::string& qemu_cfg_text) {
+  MemmapResult r;
+  const uint64_t mem = static_cast<uint64_t>(mem_size);
+
+  r.rows.push_back({"DRAM", 0, mem - 1,
+                    "shared mmap; content survives the handoff"});
+  r.rows.push_back({"V-scratch", mem, mem + HYBRID_V_SCRATCH_BYTES - 1,
+                    "reserved by the hybrid V transport; not program-usable"});
+
+  const auto props = qemu_cfg_soc_props(qemu_cfg_text);
+  // ilm/dlm/hvm rows need BOTH a transportable size (descriptor, backdoor-
+  // gated) AND the base from the engine's cfg. Sizes come from the descriptor:
+  // they are the bytes the sidecar actually carries.
+  auto base_of = [&](const char* key) -> const std::string* {
+    auto it = props.find(key);
+    return it == props.end() ? nullptr : &it->second;
+  };
+  bool geometry_missing = false;
+  auto lm_row = [&](const char* region, const char* base_key, long size,
+                    const std::string& transport) {
+    if (size <= 0) return;  // engine cannot transport it -> unsupported -> omit
+    const std::string* b = base_of(base_key);
+    if (!b) {
+      geometry_missing = true;
+      return;
+    }
+    const uint64_t base = std::strtoull(b->c_str(), nullptr, 0);
+    r.rows.push_back(
+        {region, base, base + static_cast<uint64_t>(size) - 1, transport});
+  };
+  lm_row("ILM", "ilm_base", eng.ilm_size,
+         "sidecar .ilm; DRAM overlay while milmb.IEN=1");
+  lm_row("DLM", "dlm_base", eng.dlm_size,
+         "sidecar .dlm; DRAM overlay while mdlmb.IEN=1");
+  lm_row("HVM", "hvm_base", eng.hvm_size, "sidecar .hvm");
+  if (geometry_missing)
+    r.warnings.push_back(
+        "engine '" + eng.id +
+        "' reports transportable local memories but its --print-qemu-config "
+        "gave no geometry; ILM/DLM/HVM rows omitted");
+
+  r.rows.push_back({"SimControl/HTIF", kSimControlBase,
+                    kSimControlBase + kSimControlSize - 1,
+                    "device; state does not cross the handoff"});
+  r.rows.push_back({"UART2", kUart2Base, kUart2Base + kUart2Size - 1,
+                    "device (console); state does not cross the handoff"});
+  return r;
+}
+
+std::string fmt_size(uint64_t bytes) {
+  constexpr uint64_t kK = 1024, kM = kK * 1024, kG = kM * 1024;
+  char buf[32];
+  if (bytes >= kG && bytes % kG == 0)
+    std::snprintf(buf, sizeof buf, "%lluG",
+                  static_cast<unsigned long long>(bytes / kG));
+  else if (bytes >= kM && bytes % kM == 0)
+    std::snprintf(buf, sizeof buf, "%lluM",
+                  static_cast<unsigned long long>(bytes / kM));
+  else if (bytes >= kK && bytes % kK == 0)
+    std::snprintf(buf, sizeof buf, "%lluK",
+                  static_cast<unsigned long long>(bytes / kK));
+  else
+    std::snprintf(buf, sizeof buf, "%llu",
+                  static_cast<unsigned long long>(bytes));
+  return buf;
+}
+
+std::string render_memmap(const MemmapResult& r) {
+  // Fixed-width columns sized for 64-bit hex; END is the INCLUSIVE last byte.
+  std::string out;
+  char line[256];
+  std::snprintf(line, sizeof line, "%-16s %-12s %-12s %-7s %s\n", "REGION",
+                "BASE", "END", "SIZE", "TRANSPORT");
+  out += line;
+  for (const MemmapRow& row : r.rows) {
+    char base[24], end[24];
+    std::snprintf(base, sizeof base, "0x%llx",
+                  static_cast<unsigned long long>(row.base));
+    std::snprintf(end, sizeof end, "0x%llx",
+                  static_cast<unsigned long long>(row.end));
+    std::snprintf(line, sizeof line, "%-16s %-12s %-12s %-7s %s\n",
+                  row.region.c_str(), base, end,
+                  fmt_size(row.end - row.base + 1).c_str(),
+                  row.transport.c_str());
+    out += line;
+  }
+  for (const std::string& w : r.warnings) out += "warning: " + w + "\n";
+  return out;
+}
+
+}  // namespace andes_sim
