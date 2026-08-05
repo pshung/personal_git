@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 047fa35b-69c2-4ca4-8695-5347e3e7a746
-  modified: 2026-08-04T20:05:47.372Z
+  modified: 2026-08-04T23:36:29.714Z
 ---
 
 Updated 2026-07-21 (originally 2026-07-15). Target switched Bonsai-27B -> Bonsai-4B-Q1_0 (572 MB): fits the 2 GiB cap, plain qwen3 (no qwen35 rv64 bug), and the full flow is CONFIRMED on it. Canonical recipe doc: /home/nick/work/andesim/docs/llama_roi_howto.md; roadmap: llama.cpp/opt_roadmap.md.
@@ -97,13 +97,23 @@ region in vsim main.cpp for the low window; cross-window comparisons carry
 ~0.3% layout noise, gate-3 4B K=51: 362,799 legacy vs 361,930 at 3G). FIRST
 27B hybrid measurement: `--mem-size 6G --no-mmap` (mmap+repack would exceed
 6G, same math as 8B), K=51 on qwen35 = blk.6.attn_gate [5120 x 6144] nrows=2,
-bin-d4 -> **4,578,346 cycles** (0.146 cyc/elem, d4 kernel band). F0 (qwen35
-rv64 garbage) bisected via 3-way eval-callback (host/scalar/RVV qemu-user):
-prefill logits FINE on all; injection is DECODE-path FLASH_ATTN_EXT at
-qwen35-27B's head_dim=256 (Q{256,1,24}, K{256,256,4}); zvfh-gated intrinsics
-compile out in no-zvfh builds yet garbage persists -> suspect Andes GCC RVV
-AUTOVECTORIZATION of the kernel's scalar loops; -fno-tree-vectorize probe
-build pending at session end.
+bin-d4 -> **4,578,346 cycles** (0.146 cyc/elem, d4 kernel band). F0 (qwen35 rv64 garbage) FIXED
+2026-08-05, llama.cpp 17b246b44: RVV ggml_vec_dot_f32 (+ zvfh vec_dot_f16)
+did a `_tu` init merging into an UNINITIALIZED accumulator; Andes GCC 14.2
+re-materialized the init under e8,m2,ta leaving 6/8 accumulator regs
+tail-agnostic (QEMU writes all-ones) -> every dot ~1e19 -> delta-net
+exploded (first bad node GATED_DELTA_NET layer 2, decode). qwen3 4B/8B never
+call these helpers on decode paths -> all their numbers stand (fixed-binary
+4B K=51 sanity: 362,797 vs 362,799 recorded). Fix: plain init at vlmax +
+plain loads, _tu only on the accumulate. Diagnosis pattern that worked:
+3-way eval-callback sums (host/rv64-scalar/rv64-RVV, qemu-user, 1-token),
+per-TU -march=rv64gc bisect via set_source_files_properties, then objdump.
+
+**27B FULL CHAIN (2026-08-05, fpga_l3, K=51 = blk.6.attn_gate [5120 x 6144]
+nrows=2, 6G --no-mmap)**: pristine 54,314,202 -> repack 25,629,722 (2.12x)
+-> +prefetch 16,317,304 (3.33x) -> d4 4,578,346 (**11.86x**). Per-elem
+consistency across models: pristine 1.71/1.74/1.73, repack 0.82/0.83/0.81,
+prefetch 0.264/0.264/0.259 per act, d4 0.138/0.155/0.146 (4B/8B/27B).
 
 **Still-true hard caps**
 - Guest RAM max 2 GiB (QEMU andes_ae350 + driver cap). 27B (~4.5 GB) blocked on this; 4B+KV fits in 2000M.
