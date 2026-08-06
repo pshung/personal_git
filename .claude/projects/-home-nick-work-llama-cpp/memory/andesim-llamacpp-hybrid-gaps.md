@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 047fa35b-69c2-4ca4-8695-5347e3e7a746
-  modified: 2026-08-06T06:47:51.401Z
+  modified: 2026-08-06T10:24:05.728Z
 ---
 
 Updated 2026-07-21 (originally 2026-07-15). Target switched Bonsai-27B -> Bonsai-4B-Q1_0 (572 MB): fits the 2 GiB cap, plain qwen3 (no qwen35 rv64 bug), and the full flow is CONFIRMED on it. Canonical recipe doc: /home/nick/work/andesim/docs/llama_roi_howto.md; roadmap: llama.cpp/opt_roadmap.md.
@@ -117,11 +117,12 @@ prefetch 0.264/0.264/0.259 per act, d4 0.138/0.155/0.146 (4B/8B/27B).
 
 U10g(2) CLOSED 2026-08-06: 27B fast mode 6G --no-mmap prints "The capital of
 France is Paris." in ~15 min wall (exit-trap mepc 0x97ffffdd4 = high base +
-6G). TRAP for future runs: an OVER-BUDGET mmap+repack load (27B mmap 3.8G +
-repack ~3.1G > 6G) does NOT fail fast like the 8B@2G case did - it grinds
-silently at 99% CPU for 30+ h. Always pass --no-mmap unless mem-size covers
-file+repack (~7.5G for 27B); a fail-fast guard in vlinux/llama load is a
-worthwhile future fix.
+6G). TRAP (upgraded 2026-08-06, recorded as andesim U10h): vlinux mmap-backed
+load is SUPER-LINEAR in mapping size - 8B 1.1G mapping fine (~25 min), 27B
+3.8G still inside "load" after 4 h at 8G where it FITS (~7.3G demand), 31+ h
+when over budget, vs ~15 min with --no-mmap. So --no-mmap is MANDATORY for
+multi-GB models at ANY --mem-size until U10h (suspect O(pages^2) in the
+vlinux mm fault path) is fixed.
 
 **Still-true hard caps**
 - Guest RAM max 2 GiB (QEMU andes_ae350 + driver cap). 27B (~4.5 GB) blocked on this; 4B+KV fits in 2000M.
