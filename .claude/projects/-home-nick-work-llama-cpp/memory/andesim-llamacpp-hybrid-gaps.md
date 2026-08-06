@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: 047fa35b-69c2-4ca4-8695-5347e3e7a746
-  modified: 2026-08-04T23:36:29.714Z
+  modified: 2026-08-06T06:47:51.401Z
 ---
 
 Updated 2026-07-21 (originally 2026-07-15). Target switched Bonsai-27B -> Bonsai-4B-Q1_0 (572 MB): fits the 2 GiB cap, plain qwen3 (no qwen35 rv64 bug), and the full flow is CONFIRMED on it. Canonical recipe doc: /home/nick/work/andesim/docs/llama_roi_howto.md; roadmap: llama.cpp/opt_roadmap.md.
@@ -114,6 +114,14 @@ nrows=2, 6G --no-mmap)**: pristine 54,314,202 -> repack 25,629,722 (2.12x)
 -> +prefetch 16,317,304 (3.33x) -> d4 4,578,346 (**11.86x**). Per-elem
 consistency across models: pristine 1.71/1.74/1.73, repack 0.82/0.83/0.81,
 prefetch 0.264/0.264/0.259 per act, d4 0.138/0.155/0.146 (4B/8B/27B).
+
+U10g(2) CLOSED 2026-08-06: 27B fast mode 6G --no-mmap prints "The capital of
+France is Paris." in ~15 min wall (exit-trap mepc 0x97ffffdd4 = high base +
+6G). TRAP for future runs: an OVER-BUDGET mmap+repack load (27B mmap 3.8G +
+repack ~3.1G > 6G) does NOT fail fast like the 8B@2G case did - it grinds
+silently at 99% CPU for 30+ h. Always pass --no-mmap unless mem-size covers
+file+repack (~7.5G for 27B); a fail-fast guard in vlinux/llama load is a
+worthwhile future fix.
 
 **Still-true hard caps**
 - Guest RAM max 2 GiB (QEMU andes_ae350 + driver cap). 27B (~4.5 GB) blocked on this; 4B+KV fits in 2000M.
