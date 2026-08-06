@@ -1,0 +1,482 @@
+// The phase-plan executor. See run_plan.hpp.
+#include "run_plan.hpp"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+
+#include <unistd.h>
+
+#include "argv.hpp"
+#include "log.hpp"
+#include "process.hpp"
+#include "repo_root.hpp"
+#include "shm.hpp"
+#include "state.hpp"
+#include "tempdir.hpp"
+
+namespace fs = std::filesystem;
+
+namespace andes_sim {
+namespace {
+
+// Each leg's drain file, threaded forward (leg i+1 resumes from leg i's).
+std::string state_path(const std::string& workdir, size_t i) {
+  return workdir + "/state-" + std::to_string(i) + ".bin";
+}
+
+// L2: keep at most this many failure bundles; older ones are pruned.
+constexpr size_t kMaxReproBundles = 20;
+
+// Drop the oldest bundles (dir names start with a UTC timestamp, so the
+// lexicographic order IS the age order) until at most `keep` remain.
+void prune_repro_bundles(const fs::path& root, size_t keep) {
+  std::error_code ec;
+  std::vector<fs::path> dirs;
+  for (const auto& e : fs::directory_iterator(root, ec))
+    if (e.is_directory(ec)) dirs.push_back(e.path());
+  if (dirs.size() <= keep) return;
+  std::sort(dirs.begin(), dirs.end());  // oldest first
+  for (size_t i = 0; i + keep < dirs.size(); ++i) fs::remove_all(dirs[i], ec);
+}
+
+// L2: on a leg failure, keep the run's evidence so the bug can be reported
+// and reproduced: the workdir files (drained states, LM sidecars, staged
+// qemu cfg), a copy of the ELF, and manifest.txt with the error and every
+// leg's exact command. The big shared mmap is NOT kept (the legs are
+// deterministic; re-running the kept commands regenerates it). Returns the
+// bundle dir, or "" when it cannot be written (never fails the caller).
+std::string save_repro_bundle(const std::string& wd, const Plan& plan,
+                              const std::vector<std::vector<std::string>>& argvs,
+                              size_t failed_step, const std::string& error) {
+  const std::string cache = andesim_cache_dir();
+  if (cache.empty()) return "";
+  std::error_code ec;
+  const fs::path root = fs::path(cache) / "repro";
+  fs::create_directories(root, ec);
+  if (ec) return "";
+
+  char ts[32];
+  const std::time_t now = std::time(nullptr);
+  std::tm tm{};
+  gmtime_r(&now, &tm);
+  std::strftime(ts, sizeof(ts), "%Y%m%dT%H%M%SZ", &tm);
+  const std::string stem = fs::path(plan.elf).stem().string();
+  fs::path dir = root / (std::string(ts) + "-" + stem);
+  for (int n = 1; fs::exists(dir, ec); ++n)  // same-second collisions
+    dir = root / (std::string(ts) + "-" + stem + "." + std::to_string(n));
+  fs::create_directories(dir, ec);
+  if (ec) return "";
+
+  fs::copy(wd, dir, fs::copy_options::recursive, ec);  // whatever the legs left
+  fs::copy_file(plan.elf, dir / fs::path(plan.elf).filename(),
+                fs::copy_options::skip_existing, ec);
+
+  std::ofstream m(dir / "manifest.txt");
+  m << "error: " << error << "\n";
+  m << "elf: " << plan.elf << "\n";
+  m << "failed step: " << failed_step << " (" << plan.steps[failed_step].role
+    << " [" << plan.steps[failed_step].engine_id << "])\n";
+  for (size_t i = 0; i < argvs.size(); ++i)
+    m << "step " << i << " " << plan.steps[i].role << " ["
+      << plan.steps[i].engine_id << "]: " << render_argv(argvs[i]) << "\n";
+  m << "note: the shared mmap is not kept; the commands above regenerate the "
+       "run deterministically\n";
+  m.close();
+
+  prune_repro_bundles(root, kMaxReproBundles);
+  return dir.string();
+}
+
+const EngineDescriptor* find_engine(const std::vector<EngineDescriptor>& engines,
+                                    const std::string& id) {
+  for (const EngineDescriptor& e : engines)
+    if (e.id == id) return &e;
+  return nullptr;
+}
+
+// $VSIM_PLUGIN else the in-repo default (matches the e2e harness).
+std::string resolve_plugin(const std::string& override_path) {
+  if (!override_path.empty()) return override_path;
+  if (const char* p = std::getenv("VSIM_PLUGIN"); p && *p) return p;
+  return default_plugin_path().string();
+}
+
+// `--print-qemu-config` exits in the arg parser (no simulation), so the probe is
+// cheap; this is a safety cap, not a real wait.
+constexpr int kQemuCfgProbeMs = 5000;
+
+// The one spelled-out probe spawn behind probe_qemu_cfg / sync_qemu_cfg.
+RunResult qemu_cfg_probe(const std::string& bin) {
+  return run_process({bin, "--print-qemu-config"}, kQemuCfgProbeMs);
+}
+
+}  // namespace
+
+// The engine whose hardware this plan's fast leg(s) must model: the plan's
+// explicit hw_engine_id (the --verify oracle plan, which has no accurate leg
+// of its own), else its first accurate-leg step's engine.
+static const EngineDescriptor* plan_hw_engine(
+    const Plan& plan, const std::vector<EngineDescriptor>& engines) {
+  if (!plan.hw_engine_id.empty())
+    return find_engine(engines, plan.hw_engine_id);
+  for (const Step& s : plan.steps)
+    if (s.role == "accurate-leg")
+      return find_engine(engines, s.engine_id);
+  return nullptr;
+}
+
+std::string qemu_cpu_from_cfg(const std::string& cfg_text) {
+  // First `driver = "<cpu>-riscv-cpu"` global names the CPU model the cfg's
+  // properties apply to; the fast leg must instantiate that same model.
+  static const char kKey[] = "driver = \"";
+  static const char kSuffix[] = "-riscv-cpu";
+  for (size_t pos = cfg_text.find(kKey); pos != std::string::npos;
+       pos = cfg_text.find(kKey, pos + 1)) {
+    const size_t start = pos + sizeof(kKey) - 1;
+    const size_t end = cfg_text.find('"', start);
+    if (end == std::string::npos) break;
+    const std::string driver = cfg_text.substr(start, end - start);
+    const size_t suf = driver.rfind(kSuffix);
+    if (suf != std::string::npos && suf + sizeof(kSuffix) - 1 == driver.size())
+      return driver.substr(0, suf);
+  }
+  return "";
+}
+
+std::string stage_qemu_cfg(const std::string& workdir, const RunResult& probe) {
+  if (probe.spawn_failed || probe.timed_out || probe.rc != 0 || probe.out.empty())
+    return "";
+  const std::string path = workdir + "/qemu.cfg";
+  std::ofstream f(path, std::ios::binary | std::ios::trunc);
+  f.write(probe.out.data(), static_cast<std::streamsize>(probe.out.size()));
+  if (!f) return "";
+  return path;
+}
+
+std::string probe_qemu_cfg(const std::string& bin) {
+  const RunResult r = qemu_cfg_probe(bin);
+  return (!r.spawn_failed && !r.timed_out && r.rc == 0) ? r.out : "";
+}
+
+QemuCfgSync sync_qemu_cfg(const std::string& bin, const std::string& workdir) {
+  QemuCfgSync s;
+  const RunResult probe = qemu_cfg_probe(bin);
+  s.cfg_path = stage_qemu_cfg(workdir, probe);
+  if (!s.cfg_path.empty()) s.cpu = qemu_cpu_from_cfg(probe.out);
+  return s;
+}
+
+std::string plan_step_rc_error(size_t step, const Step& s, int expect_rc,
+                               int got_rc) {
+  std::string m = "plan step " + std::to_string(step) + ": expected exit " +
+                  std::to_string(expect_rc) + ", got " + std::to_string(got_rc);
+  // A drain step (expect_rc is the handoff/drain code) that exits 0 ran the ELF
+  // to completion without ever hitting its ROI boundary -- the marker/pc
+  // trigger never fired. This is THE common "unmarked ELF / wrong trigger"
+  // mistake; name the kind so the fix is obvious, not a bare exit code.
+  if (got_rc == 0 && expect_rc == kDrainRc)
+    m += " -- the " + s.role + " ran to completion without reaching its " +
+         s.trigger.kind +
+         " trigger boundary (the ROI never drained; check the ELF actually "
+         "reaches the " +
+         s.trigger.kind + ")";
+  return m;
+}
+
+LegTriggerArgs leg_trigger_args(const Trigger& t, const std::string& role,
+                                std::string& err) {
+  err.clear();
+  LegTriggerArgs out;
+  if (t.kind == "marker") return out;  // markers detected by plugin/vsim, not argv
+
+  const bool fast = role == "fast-leg";
+  const bool accurate = role == "accurate-leg";
+  if (!fast && !accurate) return out;  // other roles carry no trigger args
+
+  // Required-param lookup. A missing key is a caller bug; surface it (don't
+  // throw) so plan_argvs can report which step failed.
+  auto param = [&](const char* key) -> const std::string* {
+    auto it = t.params.find(key);
+    if (it == t.params.end()) {
+      err = "trigger '" + t.kind + "' missing param '" + key + "'";
+      return nullptr;
+    }
+    return &it->second;
+  };
+
+  if (t.kind == "pc") {
+    if (fast) {
+      if (const std::string* p = param("enter_pc"))
+        out.plugin_suffix = ",enter_pc=" + *p;
+    } else if (const std::string* p = param("exit_pc")) {
+      out.extra = {"--hybrid-exit-pc", *p};
+    }
+    return out;
+  }
+
+  // verify oracle leg (verify_oracle F4): a pure-QEMU drain at the ROI exit
+  // boundary, sampling at vsim's actual halt pc (drain_pc -- the DMI halt
+  // lands a few insns past the trigger, and the comparison is only valid at
+  // the same architectural point). qemu-only: the oracle plan has no
+  // accurate leg.
+  if (t.kind == "verify-marker" || t.kind == "verify-pc") {
+    if (!fast) return out;
+    std::string suffix = ",exit_marker=1";
+    if (t.kind == "verify-pc") {
+      const std::string* p = param("exit_pc");
+      if (!p) return out;
+      suffix = ",exit_pc=" + *p;
+    }
+    if (const std::string* p = param("drain_pc"))
+      out.plugin_suffix = suffix + ",drain_pc=" + *p;
+    return out;
+  }
+
+  err = "unknown trigger kind '" + t.kind + "'";
+  return out;
+}
+
+std::vector<std::vector<std::string>> plan_argvs(
+    const Plan& plan, const std::vector<EngineDescriptor>& engines,
+    const std::string& workdir, const RuntimeCtx& ctx, std::string& err) {
+  std::vector<std::vector<std::string>> out;
+  out.reserve(plan.steps.size());
+  std::string prev_state_out;  // empty for the cold first leg
+
+  // hw-config sync: {vlen} comes from the hw-reference engine's descriptor
+  // (the accurate-leg engine, or plan.hw_engine_id for the oracle plan).
+  long vlen = 0;
+  // LM content transport (ROADMAP_ilm_dlm F3) + HVM (ROADMAP_hvm F3): the
+  // accurate engine's memory sizes (bytes, from its descriptor) arm the QEMU
+  // plugin's sidecar drain and the vsim leg's --ilm/--dlm/--hvm backdoor
+  // load. 0 = that engine has no such memory -> neither leg grows an arg.
+  long ilm_size = 0, dlm_size = 0, hvm_size = 0;
+  // Platform-cache (L2C/L3C) MMIO transport: the plugin's drain window
+  // follows the ENGINE's register base (its --describe shared_cache_base).
+  // 0 = the block is configured out of that RTL -> the plugin keeps its
+  // default and the plan carries no token (the demo/sweep gate).
+  long l2c_base = 0;
+  if (const EngineDescriptor* e = plan_hw_engine(plan, engines)) {
+    if (e->vlen > 0) vlen = e->vlen;
+    if (e->ilm_size > 0) ilm_size = e->ilm_size;
+    if (e->dlm_size > 0) dlm_size = e->dlm_size;
+    if (e->hvm_size > 0) hvm_size = e->hvm_size;
+    if (e->shared_cache_level > 0 && e->shared_cache_base > 0)
+      l2c_base = e->shared_cache_base;
+  }
+  const std::string vlen_str = std::to_string(synced_vlen(vlen));
+  std::string lm_suffix;
+  if (ilm_size > 0) lm_suffix += ",ilm_size=" + std::to_string(ilm_size);
+  if (dlm_size > 0) lm_suffix += ",dlm_size=" + std::to_string(dlm_size);
+  if (hvm_size > 0) lm_suffix += ",hvm_size=" + std::to_string(hvm_size);
+  if (l2c_base > 0) lm_suffix += ",l2c_base=" + std::to_string(l2c_base);
+
+  for (size_t i = 0; i < plan.steps.size(); ++i) {
+    const Step& step = plan.steps[i];
+    const EngineDescriptor* eng = find_engine(engines, step.engine_id);
+    if (!eng) {
+      err = "plan step " + std::to_string(i) + ": unknown engine '" +
+            step.engine_id + "'";
+      return {};
+    }
+    const std::vector<std::string>* tmpl = eng->invoke_for(step.role);
+    if (!tmpl) {
+      err = "plan step " + std::to_string(i) + ": engine '" + step.engine_id +
+            "' has no invoke template for role '" + step.role + "'";
+      return {};
+    }
+
+    std::string trig_err;
+    const LegTriggerArgs lt = leg_trigger_args(step.trigger, step.role, trig_err);
+    if (!trig_err.empty()) {
+      err = "plan step " + std::to_string(i) + ": " + trig_err;
+      return {};
+    }
+
+    const std::string state_out = state_path(workdir, i);
+    // {plugin_args} is the qemu plugin comma-suffix: trigger args (empty for
+    // marker) plus the LM sidecar-drain args (empty for a no-LM engine) plus
+    // the forwarded log level (L4: one --log-level drives the whole pipeline).
+    // {trigger} is its compatibility alias -- the name templates used before
+    // non-trigger args joined the suffix (build_argv ignores unused keys).
+    const std::string plugin_args = lt.plugin_suffix + lm_suffix +
+                                    ",log_level=" +
+                                    std::to_string(log_threshold());
+    const std::map<std::string, std::string> m = {
+        {"bin", eng->bin_path},
+        {"elf", plan.elf},
+        {"plugin", ctx.plugin_path},
+        {"mmap", ctx.mmap_path},
+        {"mmap_size", std::to_string(ctx.mem_size)},
+        {"mmap_base", ctx.mmap_base},
+        {"state_in", prev_state_out},
+        {"state_out", state_out},
+        {"plugin_args", plugin_args},
+        {"trigger", plugin_args},
+        {"vlen", vlen_str},
+        // {qemu_cpu}: the model the readconfig globals target; the family
+        // default when the engine has no --print-qemu-config hook.
+        {"qemu_cpu", ctx.qemu_cpu.empty() ? kDefaultQemuCpu : ctx.qemu_cpu},
+    };
+    std::vector<std::string> argv = build_argv(*tmpl, m, err);
+    if (!err.empty()) {
+      err = "plan step " + std::to_string(i) + ": " + err;
+      return {};
+    }
+    // The QEMU producer leg loads the accurate engine's ISA via -readconfig (its
+    // config.inc distilled to per-extension globals), so QEMU1 executes the same
+    // extensions the engine models. Empty => keep the descriptor's default -cpu.
+    if (step.role == "fast-leg" && !ctx.qemu_cfg.empty()) {
+      argv.push_back("-readconfig");
+      argv.push_back(ctx.qemu_cfg);
+    }
+    // LM content transport (F3): point the vsim leg at the sidecars its
+    // producer drained next to state_in (--ilm/--dlm backdoor load).
+    if (step.role == "accurate-leg") {
+      if (ilm_size > 0) {
+        argv.push_back("--ilm");
+        argv.push_back(prev_state_out + ".ilm");
+      }
+      if (dlm_size > 0) {
+        argv.push_back("--dlm");
+        argv.push_back(prev_state_out + ".dlm");
+      }
+      if (hvm_size > 0) {
+        argv.push_back("--hvm");
+        argv.push_back(prev_state_out + ".hvm");
+      }
+    }
+    // Trigger's vsim tokens, then user-forwarded per-leg flags -- both verbatim
+    // after the filled template (matches tests/e2e.sh's ordering).
+    argv.insert(argv.end(), lt.extra.begin(), lt.extra.end());
+    argv.insert(argv.end(), step.extra_args.begin(), step.extra_args.end());
+    out.push_back(std::move(argv));
+    prev_state_out = state_out;
+  }
+  err.clear();
+  return out;
+}
+
+PlanResult run_plan(const Plan& plan,
+                    const std::vector<EngineDescriptor>& engines,
+                    const PlanOptions& opts) {
+  PlanResult res;
+  if (plan.steps.empty()) {
+    res.error = "plan has no steps";
+    return res;
+  }
+
+  // Acquire the shared mmap: allocate one (and own it) when none is pinned.
+  std::string mmap_path = plan.mmap_path;
+  const bool own_mmap = mmap_path.empty();
+  if (own_mmap) {
+    std::string err;
+    // L26/F2: back the mmap with one V-scratch page above the program's RAM.
+    mmap_path = allocate(physical_mmap_bytes(plan.mem_size), err);
+    if (mmap_path.empty()) {
+      res.error = err;
+      return res;
+    }
+  }
+
+  // A private dir for the threaded drain files (the shared make_temp_dir
+  // helper: "<system temp dir>/andesim-plan-XXXXXX").
+  const std::string wd = make_temp_dir("andesim-plan");
+  if (wd.empty()) {
+    if (own_mmap) ::unlink(mmap_path.c_str());
+    res.error = "failed to create plan work dir";
+    return res;
+  }
+
+  RuntimeCtx ctx;
+  ctx.mmap_path = mmap_path;
+  // L26/F2: the legs (QEMU backend size, vsim --shared-mem-size) see the
+  // PHYSICAL window -- program RAM plus the V-scratch page. The program's own
+  // linker script still uses only --mem-size, so the scratch page sits above
+  // everything it can address.
+  ctx.mem_size = physical_mmap_bytes(plan.mem_size);
+  // U10f: past the low window the legs see RAM at the high base -- QEMU
+  // places the backend there itself (DRAM_ALIAS + DRAM_EXT are contiguous),
+  // vsim gets it as --shared-mem-base. "0x0" for every legacy size.
+  {
+    char base_hex[32];
+    std::snprintf(base_hex, sizeof(base_hex), "0x%llx",
+                  static_cast<unsigned long long>(
+                      hybrid_ram_base(plan.mem_size)));
+    ctx.mmap_base = base_hex;
+  }
+  ctx.plugin_path = resolve_plugin(opts.plugin_path);
+
+  // Match the QEMU producer leg's ISA to the hw-reference engine (the
+  // accurate-leg engine, or plan.hw_engine_id for the --verify oracle plan):
+  // ask that engine for a QEMU -readconfig cfg distilled from its config.inc.
+  // Tolerant -- an engine without --print-qemu-config leaves qemu_cfg empty
+  // (the parser throws on the unknown flag -> non-zero exit), so the fast leg
+  // keeps its -cpu.
+  if (const EngineDescriptor* e = plan_hw_engine(plan, engines);
+      e && !e->bin_path.empty()) {
+    // The cfg's globals only apply to the CPU driver they name, so the
+    // fast leg instantiates that same model ({qemu_cpu} fill).
+    const QemuCfgSync sync = sync_qemu_cfg(e->bin_path, wd);
+    ctx.qemu_cfg = sync.cfg_path;
+    ctx.qemu_cpu = sync.cpu;
+  }
+
+  std::string err;
+  const std::vector<std::vector<std::string>> argvs =
+      plan_argvs(plan, engines, wd, ctx, err);
+  if (!err.empty()) {
+    res.error = err;
+  } else if (opts.dry_run) {
+    // Build-only: the argvs are fully resolved (placeholders, staged qemu_cfg,
+    // threaded state paths) -- record them for the caller to print, spawn none.
+    res.argvs = argvs;
+  } else {
+    res.argvs = argvs;
+    // A failing leg keeps the evidence (L2) next to its error.
+    const auto fail_step = [&](size_t i, const std::string& msg) {
+      res.error = msg;
+      res.repro_dir = save_repro_bundle(wd, plan, argvs, i, msg);
+    };
+    for (size_t i = 0; i < argvs.size(); ++i) {
+      // trace: the fully resolved command, copy-pasteable to re-run this leg.
+      log_line(kLogTrace, "[andesim] exec %s [%s]: %s",
+               plan.steps[i].role.c_str(), plan.steps[i].engine_id.c_str(),
+               render_argv(argvs[i]).c_str());
+      // At debug the legs' stderr streams through live (vsim's own leveled
+      // log, the plugin's drain summary); at info and above it stays dropped.
+      const RunResult r =
+          run_process(argvs[i], opts.timeout_ms, log_on(kLogDebug));
+      if (r.spawn_failed) {
+        fail_step(i, "plan step " + std::to_string(i) + ": failed to spawn");
+        break;
+      }
+      if (r.timed_out) {
+        fail_step(i, "plan step " + std::to_string(i) + ": timed out after " +
+                         std::to_string(opts.timeout_ms) + " ms");
+        break;
+      }
+      if (r.rc != opts.expect_rc) {
+        fail_step(i, plan_step_rc_error(i, plan.steps[i], opts.expect_rc, r.rc));
+        break;
+      }
+      const StateFile sf = read_state_file(state_path(wd, i));
+      if (!sf.ok()) {
+        fail_step(i, "plan step " + std::to_string(i) + ": " + sf.error);
+        break;
+      }
+      res.phases.push_back({sf.st.mcycle, sf.st.minstret, r.out, sf.st});
+    }
+  }
+
+  std::error_code ec;
+  fs::remove_all(wd, ec);
+  if (own_mmap) ::unlink(mmap_path.c_str());
+  return res;
+}
+
+}  // namespace andes_sim
