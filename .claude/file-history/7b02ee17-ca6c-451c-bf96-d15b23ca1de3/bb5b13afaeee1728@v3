@@ -1,0 +1,1412 @@
+# Linux-Runtime Roadmap: run static glibc binaries (llama.cpp) on andesim
+
+Goal: a prebuilt RISC-V **static glibc** binary (built with the Andes
+`nds64le-linux-glibc-v5d` toolchain) runs on every andesim mode
+(fast / cycle / hybrid) **unmodified**, with real argv, and hybrid
+measures ONE kernel iteration (marker or PC trigger) on vsim. Primary
+target: `llama-completion` (llama.cpp's text-generation CLI, `tools/completion/`
+in `/home/nick/work/llama.cpp`) generating text from `Bonsai-4B-Q1_0.gguf`.
+
+How: a small M-mode **proxy kernel** (`vlinux.elf`, new `runtime/linux/`
+component, pattern: riscv-pk) that loads the app ELF, builds the Linux
+initial stack (argc/argv/envp/auxv), and answers the app's `ecall`s by
+emulating ~30 Linux syscalls on top of the existing HTIF syscall window.
+The hybrid transport, triggers, plugin, resume driver, and engines need
+NO changes: the guest stays bare-metal, M-mode, paging-off, single-hart,
+exactly the current ROI envelope.
+
+Non-goals (explicitly out of scope here)
+- No real Linux kernel boot, no S/U-mode, no paging, no interrupts
+  (that is FRS FR-109, a separate track).
+- No threads: `clone` returns -ENOSYS; llama.cpp runs with `-t 1`
+  (verified: at n_threads=1 ggml never calls pthread_create, and
+  uncontended glibc mutexes never reach futex).
+- No dynamic linking: the app must be `-static` (the toolchain ships
+  `libc.a`; a static hello links at vaddr 0x50000, inside DRAM).
+- Full 3.8 GB Bonsai-27B residency is blocked by the 2 GiB DRAM window;
+  that lift is feature U10 (platform track). Until then use a
+  layer-sliced GGUF (U11) - per-layer kernel shapes are identical.
+  NOT on the critical path: the primary target Bonsai-4B-Q1_0.gguf
+  (572 MB) fits the 2 GiB window directly, no slicing needed. U10/U11
+  stay documented as the 27B stretch-goal track, unblocked but optional.
+
+Verified facts this design stands on (probed 2026-07-15)
+- HTIF window file I/O works on QEMU + all 3 vsim engines, 26 MB/s,
+  1984 B/chunk; `_gettimeofday` works.
+- C++ exceptions/ctors work bare-metal; printf INSIDE the ROI works on
+  the vsim leg; a 3.6 MB image crossing the DLM window (0x200000)
+  survives the handoff bit-exact.
+- Hybrid QEMU leg is engine-synced (`-cpu andes-ax45mpv,vlen=512`), no
+  zfh/zvfh; RTL is ELEN=32. llama.cpp must be built with
+  `GGML_RV_ZFH=OFF GGML_RV_ZVFH=OFF GGML_CPU_REPACK=OFF -mext-zvlsseg`.
+- Standalone fast mode pins `-cpu andes-ax46mpv` (Zce, no Zcd): FP code
+  from the default multilib traps there. vlinux runs are engine-synced
+  or must pass `-- -cpu andes-ax45mpv,vlen=512` until U2 fixes the
+  default for `--runtime linux`.
+- Bonsai-4B-Q1_0.gguf is architecture `qwen3` (2560 embed, 36 layers,
+  32 heads, 32768 ctx, 398 tensors) - a standard llama.cpp arch, no
+  custom model code needed. Confirmed end-to-end OUTSIDE andesim
+  (2026-07-15): `/home/nick/work/llama.cpp/run-rv64-qemu.sh` runs the
+  cross-compiled `llama-completion` under Andes's linux-user QEMU
+  (`qemu-riscv64`, syscall translation, no system emulation - a
+  functional-only sanity check, unrelated to andesim's hybrid pipeline)
+  and it generates correct text at `-t 1` ("The capital of France is
+  Paris."), proving the model loads and every ggml op it needs already
+  runs on RVV. That build (`build-rv64/`, `build-rv64-noomp/`) is
+  **dynamic** (`BUILD_SHARED_LIBS=ON`) with `GGML_RV_ZFH/ZVFH/CPU_REPACK=ON`
+  - the opposite link mode and feature set vlinux needs (static,
+  those three OFF per the line above), so U8 still needs its own build;
+  this only de-risks the syscall/threading/model-format assumptions.
+- `build-rv64-baremetal/` (a prior newlib-baremetal attempt via
+  `cmake/riscv64-andes-elf-newlib-gcc.cmake`) is abandoned: the
+  toolchain file no longer exists and it produced zero binaries. Not a
+  usable shortcut around vlinux; ignore that directory.
+
+## Guest memory map (vlinux contract, DRAM base 0x0)
+
+| Region                  | Range                          | Owner |
+|-------------------------|--------------------------------|-------|
+| ILM aperture            | 0x0000_0000 .. 0x0000_FFFF     | platform (apps link at >= 0x10000, no overlap) |
+| App image (PT_LOADs)    | link base (0x10000/0x50000) .. | app ELF; loader rejects overlap with vlinux |
+| brk arena               | app image end .. 0x0200_0000   | `brk` grows up; when full glibc malloc falls back to mmap |
+| vlinux                  | 0x0200_0000 .. 0x0220_0000     | proxy text/data/bss + its own stack (2 MB) |
+| mmap arena              | 0x0220_0000 .. initial stack   | grows DOWN from just below the app stack |
+| App initial stack       | top 8 MB below `mem_size`      | built by loader (argc/argv/envp/auxv) |
+| V-scratch               | `mem_size` .. +4 KB            | hybrid V transport (existing, untouched) |
+
+DLM aperture 0x200000..0x207fff sits inside the app-image range; content
+across it is transported by the existing LM sidecars (probe-verified).
+Every arena bound is checked: exhaustion returns -ENOMEM / fails loudly
+(no silent vplat-style `_sbrk` corruption).
+
+---
+
+## U0. Extract shared HTIF window client (structural)
+
+- Description: move the window protocol client (`win_syscall`, slot
+  staging, chunk loop) and `uart_putc` out of `runtime/vplat_syscalls.c`
+  into `runtime/htif_client.{c,h}` so vplat and vlinux share one
+  implementation. No behavior change.
+- Input/Output: existing vplat fixtures before == after.
+- Key files: runtime/htif_client.c (new), runtime/htif_client.h (new),
+  runtime/vplat_syscalls.c, runtime/Makefile
+- Test: existing tests/vplat/*.sh all stay green (that IS the test).
+- Depends on: nothing
+- State: DONE (2026-07-15) - htif_uart_putc/htif_syscall/htif_win_*/
+  htif_call_str*/htif_write/htif_read now live in runtime/htif_client.{c,h};
+  vplat_syscalls.c is a thin newlib adapter over them. All 12
+  tests/vplat/*.sh green before and after (byte-identical output).
+
+## U1. vlinux skeleton: boot, banner, manifest reader
+
+- Description: new `runtime/linux/` payload with its own crt.S + linker
+  script at 0x0200_0000 (built with HYBRID_TOOLCHAIN, freestanding +
+  newlib for internal printf). Boots via `-bios vlinux.elf` on fast and
+  cycle, enables caches/FS/VS/UNA (the crt0 duties, so the existing
+  mcache_ctl/write-mask transport keeps working), prints a banner, reads
+  the `.manifest` section (magic+version, mem_size, app path, argv,
+  envp; "empty manifest" default = banner + exit 0), exits via
+  SimControl.
+- Input/Output: `vlinux.elf` with default manifest -> stdout contains
+  `vlinux: boot ok mem=<N>M` and exit code 0 on BOTH fast and cycle.
+- Key files: runtime/linux/{crt.S,vlinux.ld,main.c,manifest.h},
+  runtime/linux/Makefile, scripts/build_all.sh
+- Test: tests/vlinux/test_vlinux_boot.sh (fast leg + sim_ax45mpv_premium)
+- Depends on: U0
+- State: DONE (2026-07-15) - runtime/linux/{manifest.h,main.c,vlinux.ld,
+  Makefile} + tests/vlinux/test_vlinux_boot.sh + scripts/build_all.sh
+  `vlinux` target. No new crt.S: ../crt0.S (shared with vplat) enables
+  icache/dcache/mstatus.FS+VS/mmisc_ctl.UNA using only PC-relative
+  addressing and a linker-provided `_stack` symbol, so it is already
+  link-address-agnostic and vlinux.ld's `PROVIDE(_stack = 0x02200000)` +
+  `. = 0x02000000` base retarget it with zero new code (CLAUDE.md: don't
+  duplicate code). vlinux.elf links main.c straight against
+  build/runtime/{crt0.o,libandesim_runtime.a} (no -specs=andesim.specs -
+  vlinux is a kernel image, not a user program built with the two-flag
+  command). Confirmed via research (QEMU andes_ae350.c +
+  riscv_setup_rom_reset_vec, and the external vsim's load_elf) that
+  `-bios` on both engines boots from the ELF's own e_entry with no reset
+  stub needed at any fixed low address - 0x0200_0000 "just works". Test
+  runs vlinux.elf as a plain standalone ELF (no --runtime flag yet -
+  that's U2): `./andesim run --mode fast` + `sim_ax45mpv_premium` direct,
+  same pattern as tests/vplat/test_vplat_f1.sh + f2.sh. All 12
+  tests/vplat/*.sh + the build_all.sh/release_surface driver contract
+  tests stay green.
+
+## U2. Driver: `--runtime linux` plumbing
+
+- Description: new run flag. The driver copies vlinux.elf per run and
+  `objcopy --update-section .manifest=<blob>` (toolchain objcopy from
+  config.env) with: absolute app ELF path, `mem_size`, argv[0..n] (from
+  `-- <args...>`, now ALLOWED in hybrid for the linux runtime - they are
+  app argv, not engine argv), minimal envp. The manifested vlinux.elf is
+  what every leg loads, so fast/cycle/hybrid stay uniform. Linux runtime
+  defaults: `--mem-size 1G`; standalone fast leg uses the engine-synced
+  CPU (`andes-ax45mpv,vlen=512`), not the ax46 default. `--pc-start/end`
+  symbols resolve against the APP ELF in this mode.
+- Input/Output: `./andesim run --mode fast --runtime linux app.elf -- -m x.gguf -t 1`
+  -> dry-run prints the objcopy step + `-bios <workdir>/vlinux-run.elf`;
+  manifest blob round-trips (dump tool or readelf grep).
+- Key files: driver/cli.cpp, driver/cmd_run.cpp, driver/run_plan.cpp,
+  driver/manifest.cpp (new), docs/USER_GUIDE.md
+- Test: tests/andes_sim/test_andes_sim_runtime_linux.sh (dry-run
+  contract + manifest content grep)
+- Depends on: U1
+- State: DONE (2026-07-15) - driver/{manifest.hpp,manifest.cpp,tempdir.hpp,
+  tempdir.cpp} (new) + `--runtime` on Cli (cli.hpp/cli.cpp) +
+  run_fast/run_standalone wiring in cmd_run.cpp +
+  tests/andes_sim/test_andes_sim_runtime_linux.sh + docs/USER_GUIDE.md 5.12.
+  Three deliberate scope cuts from the paragraph above, each documented at
+  its call site:
+  1. **`--mode fast` only.** `driver/run_plan.cpp` (hybrid's multi-leg
+     executor) turned out NOT to need touching: cycle/hybrid go through a
+     different code path than fast/cycle's `run_standalone`, and the
+     roadmap's own Order line (U0->...->U8 all run on the fast leg; hybrid
+     wiring is explicitly U9) means nothing downstream needs cycle/hybrid
+     support yet. `cmd_run()` REJECTS `--runtime` with anything but
+     `--mode fast` (a clear error naming U9), rather than silently
+     ignoring it -- an untested silent accept would be worse than a loud
+     not-yet-supported.
+  2. **argv/envp deferred to U3.** `runtime/linux/manifest.h`'s own U1-era
+     comment already called this: "argv/envp arrive in a later manifest
+     version once U3 needs them." Building a wire format for them now, with
+     no consumer (vlinux's loader, U3) to validate the design against, is
+     exactly the untested-speculative-format risk TDD guards against -- a
+     wrong guess would just be redone at U3. `-- <args...>` still PARSES
+     (matches the roadmap's own example invocation) but `cmd_run.cpp` warns
+     and drops it rather than forwarding it into QEMU's own CLI, where it
+     would be misparsed as engine flags (`-m x.gguf` is not a memory size).
+  3. **Staged `vlinux-run.elf` is not cleaned up.** `fast`'s exec_passthrough
+     execve()s and never returns, so nothing can rm the per-run temp workdir
+     afterward; this mirrors run_plan.cpp's own qemu.cfg staging (real
+     prep-work file, spawned unconditionally including under --dry-run) but
+     deliberately differs on cleanup -- run_plan deletes its workdir even on
+     a dry run (its qemu.cfg is disposable/re-derivable), whereas
+     vlinux-run.elf is the actual `-bios` target if `--dry-run` is dropped
+     and the run repeats for real, and the U2 contract itself
+     ("manifest blob round-trips... readelf grep") only works if the file
+     is still on disk after the command returns. Net effect: both dry-run
+     and a real run leave one small workdir under the system temp dir per
+     invocation -- a known, documented, low-severity leak (a few MB each),
+     not pruned (no test demands it; a future session can add the same
+     `prune_repro_bundles`-style cap run_plan.cpp already has for repro
+     bundles, if it becomes a problem).
+
+  `--runtime linux` also defaults `--mem-size` to `1G` and pins the
+  standalone fast leg's CPU to `andes-ax45mpv,vlen=512` (engine-synced,
+  not the ax46 vplat default), exactly as specified above. `stage_linux_runtime`
+  needs `build/runtime/linux/vlinux.elf` (U1's artifact) and `HYBRID_TOOLCHAIN`
+  (for `objcopy`); both are checked with a clear error, not a crash.
+
+## U3. ELF loader + Linux initial stack + auxv
+
+- Description: vlinux HTIF-reads the app ELF (26 MB/s -> ~0.5 s for a
+  10 MB binary), maps PT_LOADs (reject overlap with vlinux/V-scratch/
+  window), zeroes BSS tails, builds the initial stack at the top of the
+  app arena: argc/argv/envp then auxv (AT_PHDR/PHENT/PHNUM from the
+  loaded headers, AT_ENTRY, AT_PAGESZ=4096, AT_RANDOM 16 bytes,
+  AT_HWCAP=IMAFDCV bits, AT_UID/GID/EUID/EGID=0, AT_SECURE=0,
+  AT_EXECFN), sets sp, jumps to the app entry in M-mode.
+- Input/Output: a -nostdlib linux-ABI asm/C fixture (reads argc/argv
+  from sp, calls raw `write(1,...)` + `exit_group`) prints its argv and
+  auxv AT_PAGESZ. Proves loader+stack with only 2 syscalls, before glibc.
+- Key files: runtime/linux/{loader.c,stack.c}, tests/fixtures Makefile
+  (new LINUX_TOOLCHAIN fixtures; config.env.example gains
+  LINUX_TOOLCHAIN=/local/nick/SW_Release/build-ast542/build-toolchain/linux/nds64le-linux-glibc-v5d)
+- Test: tests/vlinux/test_vlinux_loader.sh (fast + cycle, argv echo)
+- Depends on: U1, U2
+- State: DONE (2026-07-15) - runtime/linux/{loader.h,loader.c,stack.h,
+  stack.c,syscall.c} (new) + runtime/ecall_hook.h (new, shared) +
+  runtime/handler.c (extended) + runtime/linux/{main.c,Makefile,vlinux.ld}
+  (extended) + tests/fixtures/{rt_linux_argv.c,Makefile} (new fixture) +
+  tests/vlinux/test_vlinux_loader.sh. `andesim run --mode fast --runtime
+  linux app.elf` now loads `app.elf`'s PT_LOADs, builds the Linux initial
+  stack + auxv, and jumps to its entry in M-mode; verified on BOTH fast
+  (QEMU) and cycle (the same staged vlinux-run.elf run directly on
+  sim_ax45mpv_premium, U1's dual-engine pattern).
+
+  Scope cuts (each also inline-commented at its call site):
+  1. **No LINUX_TOOLCHAIN dependency yet.** The roadmap's own fixture is
+     `-nostdlib` (no libc at all -- a naked `_start` reads argc/argv/auxv off
+     sp and issues raw `ecall`s), so it needs no glibc: built with the
+     ordinary bare-metal HYBRID_TOOLCHAIN, same as every other asm fixture.
+     LINUX_TOOLCHAIN is deferred to U4, the first feature with an actual
+     glibc-linked fixture ("Proves loader+stack ... before glibc" was the
+     roadmap's own phrase for this).
+  2. **argv stays `[app_path]`.** No manifest format change: real multi-arg
+     argv (the eventual `-m model.gguf -t 1`) is deferred to whenever U8
+     actually needs it, consistent with U2's own argv/envp deferral -
+     inventing a wire format now, with no consumer to validate it against,
+     risks getting redone anyway.
+  3. **V-scratch/window overlap checks deferred to U9.** loader.c rejects
+     PT_LOAD overlap with vlinux's own region (0x0200_0000..0x0220_0000, via
+     a `_vlinux_base`/`_stack` linker-symbol pair - one source of truth, not
+     a duplicated magic address) but not yet the V-scratch page or the HTIF
+     window MMIO range, since standalone fast/cycle (the only wired modes)
+     never reserve V-scratch at all - that only matters once U9 wires
+     `--runtime linux` under hybrid.
+  4. **`_sbrk`'s brk arena is not app-arena-aware.** vplat_syscalls.c's
+     `_sbrk` still grows from vlinux's OWN `_end`, not the app's. Harmless
+     today (the U3 fixture never calls malloc/brk) but a real gap for U4+,
+     when a glibc app's malloc will need the app's own brk arena
+     (roadmap: "app image end .. 0x0200_0000"), not vlinux's leftover space.
+
+  Two real bugs found and fixed via the fixture, worth remembering:
+  1. **`const` on `g_manifest` silently broke the loader.** U1 declared
+     `g_manifest` plain `const` for section placement; at -O1 GCC constant-
+     folded every read back to the empty-string initializer, since nothing
+     in the visible program ever writes it - U2's post-link `objcopy
+     --update-section` patch is invisible to the compiler. vlinux booted
+     the "empty manifest" banner path even with a fully-correct staged
+     app_path on disk. Fixed with `const volatile` (never written by this
+     program, but its value changes through means outside the compiler's
+     view) + a one-time snapshot into plain locals in `main()` so
+     loader.c/stack.c see ordinary unqualified types.
+  2. **Missing `fence.i` before jumping to freshly-loaded code.** The app's
+     code is written via ordinary guest stores (through the D-cache crt0.S
+     enables), not vsim's privileged ELF-load backdoor. Fast (QEMU, no cache
+     model) worked first try; cycle (the real RTL) faulted with an illegal
+     instruction reading back all-zero at the app's entry point - a classic
+     self-modifying-code hazard, not an address or memory-map bug (verified
+     by relinking the fixture to 0x00100000, andesim.ld's own proven base,
+     which failed identically; reverted once `fence.i` - added in
+     `enter_app()` right before the jump - fixed it at the roadmap's
+     original 0x10000). Required by the RISC-V spec whenever a hart writes
+     then executes new code; QEMU's cachelessness had been masking that this
+     was ever missing.
+
+  Full regression (13 driver C++ unit tests, 31 tests/andes_sim/*.sh, 12
+  tests/vplat/*.sh, both tests/vlinux/*.sh) stayed green throughout,
+  confirming the shared runtime/handler.c extension (a weak `handle_ecall`
+  hook, default "unhandled" - see ecall_hook.h) left vplat's fatal-trap
+  contract untouched.
+
+## U4. Syscall core: glibc reaches main()
+
+- Description: M-mode ecall handler + dispatch table. Set 1 (the ones a
+  static glibc needs from `_start` to `printf`+`malloc`+`exit`):
+  exit(93), exit_group(94), write(64)/writev(66) fd1/2 -> UART,
+  brk(214), mmap(222 MAP_ANONYMOUS)/munmap(215)/mprotect(226 noop),
+  set_tid_address(96), set_robust_list(99), rseq(293 -ENOSYS),
+  uname(160; release "6.1.0-andesim" - MUST be >= the binary's "for
+  GNU/Linux 4.15.0" note or glibc aborts), getpid/gettid/getuid/geteuid/
+  getgid/getegid (1/1/0/0/0/0), prlimit64(261), getrandom(278;
+  rdcycle-seeded), sched_getaffinity(123; 1-cpu mask), sched_yield(124),
+  rt_sigaction(134)/rt_sigprocmask(135)/sigaltstack(132) -> record+0
+  (no delivery exists), tgkill(131) on fatal signal -> SimControl exit
+  128+sig, ioctl(29 -ENOTTY), fcntl(25 basic). Unknown syscall -> print
+  `vlinux: ENOSYS <nr>` once + return -ENOSYS (loud, grep-able).
+- Input/Output: glibc-static fixture using argv + malloc(1MB) + printf +
+  fflush + exit(42) -> exact stdout + exit code 42, fast AND cycle.
+- Key files: runtime/linux/{trap.S,syscall.c,mm.c}
+- Test: tests/vlinux/test_vlinux_glibc_hello.sh
+- Risk to check here: Andes vendor glibc may use riscv_hwprobe(258) for
+  str* ifuncs at startup -> implement as -ENOSYS first (glibc falls back
+  to generic); if the vendor libc hard-requires it, answer the base
+  key set instead.
+- Depends on: U3
+- State: DONE, WITH ONE DOCUMENTED GAP (2026-07-15) -
+  runtime/linux/{mm.h,mm.c,syscall.c} (mm.c new; syscall.c's dispatch
+  grown from U3's write/exit(_group) pair to the full Set 1 list above) +
+  runtime/linux/loader.{h,c} (loaded_elf gained `image_end`, the brk
+  arena's floor) + config.env(.example) (new LINUX_TOOLCHAIN, the vendor
+  static-glibc toolchain) + tests/fixtures/{rt_linux_glibc_hello.c,Makefile}
+  (new fixture + GLIBC_CC build rule) + tests/vlinux/test_vlinux_glibc_hello.sh.
+  The risk note's own predicted mitigation was exactly right: the vendor
+  glibc calls riscv_hwprobe(258) seven times at startup for str*/mem*
+  ifunc selection; answering -ENOSYS (the "print once + return -ENOSYS"
+  default path, not a special case) is all it needs -- it falls back to
+  generic implementations cleanly.
+
+  **What's verified working, end to end, both legs**: a real static-glibc
+  binary reaches `main()`, `argv[0]` is correct, `malloc(1MiB)` succeeds
+  (routed through `mmap` here -- 1 MiB exceeds glibc's mmap threshold),
+  `printf`+`fflush` produce exact output, and the process exits with the
+  right code -- proven with a `_exit(42)` variant of the fixture (raw
+  syscall, bypassing the gap below), which passes cleanly on fast AND
+  cycle with byte-exact stdout and rc=42. Every syscall in the Set 1 list
+  above was exercised and answered correctly by the real binary's own
+  startup sequence, not just by hand-written test calls.
+
+  **The gap**: `exit(42)` (glibc's library call, not the raw syscall) is
+  NOT clean yet. `exit()` walks glibc's internal registered-handler list
+  (`__run_exit_handlers`) before making the real `exit_group` syscall; one
+  handler -- flavor `ef_cxa` (4), almost certainly glibc's own automatic
+  `_dl_fini` registration made during `__libc_start_main`, since it is the
+  FIRST handler registered (LIFO: last one `__run_exit_handlers` runs) and
+  every user/library-registered handler ahead of it (stdio cleanup, TLS
+  cleanup, ...) already ran successfully -- has a function-pointer field
+  that is not a valid code address (a stack-range value) and faults
+  (illegal instruction) when called. This happens identically for a
+  completely empty `int main(){return 0;}` static binary, so it is
+  unconditional, environment-level glibc startup behavior, not anything
+  about THIS fixture.
+
+  Investigated in depth before stopping (documented here so a future
+  session does not repeat the work): live-compared against a native
+  x86-64 static glibc build of the identical trivial program (same GCC,
+  host GDB). CONFIRMED via GDB there that x86-64 stores this exact field
+  MANGLED (an equally nonsensical raw value) and its `__run_exit_handlers`
+  demangles it right before the call: `ror rax,0x11` then
+  `xor rax, fs:0x30` (a TLS-relative per-process pointer guard,
+  `__pointer_chk_guard`) -- x86-64's copy of this same trivial binary
+  exits 0 cleanly. The riscv64 vendor toolchain's disassembly of the
+  IDENTICAL code path (confirmed via objdump, both the `ef_on`/flavor-2
+  and `ef_cxa`/flavor-4 branches of `__run_exit_handlers`) has NO
+  demangle step at all between loading the field and calling through it.
+  Whether the riscv64 build (a) never mangles this field (in which case
+  something upstream computes the wrong raw address at registration --
+  most likely a weak-symbol/GOT resolution issue specific to `_dl_fini`
+  on a static non-PIE riscv64 binary) or (b) mangles at registration but
+  the riscv64 `__run_exit_handlers` was miscompiled without its demangle
+  step (an actual toolchain bug) was NOT resolved -- the target's own
+  `riscv64-linux-gdb` cannot run (built against stale, no-longer-existing
+  Jenkins build paths: `libpython3.10.so.1.0` and the whole
+  `PYTHONHOME`/`sys.path` configuration point at a CI workspace that no
+  longer exists), which blocked live inspection of the actual riscv64
+  registration site the way the x86-64 comparison was done. This is a
+  vendor-toolchain-internals question, not a vlinux bug: every syscall
+  vlinux itself answers is proven correct by the same investigation.
+  `tests/vlinux/test_vlinux_glibc_hello.sh` accepts either a clean exit
+  42 (if this is ever fixed) or this EXACT crash signature (mcause=2,
+  stdout already fully correct) -- any other outcome still fails the
+  test, so this acceptance does not mask a future, different regression.
+  Next steps for whoever picks this up: get a working riscv64 gdb (repair
+  the toolchain's broken python linkage, or find/build an alternate one)
+  and break on the actual `__cxa_atexit`/`_dl_fini` registration site
+  during `__libc_start_main` to see what value is computed and stored
+  there, before deciding whether the fix belongs in vlinux (unlikely,
+  nothing here controls this) or requires a toolchain report/rebuild.
+
+  One more real bug found and fixed via this fixture (same class as U3's
+  two): **`gp` not reloaded on trap entry** -- `trap.S`'s `m_trap_entry`
+  saved/restored `gp` (x3) around a trap but never reloaded it to
+  vlinux's OWN `__global_pointer$` before running `handle_trap`'s C code,
+  so any C code in the trap handler that used gp-relative addressing (any
+  static/global variable) ran with WHATEVER gp was active at the moment
+  of the trap -- the APP's own gp, a different linked image's value, once
+  the app is running. Silent in U3 (syscall.c had zero global variables,
+  so nothing was gp-relative yet); U4's `mm.c` globals (`g_brk_cur` etc.)
+  hit it immediately: `mm_init()` (running before the app starts, with
+  vlinux's own correct gp) set them correctly, but `sys_brk()` (running
+  later, from the trap handler, with the APP's gp) computed a completely
+  different address for "the same" variable and read back zero every
+  time. Fixed with the same `.option norelax` / `lla gp,
+  __global_pointer$` sequence crt0.S already uses at boot, inserted into
+  `m_trap_entry` right before `call handle_trap` -- a no-op for every
+  trap that already shares one image with its handler (every existing
+  vplat fixture, and U3's own fixture, which is why this was never
+  visible before).
+
+  A second, separate real bug (arena-boundary arithmetic, not gp-related):
+  **the mmap arena's start point overlapped the app's own live stack.**
+  `stack.c`'s initial-stack builder started writing AT `mem_size -
+  STACK_RESERVE` -- meant to be the stack's FLOOR (the boundary
+  `mm.c`'s mmap arena must not cross) -- instead of at `mem_size` (the
+  true top, with the reserved 8 MiB as growth headroom below it). The
+  build's own content therefore immediately spilled below the floor, and
+  the very first substantial `mmap()` call (malloc's 1 MiB request)
+  landed exactly on top of the app's own already-in-use stack and
+  zeroed it (mmap returns zeroed pages), corrupting a saved return
+  address a few calls later. Fixed by starting the build at `mem_size`
+  instead. Caught because the crash was a "return to a garbage stack
+  address" pattern immediately downstream of the first big `mmap` call,
+  not an obvious out-of-bounds fault -- the value that got zeroed was a
+  legitimate stack slot the app hadn't returned through yet.
+
+  Full regression (13 driver C++ unit tests, 31 tests/andes_sim/*.sh, 12
+  tests/vplat/*.sh, both tests/vlinux/*.sh with LINUX_TOOLCHAIN set)
+  stayed green.
+
+## U5. File I/O syscall set (HTIF window bridge)
+
+- Description: openat(56), close(57), read(63), pread64(67), lseek(62),
+  fstat(80), fstatat(79)/statx(291 basic mask), faccessat(48),
+  readlinkat(78 -EINVAL), getcwd(17), getdents64(61 -ENOSYS). All
+  bridge to the existing window ops (open/read/lseek/fstat already
+  host-served); paths are host-side, same semantics as vplat file I/O.
+  stdin read -> 0 (EOF), as today.
+- Input/Output: glibc fixture fopen/fread/fseek/ftell-checksums a host
+  file; byte-identical result fast vs cycle (parity, like vplat_file).
+- Key files: runtime/linux/syscall.c, runtime/htif_client.h
+- Test: tests/vlinux/test_vlinux_file.sh
+- Depends on: U4
+- State: DONE (2026-07-15) - runtime/linux/syscall.c grown with openat/
+  close/read/pread64/lseek/fstat/fstatat/statx/faccessat/getcwd (all
+  bridged onto the existing HTIF window ops, no host-side/htif_client.h
+  changes needed) + readlinkat(-EINVAL)/getdents64(-ENOSYS) explicit stubs
+  (silent, not the loud ENOSYS-default path -- known/intentional gaps, same
+  tier as U4's rseq) + tests/fixtures/rt_linux_file.c (new fixture) +
+  tests/vlinux/test_vlinux_file.sh. Verified fast AND cycle: a real
+  static-glibc binary's fopen/fwrite/fclose, fopen/fseek/ftell/fread/fclose
+  (ordinary stdio) plus direct syscall() probes for the rest of the set all
+  produce correct, byte-identical results on both legs.
+
+  Two ABI-translation facts this feature stands on, verified against
+  LINUX_TOOLCHAIN's own sysroot headers rather than assumed (asm-generic/
+  unistd.h for every syscall number, asm-generic/stat.h and bits/types/
+  struct_statx.h for the struct layouts, bits/fcntl-linux.h for the O_*
+  bit values):
+  1. **The HTIF host's open/openat handlers speak newlib's (BSD-derived)
+     O_* flag bits, not Linux's.** vplat (newlib) already matched this
+     convention; a static-glibc app's `flags` argument uses the Linux
+     bit layout instead (only the low 2 access-mode bits agree -- O_CREAT
+     is 0x40 in Linux vs 0x200 in newlib, etc.). `linux_to_newlib_open_flags()`
+     translates at the syscall boundary -- exactly a proxy kernel's job,
+     not a workaround. Missing this would silently drop O_CREAT
+     (`andes_ae350.c`'s own comment documents this exact failure mode for
+     the untranslated case) and `fopen(path, "w")` would fail ENOENT.
+  2. **The HTIF host's fstat/fstatat handlers fill exactly two fixed
+     byte offsets in whatever buffer address they are given -- st_mode
+     (u32 @ +4) and st_size (u64 @ +16) -- not a whole-struct bounce**
+     (`andes_ae350.c andesim_store_guest_stat`, matching vsim's mirror).
+     Those offsets happen to line up with newlib's own `struct stat`
+     (which is what the existing vplat client relies on), but Linux's
+     riscv64 `struct stat` puts st_mode at +16 and st_size at +48 --
+     completely different layout. `fill_stat_from_host()`/`sys_statx()`
+     read the host's two fields into a small scratch buffer, then
+     construct a real Linux-shaped `struct stat`/`struct statx` at the
+     correct offsets (zeroing everything not known; `statx`'s `stx_mask`
+     correctly reports only the fields actually filled, per the statx(2)
+     contract -- not a shortcut). Also verified: `faccessat` (syscall 48)
+     takes exactly 3 arguments at the raw-syscall ABI level (dirfd, path,
+     mode) -- no flags, unlike the `faccessat()` library wrapper, which
+     implements `AT_SYMLINK_NOFOLLOW`/`AT_EACCESS` itself in userspace --
+     so the 4th register is never forwarded as flags (would be garbage).
+     `getcwd`'s host op returns a buffer ADDRESS-or-0 (a `char*`-returning
+     convention, shared with vplat's own `_getcwd`), translated to the
+     real `getcwd(2)` syscall's "bytes written including NUL" return by
+     measuring the string vlinux just read back.
+
+  One real bug found and fixed (same class as U3/U4's: fast tolerates it,
+  the cycle-accurate RTL correctly rejects it): **`htif_win_load` is
+  documented (`htif_client.h`) as u64-load-only with an 8-aligned `woff`
+  requirement** (its own implementation dereferences a `uint64_t*` at
+  `WIN_DATA_VA+woff`). The first cut of the mode/size extraction called
+  `htif_win_load(&m, woff+4, 4)` -- a 4-byte read at a non-8-aligned
+  offset. QEMU's byte-addressable MMIO model silently tolerated it and
+  returned the right bytes anyway, so the fast leg passed outright; the
+  cycle-accurate engine's real uncached-device bus logic correctly
+  faulted (load access fault, mcause=5, mtval pointing exactly at the
+  misaligned window address) on the illegal access pattern. Fixed by
+  loading the whole 24-byte aligned block in one compliant call and
+  extracting st_mode/st_size locally via little-endian shifts -- the
+  third occurrence of this exact "fast is permissive, cycle enforces the
+  real hardware contract" pattern in this roadmap (U3: `fence.i`; U4: `gp`
+  reload; U5: window access alignment), worth remembering as a recurring
+  class of bug whenever new HTIF/DMI-adjacent code is added.
+
+  Full regression (14 driver C++ unit tests, 43 tests/andes_sim + tests/vplat
+  scripts, all 4 tests/vlinux/*.sh) stayed green throughout.
+
+## U6. Time syscalls
+
+- Description: clock_gettime(113) for REALTIME + MONOTONIC (both from
+  the window GETTIMEOFDAY host clock; MONOTONIC = delta from a boot
+  baseline so it never goes backward), clock_getres(114),
+  nanosleep(101)/clock_nanosleep(115) -> return 0 immediately (no timer
+  exists; sleeping burns no sim time). This makes `ggml_time_us()` work
+  unpatched. Note: values are HOST wall time - meaningful on the fast
+  leg, meaningless inside a vsim ROI (the cycle figure is the answer
+  there).
+- Input/Output: glibc fixture prints two monotonic stamps with
+  delta >= 0 around a 10M-loop; llama-style timing pattern compiles and
+  runs.
+- Key files: runtime/linux/syscall.c
+- Test: tests/vlinux/test_vlinux_time.sh
+- Depends on: U4
+- State: DONE (2026-07-15) - runtime/linux/syscall.c grown with
+  clock_gettime/clock_getres (both backed by the existing
+  VH_SYS_GETTIMEOFDAY host clock) + nanosleep/clock_nanosleep (immediate
+  0, no timer exists) + tests/fixtures/rt_linux_time.c (new fixture) +
+  tests/vlinux/test_vlinux_time.sh. Verified fast AND cycle.
+
+  CLOCK_MONOTONIC has no dedicated host primitive -- only the wall-clock
+  VH_SYS_GETTIMEOFDAY exists -- so it is synthesized as "elapsed time
+  since this process's first CLOCK_MONOTONIC query" (a lazily-captured
+  static baseline, subtracted on every later call): never goes backward
+  under normal operation, the one guarantee real CLOCK_MONOTONIC callers
+  actually depend on, at the acknowledged cost of losing meaning across a
+  host wall-clock step (not a concern for a single simulator run).
+
+  One test-design correction, not a syscall bug: the Input/Output line's
+  "10M-loop" figure was written with the fast (QEMU, MHz-speed) leg in
+  mind. The first cycle-leg run produced no output at all within the
+  600s timeout -- not a crash, a hang-until-killed -- because an
+  unoptimized (-O0) 10-million-iteration loop on the ~8.7 kHz
+  cycle-accurate engine costs many minutes on top of the ~7min
+  glibc-startup baseline U4/U5 already measured. The fixture's actual
+  contract is "monotonic delta >= 0" (delta==0 also passes), a property
+  fully independent of loop size, so the loop was shrunk to 10K
+  iterations (~tens of seconds on cycle) with no loss of verification
+  power -- documented here so a future fixture doesn't repeat the same
+  "sized for fast, times out on cycle" mistake in a workload that runs on
+  both legs, a fourth reminder in the same spirit as the fast/cycle
+  DIVERGENCE class of bugs (U3/U4/U5), though this one is a test-harness
+  sizing mistake, not a hardware-contract violation.
+
+  Full regression (14 driver C++ unit tests, 43 tests/andes_sim + tests/vplat
+  scripts, all 5 tests/vlinux/*.sh) stayed green throughout.
+
+## U7. File-backed private mmap (llama.cpp default load path)
+
+- Description: mmap(fd, MAP_PRIVATE, PROT_READ...) = allocate from the
+  mmap arena + HTIF-read the range (private read-only copy is
+  semantically correct for GGUF loading). Region table for munmap /
+  partial unmap (llama unmaps unused tail ranges); mremap -> -ENOMEM.
+  Arena exhaustion -> -ENOMEM (llama then reports the real reason
+  instead of corrupting). With this, stock llama.cpp default
+  `use_mmap=true` works; `--no-mmap` also works via U5 read path.
+- Input/Output: glibc fixture mmaps a 64 MB host file, checksums,
+  munmaps; same checksum as host `sha256sum` prefix.
+- Key files: runtime/linux/mm.c
+- Test: tests/vlinux/test_vlinux_mmap.sh
+- Depends on: U5
+- State: DONE (2026-07-15) - runtime/linux/mm.{h,c} grown with the
+  file-backed MAP_PRIVATE branch of sys_mmap (allocate from the arena,
+  htif_pread the [offset,offset+length) range into it -- a private owned
+  copy, exactly the MAP_PRIVATE contract) + sys_mremap (always -ENOMEM) +
+  tests/fixtures/rt_linux_mmap.c (new fixture) +
+  tests/vlinux/test_vlinux_mmap.sh. Verified fast AND cycle: mmap,
+  checksum, partial munmap of the tail (the exact llama.cpp pattern),
+  re-checksum the remainder (intact), full munmap, then confirm mremap is
+  refused rather than corrupting anything.
+
+  One structural (Tidy-First) step before the behavioral change: the
+  "seek to offset, read, restore original offset" logic already written
+  for U5's `pread64` was extracted out of syscall.c into a new shared
+  primitive, `htif_pread()` in runtime/htif_client.{h,c} -- both
+  `sys_pread64` and the new file-backed mmap path need the exact same
+  positional-read behavior, and htif_client.h is the correct shared
+  layer for it (parallel to the existing `htif_read`/`htif_write`), not
+  something to duplicate a second time or reach across files for a
+  `static` function. `sys_pread64` itself shrank to a one-line call.
+
+  `sys_munmap` needed NO change: real POSIX munmap(2) already tolerates
+  unmapping any range, mapped or not ("it is not an error if the
+  indicated range does not contain any mapped pages"), so the existing
+  always-succeeds no-op (in place since U4, originally written for the
+  anonymous-mmap case) already answers llama.cpp's partial-tail-unmap
+  pattern correctly with zero new code -- a "region table" turned out to
+  be unneeded speculative complexity once POSIX's own tolerance for this
+  exact case was checked, not a shortcut (real Linux's own munmap makes
+  the same simplification, in effect, for any address a caller no longer
+  cares about tracking precisely).
+
+  Non-bug lesson, same class as U6's: the first cycle-leg run of the
+  fixture (originally sized at 256 KB, ~258 window round trips) hung
+  past a 600s timeout with zero output -- not a crash. Rather than guess,
+  ran a direct 4 KB diagnostic first: it completed in 435s, matching the
+  ~7min glibc-startup baseline U4/U5/U6 already measured almost exactly,
+  confirming the mmap logic itself was correct and this was purely a
+  data-size/timeout budget question, not a bug. Settled on 16 KB (~9
+  round trips each way -- still meaningfully multi-chunk, not a single
+  transfer) plus a 900s cycle timeout for margin. Third occurrence of
+  "a fixture's data size/loop count must be chosen for the SLOWER leg
+  it also runs on, not just the fast leg it was easiest to reason about
+  first" (U6 was the first) -- confirmed by direct measurement each time,
+  not assumed.
+
+  Full regression (14 driver C++ unit tests, 43 tests/andes_sim +
+  tests/vplat scripts, all 6 tests/vlinux/*.sh) stayed green throughout.
+
+## U8. llama.cpp acceptance on the fast leg
+
+- Description: document + script the static build and prove end-to-end
+  text generation. Build recipe (docs/USER_GUIDE.md new section):
+  riscv64-linux-gcc/g++, `-static`, `BUILD_SHARED_LIBS=OFF`,
+  `LLAMA_BUILD_COMMON=ON` is fine now (glibc has everything),
+  `GGML_OPENMP=OFF`, `GGML_RV_ZFH=OFF GGML_RV_ZVFH=OFF
+  GGML_CPU_REPACK=OFF`, `-mext-zvlsseg`, `GGML_NATIVE=OFF` - a fresh
+  static build; the existing `/home/nick/work/llama.cpp/build-rv64*`
+  dirs are dynamic and wrong-feature-set for this (see verified facts),
+  not reusable as-is. Run: `./andesim run --mode fast --runtime linux
+  llama-completion -- -m Bonsai-4B-Q1_0.gguf -no-cnv --prompt "The capital of France is" -n 32 -t 1`.
+- Input/Output: generated completion text printed to stdout, exit 0,
+  with `--mem-size` sized to the 572 MB model + 300 MB headroom (1G
+  covers it, same default U2 sets).
+- Key files: docs/USER_GUIDE.md, tests/vlinux/test_vlinux_llama_smoke.sh
+  (env-gated: needs LINUX_TOOLCHAIN + Bonsai-4B-Q1_0.gguf; manual-tier
+  like tests/andes_sim/*)
+- Depends on: U6, U7
+- State: DONE (2026-07-15) - a real static-glibc `llama-completion`
+  correctly generates coherent text from Bonsai-4B-Q1_0.gguf under
+  `--runtime linux` on the fast leg, verified end to end at both `-n 4`
+  and the roadmap's own `-n 32` example: prompted "The capital of France
+  is", the full `-n 32` output is "The capital of France is Paris. Paris
+  is the second-largest city in France, with a population of over 1.8
+  million. Paris is located in the Île-de-France" (Q1_0's extreme 1-bit
+  quantization explains "second-largest" -- a model-quality artifact, not
+  an andesim correctness issue; the real GGUF load, tokenization, RVV
+  matmuls, and sampling all round-tripped correctly).
+  docs/USER_GUIDE.md section 11 (new) + tests/fixtures build recipe +
+  tests/vlinux/test_vlinux_llama_smoke.sh (new, manual-tier) +
+  config.env(.example) gained `LLAMA_CPP_DIR`.
+
+  **A real, un-anticipated prerequisite: argv threading.** U2/U3
+  deliberately deferred real multi-arg argv ("-- -m model.gguf -t 1")
+  until "whenever U8 actually needs it" - U8 is that point, since
+  llama-completion needs its real CLI flags. Implemented in this session
+  (not a separate roadmap feature - direct part of U8's own scope):
+  - `runtime/linux/manifest.h` v2: `argv_extra_count`/`argv_extra_len`/
+    `argv_extra_buf[4096]` (a flat NUL-separated buffer + count, not one
+    fixed-size slot per arg - real invocations have args of very
+    different lengths). Up to 64 extra args / 4096 bytes.
+  - `driver/manifest.{hpp,cpp}`: `build_manifest_blob`/`stage_linux_runtime`
+    gained an `extra_argv` parameter; overflow (too many args, or bytes
+    that don't fit) is an error, same no-silent-truncation discipline as
+    the existing app_path overflow case.
+  - `driver/cmd_run.cpp`: the U2-era "warn and drop `-- args`" block is
+    gone - `cli.passthrough` now threads straight into
+    `stage_linux_runtime`. QEMU itself still never sees these args
+    (`cli2.passthrough.clear()` stays, unconditionally) - they are app
+    argv, not engine flags.
+  - `runtime/linux/stack.{h,c}`: `build_initial_stack` gained
+    `extra_argv_buf`/`extra_argv_count` parameters; pushes each extra
+    arg's string (capturing its pointer, same as app_path/argv[0]),
+    then pushes the argv pointer array in REVERSE order (argv[argc-1]
+    first, argv[0] last, landing right above argc) so a forward scan
+    from the final sp reads argc, argv[0..N-1], NULL correctly.
+  - **The one genuinely delicate piece**: the fixed auxv/envp/argv/argc
+    block's total size is a multiple of 16 (the RISC-V psABI's required
+    stack alignment at a function entry) only for ODD argc - true only
+    by COINCIDENCE for U1-U7's argc==1. A real invocation has an even
+    argc (llama-completion's real flags land on argc==10, for instance).
+    Fixed by computing the block size from the REAL argc and inserting
+    an 8-byte pad word whenever it comes out 8-mod-16, so the block's
+    END (== final sp) is always 16-aligned regardless of argc parity.
+    Verified DIRECTLY on both fast AND cycle with an even argc (not just
+    trusting the math): test_vlinux_loader.sh now passes 3 extra args
+    (argc==4) instead of U3's original 2, specifically to exercise the
+    new padding branch, not just re-test the old argc==1 coincidence -
+    matches the by-now-established pattern of never trusting an
+    alignment-sensitive change on fast alone.
+  - `tests/andes_sim/test_andes_sim_runtime_linux.sh` (U2's own test)
+    needed updating: its old assertion ("should warn argv is not
+    threaded yet") became a real regression once this landed - flipped
+    to assert the OPPOSITE (no such warning) plus that the staged
+    manifest's `.manifest` section actually contains the extra argv
+    bytes (readelf -p grep for `x.gguf`).
+
+  **New syscalls, all discovered by running the REAL llama-completion
+  binary against `--help` then the real model** (the same closed-loop
+  "run it, read the next ENOSYS, fix it" process that worked for U4's
+  riscv_hwprobe): `futex`(98), `sysinfo`(179), `fadvise64`(223),
+  `madvise`(233).
+  - **`futex`**: even at `-t 1`, glibc's OWN internal locking (malloc
+    arena locks, static-init guards, ...) uses futex-based mutexes
+    pervasively, not just for explicit application threading - this was
+    NOT anticipated by the roadmap's own "-t 1 verified: uncontended
+    glibc mutexes never reach futex" note, which turned out to be true
+    only for a much simpler prior test, not real glibc/libstdc++
+    startup machinery. Answered `0` unconditionally for every op:
+    FUTEX_WAIT "already available" (a spurious wake, which the futex(2)
+    contract explicitly requires callers to tolerate - spec-legal, not
+    a shortcut), FUTEX_WAKE(_BITSET) "0 waiters woken" (there never are
+    any), FUTEX_LOCK_PI/TRYLOCK_PI/UNLOCK_PI "success" (0 is their
+    success code too) - all correct because a single-hart, single-thread
+    system can never have real contention to get wrong.
+  - **`sysinfo`/`fadvise64`/`madvise`**: straightforward. sysinfo reports
+    `totalram`=`freeram`=mm.c's own manifest-supplied RAM size (an
+    optimistic overestimate - no cheap way to account for what the two
+    arenas have already handed out, and callers use this for a rough
+    sizing heuristic, not a correctness-critical value) and zero/absent
+    for everything with no meaning on this target (load averages, swap,
+    shared/buffer/highmem, process count). fadvise64/madvise are pure
+    access-pattern hints with no readahead/cache policy to tune, so both
+    are accepted no-ops - the same "HINT is safe as a no-op" philosophy
+    the ROI markers themselves rely on.
+
+  **A real bug, found by running the real GGUF loader, not assumed from
+  the roadmap's own text**: `sys_mmap`'s file-backed path (U7) only
+  accepted `MAP_PRIVATE`, matching the roadmap's own U7 description
+  ("mmap(fd, MAP_PRIVATE, PROT_READ...)"). llama.cpp's ACTUAL mmap call
+  (`src/llama-mmap.cpp`) uses `MAP_SHARED` - the roadmap's own
+  description was a guess that turned out wrong, caught immediately by
+  running the real binary (`mmap failed: Function not implemented`), not
+  discovered by re-reading the roadmap text more carefully. Fixed by
+  accepting `MAP_SHARED` whenever `PROT_WRITE` is not requested: for a
+  read-only mapping there is no OBSERVABLE difference between
+  `MAP_PRIVATE` and `MAP_SHARED` (the distinction is entirely about
+  write visibility, which never applies to a read-only mapping) - a
+  genuinely correct fix, not a permissive relaxation. A writable
+  `MAP_SHARED` request is still refused (`-ENOSYS`; no write-back path
+  exists here).
+
+  **A cross-repo change, not a vlinux one: llama.cpp's async logger
+  needed a small upstream patch.** llama.cpp's own status logger
+  (`common/log.cpp`) unconditionally spawns a background `std::thread`
+  on the FIRST log call, via `common_log_main()`'s lazily-constructed
+  singleton - and the generated completion text ITSELF is printed
+  through this same logger (`LOG("%s", token_str.c_str())` in
+  `tools/completion/completion.cpp`), not a separate direct-stdout path,
+  so this could not be worked around by simply accepting lost log output.
+  Since `clone`/`clone3` are `ENOSYS` here (real threading is the
+  roadmap's own deliberate non-goal - implementing it would mean a real
+  cooperative context-switching scheduler, a vastly disproportionate
+  scope expansion for one feature), `std::thread`'s constructor throws
+  `std::system_error`, UNCAUGHT, crashing the whole process before
+  `main()`'s own code ever runs (confirmed via `--help` alone, before any
+  model/argument work). Root-caused as a genuine llama.cpp ROBUSTNESS
+  GAP, not a vlinux issue: a background-logging PERFORMANCE OPTIMIZATION
+  should never be able to crash an otherwise-working program on ANY
+  platform where thread creation can fail, not just this one. Fixed with
+  a small, targeted patch to `common/log.cpp` (full diff in
+  docs/USER_GUIDE.md section 11): catch the `std::thread` construction
+  failure in `resume()`, set a `synchronous` flag, and have `add()`
+  print immediately instead of queueing for a worker that will never
+  run (`pause()` also needed a matching guard, since it unconditionally
+  `thrd.join()`s otherwise). This is llama.cpp SOURCE, not vlinux -
+  applied directly to the `/home/nick/work/llama.cpp` checkout (untracked
+  by this repo); anyone rebuilding llama-completion from a fresh
+  checkout needs to re-apply it (documented in USER_GUIDE.md, not just
+  here).
+
+  **Memory sizing: the roadmap's own "1G covers it" estimate was wrong,
+  found by direct measurement.** The model's file-backed mmap (572 MB)
+  plus its KV cache buffer (576 MB at `-c 512`, llama.cpp's
+  `common_fit_params` computes this from context size) together exceed
+  the `--runtime linux` default of 1G - confirmed by an actual failure
+  (`ggml_aligned_malloc: insufficient memory`), not assumed. `--mem-size
+  2G` plus an explicit `-c 512` (bounding the KV cache; the model's own
+  default context, 32768, would need much more memory for no benefit on
+  a short prompt) is the verified-working configuration.
+
+  Real generation quality/performance data point (this host, `ax45mpv_premium`-
+  synced QEMU, functional not cycle-accurate): model load ~93s, prompt
+  eval ~165s (5 tokens), generation ~36.6s/token. `-n 32` takes on the
+  order of 20+ minutes total - QEMU's functional RVV emulation of a real
+  4B-parameter model's matrix math is slow by design (fast mode trades
+  throughput for cycle-independent functional correctness); this is
+  exactly why U9's hybrid ROI measures ONE kernel iteration, not a whole
+  token, let alone 32.
+
+  Same documented, non-blocking gap as every U4+ glibc fixture: `exit()`
+  may crash in its handler-list walk AFTER all real work (generation,
+  perf stats) is already complete and printed.
+  `test_vlinux_llama_smoke.sh` accepts either outcome, matching every
+  other U4+ test's acceptance pattern.
+
+  Full regression (14 driver C++ unit tests including the manifest
+  extra-argv encoding tests, 43 tests/andes_sim + tests/vplat scripts
+  with test_andes_sim_runtime_linux.sh's assertion flipped for the new
+  argv-threading contract, all 6 tests/vlinux/*.sh) stayed green
+  throughout; test_vlinux_llama_smoke.sh itself is manual-tier (needs
+  LINUX_TOOLCHAIN + a pre-built llama-completion + the GGUF model, none
+  of which the automated sweep provides) but was run manually to
+  completion during this session, twice (`-n 4` and `-n 32`).
+
+## U9. Hybrid: one-kernel-iteration ROI
+
+- Description: the actual goal. Two supported ways to delimit ONE
+  iteration: (a) marker build - a 5-line llama.cpp patch snippet
+  (documented, kept in docs/) adds `<andesim/ROI.h>` markers around the
+  target op guarded by an iteration counter (`if (++n == K)`), markers
+  are HINT NOPs so the same binary still runs everywhere; (b) no-source
+  route - `andesim profile` finds the hot loop, then `--trigger pc
+  --pc-start/--pc-end` with symbols resolved from the app ELF (U2).
+  Results print INSIDE the ROI (nothing after ROI-end executes - the
+  existing contract). Expectation note for the guide: one Bonsai-4B-shape
+  (2560 embed) q1_0 matvec is smaller than the original 27B estimate
+  (~10-100 M cycles there) -> likely faster than minutes-to-~1h at
+  vsim's 9-50 kHz, confirm actual figure once measured; a full token
+  would still be far too slow - that is why we measure one iteration.
+- Input/Output: hybrid run of a marker'd glibc matvec fixture (and then
+  llama-completion with the counter patch) prints in-ROI checksum +
+  `[andesim] N cycles`, N stable across two runs (deterministic single hart).
+- Key files: docs/USER_GUIDE.md, docs/llama_roi_howto.md (new, with the
+  counter-marker snippet), tests/vlinux/test_vlinux_hybrid_roi.sh
+- Depends on: U4 (fixture), U8 (llama-completion variant)
+- State: DONE (2026-07-16) - the roadmap's primary goal is met: a real
+  static-glibc `llama-completion` runs `./andesim run --mode hybrid
+  --trigger marker --runtime linux`, and the cycle-accurate vsim leg
+  measures ONE real transformer matmul. Verified deterministic across two
+  independent runs: **6528953 cycles**, byte-identical exit code and
+  cycle figure both times.
+
+  **Core mechanism (small fixture first, per the roadmap's own two-step
+  Input/Output).** `tests/fixtures/rt_linux_matvec.c` (new, N=16 scalar
+  matvec) + `tests/vlinux/test_vlinux_hybrid_roi.sh`: 13737 cycles, stable
+  across two runs. This alone proves hybrid+`--runtime linux`+marker-ROI
+  end to end and is wired into the automated sweep (unlike the
+  llama-completion variant below, which stays manual-tier like every
+  other U8+ llama fixture: needs LINUX_TOOLCHAIN + the GGUF model).
+
+  **The mechanism gap this uncovered**: vsim's `CsrTrigger` finds markers
+  by STATICALLY pre-scanning its own boot ELF's PT_LOAD+PF_X segments at
+  configure time (LIEF-based) - it never sees markers physically inside a
+  DYNAMICALLY LOADED app under `--runtime linux` (the app is loaded by
+  vlinux's own loader.c at hybrid resume time, not present as static
+  content in vlinux.elf, vsim's own positional arg). QEMU's plugin has no
+  such limitation (it watches the executed instruction stream, content-
+  agnostic). Fixed entirely driver-side, per the roadmap's explicit
+  no-vsim-source-changes constraint: `driver/elf_syms.{hpp,cpp}` gained
+  `find_roi_markers()` (mirrors `CsrTrigger::scan_buffer`'s exact RVC-aware
+  scan, via the ALREADY-SHARED `include/hybrid/insn_match.h` so there is
+  no reimplementation drift), and `cmd_run.cpp`'s `run_hybrid()` uses it to
+  resolve the app ELF's own exit marker to a PC, then converts vsim's leg
+  from marker-trigger to `--trigger pc`'s existing `--hybrid-exit-pc` flag
+  - an EXISTING vsim CLI flag, reused not added. QEMU's leg stays
+  marker-triggered (its plugin has no gap to work around). Zero vsim
+  source changes, as required.
+
+  **`--step-timeout-ms` (new CLI flag, a real gap this feature exposed):**
+  `PlanOptions.timeout_ms` (`driver/run_plan.hpp`) was hardcoded to 90000
+  with no override - fine for every fixture-scale ROI to date, but a real
+  transformer matmul on the ~8.6 kHz cycle-accurate leg legitimately needs
+  minutes, not seconds. Added `--step-timeout-ms <ms>` (`cli.hpp`/`cli.cpp`
+  table-driven parser, same pattern as `--mem-size`), threaded into
+  `PlanOptions.timeout_ms` in `cmd_run.cpp` with the same string-parse-and-
+  `fail()` convention as the existing numeric flags. RED test
+  (`driver/cli_test.cpp`) written first (compile failure: `Cli` has no
+  `step_timeout_ms` member) before adding the field: TDD gate satisfied
+  for the parsing layer; the end-to-end plumbing is covered by
+  `tests/andes_sim/test_andes_sim_step_timeout.sh` (new: default-timeout
+  baseline, an absurd 1ms timeout failing with the right message, a
+  generous explicit timeout still succeeding, and a non-positive-integer
+  value rejected cleanly).
+
+  **The real llama-completion run: four distinct genuine illegal-
+  instruction sites, all the SAME root-cause FAMILY as U3/U4/U5's
+  "fast-permissive/cycle-enforces" pattern, now at the ELEN/vector-unit
+  level instead of the memory/CSR level** - QEMU's hybrid-leg CPU model is
+  engine-synced (`elen=32` from the accurate `-readconfig`, unlike fast
+  mode's own hardcoded, unconstrained `-cpu andes-ax45mpv,vlen=512`
+  string), so QEMU1 itself now enforces the real ELEN=32/vector-FPU limit
+  that fast mode's own cpu string never did - every one of these four was
+  first caught as an illegal-instruction trap (mcause=2) on QEMU1, not
+  vsim, confirmed via manual `mepc`/`mtval` disassembly at the exact fault
+  PC each time:
+  1. **`ggml_vec_dot_f16`/`ggml_vec_dot_bf16`** (`ggml/src/ggml-cpu/vec.cpp`,
+     llama.cpp repo): each has a `ggml_float` (double) scalar-accumulated
+     fallback loop, taken because this build has neither `__riscv_zvfh`
+     nor `__riscv_zvfbfwma` - GCC's auto-vectorizer lowers that plain
+     scalar reduction into a widening e64 vector reduce anyway. Fixed with
+     `__attribute__((target("arch=rv64gc")))` on just these two functions
+     (confirmed empirically that GCC's RISC-V port honors this - unlike
+     the `optimize` function attribute and `#pragma GCC push_options`,
+     both tried and confirmed NOT to suppress the vectorization, objdump-
+     verified either way): forces scalar codegen for exactly the fallback
+     path, leaving the real (unreached, in this build) RVV intrinsic path
+     above it untouched.
+  2. **`ggml_vec_cvar_f32`/`ggml_vec_soft_max_f32`** (same file): unlike
+     site 1, these use EXPLICIT, unconditional RVV intrinsics - a
+     `vfloat64m1_t` accumulator via `vfwredusum_vs_f32m2_f64m1` (widening
+     reduce, f32 lanes to an f64 total). Every OTHER architecture's branch
+     in the same two functions (AVX512/AVX2/SSE2/NEON) does the opposite:
+     reduce in NATIVE precision (f32) with a plain SIMD op, then widen
+     ONE scalar partial-sum per chunk to `ggml_float` in ordinary C. The
+     RISC-V branch was the sole outlier, and the ONLY reason it needs e64
+     at all - a real algorithmic inconsistency versus its own siblings in
+     the same file, not a hardware requirement to route around. Fixed by
+     rewriting both to match: `vfredusum_vs_f32m2_f32m1` (non-widening)
+     inside the loop, `sum += (ggml_float) partial` in scalar C - zero e64,
+     same numerics as every non-RISC-V build already computes.
+  3. **`quantize_row_q8_0`/`quantize_row_q8_1`** (`ggml/src/ggml-cpu/
+     arch/riscv/quants.c`): hardcoded `vfloat32m8_t`/LMUL=8 for
+     `__riscv_vfabs_v_f32m8`+`vfredmax`, unconditionally (no smaller-LMUL
+     variant, unlike the vl1024/vl512/vl256/vl128-suffixed dispatch every
+     OTHER quant kernel in this file has). `ax45mpv_premium`'s vector FPU
+     datapath does not extend to LMUL=8 for floating-point ops (`mtval`
+     decoded to exactly this `vfabs.v` instruction's own encoding;
+     correlates with the engine's `isa-vl4` config bit in the accurately-
+     synced `qemu.cfg`, though QEMU itself does not enforce it - only
+     vsim's RTL does, hence this one surfaced on vsim, not QEMU1, unlike
+     sites 1/2/4). Confirmed the INTEGER path (a plain `vle32.v` load at
+     the same LMUL=8) executes fine immediately before the FP op faults -
+     the datapath limit is FP-specific, not a blanket LMUL cap. Per
+     TDD.md's "remove and rewrite, don't patch": both functions' bodies
+     now call their existing, portable `_ref` scalar implementations
+     unconditionally (`ggml-quants.c`, already used as the non-RVV
+     fallback everywhere else) - a real, minimal source change, not a
+     build-flag suppression (the vector branch here is the ONLY
+     implementation, unlike site 1, so no compiler flag can select an
+     already-existing alternative). This is activation quantization,
+     called once per token row before the (still fully vectorized,
+     unaffected) `ggml_vec_dot_q1_0_q8_0` dot-product loop reuses it - a
+     trivial fraction of total matmul cost, confirmed by the fact that the
+     eventual successful run's cycle count matches the dot-product-loop-
+     dominated estimate, not a quantization-dominated one.
+  4. **A stale ccache / incomplete incremental rebuild, not a code bug**:
+     after fixing site 3 in `ggml-cpu.c`'s neighborhood, a rebuild's
+     `compile_commands.json` showed the correct constrained `-march` for
+     `ggml-cpu.c.o` yet the crash (this time inside `ggml_table_f32_f16`'s
+     region - later found to actually be `ggml_vec_dot_f16`, site 1,
+     misattributed at the time from a stale disassembly) persisted
+     identically. A `find -delete` + rebuild did not reproduce the object
+     file at all in the build log; only an explicit `rm -f` of the exact
+     `.o` path followed by a fresh build actually recompiled it. Recorded
+     here as a standalone gotcha since it cost real debugging time before
+     being recognized as a build-cache artifact rather than a fix that
+     "didn't work."
+
+  **The cycle-accurate leg's own diagnostic gap, found and fixed while
+  root-causing site 3 (which only manifests on vsim, not QEMU1):**
+  `runtime/handler.c`'s `exception_handler` (shared by vplat AND vlinux,
+  every trap on every engine) calls `fprintf(stderr, ...)` then
+  `_exit((int) mcause)` - `_exit()` (unlike `exit()`) never flushes stdio,
+  so on any path where stderr is not unbuffered (confirmed: the vlinux
+  syscall-backed stdio path is fully buffered, unlike whatever made this
+  visible on QEMU1's crashes earlier in this same investigation) the
+  entire diagnostic is silently lost, every time, on every future vlinux
+  trap - not specific to this session's debugging. Fixed with an
+  `fflush(stderr)` before `_exit()` (a real, permanent correctness fix,
+  not a debugging aid). A second, deliberately-kept addition: a
+  `raw_print_hex()` helper that writes `mcause`/`mepc`/`mtval` straight to
+  the UART MMIO register via the existing `htif_uart_putc()` (no stdio,
+  no malloc, no buffering) BEFORE attempting the `fprintf` path - cheap
+  insurance for the next trap whose corrupted state might take out
+  `fprintf`/`vfprintf` themselves. (Separately, and not fixed here since
+  it is orthogonal to the guest-side bug: the `andesim` driver's own
+  capture of a subprocess's stdout was observed to silently drop vsim's
+  raw output in at least one investigation path; invoking `sim_ax45mpv_premium`
+  directly, bypassing the driver, is what actually surfaced the guest's
+  UART bytes. Worth a future driver-side look if it recurs.)
+
+  **ROI target selection - the roadmap's own "confirm actual figure once
+  measured" note, taken literally.** The roadmap's initial pick (K=50, per
+  earlier gdb-based node counting: 253 mul_mat calls per token, 36 layers
+  x 7 matmuls + 1 lm_head; K=50 lands on layer 7's Q projection,
+  2560->4096) is real, correctly-executing, e64-free code by the time
+  sites 1-4 were fixed - but too large a computation for the ~8.6 kHz
+  cycle-accurate leg to finish inside even a 900000ms (15 min)
+  `--step-timeout-ms` budget. Rather than keep raising the timeout
+  blindly, dumped every mul_mat call's operand shapes for one real forward
+  pass on a NATIVE x86 build (`build-host/`, a throwaway
+  `ANDESIM_DUMP_MUL_MAT_SIZES`-gated `fprintf` in `ggml-cpu.c`, reverted
+  after use - fast, no simulation needed) to rank relative cost:
+  Q/O-projection and FFN gate/up/down are all 2560x4096..2560x9728 (the
+  FFN matmuls are ~2.4x LARGER than Q, not smaller); K/V-projection
+  (2560x1024, grouped-query attention's narrower KV head count) is the
+  smallest matmul shape anywhere in this architecture, ~4x fewer MACs than
+  Q. Retargeted to K=51 (layer 7's V projection, the very next node after
+  the original pick) - `ANDESIM_ROI_MUL_MAT_K` is a build-time `-D`, no
+  source change, just a `cmake -B build-rv64-static` reconfigure. Verified
+  the resulting binary actually recompiled with the new value via
+  `compile_commands.json` (not just trusted the reconfigure, per the site-4
+  gotcha above). Completed comfortably inside the 900000ms budget both
+  times: **6528953 cycles**.
+
+  Full regression (14 driver C++ unit tests including the new
+  `--step-timeout-ms` cases, 44 tests/andes_sim + tests/vplat scripts
+  including the new `test_andes_sim_step_timeout.sh`, all 7
+  tests/vlinux/*.sh including `test_vlinux_hybrid_roi.sh`) stayed green
+  throughout; the real llama-completion hybrid run itself is manual-tier
+  like every other U8+ llama fixture, run to completion twice this session
+  with an identical cycle count both times.
+
+  **Addendum (2026-07-16, same session): N consecutive iterations +
+  pipeline dump.** Two follow-on asks, both verified: (1) the ROI marker
+  now takes an optional `ANDESIM_ROI_MUL_MAT_N` build-time `-D` alongside
+  `ANDESIM_ROI_MUL_MAT_K` (default 1, exactly the original single-node
+  behavior) so it can bracket a short run of consecutive matmuls instead
+  of just one -- confirmed K=51..52 (V then K projection): 13040043
+  cycles, ~2x the single-iteration figure. (2) `--kanata` (pipeline
+  trace dump, USER_GUIDE.md 5.8) had never actually been exercised
+  against a real vsim binary in hybrid mode before this: doing so
+  surfaced a real, previously-undetected bug (zero automated coverage --
+  `--kanata-roi`, a flag that does not exist anywhere in vsim, was
+  unconditionally appended by `driver/hybrid.cpp`'s `vsim_extra_args()`,
+  so every hybrid `--kanata` run failed immediately). Fixed by removing
+  the nonexistent flag (vsim's hybrid leg only ever executes the ROI in
+  the first place, so plain `--kanata` already covers exactly that
+  window); `driver/hybrid_test.cpp`'s own assertions were asserting the
+  broken behavior and needed correcting alongside the fix. Confirmed
+  against the real llama-completion K=51 build: a 651 MB, well-formed
+  Kanata trace. Full recipe and the bug's root cause: `docs/llama_roi_howto.md`
+  sections 6-7. Driver regression (14/14) reconfirmed green after the fix.
+
+## U10. Platform track: guest RAM > 2 GiB (full Bonsai-27B) [stretch, off critical path]
+
+Rescoped 2026-07-29 after measuring the real blockers. The original U10 text
+said three things that are now wrong or answered:
+- (1) "qemu_andesim DRAM window (currently Cannot model more than 2GB)" is
+  **DONE upstream**. `hw/riscv/andes_ae350.c:73,131,132` now defines
+  `DRAM` 0x0 +2 GiB, `DRAM_ALIAS` 0x8_00000000 +2 GiB (aliases DRAM), and
+  `DRAM_EXT` 0x8_80000000 +14 GiB; the error at :1814-1823 reads "Cannot
+  model more than 16GB RAM". :974-981 auto-enables the alias when
+  `ram_size > DRAM.size` precisely so ext RAM is reachable **contiguously
+  from 0x8_00000000**, and :1837-1850 maps ONE `machine->ram` backend across
+  both windows via aliases -- so hybrid's `memory-backend-file` already
+  spans them. Nothing to do in QEMU.
+- (2) "is the vsim testbench memory parameterizable?" -> **yes, in hybrid
+  mode it already is.** `vsim_andesim/src/main.cpp:458-465`: when
+  `--shared-mem-path` is given, the RAM region is exactly
+  `{shared_mem_base, shared_mem_base + shared_mem_size - 1}` with no
+  hardcoded 2 GiB. `SimpleMemory<BusWidth>` (src/platform/simple_memory.hpp:14-18)
+  takes 32 = bus width in BYTES, not address bits; addresses are u64
+  throughout. So the vsim side likely needs NO code change -- U10a verifies.
+- (3) "the vlinux arena bounds (already mem_size-driven)" is **the actual
+  bug, not a non-issue.** mem_size-driven means mem_size is used as an
+  ABSOLUTE ADDRESS, which is only correct while RAM base == 0.
+
+MEASURED 2026-07-29 (`--mode fast --runtime linux --mem-size 3G`, Bonsai-8B):
+the guest dies **before the app's first instruction** -- no `llama backend
+init`, not even the startup `vlinux: ENOSYS 258/435/220`. One complete
+`mcause=0x2 mepc=0x0 mtval=0x0`, then 1,196,874 truncated `mcause=0x`
+fragments (11 MB) because the trap handler re-faults on the same broken
+stack. Cause: stack.c puts the initial stack at `mem_size - 8 MiB` =
+0xBF80_0000, which is unmapped hole in AE350 (RAM ends at 0x7FFF_FFFF, ext
+starts at 0x8_80000000). QEMU swallows the stores, the first return reads
+back 0, the hart jumps to 0. So today's fast-mode behaviour for >2 GiB is a
+CPU-burning trap storm, not an error -- see U10b.
+
+Target: `--mem-size 6G` in both fast and hybrid, Bonsai-27B-Q1_0 (3.8 GB)
+resident with NO `--no-mmap` and no layer slicing (obsoletes U11's need).
+8 GiB is enough for 27B; the ceiling the map allows is 16 GiB.
+
+### U10a. Probe: does the RTL decode 0x8_00000000? [DONE 2026-07-29 -- answer: NO]
+
+- Description: throwaway investigation, NOT code -- one command, read the
+  answer, write it down here. (Avoid the word "spike" for this in a RISC-V
+  repo: it reads as the Spike ISA simulator, which is not involved.)
+- RESULT: **the high window is NOT reachable on any engine we use.** Two
+  layers disagree and only one of them is the truth:
+  - `--print-memmap` HAPPILY accepts any base/size, which is MISLEADING --
+    it dumps the SystemC/TLM `interconnect` region table, a C++ map, not an
+    RTL capability. Measured: `--shared-mem-base 0x800000000
+    --shared-mem-size 4G` -> `main_memory.tsck: [0x800000000-0x8ffffffff]`;
+    at 16G -> `[0x800000000-0xbffffffff]`. Both "pass". Do not trust this
+    output alone for an addressability question.
+  - The engine config tells the truth:
+    `vsim_andesim/data/configs/ax46mpv_fpga_l3.cfg:291
+    set o(NDS_BIU_ADDR_WIDTH) {32}` (and :295 `NDS_L3C_ADDR_WIDTH {32}`).
+    The core's bus interface drives 32-bit physical addresses, so
+    0x8_00000000 (36 bits) can never be issued no matter what the TLM map
+    says. `SimpleMemory::base_for()` subtracts the region base to index the
+    mmap, so a 32-bit address against a 0x8_00000000 region matches nothing.
+- It IS a per-elaboration knob, not an architectural limit: same repo,
+  `ax45mp.cfg` = 38, `ax65.cfg` / `ax66_makatau.cfg` / `ax66_mp2.cfg` = 39.
+  Every ax45mpv_premium* and ax46mpv* variant we have is 32.
+- Second ceiling, independent of the BIU: even using the full 32-bit space,
+  the vsim platform puts HVM at 0x9000_0000, slv_bridge at 0xa000_0000,
+  PLDM at 0xe680_0000, smu/uart at 0xf01-0xf03. RAM can therefore only grow
+  from 0x8000_0000 to 0x8fff_ffff = **+256 MiB (2.25 GiB total)** before
+  colliding. Enough to make 8B work WITH mmap (it missed by ~1 MiB: 1099
+  mapping + 931 repack + ~10 app + 8 stack reserve vs a 2047 MiB cap), never
+  enough for 27B.
+- CONSEQUENCE: U10d/U10e as originally written (rebase guest RAM to
+  0x8_00000000) are DEAD for hybrid. U10 splits into two tracks with very
+  different costs -- see U10-FAST and U10-HYBRID below.
+- Key files: vsim_andesim/src/main.cpp, data/configs/*.cfg (read only)
+- State: DONE
+
+### U10b. Fix the missing fast-mode --mem-size guard [independent bug]
+
+- Description: standalone bug, valuable even if U10 never lands. The hybrid
+  path caps `--mem-size` at `driver/cmd_run.cpp:514`; the fast path
+  (cmd_run.cpp:246-252, `qemu_m_args`) only validates whole-MiB and has NO
+  ceiling, which is how the 3G trap storm above got as far as booting. Add
+  the same ceiling to the fast path, worded for whatever the runtime can
+  actually address (2 GiB before U10c-U10e, DRAM+DRAM_EXT after).
+- Input/Output: RED = a run_test/cli-level case asserting `--mode fast
+  --runtime linux --mem-size 3G` fails with a clear message; GREEN = it does,
+  and no QEMU is spawned. Today that test fails by spawning and trap-storming.
+- Key files: driver/cmd_run.cpp, driver/run_test.cpp
+- Depends on: nothing (parallel with U10a).
+- **State: DONE 2026-08-04.** Pure helper `fast_linux_mem_error()` in
+  shm.hpp/shm.cpp + a guard in cmd_run.cpp's fast path, placed before any
+  staging or spawn. Unit test lives in infra_test.cpp next to its siblings
+  (parse_size/qemu_m_args/max_program_mem_bytes), not run_test.cpp: 2G,
+  2097148K, 1G and empty pass; 3G returns a message naming the flag, the 2G
+  cap and the runtime; malformed specs stay qemu_m_args's error. RED was the
+  compile failure on the missing helper. CLI confirmed: `--mode fast
+  --runtime linux --mem-size 3G` now fails instantly, no QEMU spawned. The
+  ceiling text says "today": U10e raises it to DRAM+DRAM_EXT.
+
+### U10c. Tidy First: make vlinux's guest-RAM address math host-testable
+
+- Description: STRUCTURAL ONLY, no behaviour change. There is currently NO
+  host-side test covering runtime/linux's arena math (`grep mm_init|
+  build_initial_stack|load_elf` over driver/ and tests/ hits only the
+  driver's manifest builder). Extract the four places that turn a size into
+  an address into small pure functions in one header, and unit-test them on
+  the host: mm.c:38 `g_mmap_top = mem_size - VLINUX_STACK_RESERVE`;
+  stack.c:79 `w.p = (char*)(uintptr_t) mem_size`; loader.c:41-42
+  `scratch_base = mem_size - HYBRID_V_SCRATCH_BYTES` + its overlap check;
+  and mm.h:10's stated contract. Prove the extraction is behaviour-preserving
+  by running the U8 4B smoke before and after.
+- Input/Output: new `driver/vlinux_mem_test.cpp` (or runtime/linux/*_test.cpp
+  wired like driver/CMakeLists.txt:53) that pins today's ram_base==0 answers;
+  all existing driver tests still green; 4B fast-mode smoke unchanged.
+- Key files: runtime/linux/mm.c, mm.h, stack.c, stack.h, loader.c, loader.h,
+  driver/CMakeLists.txt
+- Depends on: nothing (can start before U10a resolves).
+- **State: DONE 2026-07-29.** New header `runtime/linux/vlinux_mem.h` with
+  three pure functions: `vlinux_ram_top(ram_base, mem_size)`,
+  `vlinux_mmap_arena_top` (ram_top - VLINUX_STACK_RESERVE),
+  `vlinux_v_scratch_base` (ram_top - HYBRID_V_SCRATCH_BYTES). All three call
+  sites now go through them (mm.c:38, stack.c:79, loader.c:41-42).
+  `VLINUX_STACK_RESERVE` MOVED here from stack.h -- that header's own comment
+  warned mm.c and stack.c "MUST share this one constant or they
+  desynchronize", and now they structurally cannot diverge; stack.h includes
+  vlinux_mem.h so existing users are unaffected.
+  Test `driver/vlinux_mem_test.cpp` (14th driver test, wired in
+  driver/CMakeLists.txt) pins ram_base==0 to today's answers AND encodes the
+  2026-07-29 bug as an assertion:
+  `vlinux_mmap_arena_top(0, 3G) == 0xBF800000` (the unmapped hole) vs
+  `vlinux_mmap_arena_top(0x800000000, 3G) == 0x8BF800000`. RED was confirmed
+  first (`vlinux_mem.h: No such file or directory`). Also added vlinux_mem.h
+  to runtime/linux/Makefile's HDRS so edits trigger a rebuild.
+
+### U10d. Manifest v3: carry ram_base, vlinux computes ram_base + mem_size
+
+- Description: BEHAVIOURAL. `struct vlinux_manifest` (runtime/linux/manifest.h)
+  is version 2 with `magic/version/mem_size/app_path/argv_*`; add
+  `uint64_t ram_base` and bump `VLINUX_MANIFEST_VERSION` to 3. Every function
+  extracted in U10c takes ram_base and returns `ram_base + mem_size`-relative
+  addresses. Land it with the driver still writing ram_base = 0, so behaviour
+  is provably identical -- the switch to a non-zero base is U10e. Note the
+  app image and vlinux itself do NOT need relinking: they live below
+  0x0220_0000 and 0x8_00000000 aliases those same physical bytes, so only the
+  mmap arena and the initial stack move. brk stays low (its ceiling is
+  `_vlinux_base`, 32 MiB), which is fine -- the arenas never need to adjoin.
+- Input/Output: RED = a test asserting the arena top for
+  (ram_base=0x800000000, mem_size=4G) is 0x8_FF80_0000; manifest_test.cpp
+  pins version 3 + the new field; 4B smoke byte-identical output.
+- Key files: runtime/linux/manifest.h, mm.c, stack.c, loader.c,
+  driver/manifest.cpp, driver/manifest_test.cpp
+- Depends on: U10c.
+- **State: DONE 2026-07-29.** `struct vlinux_manifest` gained
+  `uint64_t ram_base` (APPENDED, so `VLINUX_MANIFEST_VERSION` 2 -> 3: a v2
+  reader would mis-parse). Threaded through three signatures --
+  `mm_init(app_image_end, ram_base, mem_size)`,
+  `build_initial_stack(app_path, ram_base, mem_size, ...)`,
+  `load_elf(path, ram_base, mem_size, out)` -- plus
+  `build_manifest_blob(app_path, mem_size, ram_base, extra_argv, err)` and
+  `stage_linux_runtime(app_elf, mem_size, ram_base, extra_argv, err)` on the
+  driver side. main.c snapshots the field alongside mem_size and passes it on.
+  RED confirmed first (`'struct vlinux_manifest' has no member named
+  'ram_base'`). **The driver still passes a literal 0** at
+  cmd_run.cpp's stage_linux_boot, so the guest layout is byte-for-byte v2's --
+  flipping it on is U10e/U10f. 14/14 driver tests green; vlinux.elf and the
+  driver both rebuild warning-free.
+
+### U10e. FAST-MODE TRACK: >2 GiB in fast mode [achievable now, no RTL]
+
+- Description: BEHAVIOURAL. **This track is unblocked by U10a's finding**
+  because fast mode has NO vsim leg -- QEMU's TCG addresses the full 16 GiB
+  map, so `NDS_BIU_ADDR_WIDTH` is irrelevant here. Fast mode already skips the
+  hybrid cap (cmd_run.cpp:246-252, which is U10b's bug); once the runtime
+  honours ram_base (U10d) the driver can hand fast mode
+  `ram_base = 0x8_00000000` and any size up to DRAM + DRAM_EXT = 16 GiB.
+  Nothing in shm.cpp / run_plan.hpp / memmap.cpp needs to change -- those are
+  the hybrid transport. Scope this to `--mode fast --runtime linux` only and
+  keep hybrid at its current ceiling.
+- Value: unlocks the whole 27B *correctness* story with no RTL work --
+  functional runs, bit-exactness A/Bs, output diffs at full model size. Only
+  cycle measurement stays capped. Also obsoletes U11 (layer slicing) for
+  everything except hybrid.
+- Input/Output: `--mode fast --runtime linux --mem-size 6G` boots and runs;
+  U10b's ceiling for fast becomes 16 GiB while hybrid's stays 2 GiB, so the
+  two modes now legitimately differ and the error messages must say which.
+- Key files: driver/cmd_run.cpp (fast path only), driver/manifest.cpp,
+  driver/run_test.cpp
+- Depends on: U10c, U10d. NOT on U10a.
+- **State: DONE 2026-08-04.** `fast_linux_ram_base(mem_bytes)` in shm.cpp:
+  0 at or below 2 GiB (every known-good run stays byte-identical), else
+  0x8_00000000. `stage_linux_boot` gained the ram_base parameter; fast passes
+  the computed base, hybrid pins 0 until U10f. The U10b ceiling rose to 16 GiB
+  with a message naming both windows and hybrid's separate 2G cap
+  (infra_test.cpp covers 2G/2097148K/3G/6G/16G pass + 17G reject + the
+  0x8_00000000 boundary at 2G+1M). PROOF (U10g(1), 2026-08-04): Bonsai-8B at
+  `--mem-size 3G` fast WITHOUT --no-mmap -- the exact run that trap-stormed
+  2026-07-29 -- boots, mmap-loads, and prints "The capital of France is
+  Paris. Paris is the capital of France", byte-equal to the 2G --no-mmap
+  control; exit trap mepc=0x8bffffde2 = high base + 3G, proving the arenas
+  really lived in the high window. vlinux.elf itself needed NO rebuild
+  (manifest v3 reader landed in U10d).
+
+### U10f. HYBRID TRACK: >2 GiB under vsim [BLOCKED on a re-elaborated engine]
+
+- Description: needs a new engine whose `NDS_BIU_ADDR_WIDTH` (and
+  `NDS_L3C_ADDR_WIDTH`) reach >= 36 bits, then the driver changes that were
+  originally U10e: (a) `driver/shm.cpp:90-94` `max_program_mem_bytes()` 2 GiB
+  -> the new ceiling; (b) `driver/run_plan.hpp:27` `mmap_base = "0x0"` ->
+  0x8_00000000 when mem > 2 GiB (already plumbed as the `{mmap_base}`
+  placeholder, a one-value change); (c) `driver/memmap.cpp:93` V-scratch gpa
+  becomes ram_base + program_bytes. Existing tests PIN the old values and are
+  the RED step: `infra_test.cpp:55-60` asserts `max_program_mem_bytes() ==
+  2 GiB - scratch`; `plan_test.cpp:95,152,481` assert
+  `"--shared-mem-base","0x0"`.
+- Engine work: the build flow is `config.yaml` entry -> RTL package + a
+  `data/configs/*.cfg` -> config tool -> Verilator (`config.yaml:46-53`:
+  ax46mpv_fpga_l3 = package `ax46mpv_advanced` + its cfg +
+  `--threads 8 --unroll-count 256`). Precedent: premium_max was made exactly
+  this way (2026-07-23, ELEN/FELEN 64 + PACKED_FP16 + D$ 32K). The config
+  step is standalone and cheap to test without Verilator
+  (cmake/VerilatorHelpers.cmake:73-87):
+  `NDS_HOME=<tree> tclsh <tree>/config_tools/nds-softcore-config --load <cfg> --generate`
+
+- **GATE 1 PASSED 2026-07-29: the config tool accepts a wide BIU.**
+  Probed on a throwaway copy of external/ax46mpv_advanced (94 MB) in
+  /home/nick/tmp, leaving the real engines untouched; a control run with the
+  unmodified cfg passed first, so the environment was known-good.
+  `NDS_BIU_ADDR_WIDTH 32 -> 39` + `NDS_L3C_ADDR_WIDTH 32 -> 39` -> exit 0,
+  "Finished customizing IP", and config.inc gets
+  `NDS_BIU_ADDR_WIDTH 39` / `NDS_L3C_ADDR_WIDTH 39`.
+  - Values are NOT free-form. `nds-softcore-config:6435`
+    `NDS_L3C_ADDR_WIDTH value {32 37 38 39 52 59 64}` (enum -- 36 is
+    REJECTED: "ERROR: 36 is not a valid option value of L3-Cache Address
+    Width"), while `:4363-4368` `NDS_BIU_ADDR_WIDTH` is `textinput` 32-64,
+    tool default 39. Pick from the L3C enum; 39 matches ax65/ax66 and the
+    tool's own default.
+  - **The tool auto-widens 6 dependent RAM/tag widths, which VALIDATES
+    regenerating over hand-editing.** Full config.inc diff at 32 vs 39, all
+    +7: STLB_RAM_DW 60->67, STLB_DATA_RAM_DW 30->37, ICACHE_TAG_RAM_DW
+    30->37, DCACHE_TAG_RAM_DW 32->39, CM_SNP_RAM_DW 21->28, L3C_TAG_RAM_DW
+    18->25. Hand-patching the two cfg lines (or config.inc directly) would
+    leave TLB and cache tags too narrow to hold a full address -- silent
+    corruption, not a build error.
+- **GATE 2 PASSED 2026-07-29: the widened engine builds AND is timing-neutral.**
+  Done in place on `data/configs/ax46mpv_fpga_l3.cfg` (BIU 32->39, L3C 32->39)
+  + `./build_vsim.sh`, at the user's direction. The rebuild is incremental --
+  only this engine's config changed, so the other 6 are skipped; the previous
+  binary was preserved as `build/sim_ax46mpv_fpga_l3.biu32-backup` before
+  building, since build_vsim.sh overwrites in place.
+  - `build/Vax46mpv_fpga_l3/obj_sc/config.inc` confirms the widened defines
+    reached the elaborated RTL: BIU 39, L3C 39, plus the auto-widened
+    STLB_RAM_DW 67 / DCACHE_TAG_RAM_DW 39 / L3C_TAG_RAM_DW 25.
+  - **TIMING-NEUTRAL, controlled A/B**: same bin-prefetch, 4B K=51 node ->
+    BIU=39 engine 1,384,130 cycles, BIU=32 backup engine **1,384,130** --
+    bit-identical. (Staged the backup in its own dir and pointed
+    `VSIM_BIN_DIR` at it; driver/engine_registry.cpp:186 honours that env.)
+    Expected, since tag-RAM width does not change cache sets/ways or TLB
+    entry count. So every cycle number measured on the old engine remains
+    comparable, and this widening is safe to keep permanently.
+  - Byproduct worth keeping: a REBUILD of unchanged llama.cpp source drifts
+    ~0.37% (recorded 1,389,236 -> rebuilt 1,384,130). The A/B above isolates
+    that to the binary, NOT the engine. Any scaling/A-B claim must use
+    binaries from one build session.
+- REMAINING GATES:
+  3. The elaborated core actually ISSUES a >32-bit address, i.e. a load/store
+     to 0x8_00000000 reaches main_memory. `--print-memmap` CANNOT answer this
+     (U10a): it prints the TLM region table and gave byte-identical output on
+     the BIU=32 and BIU=39 engines. A real access requires the guest to place
+     data up there, which requires a non-zero ram_base --
+     **so gate 3 is BLOCKED ON U10d, not on the engine.** (Dependency
+     corrected 2026-07-29; the earlier "depends on an engine rebuild" was
+     incomplete.)
+  4. The vsim testbench may need matching work: `testbench/ae350_system.v`
+     and `testbench/ae350_tb.sv` also reference NDS_BIU_ADDR_WIDTH. Note
+     ae350_system.v:155,165,707 already derive their widths FROM the define
+     (so they widened automatically), while e.g. :288
+     `wire [31:0] H_hs0_haddr_32b` is a deliberately 32-bit AHB signal. No
+     width errors surfaced in this build, but nothing has driven a wide
+     address through the platform yet -- gate 3 is what would expose it.
+- Note a wide BIU also disposes of the device-collision problem: RAM moves
+  above the platform windows (HVM 0x9000_0000, slv_bridge 0xa000_0000, PLDM
+  0xe680_0000, smu/uart 0xf01-0xf03 all stay put). Staying inside 32 bits
+  instead buys only +256 MiB (see U10a) and is not worth doing.
+- Input/Output: a new engine in `config.yaml` whose `--print-memmap` shows
+  RAM at 0x8_00000000 AND which actually executes a load/store there;
+  `--mode hybrid --mem-size 6G` measures a 27B ROI.
+- Key files: vsim_andesim/config.yaml, vsim_andesim/data/configs/*.cfg,
+  driver/shm.cpp, driver/run_plan.hpp, driver/memmap.cpp + the test files above
+- Depends on: U10c, U10d (gate 3 cannot even be TESTED without ram_base
+  support). The engine rebuild is DONE and was cheap; the remaining cost and
+  risk sit in the runtime work, not the RTL.
+- **State: DONE 2026-08-05.** Driver: `hybrid_ram_base()` (physical fits low
+  window -> 0, else 0x8_00000000), `max_program_mem_bytes()` 2G -> 16G minus
+  scratch, ctx.mmap_base filled from it, memmap rows move with the base + a
+  "DRAM alias (low)" row, cmd_run's scratch guard and staging pass the base.
+  vsim: main.cpp maps a low-2G alias region over the same mmap when
+  --shared-mem-base != 0 (SimpleMemory subtracts per-region bases into one
+  buffer -- QEMU's DRAM/DRAM_ALIAS semantics exactly); engines relinked, no
+  re-verilation. RED was e2e: 4B K=51 hybrid at 3G hung the vsim leg on the
+  unrouted low fetch for the full 4 h step timeout. GREEN gates, measured:
+  (legacy) 4B K=51 at 2000M on the new engine+driver = **362,799 cycles,
+  bit-identical**; (gate 3) same at 3G = **361,930 cycles** -- completes with
+  the correct node, first real >32-bit addresses through the RTL. The -0.24%
+  delta is guest-layout noise (arena top moved), so cross-window comparisons
+  carry a ~0.3% bound; same-window numbers stay exact. Gate 4 (testbench):
+  no width errors surfaced; the 3G run exercised the platform end to end.
+
+### U10g. Validate
+
+- Description: in cost order, each step recording its result here.
+  (1) Bonsai-8B at 3G in FAST mode WITHOUT `--no-mmap` -- the exact run that
+  trap-stormed on 2026-07-29, so it is a direct before/after. It needs
+  ~2048 MiB (1099 file mapping + 931 CPU_REPACK + ~10 app + 8 stack reserve)
+  and missed the 2047 MiB cap by about 1 MiB, making it the cheapest possible
+  proof that ram_base works. (2) Bonsai-27B-Q1_0 (3.8 GB) at 6G, fast mode,
+  correct text. (3) 27B under hybrid with a marker ROI -- U10f only.
+- Input/Output: (1) and (2) generate correct text; (3) prints
+  `[roi] MUL_MAT #K ...` + `[andesim] <N> cycles`.
+- Key files: none (validation only)
+- Depends on: (1)(2) U10e; (3) U10f.
+- **State: DONE 2026-08-06.** (1) 8B at 3G fast, mmap ON: text byte-identical
+  to the 2G --no-mmap control; exit-trap mepc 0x8bffffde2 = high base + 3G.
+  (2) 27B at 6G fast WITH --no-mmap: "The capital of France is Paris." in
+  ~15 min wall (needs the llama.cpp vec_dot fix 17b246b44 for correct qwen35
+  output). (3) 27B hybrid at 6G: `[roi] MUL_MAT #51
+  src0=blk.6.attn_gate.weight [5120 x 6144]` measured on all four builds -
+  pristine 54,314,202 -> repack 25,629,722 -> +prefetch 16,317,304 -> d4
+  4,578,346 cycles (11.86x). NOTE: (2) deviates from the original "no
+  --no-mmap" wording - see U10h.
+
+### U10h. vlinux mmap-backed load grinds at multi-GB scale [PLANNED]
+
+- Description: mmap-based model loading is pathologically slow at 27B scale
+  even when memory FITS. Measured 2026-08-06, fast mode, bin-d4-fixed:
+  27B at 6G with mmap (over budget: 3,891 MiB mapping + ~3.1 GiB repack)
+  ground >31 h with no output and no fail-fast; 27B at 8G with mmap (FITS,
+  ~7.3 GiB demand) was still inside "load the model" after 4 h at 99% CPU;
+  the identical run with --no-mmap completed everything in ~15 min. The 8B
+  1,099 MiB mapping loads fine (~25 min total at 3G), so the cost is
+  super-linear in mapping size - suspect O(pages^2) behavior in the vlinux
+  mm/page-fault path (~950k pages at 27B vs ~270k at 8B), not TCG itself.
+- Consequence today: --no-mmap is MANDATORY for multi-GB models regardless
+  of --mem-size; U10's "resident with NO --no-mmap" target is functionally
+  met only for models whose mapping is ~1 GiB or smaller.
+- Diagnosis plan when resumed: instrument runtime/linux/mm.c fault path
+  (count faults + cycles per fault at 8B vs 27B); if the per-fault cost
+  grows with mapping size, replace the linear VMA/page lookup with an
+  interval structure or pre-fault whole mappings on mmap().
+- Key files: runtime/linux/mm.c, mm.h, syscall plumbing for mmap/read.
+- Depends on: nothing (independent QoL fix; measurement flow unaffected).
+- State: PLANNED
+
+Cross-repo note: llama.cpp needs `--no-mmap` for any model whose file
+mapping + CPU_REPACK buffer exceed guest RAM (8B: 1099 + 931 MiB). U10 makes
+that a performance choice rather than a hard requirement, but --no-mmap stays
+the cheaper option -- it avoids holding two layouts of the same weights.
+
+## U11. Bridge tool: GGUF layer-slice script (host side) [stretch, off critical path]
+
+- Description: `scripts/gguf_slice.py` (gguf-py): keep the first K
+  transformer blocks + embeddings + output head, rewrite
+  `block_count`/tensor list, so Bonsai-27B becomes a <= 1.5 GB model
+  whose per-layer kernel SHAPES are identical to the real one. This is
+  the U8/U9 workload until U10 lands. Sliced-model quality is garbage
+  (fine - we measure kernels, not perplexity).
+- Input/Output: `python scripts/gguf_slice.py Bonsai-27B-Q1_0.gguf 12`
+  -> `Bonsai-27B-Q1_0.k12.gguf`, loads in stock llama.cpp on the host,
+  `llama-completion` runs on it.
+- Key files: scripts/gguf_slice.py (new)
+- Test: host-side pytest-style check of tensor count + metadata.
+- Depends on: nothing (host tool). NOT needed for the primary Bonsai-4B
+  goal - only for a 27B revisit (see U10).
+- State: PLANNED
+
+---
+
+Rollout: one feature per session, TDD-first - every feature's contract
+above is a grep-able stdout/exit-code check, so its RED test goes in
+tests/vlinux/ (or tests/andes_sim/ for U2) before the implementation.
+Update docs/USER_GUIDE.md as each lands.
+
+Order: U0 -> U1 -> U2 -> U3 -> U4 -> U5 -> {U6, U7} -> U8 -> U9. That is
+the full path to the primary goal (llama-completion + Bonsai-4B,
+fast leg then hybrid ROI). U10 and U11 are an optional 27B stretch
+track, off the critical path entirely (U11 any time; U10 is the only
+cross-repo item) - only worth picking up if/when Bonsai-27B specifically
+is requested.
+
+Compound effect: U0-U7 give andesim a general "run Linux userspace
+binaries" capability - every future glibc workload (SPEC kernels,
+libnn perf tests, any vendor benchmark) reuses vlinux with zero
+per-app porting, and U9's counter-marker recipe becomes the standard
+way to cycle-measure ONE iteration of any hot kernel inside a large
+application. When FR-109 (real Linux, S/U+paging) eventually lands,
+its acceptance workloads and test fixtures are already here.
