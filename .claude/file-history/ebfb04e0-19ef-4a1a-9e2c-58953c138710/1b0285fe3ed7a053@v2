@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Bonsai-27B decode (gemv) cache A/B. Same binary, two engines that differ ONLY
+# in cache size (both are addr39):
+#   ax46mpv_fpga_l3            32 KB D$ / 2 MB L3
+#   ax46mpv_fpga_l3_bigcache_aw 64 KB D$ / 4 MB L3
+#
+#   bash measure27.sh bin-d4-k59:ax46mpv_fpga_l3 bin-d4-k59:ax46mpv_fpga_l3_bigcache_aw
+#
+# ROI nodes (indices from llama-eval-callback on the host, one decode pass):
+#   K=59  blk.7.attn_output [6144 x 5120]   3.93 MB  misses 2 MB, FITS 4 MB
+#   K=31  blk.3.ffn_down    [17408 x 5120] 11.14 MB  misses both
+# Env: MEM MODE TIMEOUT PROMPT.
+set -e
+export TMPDIR=${TMPDIR:-/home/nick/tmp}
+LLAMA=${LLAMA:-/home/nick/work/llama.cpp}
+ANDESIM=${ANDESIM:-/home/nick/work/andesim}
+MODEL=${MODEL:-$LLAMA/models/Bonsai-27B-Q1_0.gguf}
+MEM=${MEM:-12G}
+MODE=${MODE:-hybrid}
+TIMEOUT=${TIMEOUT:-28800000}
+PROMPT=${PROMPT:-The capital of France is}
+
+for spec in "$@"; do
+  bin=${spec%%:*}; eng=${spec##*:}
+  echo "=== $bin @ $eng (mode=$MODE mem=$MEM) ==="
+  if [ "$MODE" = fast ]; then
+    ( cd "$ANDESIM" && ./andesim run --mode fast --runtime linux \
+        --mem-size "$MEM" --engine "vsim:$eng" \
+        "$LLAMA/$bin" -- -m "$MODEL" -no-cnv --prompt "$PROMPT" \
+        -n 1 -c 512 -t 1 --no-mmap ) 2>&1 \
+      | grep -aE '\[roi\]|\[andesim\]|error|failed|cannot|Aborted|mcause' | head -40
+  else
+    ( cd "$ANDESIM" && ./andesim run --mode hybrid --trigger marker --runtime linux \
+        --mem-size "$MEM" --engine "vsim:$eng" --step-timeout-ms "$TIMEOUT" \
+        "$LLAMA/$bin" -- -m "$MODEL" -no-cnv --prompt "$PROMPT" \
+        -n 32 -c 512 -t 1 --no-mmap ) 2>&1 \
+      | grep -aE '\[roi\]|\[andesim\] .*cycles|error|failed|cannot|Aborted' | head -20
+  fi
+done
