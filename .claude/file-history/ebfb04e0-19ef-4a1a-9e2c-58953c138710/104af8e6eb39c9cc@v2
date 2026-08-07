@@ -1,0 +1,214 @@
+"""The blog must stay well-formed, layered, and honest about its numbers.
+
+Three jobs:
+  1. the figures' drawn geometry must match the labels printed on them,
+  2. no section may dump more than a handful of blocks on the reader,
+  3. every number in the prose must be one the figure module owns.
+"""
+import pathlib, re
+from html.parser import HTMLParser
+
+import figs
+
+HERE = pathlib.Path(__file__).parent
+PAGE = HERE / "blog_1bit.html"
+VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+        "param", "source", "track", "wbr", "path", "rect", "circle", "use", "stop",
+        "line", "polygon", "polyline"}
+BLOCK_CAP = 7
+
+
+def page():
+    return PAGE.read_text()
+
+
+# --- the module's own arithmetic -------------------------------------------
+
+def test_speedups_derive_from_the_measured_cycles():
+    """The headline ratios are never typed - they come out of CYCLES."""
+    got = {m["key"]: round(figs.speedup(m["key"]), 2) for m in figs.MODELS}
+    assert got == {"4B": 12.34, "8B": 11.23, "27B": 11.86}, got
+
+
+def test_cost_per_weight_reproduces_the_recorded_band():
+    """Independently recorded per-element figures, to 2 dp."""
+    want = {"upstream": (1.71, 1.74, 1.73), "repack": (0.82, 0.83, 0.81),
+            "vd4dots": (0.14, 0.15, 0.15)}
+    for stage, expect in want.items():
+        got = tuple(round(figs.cyc_per_weight(stage, m["key"]), 2) for m in figs.MODELS)
+        assert got == expect, (stage, got, expect)
+
+
+def test_the_register_geometry_is_internally_consistent():
+    """bytes_live must equal vl lanes of SEW/8, and never exceed the group."""
+    for s in figs.STEPS:
+        assert figs.bytes_live(s) == s["vl"] * s["sew"] // 8
+        assert figs.bytes_live(s) <= figs.reg_bytes(s)
+        assert figs.vtype(s) == s["vlmax"], s["name"]
+
+
+def test_only_the_upstream_step_wastes_lanes_or_reduces():
+    up = figs.STEPS[0]
+    assert figs.lane_fraction(up) == 0.25 and up["reduces"]
+    for s in figs.STEPS[1:]:
+        assert figs.lane_fraction(s) == 1.0 and not s["reduces"]
+
+
+# --- figure geometry vs printed labels -------------------------------------
+
+def test_every_lit_lane_rect_is_actually_drawn():
+    """The bar claims 'N of M lanes'; count the accent rects and compare."""
+    svg = figs.fig_lanes()
+    rows = svg.split('stroke="var(--rule)" stroke-width="1"/>')
+    assert len(rows) == len(figs.STEPS) + 1
+    for s, chunk in zip(figs.STEPS, rows[1:]):
+        lit = len(re.findall(r'fill="var\(--accent\)" stroke="var\(--card\)"', chunk))
+        assert lit == s["vl"], (s["name"], lit, s["vl"])
+        assert "%d of %d lanes" % (s["vl"], s["vlmax"]) in chunk
+
+
+def test_the_output_matrix_lights_exactly_the_rows_the_label_claims():
+    svg = figs.fig_lanes()
+    for s in figs.STEPS:
+        assert "%d of %d output rows" % (figs.outputs(s), figs.OUT_ROWS) in svg
+    # 64 cells drawn per step, no more and no fewer
+    cells = len(re.findall(r'rx="1" fill="var\(--(?:accent|card-2)\)"', svg))
+    assert cells == figs.OUT_ROWS * len(figs.STEPS), cells
+
+
+def test_bar_lengths_are_proportional_to_the_values_printed_beside_them():
+    svg = figs.fig_models()
+    widths = [float(w) for w in re.findall(r'<rect x="96.0" y="[\d.]+" width="([\d.]+)"', svg)]
+    vals = [figs.cyc_per_weight(st, m["key"])
+            for st in figs.STAGE_ORDER for m in figs.MODELS]
+    assert len(widths) == len(vals) == 12
+    k = widths[0] / vals[0]
+    for w, v in zip(widths, vals):
+        assert abs(w - k * v) < 0.6, (w, v)
+
+
+def test_the_handoff_split_is_drawn_to_the_measured_times():
+    svg = figs.fig_handoff()
+    assert "5.6 min" in svg and "21.0 min" in svg and "26.6 min total" in svg
+    rects = re.findall(r'<rect x="([\d.]+)" y="58" width="([\d.]+)"', svg)
+    assert len(rects) == 2
+    fast_w, rtl_w = float(rects[0][1]), float(rects[1][1])
+    assert abs(fast_w / (fast_w + rtl_w) - 5.6 / 26.6) < 0.01
+
+
+def test_no_figure_asks_the_reader_to_do_arithmetic():
+    """Every ratio a figure implies is also printed on it in words."""
+    lanes = figs.fig_lanes()
+    for s in figs.STEPS:
+        assert "%d of %d bytes live" % (figs.bytes_live(s), figs.reg_bytes(s)) in lanes
+
+
+# --- the page ---------------------------------------------------------------
+
+class Balance(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.stack, self.errors = [], []
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in VOID:
+            self.stack.append((tag, self.getpos()))
+
+    def handle_endtag(self, tag):
+        if tag in VOID:
+            return
+        if not self.stack:
+            self.errors.append("stray </%s> at %s" % (tag, self.getpos()))
+        elif self.stack[-1][0] != tag:
+            self.errors.append("</%s> closes <%s> from %s"
+                               % (tag, self.stack[-1][0], self.stack[-1][1]))
+            self.stack.pop()
+        else:
+            self.stack.pop()
+
+
+def test_the_document_tags_are_balanced():
+    b = Balance()
+    b.feed(page())
+    assert b.errors == [] and [t for t, _ in b.stack] == []
+
+
+def test_the_page_runs_high_level_to_low():
+    order = re.findall(r'<section class="sec" id="([^"]+)"', page())
+    assert order == ["result", "problem", "moves", "models", "method", "machine"], order
+
+
+def test_the_problem_picture_comes_before_any_section():
+    p = page()
+    assert p.index('<svg class="fig"') < p.index('<section class="sec"')
+
+
+def visible_blocks(body):
+    body = re.sub(r"<details.*?</details>", "", body, flags=re.S)
+    return len(re.findall(r'<(?:div|p|ul|table|figure)\s[^>]*class="(?:prose|panels|cards'
+                          r'|tablewrap|figbox|kv|pull|lede|stat)', body))
+
+
+def test_no_section_dumps_more_than_seven_blocks_at_once():
+    p = page()
+    secs = [(m.group(1), m.start())
+            for m in re.finditer(r'<section class="sec" id="([^"]+)"', p)]
+    heavy = {}
+    for i, (name, pos) in enumerate(secs):
+        stop = secs[i + 1][1] if i + 1 < len(secs) else p.index("<footer")
+        n = visible_blocks(p[pos:stop])
+        if n > BLOCK_CAP:
+            heavy[name] = n
+    assert not heavy, heavy
+
+
+def test_every_disclosure_has_a_real_summary():
+    p = page()
+    opens = re.findall(r'<details class="more">\s*<summary>([^<]+)</summary>', p)
+    assert len(opens) == p.count("<details"), "a details without a summary"
+    assert p.count("<details") == p.count("</details>")
+    assert all(len(t.strip()) > 12 for t in opens), opens
+
+
+def test_the_page_carries_the_numbers_the_module_owns():
+    p = page()
+    for m in figs.MODELS:
+        assert "%.2fx" % figs.speedup(m["key"]) in p, m["key"]
+        assert "{:,}".format(figs.CYCLES["upstream"][m["key"]]) in p
+        assert "{:,}".format(figs.CYCLES["vd4dots"][m["key"]]) in p
+
+
+def test_the_page_stays_scoped_to_the_optimization():
+    """No war stories: no traps, no reverted experiments, no open-items list."""
+    p = page().lower()
+    for gone in ("did not work", "trap 0", "reverted", "what is left",
+                 "correction on the record", "we were wrong", "bigcache"):
+        assert gone not in p, gone
+
+
+def test_every_nav_link_points_at_a_real_section():
+    p = page()
+    ids = set(re.findall(r'id="([^"]+)"', p))
+    for href in re.findall(r'<a href="#([^"]+)">', p):
+        assert href in ids, href
+
+
+def test_typography_stays_inside_the_subsetted_font():
+    p = re.sub(r"src:url\(data:font/woff2;base64,[^)]*\)", "", page())
+    assert {c for c in p if ord(c) > 126 and c not in "\n\t"} == set()
+
+
+def test_the_four_change_gains_multiply_to_the_ladder_total():
+    """Each card quotes 'x on top'. Chained, they must reproduce the model's
+    own end-to-end speedup - otherwise a change is double-counted."""
+    prod = 1.0
+    for c in figs.CHANGES:
+        prod *= figs.change_gain(c)
+    assert abs(prod - figs.speedup(figs.LADDER_MODEL)) < 0.01, prod
+
+
+def test_the_page_quotes_those_gains_and_says_which_model_they_are_from():
+    p = page()
+    for c in figs.CHANGES:
+        assert "%.2fx" % figs.change_gain(c) in p, c["n"]
+    assert "4B ladder" in p, "the per-change gains must be attributed"
