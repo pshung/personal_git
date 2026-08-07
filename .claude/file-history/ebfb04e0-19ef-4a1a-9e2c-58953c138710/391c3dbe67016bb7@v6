@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""Figures for the 1-bit-LLM blog, drawn at the machine's real dimensions.
+
+The subject is proportion: a 1024-bit vector unit is 128 byte-lanes wide and
+the stock kernel fills 32 of them; a 64 x 128 weight tile has 8192 weights and
+one stock step touches 32. Drawing that to scale is the whole explanation, so
+nothing here is shrunk to a toy size and no figure asks the reader to compute.
+
+Every quantity a figure prints is derived from the constants below, never typed
+twice. test_blog.py checks the drawn geometry against the printed labels.
+"""
+
+VLEN = 1024                       # bits, ax46mpv_fpga_l3
+TILE_ROWS, TILE_COLS = 64, 128    # one block_q1_0x64: 64 rows, QK1_0 columns
+TILE_WEIGHTS = TILE_ROWS * TILE_COLS
+
+# What ONE vector step of each kernel covers of that tile, and how much of a
+# vector instruction it asks for. Both are geometric facts about the layout,
+# independent of how the surrounding loop is counted.
+STEPS = [
+    dict(key="01", name="upstream", kernel="ggml_vec_dot_q1_0_q8_0",
+         rows=1, cols=32, vl=32, vlmax=128, sew=8, lmul=1, reduces=True),
+    dict(key="02", name="repack", kernel="block_q1_0x64",
+         rows=64, cols=1, vl=64, vlmax=64, sew=16, lmul=1, reduces=False),
+    dict(key="04", name="vd4dots", kernel="nds.vd4dots.vv",
+         rows=64, cols=4, vl=64, vlmax=64, sew=32, lmul=2, reduces=False),
+]
+
+# Measured decode cycles, one MUL_MAT node per model. Sources: andesim hybrid
+# marker mode on vsim:ax46mpv_fpga_l3, single hart.
+MODELS = [
+    dict(key="4B",  label="Bonsai-4B",  node="blk.7.attn_v",    ne=(2560, 1024)),
+    dict(key="8B",  label="Bonsai-8B",  node="blk.7.attn_v",    ne=(4096, 1024)),
+    dict(key="27B", label="Bonsai-27B", node="blk.6.attn_gate", ne=(5120, 6144)),
+]
+
+CYCLES = {                       # stage -> {model: cycles}
+    "upstream": {"4B": 4_476_673, "8B": 7_278_168, "27B": 54_314_202},
+    "repack":   {"4B": 2_144_213, "8B": 3_475_147, "27B": 25_629_722},
+    "prefetch": {"4B": 1_389_236, "8B": 2_218_540, "27B": 16_317_304},
+    "vd4dots":  {"4B":   362_799, "8B":   648_246, "27B":  4_578_346},
+}
+STAGE_ORDER = ["upstream", "repack", "prefetch", "vd4dots"]
+
+# The shipped kernel is CYCLES["vd4dots"]; the codegen work that keeps the dot
+# fed is inside it, not a separate build. So the ladder is three consecutive
+# steps and their gains multiply back to the model's end-to-end speedup.
+LADDER_MODEL = "4B"
+
+CHANGES = [
+    dict(n="01", gain_from="upstream", gain_to="repack"),
+    dict(n="02", gain_from="repack",   gain_to="prefetch"),
+    dict(n="03", gain_from="prefetch", gain_to="vd4dots"),
+]
+
+
+def change_gain(change):
+    m = LADDER_MODEL
+    return CYCLES[change["gain_from"]][m] / CYCLES[change["gain_to"]][m]
+
+
+def portable_gain():
+    """What the two vendor-neutral changes buy on their own."""
+    m = LADDER_MODEL
+    return CYCLES["upstream"][m] / CYCLES["prefetch"][m]
+
+
+def weights(model):
+    return model["ne"][0] * model["ne"][1]
+
+
+def cyc_per_weight(stage, model_key):
+    m = next(m for m in MODELS if m["key"] == model_key)
+    return CYCLES[stage][model_key] / weights(m)
+
+
+def speedup(model_key):
+    return CYCLES["upstream"][model_key] / CYCLES["vd4dots"][model_key]
+
+
+def step_weights(step):
+    return step["rows"] * step["cols"]
+
+
+def tile_fraction(step):
+    return step_weights(step) / TILE_WEIGHTS
+
+
+def lane_fraction(step):
+    return step["vl"] / step["vlmax"]
+
+
+def vtype(step):
+    """lanes = VLEN * LMUL / SEW -- this is what sets VLMAX."""
+    return VLEN * step["lmul"] // step["sew"]
+
+
+# --- svg helpers ------------------------------------------------------------
+
+MONO = 'font-family="var(--f-mono)"'
+
+
+def esc(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def txt(x, y, s, size=10, fill="var(--muted)", anchor="start", weight=None, mono=True):
+    w = ' font-weight="%s"' % weight if weight else ""
+    f = MONO if mono else 'font-family="var(--f-body)"'
+    return ('<text x="%.1f" y="%.1f" %s font-size="%s" fill="%s" '
+            'text-anchor="%s"%s>%s</text>' % (x, y, f, size, fill, anchor, w, esc(s)))
+
+
+# --- figure 1: the register, and what one step advances ---------------------
+
+OUT_ROWS = 64            # output rows a 64-row tile can advance at once
+
+
+def reg_bytes(step):
+    """The register group a step works in, in bytes. m2 really is twice as
+    wide as m1 -- the figure draws that difference rather than hiding it."""
+    return VLEN * step["lmul"] // 8
+
+
+def bytes_live(step):
+    """Bytes of that group carrying operand data: vl lanes of SEW/8 each."""
+    return step["vl"] * step["sew"] // 8
+
+
+def outputs(step):
+    """Output rows one step advances. This is where the layout wins."""
+    return step["rows"] if step["rows"] > 1 else 1
+
+
+def fig_lanes(bpx=2.6, dot=7.0, gapd=2.0, rowgap=34, left=152, top=30):
+    """One row per kernel. Left: the vector register at real byte width, split
+    into its real lanes, lit where operands live. Right: the 64 output rows of
+    the tile, lit where this step advances one. Nothing to compute."""
+    maxb = max(reg_bytes(s) for s in STEPS)
+    barw = maxb * bpx
+    dots = 8 * dot + 7 * gapd
+    rowh = max(OUT_ROWS / 8 * (dot + gapd), 46)
+    h = top + len(STEPS) * (rowh + rowgap)
+    w = left + barw + 40 + dots + 158
+    o = ['<svg class="fig" viewBox="0 0 %.0f %.0f" width="100%%" role="img" '
+         'aria-label="Vector register occupancy and output rows advanced, per kernel">' % (w, h)]
+    o.append(txt(left, 15, "the vector register, to scale", 10))
+    o.append(txt(left + barw, 15, "%d bytes" % maxb, 9, anchor="end"))
+    o.append(txt(left + barw + 40, 15, "output rows advanced", 10))
+
+    for i, s in enumerate(STEPS):
+        y = top + i * (rowh + rowgap)
+        rb, live = reg_bytes(s), bytes_live(s)
+        lanes = s["vlmax"]
+        lw = rb * bpx / lanes                      # one lane, in px
+        # the register: outline at its real width, lanes drawn individually
+        o.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="none" '
+                 'stroke="var(--rule)" stroke-width="1"/>' % (left, y, rb * bpx, rowh))
+        for L in range(lanes):
+            on = L < s["vl"]
+            o.append('<rect x="%.2f" y="%.1f" width="%.2f" height="%.1f" fill="%s" '
+                     'stroke="var(--card)" stroke-width=".3"/>'
+                     % (left + L * lw, y, lw, rowh,
+                        "var(--accent)" if on else "var(--card-2)"))
+        # output rows: 64 cells, lit = advanced by this step
+        ox = left + barw + 40
+        adv = outputs(s)
+        for k in range(OUT_ROWS):
+            cx = ox + (k % 8) * (dot + gapd)
+            cy = y + (k // 8) * (dot + gapd)
+            o.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="1" fill="%s"/>'
+                     % (cx, cy, dot, dot,
+                        "var(--accent)" if k < adv else "var(--card-2)"))
+        # labels
+        o.append(txt(left - 12, y + 12, s["key"] + " " + s["name"], 11,
+                     fill="var(--ink)", anchor="end", weight="700"))
+        o.append(txt(left - 12, y + 26, s["kernel"], 8.5, anchor="end"))
+        o.append(txt(left - 12, y + 39, "e%d m%d" % (s["sew"], s["lmul"]), 8.5, anchor="end"))
+        rx = ox + dots + 16
+        o.append(txt(rx, y + 12, "%d of %d lanes" % (s["vl"], lanes), 10,
+                     fill="var(--ink)", weight="700"))
+        o.append(txt(rx, y + 26, "%d of %d bytes live" % (live, rb), 8.5))
+        o.append(txt(rx, y + 39, "%d of %d output rows" % (adv, OUT_ROWS), 8.5,
+                     fill="var(--ink)" if adv == OUT_ROWS else "var(--warn)"))
+        if s["reduces"]:
+            o.append(txt(rx, y + 52, "then a serial reduction", 8.5, fill="var(--warn)"))
+    o.append("</svg>")
+    return "\n".join(o)
+
+
+# --- figure 2: cost per weight, every stage, every model --------------------
+
+def fig_models(bar_h=13, gap_row=7, gap_stage=20, left=96, top=26, scale=380,
+               val_w=52, key_w=40):
+    """Four stages, three models each, one shared axis. Bars within a stage are
+    the same length -> the win does not depend on model size. The value column
+    and the model column get their own reserved width so they cannot collide."""
+    top_val = max(cyc_per_weight(st, m["key"]) for st in STAGE_ORDER for m in MODELS)
+    rows = len(STAGE_ORDER) * len(MODELS)
+    h = top + rows * (bar_h + gap_row) + len(STAGE_ORDER) * gap_stage + 10
+    w = left + scale + val_w + key_w + 18
+    o = ['<svg class="fig" viewBox="0 0 %.0f %.0f" width="100%%" role="img" '
+         'aria-label="Decode cycles per weight for every stage and every model">' % (w, h)]
+    o.append(txt(left, 13, "decode cycles per weight, one MUL_MAT node", 10))
+    o.append(txt(left + scale + val_w + key_w, 13, "lower is better", 9, anchor="end"))
+
+    y = top
+    for st in STAGE_ORDER:
+        o.append(txt(left - 10, y + 10, st, 11, fill="var(--ink)", anchor="end", weight="700"))
+        for m in MODELS:
+            v = cyc_per_weight(st, m["key"])
+            bw = scale * v / top_val
+            fill = "var(--accent)" if st == "vd4dots" else "var(--bar)"
+            o.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%d" fill="%s" rx="1"/>'
+                     % (left, y, max(bw, 1.2), bar_h, fill))
+            o.append(txt(left + scale + val_w - 8, y + 10, "%.3f" % v, 9,
+                         fill="var(--ink-2)", anchor="end"))
+            o.append(txt(left + scale + val_w + key_w, y + 10, m["key"], 9, anchor="end"))
+            y += bar_h + gap_row
+        y += gap_stage
+    o.append("</svg>")
+    return "\n".join(o)
+
+
+# --- figure 3: where the cycles come from -----------------------------------
+
+def fig_handoff(w=760, h=118, left=8):
+    """The measurement itself: functional model runs everything, RTL runs the
+    window. Drawn to the real time split of a 27B run."""
+    fast_min, rtl_min = 5.6, 21.0            # measured, one K=59-sized node
+    total = fast_min + rtl_min
+    bar_y, bar_h = 58, 34
+    usable = w - 2 * left
+    fw = usable * fast_min / total
+    o = ['<svg class="fig" viewBox="0 0 %d %d" width="100%%" role="img" '
+         'aria-label="andesim hybrid: functional leg then cycle-accurate window">' % (w, h)]
+    o.append(txt(left, 16, "one hybrid run, to scale", 10))
+    o.append(txt(left + usable, 16, "%.1f min total" % total, 10, anchor="end"))
+    o.append('<rect x="%.1f" y="%d" width="%.1f" height="%d" fill="var(--bar)" rx="2"/>'
+             % (left, bar_y, fw, bar_h))
+    o.append('<rect x="%.1f" y="%d" width="%.1f" height="%d" fill="var(--accent)" rx="2"/>'
+             % (left + fw, bar_y, usable - fw, bar_h))
+    o.append(txt(left + 8, bar_y + 21, "functional model", 10, fill="var(--card)", weight="700"))
+    o.append(txt(left + fw + 8, bar_y + 21, "cycle-accurate RTL", 10,
+                 fill="var(--card)", weight="700"))
+    o.append(txt(left, bar_y + bar_h + 15, "loads 3.8 GB, runs 58 matmuls", 9))
+    o.append(txt(left + fw + 8, bar_y + bar_h + 15, "measures ONE matmul", 9))
+    o.append(txt(left, bar_y - 8, "%.1f min" % fast_min, 9, fill="var(--ink-2)"))
+    o.append(txt(left + fw + 8, bar_y - 8, "%.1f min" % rtl_min, 9, fill="var(--ink-2)"))
+    # the marker
+    o.append('<line x1="%.1f" y1="%d" x2="%.1f" y2="%d" stroke="var(--ink)" '
+             'stroke-width="2"/>' % (left + fw, bar_y - 22, left + fw, bar_y + bar_h + 4))
+    o.append(txt(left + fw - 6, bar_y - 26, "ROI marker", 9, fill="var(--ink)",
+                 anchor="end", weight="700"))
+    o.append("</svg>")
+    return "\n".join(o)
+
+
+
+
+# --- figure 0: why one bit -------------------------------------------------
+#
+# ggml block sizes, bytes per weight. Q1_0 derived here reproduces the real
+# Bonsai-27B-Q1_0.gguf on disk (3.8 GB), which is the check that these
+# constants are right.
+PARAMS_27B = 27e9
+FORMATS = [
+    dict(name="F16",  bpw=2.0,      note="the unquantized model"),
+    dict(name="Q8_0", bpw=34 / 32,  note="8-bit, 34 B per 32 weights"),
+    dict(name="Q4_0", bpw=18 / 32,  note="4-bit, 18 B per 32 weights"),
+    dict(name="Q1_0", bpw=18 / 128, note="1-bit, 18 B per 128 weights"),
+]
+BUDGET_GB = 4.0                     # an illustrative edge-class DRAM budget
+SMALL_PARAMS = 4e9                  # the 4B model, for the same-budget compare
+
+
+# Provenance and quality, published by PrismML for Bonsai-27B (a compressed
+# Qwen 27B, Apache 2.0, July 2026). We did NOT measure these - they are the
+# model publisher's own figures, averaged over 15 benchmarks. Our contribution
+# is the speed half, not the quality half.
+QUALITY = [
+    dict(name="FP16",    bpw=16.0,  score=85.0),
+    dict(name="ternary", bpw=1.71,  score=80.5),
+    dict(name="1-bit",   bpw=1.125, score=76.1),
+]
+WEAKEST = [("tool calling", -26.0), ("vision", -24.3)]
+
+
+def retention(q):
+    return q["score"] / QUALITY[0]["score"]
+
+
+BITS_PER_WEIGHT = 18 * 8 / 128      # ggml block_q1_0, = PrismML's stated 1.125
+
+
+def model_gb(params, bpw):
+    return params * bpw / 1e9
+
+
+def fmt_gb(f, params=PARAMS_27B):
+    return model_gb(params, f["bpw"])
+
+
+def fits(f):
+    return fmt_gb(f) <= BUDGET_GB
+
+
+def same_budget_ratio():
+    """At one budget: a small model at 8-bit, or a big one at 1-bit."""
+    return PARAMS_27B / SMALL_PARAMS
+
+
+def fig_budget(left=76, top=30, rowh=26, gap=14, scale=430, right=150):
+    """Four bars, one axis, to scale. Only one of them lands under the line."""
+    top_gb = max(fmt_gb(f) for f in FORMATS)
+    h = top + len(FORMATS) * (rowh + gap) + 34
+    w = left + scale + right
+    o = ['<svg class="fig" viewBox="0 0 %.0f %.0f" width="100%%" role="img" '
+         'aria-label="A 27B model in four quantization formats against an edge memory budget">'
+         % (w, h)]
+    o.append(txt(left, 15, "a 27B model, memory for weights", 10))
+    o.append(txt(left + scale, 15, "%.0f GB" % top_gb, 9, anchor="end"))
+
+    bx = left + scale * BUDGET_GB / top_gb
+    ytop, ybot = top - 8, top + len(FORMATS) * (rowh + gap) + 4
+    o.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="var(--warn)" '
+             'stroke-width="1.5" stroke-dasharray="4 3"/>' % (bx, ytop, bx, ybot))
+    o.append(txt(bx + 6, ybot + 14, "a %.0f GB device" % BUDGET_GB, 9, fill="var(--warn)",
+                 weight="700"))
+
+    for i, f in enumerate(FORMATS):
+        y = top + i * (rowh + gap)
+        gb = fmt_gb(f)
+        bw = scale * gb / top_gb
+        ok = fits(f)
+        o.append('<rect x="%.1f" y="%.1f" width="%.1f" height="%d" rx="1" fill="%s"/>'
+                 % (left, y, max(bw, 2), rowh, "var(--accent)" if ok else "var(--bar)"))
+        o.append(txt(left - 10, y + 17, f["name"], 11, fill="var(--ink)", anchor="end",
+                     weight="700"))
+        lx = left + max(bw, 2) + 8
+        o.append(txt(lx, y + 12, "%.1f GB" % gb, 10, fill="var(--ink)", weight="700"))
+        o.append(txt(lx, y + 24, f["note"], 8.5))
+        if ok:
+            o.append(txt(lx + 78, y + 12, "fits", 10, fill="var(--accent)", weight="700"))
+    o.append("</svg>")
+    return "\n".join(o)
+
+
+FIGURES = {"budget": fig_budget, "lanes": fig_lanes, "models": fig_models, "handoff": fig_handoff}
+
+if __name__ == "__main__":
+    import pathlib
+    out = pathlib.Path(__file__).parent
+    for k, f in FIGURES.items():
+        (out / ("fig_%s.svg" % k)).write_text(f())
+        print("fig_%s.svg" % k)
+    for m in MODELS:
+        print("%-4s %s weights, speedup %.2fx" % (m["key"], f"{weights(m):,}", speedup(m["key"])))
