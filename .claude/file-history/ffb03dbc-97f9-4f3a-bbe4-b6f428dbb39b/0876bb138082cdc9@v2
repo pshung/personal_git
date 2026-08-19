@@ -1,0 +1,189 @@
+# Reproducing the Q1_0 RISC-V kernel optimizations
+
+Four checks, cheapest first. Each one proves a different claim from the
+summit abstract; run them in order and stop wherever you have enough
+confidence.
+
+| level | proves                                   | needs                | time     |
+|-------|-------------------------------------------|-----------------------|----------|
+| 1     | repack layout is numerically correct       | toolchain + qemu-user | ~1 min   |
+| 2     | prefetch / `vd4dots` are actually emitted  | an existing build dir | ~1 min   |
+| 3     | prefetch and d4 reproduce the baseline text | andesim, fast mode    | ~8 min   |
+| 4     | the cycle counts in the abstract           | andesim, hybrid + RTL | minutes/binary |
+
+## Prerequisites
+
+```bash
+export LLAMA=~/work/llama.cpp
+export ANDESIM=~/work/andesim
+export TC=/local/nick/SW_Release/build-ast542/build-toolchain/linux/nds64le-linux-glibc-v5d
+cd "$LLAMA"
+
+# confirm the pieces exist before running anything below
+test -x "$TC/bin/riscv64-linux-gcc" && echo "toolchain: OK"
+test -x "$ANDESIM/andesim"          && echo "andesim: OK"
+test -f models/Bonsai-4B-Q1_0.gguf  && echo "4B model: OK"
+```
+
+## Level 1 - repack layout correctness (qemu-user)
+
+This checks the math, independent of the vendor instruction: pack random
+weights, run the packed gemv/gemm, compare against a reference. Run it once
+with the plain-RVV layout and once with the `vd4dots` layout - both must
+pass, since they share the test and differ only in `D4`.
+
+`o``bash
+D4=0 bash build-d4-qemu.sh   # plain RVV layout (control)
+D4=1 bash build-d4-qemu.sh   # vd4dots layout
+
+QEMU_CPU=andes-ax45mpv,vlen=1024,zfh=true,zvfh=true \
+  BIN_DIR=build-d4-qemu/bin ./run-rv64-qemu.sh test-repack-q1_0
+```
+
+Expect `13/13 repack cases passed` both times. `D4=1`'s build directory is
+overwritten by the second `build-d4-qemu.sh` call, so run the test between
+the two builds if you want to see both pass lines separately.
+
+These binaries are dynamic and built with a plain `-march` specifically so
+qemu-user can run them directly. The `build.sh` binaries below (`bin-*`) are
+static with the Zc compressed-instruction extensions, built for andesim -
+qemu-user is not the right runner for those; use `run-rv64-qemu.sh` only on
+`build-d4-qemu.sh` output.
+
+## Level 2 - confirm the instructions are actually emitted
+
+Correct output doesn't prove the fast path ran - a silently-generic fallback
+gives the same numbers, just slower. These gates disassemble the built
+object and count instructions.
+
+```bash
+bash build.sh prefetch d4     # needs the two builds these gates check
+
+BUILD=b-prefetch ./check-prefetch.sh   # expects 2x prefetch.r per entry point
+BUILD=b-d4        ./check-vd4dots.sh   # expects nds.vd4dots in gemv AND gemm,
+                                        # no vtype churn, no strided broadcast
+```
+
+Both print `PASS: ...`. Either failing means the codegen regressed even
+though Level 1's numbers still look right - that's the failure mode these
+exist to catch.
+
+## Level 3 - whole-model output matches the baseline (andesim fast mode)
+
+No RTL here. `--mode fast` is QEMU only: `qemu-system-riscv64 -machine
+andes_ae350 -cpu andes-ax46mpv,vlen=1024`, with the binary staged into a
+`vlinux-run.elf` and program output returned over semihosting. It runs the
+real Bonsai-4B model end to end and compares each kernel build's generated
+text against the **no-prefetch repack baseline** - `bin-baseline`, which is
+`GGML_CPU_REPACK=ON` with `Q1_PREFETCH_DIST=0`, not the upstream kernel.
+(`--engine` is accepted but ignored in fast mode; it only selects an engine
+for `cycle` and `hybrid`.)
+
+```bash
+bash build.sh baseline prefetch d4   # if not already built
+bash verify.sh                       # compares prefetch and d4 against baseline
+```
+
+Expect:
+```
+PREFETCH: The capital of France is Paris. Paris is the capital of France. Paris is the capital of France.
+BASELINE: The capital of France is Paris. Paris is the capital of France. Paris is the capital of France.
+PASS: prefetch output is bit-identical to baseline
+```
+
+The two comparisons are not worth the same thing:
+
+- **`prefetch` must match.** `prefetch.r` is an architectural hint and cannot
+  change a result, so what is actually under test is the code *around* it -
+  the address arithmetic and the `l + DIST < nb` bound in the prefetch helper.
+  A mismatch here is a wrapper bug, never "the hint changed the answer".
+- **`d4` matching is a measured result, not a guarantee.** The d4 gemv keeps
+  the baseline's float nesting, so decode is exact. The d4 *gemm* does not: it
+  folds `dx * ad[m]` into each q8 group and accumulates into `sumf` eight
+  times per block (`q1_gemm_64d4_vl1024`), where the baseline builds `facc`
+  across the groups first and accumulates once per block
+  (`q1_gemm_64x1_vl1024`). That is a different rounding order, so prefill
+  floats differ at the ULP level by construction. Equal greedy text is the
+  acceptance bar; a future mismatch calls for a tolerance comparison, not a
+  logic-bug hunt. `nds.vd4dots` does really execute here - its decode is gated
+  by `xandesv5isa`, which the fast-mode QEMU config turns on.
+
+Two limits worth stating plainly. This level compares *decoded text*, not
+tensor bits: greedy argmax over 16 tokens is a coarse filter, so it catches
+gross corruption, not small numeric drift. And it does not compare `pristine`
+against `baseline` - repack changes the accumulation structure versus
+upstream, so those two are not expected to be byte-equal and would need a
+tolerance comparison. Level 1's `test-repack-q1_0` is the numerical gate;
+Level 3 is a whole-model smoke test layered on top of it.
+
+## Level 4 - the cycle counts behind the speedup numbers
+
+This is the slow one: andesim hybrid mode fast-forwards the model load with
+a functional model, then hands off to the RTL engine at the K=51 attention
+node and counts real cycles.
+
+```bash
+bash measure.sh pristine baseline prefetch d4
+```
+
+Expect, on `vsim:ax46mpv_fpga_l3` (cycles will vary by a fraction of a
+percent run to run; the ratios are what matters):
+
+| build    | cycles    | vs. pristine |
+|----------|-----------|--------------|
+| pristine | 4,476,168 | 1.00x        |
+| baseline | 2,144,213 | 2.09x        |
+| prefetch | 1,389,236 | 3.22x        |
+| d4       |   362,799 | 12.34x       |
+
+<details>
+<summary>Appendix - 8B/27B, script reference, troubleshooting</summary>
+
+### Reproducing the 8B and 27B numbers
+
+Same four binaries, same `measure.sh`-style invocation, different
+`--mem-size`/`--no-mmap` flags because the bigger models press against the
+guest RAM window. Full commands and the per-model reasoning are in
+`q1_0_8b_hybrid.md`.
+
+```bash
+# 8B
+cd "$ANDESIM" && ./andesim run --mode hybrid --trigger marker --runtime linux \
+  --mem-size 2097148K --engine vsim:ax46mpv_fpga_l3 --step-timeout-ms 14400000 \
+  "$LLAMA/bin-d4" -- -m "$LLAMA/models/Bonsai-8B-Q1_0.gguf" \
+  --no-mmap -no-cnv --prompt 'The capital of France is' -n 32 -c 512 -t 1
+
+# 27B
+cd "$ANDESIM" && ./andesim run --mode hybrid --trigger marker --runtime linux \
+  --mem-size 6G --engine vsim:ax46mpv_fpga_l3 --step-timeout-ms 14400000 \
+  "$LLAMA/bin-d4" -- -m "$LLAMA/models/Bonsai-27B-Q1_0.gguf" \
+  --no-mmap -no-cnv --prompt 'The capital of France is' -n 32 -c 512 -t 1
+```
+
+### Script reference
+
+| script              | what it does                                            |
+|---------------------|----------------------------------------------------------|
+| `build.sh`          | builds `bin-pristine/baseline/prefetch/d4[-nopf]` for andesim |
+| `build-d4-qemu.sh`  | builds a dynamic `test-repack-q1_0` for qemu-user (Level 1) |
+| `check-prefetch.sh` | codegen gate: counts `prefetch.r` per entry point         |
+| `check-vd4dots.sh`  | codegen gate: counts `nds.vd4dots`, checks for vtype churn and strided loads |
+| `verify.sh`         | fast-mode text check: prefetch and d4 vs. baseline         |
+| `measure.sh`        | hybrid-mode cycle counts, any subset of the four builds    |
+| `run-rv64-qemu.sh`  | runs a riscv64 binary under qemu-user                      |
+
+### Troubleshooting
+
+- **`run-rv64-qemu.sh` exits 139 (SIGSEGV), no output at all**: you pointed it
+  at a `build.sh` binary (`bin-pristine`, `b-d4/bin/...`, etc). Those are
+  static Zc-extension binaries for andesim; qemu-user only runs the plain
+  `-march` binaries from `build-d4-qemu.sh`.
+- **`check-*.sh` says "no compile_commands.json"**: that build dir was
+  configured without `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`. `build.sh` already
+  sets this; if you hand-rolled a `cmake` call, add the flag and reconfigure.
+- **andesim run looks stuck**: hybrid mode's RTL leg runs at a few kHz: budget
+  minutes per binary, not seconds. Watch for the `[roi]` line first (model
+  load finished, ROI entered) - if that never appears, the model load itself
+  is the problem, not the measurement.
+
+</details>

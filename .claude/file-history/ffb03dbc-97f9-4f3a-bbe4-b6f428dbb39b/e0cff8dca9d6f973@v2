@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Fast-mode text-equivalence check for q1_0_reproduce.md Level 3: run each
+# candidate kernel build and the no-prefetch repack baseline under
+# andesim --mode fast (functional model, no cycle leg), greedy, same prompt,
+# and confirm the generated text is byte-identical to the baseline's.
+#
+#   bash verify.sh              # prefetch d4  (the default set)
+#   bash verify.sh prefetch     # just the prefetch A/B
+#
+# What each comparison is worth is NOT the same:
+#
+#   prefetch  Identical text is REQUIRED. prefetch.r is an architectural hint
+#             and cannot change a result, so this tests the helper AROUND it -
+#             its address math and its l+DIST<nb bound. A mismatch is a wrapper
+#             bug, never "the hint changed the answer".
+#
+#   d4        Identical text is NOT guaranteed a priori. The d4 gemv keeps the
+#             baseline's float nesting (facc per q8 group, sumf per block), so
+#             decode should match exactly. The d4 GEMM does not: it folds
+#             dx*ad[m] into each group and accumulates into sumf 8x per block
+#             (q1_gemm_64d4_vl1024), where the baseline builds facc first and
+#             accumulates once per block (q1_gemm_64x1_vl1024). Different
+#             rounding order, so prefill floats differ at the ULP level. Equal
+#             greedy text is the acceptance bar. If this ever fails, compare
+#             tensors with a tolerance - do not go hunting for a logic bug.
+#
+# Minutes, not hours. Override via env LLAMA / ANDESIM / MODEL / ENGINE / PROMPT.
+set -e
+export TMPDIR=${TMPDIR:-/home/nick/tmp}
+LLAMA=${LLAMA:-/home/nick/work/llama.cpp}
+ANDESIM=${ANDESIM:-/home/nick/work/andesim}
+MODEL=${MODEL:-$LLAMA/models/Bonsai-4B-Q1_0.gguf}
+ENGINE=${ENGINE:-vsim:ax46mpv_fpga_l3}
+PROMPT=${PROMPT:-The capital of France is}
+
+gen() {  # $1 = binary -> its generated continuation line
+  ( cd "$ANDESIM" && ./andesim run --mode fast --runtime linux --mem-size 2000M \
+      --engine "$ENGINE" "$1" -- -m "$MODEL" -no-cnv \
+      --prompt "$PROMPT" -n 16 -c 512 -t 1 --temp 0 ) 2>&1 \
+    | grep "$PROMPT" | head -1
+}
+
+# llama-completion echoes the prompt before it generates (display_prompt
+# defaults true), so two runs that both produced ZERO tokens would compare
+# equal and non-empty, and the old script called that a PASS. Require the line
+# to be strictly longer than the prompt it echoed.
+run() {  # $1 = build name -> its line, or exit 1
+  local line
+  line=$(gen "$LLAMA/bin-$1")
+  [ ${#line} -gt ${#PROMPT} ] || { echo "FAIL: $1 generated no tokens" >&2; exit 1; }
+  printf '%s\n' "$line"
+}
+
+B=$(run baseline)
+printf '%-9s %s\n' "BASELINE:" "$B"
+
+rc=0
+for t in ${*:-prefetch d4}; do
+  O=$(run "$t")
+  printf '%-9s %s\n' "$(printf '%s' "$t" | tr '[:lower:]' '[:upper:]'):" "$O"
+  if [ "$O" = "$B" ]; then
+    echo "PASS: $t output is byte-identical to baseline"
+  else
+    echo "FAIL: $t output differs from baseline"
+    rc=1
+  fi
+done
+exit $rc
