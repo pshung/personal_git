@@ -1,0 +1,82 @@
+# Optimizing 1-bit LLM Inference for RISC-V Edge Devices
+
+# Author: Pei-Hsiang Hung, Andes Technology
+
+---
+
+## Abstract
+
+1-bit compression has left the lab. You can download the Bonsai 27B model that fits in
+3.8 GB and keeps 90% of its FP16 benchmark score. That moves the edge
+bottleneck from 'Does the model fit?' to 'Can the silicon execute it?'.
+
+At one bit the multiply disappears: a weight is a sign, so the inner operation
+is add-or-subtract. The expensive part of an NPU is its multiply array, and
+here that array has nothing to do -- you would be paying for multipliers to
+compute plus-or-minus one times x. What the work needs instead is many lanes
+doing trivial arithmetic, plus the bit manipulation to feed them: sign masks,
+bit-planes, per-block scales. A vector CPU already has both, with no extra IP
+and no weights to ship across to an accelerator.
+
+We targeted an **Andes AX46MPV**: a single hart with a 1024-bit vector unit,
+32 KB of L1 data cache, no L2 and 2 MB of L3 -- wide vectors on a thin memory
+system, which is what an edge core actually looks like. On it, upstream
+llama.cpp used **32 of the 128 available byte-lanes** per reduction step and
+paid a serial reduction every 32 columns.
+
+We optimized the kernel at three levels. Data layout: repack the weights so
+every lane owns an output row and the serial reductions disappear. Memory:
+prefetch the weight stream, which is read once and never reused. ISA: hand
+the reduction to `nds.vd4dots.vv`, a stock Andes V5 vendor instruction whose
+operand shape already matches the repacked layout.
+
+What we measure is the 1-bit matmul kernel that dominates decode time. On
+Bonsai 27B it runs **11.86x** faster than upstream llama.cpp on the same
+core, with bit-identical output. The same three changes, applied unchanged,
+carry across two more models spanning a 12x range in kernel size and two
+different attention architectures:
+
+| model      | arch   | pristine   | repack     | + prefetch | + `vd4dots` | decode speedup |
+|------------|--------|------------|------------|------------|-------------|----------------|
+| Bonsai 4B  | qwen3  | 4,476,168  | 2,144,213  | 1,389,236  | 362,799     | **12.34x**     |
+| Bonsai 8B  | qwen3  | 7,278,168  | 3,475,147  | 2,218,540  | 648,246     | **11.23x**     |
+| Bonsai 27B | qwen35 | 54,314,202 | 25,629,722 | 16,317,304 | 4,578,346   | **11.86x**     |
+
+*(cycles, same K=51 projection node in each model, decode / nrows=2)*
+
+Data layout plus prefetch alone -- no vendor-specific instruction -- are worth
+**3.2-3.3x** on any compliant RVV core. The 4-way dot adds a further
+**3.4-3.8x** on top of that: reading 4 columns per lane moves the same bytes
+in a quarter as many load instructions, which is what moves the needle when
+the kernel is issue-bound rather than bandwidth-bound.
+
+We measure the cycle with AndeSim's newly developed hybrid mode: a fast
+functional model races through the long-running model load, then hands the
+machine state to the RTL engine at exactly the matmul we care about --
+cycle-accurate, pre-silicon, reproducible to the cycle.
+
+---
+
+## Takeaways
+
+1. **For 1-bit models the kernel is a data-layout problem.** Transpose into
+   the lanes first; everything else follows from that.
+2. **Most of the win is vendor-neutral.** Repack + prefetch alone reach
+   3.2-3.3x on any compliant RVV core; the vendor 4-way dot is the last
+   3.4-3.8x, not the bulk of it.
+3. **The chain transfers across models, not just within one.** Same three
+   changes, same order, unchanged code, 11.2x-12.3x decode speedup across two
+   architectures and a 12x range in kernel size.
+4. **Per-kernel pre-silicon measurement changes which optimizations you
+   attempt**, because it ranks them correctly when cheaper tools do not.
+
+---
+
+
+**Speaker:** _to fill in_
+
+**Notes for reviewers:** all cycle figures are measured, not simulated
+estimates. Quality-retention figures are the model publisher's, not ours.
+
+## Reference
+https://makerpro.cc/how-can-bonsai-27b-disrupt-the-boundaries-between-local-llm-and-slm/
