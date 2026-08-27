@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Fast-mode whole-model check for q1_0_reproduce.md Level 3.
+#
+# Runs the three configurations that actually ship, under andesim --mode fast
+# (QEMU only - functional, no cycle leg), greedy, same prompt, and compares
+# each optimized build's generated text against upstream's:
+#
+#   pristine  GGML_CPU_REPACK=OFF                      <- the reference
+#   prefetch  repack + weight-stream prefetch (DIST=1)
+#   d4        repack + prefetch + nds.vd4dots.vv
+#
+#   bash verify.sh                  # 4b model, prefetch and d4 vs pristine
+#   MODEL=8b bash verify.sh         # same, on Bonsai-8B
+#   MODEL=27b bash verify.sh
+#   MODEL=/path/to/x.gguf bash verify.sh
+#   REF=baseline bash verify.sh prefetch    # isolate the prefetch hint alone
+#
+# Why equality is the right bar, per comparison:
+#
+#   prefetch vs pristine  Expected to match exactly. Upstream's VLEN>=256 path
+#       (ggml_vec_dot_q1_0_q8_0_vl256) reduces as `acc += d1*sumi` per q8 group
+#       then `sumf += d0*acc` per block, and the repack gemv uses that same
+#       nesting (facc per group, sumf per block). prefetch.r on top is an
+#       architectural hint and cannot change a result, so a mismatch means the
+#       repack layout or the prefetch helper's address math is wrong.
+#
+#   d4 vs pristine  Not guaranteed bit-for-bit. The gemv keeps the nesting
+#       above, so decode is exact, but the vd4dot GEMM folds dx*ad[m] into
+#       each q8 group and accumulates into sumf 4x per block
+#       (q1_gemm_64_vd4dot_vl1024)
+#       where the others build facc first and accumulate once per block. That
+#       is a different rounding order, so PREFILL floats differ at the ULP
+#       level by construction. Equal greedy text is the acceptance bar; if it
+#       ever fails, compare tensors with a tolerance, do not hunt a logic bug.
+#
+# Minutes per binary. Override via env LLAMA / ANDESIM / MODEL / REF / PROMPT / NGEN.
+set -e
+export TMPDIR=${TMPDIR:-/home/nick/tmp}
+LLAMA=${LLAMA:-/home/nick/work/llama.cpp}
+ANDESIM=${ANDESIM:-/home/nick/work/andesim}
+# --engine is NOT cosmetic in fast mode: it picks QEMU's -cpu and VLEN.
+# vsim:ax46mpv_fpga_l3 -> andes-ax46mpv,vlen=1024; omitting it falls back to
+# andes-ax45mpv,vlen=512, where q1_gemv_64_vd4dot_vl1024 does not apply and the
+# d4 build silently drops to the generic kernel - the comparison would still PASS
+# while testing nothing. Keep this at a VLEN>=1024 engine.
+ENGINE=${ENGINE:-vsim:ax46mpv_fpga_l3}
+REF=${REF:-pristine}
+PROMPT=${PROMPT:-The capital of France is}
+NGEN=${NGEN:-16}
+
+# Model selection. The bigger models need more guest RAM than the 4B, and need
+# --no-mmap because the mapped file does not fit the guest window. These are
+# FAST-mode sizes: unlike hybrid, fast mode has no 2G cap (it is just QEMU's
+# -m), but QEMU takes whole MiB - the hybrid runbook's 2097148K is rejected here.
+case "${MODEL:-4b}" in
+  4b)  GGUF="$LLAMA/models/Bonsai-4B-Q1_0.gguf";  MEM=${MEM:-2000M}; MMAP="" ;;
+  8b)  GGUF="$LLAMA/models/Bonsai-8B-Q1_0.gguf";  MEM=${MEM:-4G};    MMAP="--no-mmap" ;;
+  27b) GGUF="$LLAMA/models/Bonsai-27B-Q1_0.gguf"; MEM=${MEM:-8G};    MMAP="--no-mmap" ;;
+  *)   GGUF="$MODEL";                             MEM=${MEM:-8G};    MMAP="--no-mmap" ;;
+esac
+[ -f "$GGUF" ] || { echo "no such model: $GGUF" >&2; exit 1; }
+
+gen() {  # $1 = binary -> the line holding the prompt and its continuation
+  ( cd "$ANDESIM" && ./andesim run --mode fast --runtime linux --mem-size "$MEM" \
+      --engine "$ENGINE" "$1" -- -m "$GGUF" $MMAP -no-cnv \
+      --prompt "$PROMPT" -n "$NGEN" -c 512 -t 1 --temp 0 ) 2>&1 \
+    | grep "$PROMPT" | head -1
+}
+
+# llama-completion echoes the prompt before it generates (display_prompt
+# defaults true), so two runs that both produced ZERO tokens would compare
+# equal and non-empty. Require the line to be longer than the prompt it echoed.
+run() {  # $1 = build name -> its line, or exit 1
+  local bin="$LLAMA/bin-$1" line
+  [ -x "$bin" ] || { echo "missing build: $bin (run: bash build.sh $1)" >&2; exit 1; }
+  line=$(gen "$bin")
+  [ ${#line} -gt ${#PROMPT} ] || { echo "FAIL: $1 generated no tokens" >&2; exit 1; }
+  printf '%s\n' "$line"
+}
+
+label() { printf '%-9s %s\n' "$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]'):" "$2"; }
+
+echo "model: $GGUF   ref: $REF   engine: $ENGINE"
+R=$(run "$REF")
+label "$REF" "$R"
+
+rc=0
+for t in ${*:-prefetch d4}; do
+  O=$(run "$t")
+  label "$t" "$O"
+  if [ "$O" = "$R" ]; then
+    echo "PASS: $t output is identical to $REF"
+  else
+    echo "FAIL: $t output differs from $REF"
+    rc=1
+  fi
+done
+exit $rc
