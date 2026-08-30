@@ -1,0 +1,233 @@
+# Bonsai-4B prefill profiling: measured cycles per MUL_MAT node (gemm path)
+
+The prefill counterpart of `profiling_data.md`. Same four build stages, same
+engine, same per-node marker ROI -- on the **gemm** path (`nrows=4`) instead of
+the decode gemv path, plus a matching gemv sweep so the two are comparable
+node for node.
+
+Generated 2026-08-28. Every figure is a cycle-accurate RTL measurement of one
+MUL_MAT node, produced by `bash sweep.sh` and regenerable with
+`bash sweep.sh --md`.
+
+## Setup
+
+| | |
+|---|---|
+| Engine | `vsim:ax46mpv_fpga_l3` -- VLEN 1024, 1 hart, 32 KB L1D, no L2, 2 MB L3 |
+| Model | `Bonsai-4B-Q1_0.gguf`, qwen3, 36 layers, 572 MB |
+| Mode | andesim hybrid, marker trigger, `--mem-size 2000M -t 1` |
+| Node id | `ROI_K` = index of the MUL_MAT in graph order, 1-based |
+| Nodes | layer 7, K=50..56 -- all 7 distinct Q1_0 shapes in the model |
+
+The path is selected by the prompt, and by nothing else:
+
+| path | invocation | `nrows` |
+|---|---|---:|
+| gemv / decode | warmup forward pass | 2 |
+| gemm / prefill | `--no-warmup` + a 4-token prompt | 4 |
+
+A 5-token prompt would give gemm(4) plus a gemv(1) tail and silently mix the
+two kernels, so every leg re-reads `nrows` from its own `[roi]` line and
+refuses to report a number that disagrees with the requested path.
+
+## Build variants
+
+| name | flags | meaning |
+|---|---|---|
+| `pristine` | `GGML_CPU_REPACK=OFF` | upstream llama.cpp |
+| `baseline` | repack ON, `Q1_PREFETCH_DIST=0` | + row-parallel 64x1 repack |
+| `prefetch` | repack ON, `Q1_PREFETCH_DIST=1` | + zicbop prefetch = **standard RVV** |
+| `d4` | + `GGML_RV_XANDESVDOT=ON`, `Q1_VD4DOT=1` | + `nds.vd4dots.vv` |
+
+## Layer 7, prefill / gemm (`nrows=4`)
+
+<!-- BEGIN GEMM TABLE (regenerate: bash sweep.sh --md) -->
+| K | tensor | ne0 x ne1 | weights | upstream | +repack | +prefetch | +vd4dots | total |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 50 | `blk.7.attn_q` | 2560 x 4096 | 10,485,760 | 35,510,678 | 5,566,590 | 5,386,377 | 2,071,451 | 17.14x |
+| 51 | `blk.7.attn_v` | 2560 x 1024 | 2,621,440 | 8,879,897 | 1,695,440 | 1,651,086 | 823,397 | 10.78x |
+| 52 | `blk.7.attn_k` | 2560 x 1024 | 2,621,440 | 8,929,195 | 1,696,273 | 1,651,132 | 823,291 | 10.85x |
+| 53 | `blk.7.attn_output` | 4096 x 2560 | 10,485,760 | 36,923,068 | 5,844,812 | 5,592,124 | 2,357,551 | 15.66x |
+| 54 | `blk.7.ffn_gate` | 2560 x 9728 | 24,903,680 | 82,747,014 | 12,701,128 | 12,066,600 | 3,972,668 | 20.83x |
+| 55 | `blk.7.ffn_up` | 2560 x 9728 | 24,903,680 | 82,690,333 | 12,696,438 | 12,069,169 | 3,971,366 | 20.82x |
+| 56 | `blk.7.ffn_down` | 9728 x 2560 | 24,903,680 | 95,939,361 | 14,196,333 | 13,483,443 | 5,709,937 | 16.80x |
+| | **ALL 7** | | | **351,619,546** | **54,397,014** | **51,899,931** | **19,729,661** | **17.82x** |
+
+### Where the gemm speedup comes from (n = 7 nodes with all four stages)
+
+| step | geo mean | min | max |
+|---|---:|---:|---:|
+| upstream to +repack -- row-parallel 64x1 layout | **6.11x** | 5.24x | 6.76x |
+| +repack to +prefetch -- zicbop weight stream | **1.04x** | 1.03x | 1.05x |
+| +prefetch to +vd4dots -- Andes XAndesVDot | **2.46x** | 2.01x | 3.04x |
+| **total** | **15.64x** | | |
+<!-- END GEMM TABLE -->
+
+## Layer 7, decode / gemv (`nrows=2`), measured the same way
+
+<!-- BEGIN GEMV TABLE (regenerate: MODE=gemv bash sweep.sh --md) -->
+| K | tensor | ne0 x ne1 | weights | upstream | +repack | +prefetch | +vd4dots | total |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 50 | `blk.7.attn_q` | 2560 x 4096 | 10,485,760 | 17,981,071 | 8,516,129 | 5,475,562 | 1,437,326 | 12.51x |
+| 51 | `blk.7.attn_v` | 2560 x 1024 | 2,621,440 | 4,478,183 | 2,145,948 | 1,387,101 | 381,355 | 11.74x |
+| 52 | `blk.7.attn_k` | 2560 x 1024 | 2,621,440 | 4,513,768 | 2,148,809 | 1,388,277 | 381,654 | 11.83x |
+| 53 | `blk.7.attn_output` | 4096 x 2560 | 10,485,760 | 18,320,199 | 8,583,053 | 5,490,245 | 1,520,976 | 12.05x |
+| 54 | `blk.7.ffn_gate` | 2560 x 9728 | 24,903,680 | 42,194,328 | 20,243,782 | 12,958,214 | 3,326,210 | 12.69x |
+| 55 | `blk.7.ffn_up` | 2560 x 9728 | 24,903,680 | 42,151,859 | 20,244,994 | 12,960,767 | 3,326,247 | 12.67x |
+| 56 | `blk.7.ffn_down` | 9728 x 2560 | 24,903,680 | 49,058,107 | 20,844,150 | 12,991,435 | 3,770,805 | 13.01x |
+| | **ALL 7** | | | **178,697,515** | **82,726,865** | **52,651,601** | **14,144,573** | **12.63x** |
+
+### Where the gemv speedup comes from (n = 7 nodes with all four stages)
+
+| step | geo mean | min | max |
+|---|---:|---:|---:|
+| upstream to +repack -- row-parallel 64x1 layout | **2.13x** | 2.08x | 2.35x |
+| +repack to +prefetch -- zicbop weight stream | **1.56x** | 1.55x | 1.60x |
+| +prefetch to +vd4dots -- Andes XAndesVDot | **3.70x** | 3.45x | 3.90x |
+| **total** | **12.35x** | | |
+<!-- END GEMV TABLE -->
+
+## The finding: same destination, opposite routes
+
+| step | gemm (prefill) | gemv (decode) |
+|---|---:|---:|
+| upstream to +repack | **6.11x** | 2.13x |
+| +repack to +prefetch | **1.04x** | 1.56x |
+| +prefetch to +vd4dots | **2.46x** | 3.70x |
+| **total** | **15.64x** | **12.35x** |
+
+Per node, so the spread is visible:
+
+| K | tensor | repack gemm | repack gemv | prefetch gemm | prefetch gemv | vd4dots gemm | vd4dots gemv | total gemm | total gemv |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 50 | `blk.7.attn_q` | 6.38x | 2.11x | 1.03x | 1.56x | 2.60x | 3.81x | **17.14x** | **12.51x** |
+| 51 | `blk.7.attn_v` | 5.24x | 2.09x | 1.03x | 1.55x | 2.01x | 3.64x | **10.78x** | **11.74x** |
+| 52 | `blk.7.attn_k` | 5.26x | 2.10x | 1.03x | 1.55x | 2.01x | 3.64x | **10.85x** | **11.83x** |
+| 53 | `blk.7.attn_output` | 6.32x | 2.13x | 1.05x | 1.56x | 2.37x | 3.61x | **15.66x** | **12.05x** |
+| 54 | `blk.7.ffn_gate` | 6.51x | 2.08x | 1.05x | 1.56x | 3.04x | 3.90x | **20.83x** | **12.69x** |
+| 55 | `blk.7.ffn_up` | 6.51x | 2.08x | 1.05x | 1.56x | 3.04x | 3.90x | **20.82x** | **12.67x** |
+| 56 | `blk.7.ffn_down` | 6.76x | 2.35x | 1.05x | 1.60x | 2.36x | 3.45x | **16.80x** | **13.01x** |
+
+Two things stand out.
+
+1. **Prefill buys its win from the layout, decode from the instructions.**
+   Repack is worth 6.1x to prefill and 2.1x to decode; prefetch and vd4dots are
+   each worth roughly half as much to prefill as to decode.
+2. **Decode's speedup is shape-invariant, prefill's is not.** gemv spans
+   11.74x-13.01x across a 9.5x range of node sizes (a 1.11x spread). gemm spans
+   10.78x-20.83x (1.93x). On the smallest node prefill gains *less* than decode;
+   on the largest it gains far more.
+
+### Why prefill wins at the layout stage
+
+**Upstream has no prefill kernel at all.** `GGML_TYPE_Q1_0` sets `.nrows = 1`
+(`ggml-cpu.c:257`), and `ggml_compute_forward_mul_mat_one_chunk` issues one
+`vec_dot` per (weight row, token) pair, so upstream cost is exactly linear in
+token count. Measured on all seven nodes -- 2x the tokens costs 2x the cycles,
+across a 9.5x range of node sizes:
+
+| node | 2 tokens | 4 tokens | ratio |
+|---|---:|---:|---:|
+| K=50 `attn_q` | 17,981,071 | 35,510,678 | 1.97x |
+| K=51 `attn_v` | 4,478,183 | 8,879,897 | 1.98x |
+| K=52 `attn_k` | 4,513,768 | 8,929,195 | 1.98x |
+| K=53 `attn_output` | 18,320,199 | 36,923,068 | 2.02x |
+| K=54 `ffn_gate` | 42,194,328 | 82,747,014 | 1.96x |
+| K=55 `ffn_up` | 42,151,859 | 82,690,333 | 1.96x |
+| K=56 `ffn_down` | 49,058,107 | 95,939,361 | 1.96x |
+
+**The repack gemm amortizes every weight-side operation across the M-tile.**
+Per 4 columns of weights:
+
+| kernel | vlm mask loads | vmerge | `nds.vd4dots.vv` |
+|---|---:|---:|---:|
+| gemv (`q1_vd4dots_x4_m2`, `arch/riscv/repack.cpp:1809`) | 4 | 4 | 4 |
+| gemm (`arch/riscv/repack.cpp:1967-1972`) | 1 | 1 | 4 |
+
+The gemm loads one weight vector and fires four dots against it, one per token
+(`q1_vd4dots_4acc_m2` reuses `%[w]` across accumulators `a0..a3`). That is ~4x
+off all weight traffic in one step -- and, having removed the memory stall up
+front, it is also why the prefetch stage has almost nothing left to hide.
+
+### Why prefill loses on small tensors: a scalar activation quantizer
+
+attn_q, attn_v, attn_k, ffn_gate and ffn_up all have `ne0 = 2560` and differ
+only in row count, so a node's cost splits into a per-call constant and a
+per-64-row-tile term. Fitting `cycles = F + T * tiles`:
+
+| | fixed per call `F` | per tile `T` | per tile **per token** |
+|---|---:|---:|---:|
+| gemv `d4` (2 tok) | 39,491 | 21,638 | 10,819 |
+| gemm `d4` (4 tok) | 489,581 | 23,036 | **5,759** |
+
+The fit is tight (gemv residuals within 1.1%). In steady state the gemm is
+**1.88x more efficient per token**, exactly as the M-tile sharing predicts. But
+it carries **12.4x the per-call fixed cost**, and that constant is what decides
+the small nodes: `F` is 59% of attn_v's 823,397 total and only 12% of
+ffn_gate's 3,972,668.
+
+`F` is not part of the kernel. Fitting the same model to every repack variant
+of both paths:
+
+| variant | gemm `F` | gemm `T` | gemv `F` | gemv `T` |
+|---|---:|---:|---:|---:|
+| `baseline` | 398,003 | 80,915 | 13,379 | 133,082 |
+| `prefetch` | 441,355 | 76,544 | 27,294 | 85,084 |
+| `d4` | 489,581 | 23,036 | 39,491 | 21,638 |
+
+`T` collapses 3.5x (gemm) and 6.2x (gemv) as the kernel improves; `F` stays put
+and stays an order of magnitude apart between the two paths. It is the shared
+activation path, and the source says what it is. `forward_mul_mat` quantizes
+activations before the kernel runs (`repack.cpp:4456-4469`), and the routine it
+picks depends on the token count:
+
+- **4 tokens** (`ne11 - ne11 % 4 == 4`) take
+  `ggml_quantize_mat_t<1, GGML_TYPE_Q8_0>`, which selects
+  `ggml_quantize_mat_q8_0_4x1_generic` -- a **pure scalar** loop
+  (`repack.cpp:51`, its own comment says `// scalar`): per 32-column block, 128
+  `fabsf` for the amax scan plus 128 `roundf` plus the de-interleave index
+  arithmetic. Its vector twin is gated behind `__riscv_zvfh`, and the
+  measurement build sets `-DGGML_RV_ZVFH=OFF`.
+- **2 tokens** are not a multiple of 4, so they fall through to `from_float` =
+  `quantize_row_q8_0`, which **is** RVV-vectorized on RISC-V
+  (`arch/riscv/quants.c:32`, gated only on `__riscv_v`).
+
+So decode gets a vector quantizer and prefill gets a scalar one. That is the
+whole 12.4x fixed-cost gap, and at ~490K cycles per node it is now the largest
+single item in a small prefill matmul -- bigger than the kernel it feeds.
+
+## Notes
+
+- **Identical shapes give identical cycles.** attn_v and attn_k (both
+  2560x1024) agree to 0.003% at `prefetch` and 0.01% at `d4`; ffn_gate and
+  ffn_up (both 2560x9728) agree to 0.02%. That is the noise floor.
+- **The prefetch stage tracks L3 residency.** 1.03x on attn_v (360 KB repacked,
+  fits the 2 MB L3) against 1.05x on ffn_down (3.5 MB, does not). Weight reuse
+  across the M-tile already hides the rest.
+- **Cross-checks against earlier sessions**, all within 1%: gemm K=51
+  `baseline` (1,695,440 vs 1,696,704), `prefetch` (1,651,086 vs 1,651,949),
+  `d4` (823,397 vs 818,314); gemm K=56 `prefetch` (13,483,443 vs 13,474,132);
+  gemv K=51 `pristine` (4,478,183 vs 4,476,168), `baseline` (2,145,948 vs
+  2,144,213), `prefetch` (1,387,101 vs 1,389,236); gemv K=56 `pristine`
+  (49,058,107 vs 49,054,708). The gemv layer-7 aggregate prefetch-vs-pristine
+  ratio, 178,697,515 / 52,651,601 = 3.394x, reproduces the 3.39x that two
+  earlier sessions measured independently.
+- **One cross-check is not within 1%:** gemv `d4` K=51 measures 381,355 here
+  against a published 362,799 (5.1%). The published figure dates from
+  2026-08-01 and these binaries from 2026-08-19. Every number in this document
+  comes from that one binary set, so the tables are internally consistent; the
+  older value is simply not from the same build.
+
+## Reproducing
+
+```sh
+bash sweep.sh --selfcheck    # gate: re-derive two published K=51 numbers
+bash sweep.sh                # the prefill grid, K=50..56 x 4 variants
+MODE=gemv bash sweep.sh      # the matching decode grid
+bash sweep.sh --md           # regenerate the tables above from the logs
+```
+
+Legs are independent, resumable, and safe to run concurrently: each hybrid run
+stages into its own temp dir, and the cycle figure comes from a cycle-accurate
+RTL model, so host load cannot move it. Budget 24 h per leg -- `pristine`
+ffn_down at 4 tokens is ~97M cycles.
