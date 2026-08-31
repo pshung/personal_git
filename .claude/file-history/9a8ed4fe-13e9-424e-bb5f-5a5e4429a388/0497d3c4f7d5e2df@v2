@@ -1,0 +1,149 @@
+# Bonsai-27B prefill: measured cycles per MUL_MAT node, SSM and attention layers
+
+The prefill/gemm counterpart of `profiling_data.md`, which covers the same
+27B nodes on the decode/gemv path. Same engine, same nodes, same four build
+stages -- `nrows=4` instead of `nrows=2`.
+
+Generated 2026-08-31 with `bash sweep.sh`; regenerate any table with
+`MODEL=27b NODES="..." bash sweep.sh --md`.
+
+## Setup
+
+| | |
+|---|---|
+| Engine | `vsim:ax46mpv_fpga_l3` -- VLEN 1024, 1 hart, 32 KB L1D, no L2, 2 MB L3 |
+| Model | `Bonsai-27B-Q1_0.gguf`, qwen35, 64 layers, 3.80 GB, 1.125 bits/weight |
+| Mode | andesim hybrid, marker trigger, `--no-mmap --mem-size 12G -t 1` |
+| Path | prefill / gemm, `nrows=4` (asserted per leg from the `[roi]` line) |
+| Layer mix | `full_attention_interval=4`: 48 SSM layers, 16 attention layers |
+
+The node map is identical to the decode run: node #48 brackets
+`blk.6.attn_qkv` on both paths. qwen35's SSM layers could in principle build a
+different graph for prefill, but the decode baseline is already a 2-token pass,
+so 2 and 4 tokens fall in the same chunk and produce the same graph. Verified
+before the sweep, and every leg re-reports its own tensor.
+
+| name | flags | meaning |
+|---|---|---|
+| `pristine` | `GGML_CPU_REPACK=OFF` | upstream llama.cpp |
+| `baseline` | repack ON, `Q1_PREFETCH_DIST=0` | + row-parallel 64x1 repack |
+| `prefetch` | repack ON, `Q1_PREFETCH_DIST=1` | + zicbop prefetch = **standard RVV** |
+| `d4` | + `GGML_RV_XANDESVDOT=ON` | + `nds.vd4dots.vv` |
+
+## SSM layer (`blk.6`) -- 48 of 64 layers
+
+| K | tensor | ne0 x ne1 | weights | upstream | +repack | +prefetch | +vd4dots | total |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 48 | `attn_qkv` | 5120 x 10240 | 52,428,800 | *running* | 27,118,723 | 25,385,875 | 8,976,703 | - |
+| 49 | `ssm_alpha` | 5120 x 48 | 245,760 | 936,969 | 939,289 | 939,798 | 938,688 | **1.00x** |
+| 50 | `ssm_beta` | 5120 x 48 | 245,760 | 949,957 | 947,611 | 947,471 | 945,595 | **1.00x** |
+| 51 | `attn_gate` | 5120 x 6144 | 31,457,280 | 109,087,879 | 16,595,177 | 15,548,729 | 5,708,128 | **19.11x** |
+| 52 | `ssm_out` | 6144 x 5120 | 31,457,280 | 122,621,082 | 17,362,812 | 16,461,292 | 6,500,681 | **18.86x** |
+| 53 | `ffn_gate` | 5120 x 17408 | 89,128,960 | *running* | 45,434,691 | 42,133,870 | 14,351,598 | - |
+| 54 | `ffn_up` | 5120 x 17408 | 89,128,960 | *running* | 45,437,135 | 42,135,770 | 14,349,546 | - |
+| 55 | `ffn_down` | 17408 x 5120 | 89,128,960 | *running* | 47,880,022 | 44,881,677 | 17,064,993 | - |
+| | **LAYER** | | **383,221,760** | | **201,715,460** | **188,434,482** | **68,835,932** | |
+
+Per-stage speedup, per node:
+
+| K | tensor | +repack | +prefetch | +vd4dots | **total** |
+|---|---|---:|---:|---:|---:|
+| 48 | `attn_qkv` | - | 1.07x | 2.83x | - |
+| 49 | `ssm_alpha` | 1.00x | 1.00x | 1.00x | **1.00x** |
+| 50 | `ssm_beta` | 1.00x | 1.00x | 1.00x | **1.00x** |
+| 51 | `attn_gate` | 6.57x | 1.07x | 2.72x | **19.11x** |
+| 52 | `ssm_out` | 7.06x | 1.05x | 2.53x | **18.86x** |
+| 53 | `ffn_gate` | - | 1.08x | 2.94x | - |
+| 54 | `ffn_up` | - | 1.08x | 2.94x | - |
+| 55 | `ffn_down` | - | 1.07x | 2.63x | - |
+
+## Attention layer (`blk.7`) -- 16 of 64 layers
+
+| K | tensor | ne0 x ne1 | weights | upstream | +repack | +prefetch | +vd4dots | total |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 56 | `attn_q` | 5120 x 12288 | 62,914,560 | *running* | 32,315,274 | 30,372,677 | 10,662,439 | - |
+| 57 | `attn_v` | 5120 x 1024 | 5,242,880 | 18,582,438 | 3,434,839 | 3,268,543 | 1,630,251 | **11.40x** |
+| 58 | `attn_k` | 5120 x 1024 | 5,242,880 | 18,575,271 | 3,432,110 | 3,268,500 | 1,628,900 | **11.40x** |
+| 59 | `attn_output` | 6144 x 5120 | 31,457,280 | 119,759,239 | 17,118,167 | 16,275,722 | 6,337,136 | **18.90x** |
+| 60 | `ffn_gate` | 5120 x 17408 | 89,128,960 | *running* | 45,434,691 | 42,133,870 | 14,351,598 | - |
+| 61 | `ffn_up` | 5120 x 17408 | 89,128,960 | *running* | 45,437,135 | 42,135,770 | 14,349,546 | - |
+| 62 | `ffn_down` | 17408 x 5120 | 89,128,960 | *running* | 47,880,022 | 44,881,677 | 17,064,993 | - |
+| | **LAYER** | | **372,244,480** | | **195,052,238** | **183,201,859** | **68,024,863** | |
+
+K=60/61/62 are the same tensors shapes as K=53/54/55 and are carried from them,
+exactly as `profiling_data.md` does for decode. Identical shapes measure
+identical here too: `ffn_gate` and `ffn_up` agree to **0.01%** at `d4`
+(14,351,598 vs 14,349,546) and 0.005% at `baseline`.
+
+Per-stage speedup, per node:
+
+| K | tensor | +repack | +prefetch | +vd4dots | **total** |
+|---|---|---:|---:|---:|---:|
+| 56 | `attn_q` | - | 1.06x | 2.85x | - |
+| 57 | `attn_v` | 5.41x | 1.05x | 2.00x | **11.40x** |
+| 58 | `attn_k` | 5.41x | 1.05x | 2.01x | **11.40x** |
+| 59 | `attn_output` | 7.00x | 1.05x | 2.57x | **18.90x** |
+| 60 | `ffn_gate` | - | 1.08x | 2.94x | - |
+| 61 | `ffn_up` | - | 1.08x | 2.94x | - |
+| 62 | `ffn_down` | - | 1.07x | 2.63x | - |
+
+## Where the prefill speedup comes from
+
+Over the 5 nodes with all four stages measured, excluding the two repack-gate
+failures:
+
+| step | 27B gemm | 27B gemv (decode) |
+|---|---:|---:|
+| upstream to +repack | **6.25x** | 2.24x |
+| +repack to +prefetch | **1.05x** | 1.58x |
+| +prefetch to +vd4dots | **2.35x** | 3.54x |
+| **total (geo mean)** | **15.47x** | 12.64x |
+| aggregate over those nodes | **17.82x** | |
+
+This reproduces the 4B prefill result (6.11x / 1.04x / 2.46x = 15.64x) on a
+model 6.5x larger with a different architecture. Prefill takes its win from the
+**layout**; decode takes its win from **prefetch and the dot instruction**.
+
+The absolute cycles make the point without any ratio. On `ffn_gate` at the
+`+repack` stage:
+
+| path | tokens | cycles | per token |
+|---|---:|---:|---:|
+| decode | 2 | 73,356,044 | 36,678,022 |
+| prefill | 4 | **45,434,691** | **11,358,673** |
+
+Prefill does twice the tokens in 62% of the cycles -- 3.2x cheaper per token --
+because the gemm loads each weight vector once and fires four dots against it
+(`arch/riscv/repack.cpp:1967-1972`), while the gemv reloads it per token.
+
+## Notes
+
+- **`ssm_alpha` and `ssm_beta` get nothing on prefill either.** All four builds
+  land within 0.3% (936,969 / 939,289 / 939,798 / 938,688). 48 rows fails the
+  repack gate `ne1 % 64 == 0`, so every build runs the identical stock kernel.
+  They are 0.06% of the layer's weights but **1.4% of its optimized cycles** --
+  the same over-weight dead spot decode has. Padding them to 64 rows is the
+  cheapest win available on this model.
+- **Total speedup tracks node size, as on 4B.** `attn_v`/`attn_k` (1024 rows)
+  reach 11.40x while `attn_gate`/`ssm_out`/`attn_output` reach 18.9-19.1x. On
+  the small nodes prefill gains **no more than decode** (11.40x vs 11.24x),
+  because the per-call scalar activation quantize dominates when there are few
+  row tiles to amortize it over. See `profiling_gemm.md` for the decomposition.
+- **Upstream is exactly linear in tokens**, confirmed on every node measured so
+  far -- 1.97x to 2.01x for 2x the tokens (K=49 1.98x, K=50 1.99x, K=51 2.01x,
+  K=52 1.97x, K=57 2.00x, K=59 1.98x). `.nrows = 1` (`ggml-cpu.c:257`) means one
+  `vec_dot` per (weight row, token); there is no prefill kernel upstream.
+- **Prefetch is worth slightly more here than on 4B** (1.05-1.08x vs
+  1.03-1.05x). 27B tensors are far larger than the 2 MB L3, so more miss
+  latency survives the M-tile reuse.
+- **`ssm_out` and `attn_output` are the same shape** (6144 x 5120) and agree to
+  2.4% at upstream, matching the 2.6% decode spread `profiling_data.md`
+  reports. At `d4` they are 2.5% apart, wider than the 0.04% decode figure.
+
+## Still running
+
+Five `pristine` legs -- K=48, 53, 54, 55, 56 -- are the most expensive in the
+grid (183M to 381M cycles each, hours of RTL apiece). Their `+repack`,
+`+prefetch` and `+vd4dots` columns are complete; only the `total` column waits
+on them. If they prove impractical, upstream can be derived as 2x the decode
+value, which the linearity check above validates to within 3% on this model.
