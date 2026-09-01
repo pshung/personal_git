@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# Cycle sweep over the whole (build variant x MUL_MAT node) grid, in parallel.
+#
+# measure.sh runs ONE node across a few variants, serially, straight to the
+# terminal. This runs the grid: every variant against every node, many legs at
+# once, one log per leg, so a killed or timed-out leg is re-run on its own
+# without repeating the rest. The deliverable is the table --report prints.
+#
+#   bash sweep.sh                      # gemm/prefill, K=50..56, all 4 variants
+#   MODE=gemv bash sweep.sh            # the decode path instead
+#   NODES="51 56" VARIANTS="prefetch d4" bash sweep.sh
+#   J=4 bash sweep.sh                  # 4 legs at a time (default 8)
+#   bash sweep.sh --report             # re-print the table, run nothing
+#   bash sweep.sh --selfcheck          # gate: reproduce two published numbers
+#
+# MODE picks the ggml path by picking the prompt, which is the ONLY thing that
+# decides it (opt_roadmap F7, "MEASUREMENT GOTCHA"):
+#   gemv  the warmup forward pass          -> nrows=2, decode kernel
+#   gemm  --no-warmup + a 4-token prompt   -> nrows=4, pure prefill, no gemv tail
+# The [roi] line reports nrows, and a leg whose nrows disagrees with MODE is
+# recorded as BAD-NROWS instead of as a number. This matters more than it
+# looks: the wrong prompt measures the OTHER kernel and still prints a
+# perfectly plausible cycle count, so the count alone can never catch it.
+#
+# Concurrency is safe: each hybrid run stages into its own make_temp_dir
+# (andesim driver/manifest.cpp), and the cycle figure comes from a
+# cycle-accurate RTL model, so host load cannot move it. --selfcheck proves
+# both claims at once by running two legs together and comparing each against
+# its published value.
+#
+# Slow: the RTL leg runs at a few kHz. A leg costs about 1 hour per 12M cycles,
+# so the pristine ffn_* prefill legs are ~8 h each. Everything else is minutes.
+set -u
+export TMPDIR=${TMPDIR:-/home/nick/tmp}
+LLAMA=${LLAMA:-/home/nick/work/llama.cpp}
+ANDESIM=${ANDESIM:-/home/nick/work/andesim}
+# MODEL=4b|8b|27b picks the gguf AND the guest-RAM settings it needs. The big
+# models do not fit the guest window mapped, so they need --no-mmap and a much
+# larger --mem-size; getting this wrong does not error, it trap-storms.
+#
+# The resolved path goes in GGUF, NOT back into MODEL. MODEL arrives exported
+# (`MODEL=27b bash sweep.sh`), so overwriting it with the path would re-export
+# the path, and the `--leg` children xargs spawns would then resolve a
+# DIFFERENT tag than their parent -- and so a different $OUT than the one the
+# parent created.
+TAG=${MODEL:-4b}
+case "$TAG" in
+  4b)  GGUF=$LLAMA/models/Bonsai-4B-Q1_0.gguf;  MEM=${MEM:-2000M}; MMAP=${MMAP-} ;;
+  8b)  GGUF=$LLAMA/models/Bonsai-8B-Q1_0.gguf;  MEM=${MEM:-6G};    MMAP=${MMAP---no-mmap} ;;
+  27b) GGUF=$LLAMA/models/Bonsai-27B-Q1_0.gguf; MEM=${MEM:-12G};   MMAP=${MMAP---no-mmap} ;;
+  *)   GGUF=$TAG; MEM=${MEM:-12G}; MMAP=${MMAP---no-mmap}
+       TAG=$(basename "$GGUF" .gguf) ;;
+esac
+ENGINE=${ENGINE:-vsim:ax46mpv_fpga_l3}
+MODE=${MODE:-gemm}
+NODES=${NODES:-"50 51 52 53 54 55 56"}
+VARIANTS=${VARIANTS:-"pristine baseline prefetch d4"}
+J=${J:-8}
+# Hybrid per-leg spawn timeout, ms. 24 h, because 12 h was NOT enough: the two
+# largest upstream prefill legs (pristine ffn_up / ffn_down, ~83M and ~97M
+# cycles) timed out at 12 h when the grid was running 16-wide. A timed-out leg
+# costs its whole wall clock and yields nothing, so this is deliberately set
+# well above the worst leg rather than close to it.
+TIMEOUT=${TIMEOUT:-86400000}
+# Per model AND per path: the node index K means a different tensor in a
+# different model, so 4B and 27B results must never share a directory.
+# 4b keeps the original unsuffixed names so the existing sweeps still resolve.
+OUT=${OUT:-$LLAMA/sweep-$MODE$([ "$TAG" = 4b ] || echo "-$TAG")}
+
+case "$MODE" in
+  gemm) PROMPT="The capital of France"; WARMUP="--no-warmup"; WANT_NROWS=4 ;;
+  gemv) PROMPT="The capital of France is"; WARMUP="";         WANT_NROWS=2 ;;
+  *) echo "MODE must be gemm or gemv (got '$MODE')" >&2; exit 2 ;;
+esac
+
+bin_of() {  # $1 variant  $2 node -> the binary build.sh produced for that pair
+  local suf=""; [ "$2" = 51 ] || suf="-k$2"
+  printf '%s/bin-%s%s\n' "$LLAMA" "$1" "$suf"
+}
+
+# ---------------------------------------------------------------- one leg ---
+# Runs to completion, leaves everything in the log. Never parses; --report is
+# the single parser, so a leg re-run and a fresh report cannot disagree.
+run_leg() {  # $1 variant  $2 node
+  # Separate statements on purpose: bash expands every word of a `local` line
+  # before it performs any of the assignments, so a log="...$v..." on the same
+  # line would read an unset v.
+  local v=$1 k=$2
+  local log="$OUT/$v-k$k.log"
+  local bin
+  bin=$(bin_of "$v" "$k")
+  # Own the directory rather than assume the parent made it: if the redirect
+  # below fails the leg dies instantly having done nothing, and 12 of those
+  # look exactly like a fast successful sweep.
+  mkdir -p "$OUT"
+  if [ ! -x "$bin" ]; then
+    echo "SKIP $v k=$k: no $bin (run: ROI_K=$k bash build.sh $v)" >&2
+    return 0
+  fi
+  # Resume: a leg that already produced both lines is done. Anything else
+  # (empty, truncated, timed out) is re-run.
+  if [ -f "$log" ] && grep -q '^\[andesim\] .* cycles' "$log" && grep -q '\[roi\] MUL_MAT' "$log"; then
+    echo "have $v k=$k"
+    return 0
+  fi
+  echo "run  $v k=$k -> $log"
+  ( cd "$ANDESIM" && ./andesim run --mode hybrid --trigger marker --runtime linux \
+      --mem-size "$MEM" --engine "$ENGINE" --step-timeout-ms "$TIMEOUT" \
+      "$bin" -- -m "$GGUF" $MMAP -no-cnv $WARMUP --prompt "$PROMPT" \
+      -n 32 -c 512 -t 1 ) > "$log" 2>&1
+  local rc=$?
+  grep -E '\[roi\] MUL_MAT|^\[andesim\] .* cycles' "$log" | sed "s/^/    $v k=$k: /"
+  [ $rc -eq 0 ] || echo "    $v k=$k: exit $rc" >&2
+}
+
+# --------------------------------------------------------------- reporting ---
+# One log -> "cycles<TAB>nrows<TAB>tensor<TAB>shape", or a reason it is not a
+# number. Kept in awk so the nrows gate and the cycle read come from the same
+# pass over the same file.
+read_leg() {  # $1 variant  $2 node
+  local log="$OUT/$1-k$2.log"
+  [ -f "$log" ] || { printf 'MISSING\t\t\t\n'; return; }
+  # [roi] MUL_MAT #51 src0=blk.7.attn_v.weight [2560 x 1024] nrows=4
+  awk -v want="$WANT_NROWS" '
+    /\[roi\] MUL_MAT/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^src0=/)   { name = substr($i, 6) }
+        if ($i ~ /^nrows=/)  { nrows = substr($i, 7) }
+        if ($i ~ /^\[[0-9]+$/) { ne1 = $(i+2); sub(/\]$/, "", ne1)
+                                 shape = substr($i, 2) "x" ne1 }
+      }
+    }
+    /^\[andesim\] .* cycles/ { cyc = $2 }
+    END {
+      if (cyc == "")           { printf "PENDING\t%s\t%s\t%s\n", nrows, name, shape; exit }
+      if (nrows != want)       { printf "BAD-NROWS\t%s\t%s\t%s\n", nrows, name, shape; exit }
+      printf "%s\t%s\t%s\t%s\n", cyc, nrows, name, shape
+    }' "$log"
+}
+
+report() {
+  printf '%s sweep -- %s, %s, nrows=%s\n\n' "$MODE" "$(basename "$GGUF")" "$ENGINE" "$WANT_NROWS"
+  # Header is built from VARIANTS so a partial sweep still lines up.
+  printf '%-4s %-16s %-12s' K tensor shape
+  for v in $VARIANTS; do printf ' %14s' "$v"; done
+  printf '\n'
+  for k in $NODES; do
+    local name="" shape="" cells=() f
+    for v in $VARIANTS; do
+      IFS=$'\t' read -r cyc nrows nm sh <<<"$(read_leg "$v" "$k")"
+      [ -n "$nm" ] && name=$nm && shape=$sh
+      cells+=("$cyc")
+    done
+    printf '%-4s %-16s %-12s' "$k" "${name%.weight}" "$shape"
+    for f in "${cells[@]}"; do printf ' %14s' "$f"; done
+    printf '\n'
+  done
+}
+
+# --------------------------------------------------------------- markdown ---
+# The deliverable: profiling_data.md's table shape, generated from the logs so
+# the document and the measurement can never drift apart. Reads the four
+# stages BY NAME, so it does not care what order VARIANTS is in.
+#   +repack    = upstream / baseline   (row-parallel 64x1 layout, F4)
+#   +prefetch  = baseline / prefetch   (zicbop weight-stream prefetch, F7)
+#   +vd4dots   = prefetch / d4         (nds.vd4dots.vv, F8+F9)
+# A node missing any stage still prints its measured cells; only nodes with all
+# four contribute to the geometric means, which is what "n =" reports.
+md() {
+  local k
+  for k in $NODES; do
+    local name shape cyc nrows nm sh v
+    name=""; shape=""
+    local -A c=()
+    for v in pristine baseline prefetch d4; do
+      IFS=$'\t' read -r cyc nrows nm sh <<<"$(read_leg "$v" "$k")"
+      [ -n "$nm" ] && name=$nm && shape=$sh
+      c[$v]=$cyc
+    done
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$k" "${name%.weight}" "$shape" \
+      "${c[pristine]}" "${c[baseline]}" "${c[prefetch]}" "${c[d4]}"
+  done | awk -F'\t' -v mode="$MODE" -v nr="$WANT_NROWS" -v eng="$ENGINE" '
+    function num(x) { return (x ~ /^[0-9]+$/) }
+    # Group digits by hand. printf "%%%'"'"'d" would need a locale that defines a
+    # thousands separator; under LC_NUMERIC=C it silently prints plain digits.
+    function comma(v,   s, o) {
+      s = sprintf("%d", v); o = ""
+      while (length(s) > 3) { o = "," substr(s, length(s) - 2) o
+                              s = substr(s, 1, length(s) - 3) }
+      return s o
+    }
+    function fmt(x) { return num(x) ? comma(x + 0) : x }
+    function rat(a, b) { return (num(a) && num(b) && b+0 > 0) \
+                                ? sprintf("%.2fx", a/b) : "-" }
+    BEGIN {
+      printf "| layer | node | ne0 x ne1 | weights | upstream | +repack | +prefetch | +vd4dots | total |\n"
+      printf "|---|---|---:|---:|---:|---:|---:|---:|---:|\n"
+      n = 0
+    }
+    {
+      split($3, d, "x"); w = d[1] * d[2]
+      # ggml names weights "blk.<layer>.<node>.weight"; the row reads as the
+      # model sees it (which layer, which matmul), not as the harness does.
+      # K, the graph-order index, is a measurement handle and stays out of it.
+      split($2, t, ".")
+      printf "| %s | `%s` | %s x %s | %s | %s | %s | %s | %s | %s |\n",
+             (t[2] == "" ? $1 : t[2]), (t[3] == "" ? $2 : t[3]), d[1], d[2], comma(w),
+             fmt($4), fmt($5), fmt($6), fmt($7), rat($4, $7)
+      # totals and geo means over the fully-measured nodes only
+      if (num($4) && num($5) && num($6) && num($7)) {
+        n++
+        lr = log($4/$5); lp = log($5/$6); lv = log($6/$7)
+        sr += lr; sp += lp; sv += lv
+        if (n == 1 || lr < mnr) mnr = lr; if (n == 1 || lr > mxr) mxr = lr
+        if (n == 1 || lp < mnp) mnp = lp; if (n == 1 || lp > mxp) mxp = lp
+        if (n == 1 || lv < mnv) mnv = lv; if (n == 1 || lv > mxv) mxv = lv
+        tu += $4; tb += $5; tp += $6; td += $7
+      }
+    }
+    END {
+      if (n) printf "| | **ALL %d** | | | **%s** | **%s** | **%s** | **%s** | **%.2fx** |\n",
+                    n, comma(tu), comma(tb), comma(tp), comma(td), tu/td
+      printf "\n### Where the %s speedup comes from (n = %d nodes with all four stages)\n\n", mode, n
+      printf "| step | geo mean | min | max |\n|---|---:|---:|---:|\n"
+      if (n) {
+        printf "| upstream to +repack -- row-parallel 64x1 layout | **%.2fx** | %.2fx | %.2fx |\n",
+               exp(sr/n), exp(mnr), exp(mxr)
+        printf "| +repack to +prefetch -- zicbop weight stream | **%.2fx** | %.2fx | %.2fx |\n",
+               exp(sp/n), exp(mnp), exp(mxp)
+        printf "| +prefetch to +vd4dots -- Andes XAndesVDot | **%.2fx** | %.2fx | %.2fx |\n",
+               exp(sv/n), exp(mnv), exp(mxv)
+        printf "| **total** | **%.2fx** | | |\n", exp((sr+sp+sv)/n)
+      }
+      printf "\nengine %s, nrows=%d (%s path)\n", eng, nr, mode
+    }'
+}
+
+# --------------------------------------------------------------- selfcheck ---
+# The harness gate. Two legs with values published in opt_roadmap (F8 for the
+# prefetch build, F9 for the vd4dot one), run AT THE SAME TIME. Passing means
+# the invocation measures what it claims AND that two concurrent hybrid runs
+# do not disturb each other -- which is what licenses the parallel sweep.
+selfcheck() {
+  [ "$MODE" = gemm ] || { echo "--selfcheck has reference values for MODE=gemm only" >&2; exit 2; }
+  mkdir -p "$OUT"
+  run_leg prefetch 51 & local p1=$!
+  run_leg d4       51 & local p2=$!
+  wait $p1 $p2
+  local rc=0 got
+  # opt_roadmap F8: prefill K=51 prefetch 1,651,949 (an earlier session read
+  # 1,649,275 on the same build -- 0.16% apart, so allow 1%).
+  # opt_roadmap F9: prefill K=51 d4 818,314.
+  for pair in "prefetch:1651949" "d4:818314"; do
+    got=$(read_leg "${pair%%:*}" 51 | cut -f1)
+    local want=${pair##*:}
+    if [[ "$got" =~ ^[0-9]+$ ]] && awk -v g="$got" -v w="$want" 'BEGIN{exit !(g>w*0.99 && g<w*1.01)}'; then
+      printf 'PASS %-8s k=51 %s cycles (published %s)\n' "${pair%%:*}" "$got" "$want"
+    else
+      printf 'FAIL %-8s k=51 got %s, published %s\n' "${pair%%:*}" "$got" "$want"
+      rc=1
+    fi
+  done
+  return $rc
+}
+
+# -------------------------------------------------------------------- main ---
+# No argument = run the grid. Any UNKNOWN argument is an error, never a run:
+# a mistyped flag used to fall through to the sweep and quietly start hours of
+# simulation, which is the worst possible default.
+case "${1:-}" in
+  "")          ;;
+  --report)    report; exit 0 ;;
+  --md)        md; exit 0 ;;
+  --selfcheck) selfcheck; exit $? ;;
+  --leg)       run_leg "$2" "$3"; exit $? ;;   # internal: one xargs slot
+  *) echo "usage: sweep.sh [--report|--md|--selfcheck]  (got '$1')" >&2; exit 2 ;;
+esac
+
+[ -f "$GGUF" ] || { echo "no such model: $GGUF" >&2; exit 1; }
+mkdir -p "$OUT"
+# Variant-major, in the order VARIANTS is given. xargs fills its slots from the
+# front, so the slowest legs must be emitted first or they queue behind the
+# fast ones and add their hours to the tail. `pristine` is ~6x every other
+# variant on the same node, so emitting all of it first makes the wall clock
+# the single longest leg instead of the sum.
+for v in $VARIANTS; do for k in $NODES; do echo "$v $k"; done; done \
+  | xargs -P "$J" -n 2 bash "$0" --leg
+echo
+report
