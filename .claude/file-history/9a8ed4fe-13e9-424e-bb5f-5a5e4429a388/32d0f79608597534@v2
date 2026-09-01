@@ -1,0 +1,90 @@
+# Bonsai-27B decode profiling: measured cycles per MUL_MAT node (gemv path)
+
+The decode/gemv half of the pair; `profiling_gemm_27b.md` covers the same 27B
+nodes on the prefill/gemm path (`nrows=4`).
+
+Generated 2026-08-25. All 15 matmuls of one SSM layer and one attention layer.
+Every figure is a cycle-accurate RTL measurement except the three marked as
+inferred from an identical shape.
+
+## Setup
+
+| | |
+|---|---|
+| Engine | `vsim:ax46mpv_fpga_l3` -- VLEN 1024, 1 hart, 32 KB L1D, no L2, 2 MB L3 |
+| Model | `Bonsai-27B-Q1_0.gguf`, qwen35, 64 layers, 3.80 GB, 1.125 bits/weight |
+| Mode | andesim hybrid, marker trigger, `--no-mmap --mem-size 12G -t 1` |
+| Path | decode / gemv, `nrows=2` (confirmed per run by the `[roi]` line) |
+| Node id | `ROI_K` = index of the MUL_MAT in graph order, 1-based, 497 per token |
+| Layer mix | `full_attention_interval=4`: 48 SSM layers, 16 attention layers |
+
+## Build variants
+
+| name | flags | meaning |
+|---|---|---|
+| `pristine` | `GGML_CPU_REPACK=OFF` | upstream llama.cpp |
+| `baseline` | repack ON, `Q1_PREFETCH_DIST=0` | + row-parallel repack |
+| `prefetch` | repack ON, `Q1_PREFETCH_DIST=1` | + zicbop prefetch = **standard RVV** |
+| `d4` | + `GGML_RV_XANDESVDOT=ON`, `Q1_VD4DOT=1` | + `nds.vd4dots.vv` |
+
+## SSM layer (`blk.6`) -- 48 of 64 layers
+
+| K | tensor | ne0 x ne1 | weights | upstream | +repack | +prefetch | +vd4dots | total | source |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| 48 | `attn_qkv` | 5120 x 10240 | 52,428,800 | 91,575,245 | - | - | 7,611,322 | 12.03x | 2 stages |
+| 49 | `ssm_alpha` | 5120 x 48 | 245,760 | 474,303 | - | - | 474,148 | 1.00x | 2 stages |
+| 50 | `ssm_beta` | 5120 x 48 | 245,760 | 476,969 | - | - | 474,715 | 1.00x | 2 stages |
+| 51 | `attn_gate` | 5120 x 6144 | 31,457,280 | 54,314,202 | 25,629,722 | 16,317,304 | 4,578,346 | 11.86x | 4 stages |
+| 52 | `ssm_out` | 6144 x 5120 | 31,457,280 | 62,167,936 | 26,362,803 | 16,678,952 | 4,804,951 | 12.94x | 4 stages |
+| 53 | `ffn_gate` | 5120 x 17408 | 89,128,960 | 155,693,295 | 73,356,044 | 46,149,969 | 12,853,427 | 12.11x | 4 stages |
+| 54 | `ffn_up` | 5120 x 17408 | 89,128,960 | 155,615,861 | 73,374,731 | 46,154,233 | 12,851,563 | 12.11x | 4 stages |
+| 55 | `ffn_down` | 17408 x 5120 | 89,128,960 | 190,387,121 | 76,756,713 | 46,286,144 | 13,309,952 | 14.30x | 4 stages |
+| | **LAYER** | | **383,221,760** | **710,704,932** | | | **56,958,424** | **12.48x** | |
+
+## Attention layer (`blk.7`) -- 16 of 64 layers
+
+| K | tensor | ne0 x ne1 | weights | upstream | +repack | +prefetch | +vd4dots | total | source |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| 56 | `attn_q` | 5120 x 12288 | 62,914,560 | 110,486,684 | - | - | 9,343,961 | 11.82x | 2 stages |
+| 57 | `attn_v` | 5120 x 1024 | 5,242,880 | 9,301,955 | - | - | 827,451 | 11.24x | 2 stages |
+| 58 | `attn_k` | 5120 x 1024 | 5,242,880 | 9,306,973 | - | - | 826,999 | 11.25x | 2 stages |
+| 59 | `attn_output` | 6144 x 5120 | 31,457,280 | 60,577,109 | - | - | 4,803,183 | 12.61x | 2 stages |
+| 60 | `ffn_gate` | 5120 x 17408 | 89,128,960 | 155,693,295 | 73,356,044 | 46,149,969 | 12,853,427 | 12.11x | inferred, = K53 |
+| 61 | `ffn_up` | 5120 x 17408 | 89,128,960 | 155,615,861 | 73,374,731 | 46,154,233 | 12,851,563 | 12.11x | inferred, = K54 |
+| 62 | `ffn_down` | 17408 x 5120 | 89,128,960 | 190,387,121 | 76,756,713 | 46,286,144 | 13,309,952 | 14.30x | inferred, = K55 |
+| | **LAYER** | | **372,244,480** | **691,368,998** | | | **54,816,536** | **12.61x** | |
+
+## Summary -- geometric means
+
+| set | nodes | **geo mean** | min | max | aggregate |
+|---|---:|---:|---:|---:|---:|
+| SSM layer, all 8 | 8 | **6.67x** | 1.00x | 14.30x | 12.48x |
+| SSM layer, excl. `ssm_alpha`/`ssm_beta` | 6 | **12.53x** | 11.86x | 14.30x | 12.67x |
+| Attention layer, all 7 | 7 | **12.17x** | 11.24x | 14.30x | 12.61x |
+| All 10 distinct shapes | 10 | **12.20x** | 11.24x | 14.30x | 12.52x |
+
+## Where the speedup comes from
+
+The five nodes with all four stages measured.
+
+| step | geo mean | min | max |
+|---|---:|---:|---:|
+| upstream to standard RVV -- portable, any RVV core | **3.57x** | 3.33x | 4.11x |
+| standard RVV to vd4dots -- Andes V5 XAndesVDot | **3.54x** | 3.47x | 3.59x |
+| **total** | **12.64x** | | |
+
+## Notes
+
+- `ssm_alpha` and `ssm_beta` get **no speedup at all** (1.00x). They have 48 rows and
+  the repack gate requires `ne[1] %% 64 == 0`, so both builds run the stock kernel.
+  They are the only two gate failures in the model: 0.09%% of the weights but 1.7%% of
+  the optimized cycles. Padding them to 64 rows would recover about 1%% of a token.
+- Identical shapes give identical cycles **once optimized**. `ssm_out` and
+  `attn_output` are both 6144 x 5120: 0.037%% apart at vd4dots, **2.63%% apart at
+  upstream**. The stock kernel is sensitive to where in the graph a node sits; the
+  prefetching one is not. K=60/61/62 are inferred on that basis, so their upstream
+  column carries roughly 2.6%% uncertainty while their vd4dots column does not.
+- `ffn_gate` and `ffn_up` are the same shape and agree within 0.05%% at every stage,
+  which is the run-to-run noise floor here.
+- Optimization compresses the spread. Upstream costs 1.75-2.14 cycles per weight
+  across these shapes (22%% spread); vd4dots costs 0.144-0.158 (9%% spread).
