@@ -50,5 +50,5 @@ def make_project(commit=True, git_init=True):
 
 def run_crap(root, *args, stdin=""):
     """Run crap.py the way crap.sh does: gcov JSON on stdin, --root given."""
-    return subprocess.run(["python3", CRAP_PY, "--root", root, *args],
+    return subprocess.run(["python3", "-B", CRAP_PY, "--root", root, *args],
                           input=stdin, capture_output=True, text=True)

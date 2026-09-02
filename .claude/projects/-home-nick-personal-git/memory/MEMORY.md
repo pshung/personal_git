@@ -1,1 +1,2 @@
 - [Git commit exclusion list](feedback_git_exclude_list.md) - Never commit .claude.json, cache, debug, file-history, logs, paste-cache, plans, plugins, projects, session-env, sessions, shell-snapshots, statsig, tasks
+- [~/.claude autosync](project_claude_dir_autosync.md) - ~/.claude symlinks into personal_git; hourly cron commits everything on disk, so leave no scratch files there

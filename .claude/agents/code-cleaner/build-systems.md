@@ -13,6 +13,8 @@ implausible number as a tooling bug until you have ruled it out.
 
 - [How it works](#how-it-works) - the three files, and why order matters
 - [Per build system](#per-build-system) - CMake, Make, single file, Bazel/Meson
+- [Which gcov](#which-gcov) - GCC, clang, cross toolchains
+- [What cov_build.sh leaves behind](#what-cov_buildsh-leaves-behind)
 - [The five traps](#the-five-traps)
 - [Reading raw gcov by hand](#reading-raw-gcov-by-hand)
 
@@ -36,10 +38,13 @@ only their sum tells you whether a line is covered. `crap.sh` feeds gcov every
 
 ### CMake
 
-Use a separate build tree so the project's normal build keeps its own flags:
+Use a separate build tree so the project's normal build keeps its own flags.
+`CMAKE_EXPORT_COMPILE_COMMANDS` is what lets clang-tidy (the cog column) see the
+project's real include paths and defines:
 
 ```sh
 cmake -S . -B build-coverage -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
   -DCMAKE_C_FLAGS='--coverage -O0 -g' \
   -DCMAKE_CXX_FLAGS='--coverage -O0 -g' \
   -DCMAKE_EXE_LINKER_FLAGS='--coverage'
@@ -68,6 +73,10 @@ it on the command line drops flags the project needs (`-fPIC`, `-std=`, include
 paths). A command-line `CC`/`CXX` beats any assignment in the file except
 `override`, and rides along into both compile and link.
 
+`cov_build.sh` finds the test target with a dry run (`make -n test`, then
+`check`) and runs it plainly, so a failing test fails the script. A Makefile with
+neither target is a configuration error: write `COV_TEST_CMD` in `.crap.conf`.
+
 ### A single test binary
 
 Often the fastest path, especially for header-only code whose tests link nothing:
@@ -93,6 +102,39 @@ Meson: `meson setup build-coverage -Db_coverage=true`, then run the tests.
 Either way, record the working commands in `.crap.conf` so the next run is
 deterministic.
 
+### No git history
+
+`crap.sh` selects functions from `git diff` by default. In a directory that is
+not a git repository, or when the work is already committed, it exits 2 with
+`nothing to gate` instead of passing. Use `--all` (every function under
+`--filter`) or `--diff HEAD~N`.
+
+## Which gcov
+
+`.gcno`/`.gcda` are version-locked to the compiler that wrote them. `cov_build.sh`
+reads the compiler from the CMake cache (or `$CC`/`$CXX` for Make) after the
+build and records the matching reader in `.crap.conf` as `COV_GCOV`:
+
+| compiler | `COV_GCOV` |
+|---|---|
+| gcc / g++ | `gcov` |
+| gcc-14 | `gcov-14` |
+| riscv64-unknown-elf-gcc | `riscv64-unknown-elf-gcov` |
+| clang / clang++ | `llvm-cov gcov` |
+
+`crap.sh` honours `--gcov`, then `$GCOV`, then `COV_GCOV`. For clang it runs
+`llvm-cov gcov -b -i` (llvm-cov has no JSON mode) and `crap.py` reads that
+intermediate text; stale-data detection relies on GCC's `stamp mismatch` warning
+and is not available for clang builds, so rerun `cov_build.sh` after any
+recompile.
+
+## What cov_build.sh leaves behind
+
+Two things in the repo root: `.crap.conf` (the detected commands) and
+`build-coverage/` (the instrumented tree, including `compile_commands.json`).
+Both are appended to `.git/info/exclude` on first run so they never show up in
+the project's `git status` and never get committed by accident.
+
 ## The five traps
 
 **1. Stale `.gcda` (`stamp mismatch`).** You recompiled but did not re-run the
@@ -113,7 +155,9 @@ Use `-O0 -g` for anything you intend to read line by line.
 **4. gcov version must match the compiler.** `.gcno`/`.gcda` are version-locked.
 Building with GCC 14 and reading with the host's GCC 16 `gcov` fails; with a
 cross-toolchain, use *its* `gcov` (`riscv64-unknown-elf-gcov`). Clang's
-`llvm-cov gcov` reads only Clang-produced data.
+`llvm-cov gcov` reads only Clang-produced data. `cov_build.sh` records the right
+one in `.crap.conf` (see [Which gcov](#which-gcov)); if you changed compilers,
+run `cov_build.sh --reset`.
 
 **5. Parallel runs and `fork`/`exec`.** On Linux libgcov takes a lock per
 `.gcda`, so concurrent test processes merge safely - but a child that calls

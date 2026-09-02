@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # crap.sh -- score the functions you just wrote.
 #
-#   CRAP(f) = CC(f)^2 * (1 - coverage(f))^3 + CC(f)
+#   CRAP(f) = CC(f)^2 * (1 - branch_coverage(f))^3 + CC(f)
 #
 # Complexity is a debt and tests are how you pay it down: a function simple
 # enough needs no tests, a complicated one can never be paid off. The default
@@ -11,14 +11,20 @@
 #   crap.sh --filter 'src/'                    # functions changed vs HEAD
 #   crap.sh --filter 'src/' --diff HEAD~3      # ... changed in the last 3 commits
 #   crap.sh --filter 'src/' --min-churn 5      # audit mode: often-edited old code
+#   crap.sh --filter 'src/' --all              # every function: no git, or a full audit
+#   crap.sh --filter 'src/' --json             # one JSON object instead of the table
 #   crap.sh --hook --filter 'src/'             # Claude Code Stop hook exit codes
 #
-# Needs .gcda files -- run cov_build.sh first. Also: pip install lizard
+# Needs .gcda files -- run cov_build.sh first. Also: pip install lizard, and
+# clang-tidy for the cog (cognitive complexity) column.
+#
+# Exit codes without --hook: 0 pass, 1 over budget, 2 tool problem. An empty
+# gated set ("nothing to gate": work already committed, no git history) is 2,
+# never 0 -- a pass has to be backed by at least one scored function.
 #
 # --hook adapts the exit codes for a Stop hook, where 2 blocks the agent:
 #   no C/C++ touched -> 0 immediately, so a plain conversation costs ~10ms
 #   over budget, or coverage data missing/stale -> 2, with an actionable message
-# Without --hook: 0 pass, 1 over budget, 2 tool problem.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -97,7 +103,7 @@ if grep -q 'stamp mismatch' "$STDERR"; then
   exit 2
 fi
 
-python3 "$HERE/crap.py" --root "$ROOT" "${PY_ARGS[@]}" < "$JSON"
+python3 -B "$HERE/crap.py" --root "$ROOT" "${PY_ARGS[@]}" < "$JSON"
 rc=$?
 # crap.py: 0 clean, 1 over budget, 2 nothing matched --filter. Under --hook only
 # a real overage may block; "nothing matched" is not the agent's problem.

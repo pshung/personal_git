@@ -26,7 +26,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$1" ] || { echo "cc.sh: no such file: $1" >&2; exit 2; }
 
 HERE="$HERE" FILE="$1" PATTERN="${2:-}" \
-ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)" python3 - <<'PY'
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)" python3 -B - <<'PY'
 import os, re, sys
 
 try:
