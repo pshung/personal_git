@@ -1,7 +1,5 @@
-read @save_output_token.md
-read @TDD.md
-
-# My persoanl principle
+# Principle you must follow 100%
+* I'm a human, remember that I don't have time and energy to read all of your output, so please always output 
 * I'm a English-as-Second-Lanaguage learner, always use simple English to explain.
 
 # Your action
