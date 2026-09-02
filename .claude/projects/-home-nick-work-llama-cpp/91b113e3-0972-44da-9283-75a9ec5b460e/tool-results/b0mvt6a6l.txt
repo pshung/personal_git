@@ -1,0 +1,263 @@
+#### KEY: v2:b9a403d3dc6f8e058dbd6aa5317df5afd99c212d1c4a73eab5ad23524f51e58f
+{
+ "summary": "Lens 4 verdict: the document's code anchors are unusually accurate. Seven of the eight cited locations point at exactly the code claimed, in the current tree, with no line drift - repack.cpp:4889, 4456-4469, 51; arch/riscv/quants.c:32; ggml-cpu.c:257; and build.sh really does set -DGGML_RV_ZVFH=OFF for every variant. All 48 published 27B cycle figures match the logs byte-for-byte and `bash sweep.sh --md` regenerates the tables. Two mechanistic claims do not survive: (a) the \"vector twin gated behind __riscv_zvfh\" does not exist on RISC-V at all - arch-fallback.h:221 aliases the generic scalar routine to the arch name, so both arms of the #if at repack.cpp:347 call the same scalar function and flipping GGML_RV_ZVFH=ON would change nothing; (b) the M-tile-sharing citation arch/riscv/repack.cpp:1967-1972 lives inside the `Q1_VD4DOT` block, i.e. the d4 build, yet it is cited to explain a `+repack` measurement (the mechanism is nonetheless real in the baseline kernel at lines 2120-2132). Separately, the central causal story - that F is the scalar activation quantizer - was never measured directly, only curve-fitted; I built an independent cross-check the document does not perform (fit F on the seven 27B ne0=5120 nodes: F doubles from ~450K to ~880K exactly as ne0 doubles 2560->5120), which corroborates it, but the 6-significant-figure F=489,581 rests on a fit with +/-5.2% residuals whose two-point estimates span 407K-690K, and the derived superlative \"bigger than the kernel it feeds\" flips depending on which pair you fit.",
+ "verified_ok": [
+  {
+   "claim": "'The dispatch gate at `repack.cpp:4889` requires `cur->ne[1] % 64 == 0`' - the line number and the condition.",
+   "evidence": "`grep -n 'ne\\[1\\] % 64' ggml/src/ggml-cpu/repack.cpp` -> line 4889 exactly: `if (__riscv_vlenb() * 8 >= 512 && cur->ne[1] % 64 == 0 && cur->ne[0] % QK1_0 == 0) {`. No line drift; the quoted condition is really there, inside `else if (cur->type == GGML_TYPE_Q1_0)` (4885) and `if (ggml_cpu_has_riscv_v())` (4886)."
+  },
+  {
+   "claim": "ssm_alpha / ssm_beta (48 rows) are the only measured tensors the gate rejects, and every build therefore runs the stock kernel on them.",
+   "evidence": "48 % 64 != 0. Every other measured ne1 (10240, 6144, 5120, 17408, 12288, 1024, 4096, 9728, 2560) is a multiple of 64. The four 27B builds land at 936,969 / 939,289 / 939,798 / 938,688 (sweep-gemm-27b/{pristine,baseline,prefetch,d4}-k49.log), spread 0.30% - matches the document's '0.3%'."
+  },
+  {
+   "claim": "'the gemm loads each weight vector once and fires four dots against it' - the mechanism itself.",
+   "evidence": "arch/riscv/repack.cpp:1968 loads one sign mask `__riscv_vlm_v_b4(...)`, 1969 builds one weight vector `w`, 1970-1971 passes that single `w` to `q1_vd4dots_4acc_m2` with four activation words. The same shape holds in the NON-vd4dot gemm actually used at `+repack`: line 2121 loads `sign` once, lines 2124-2131 accumulate four independent sums from it."
+  },
+  {
+   "claim": "'while the gemv reloads it per token'.",
+   "evidence": "repack.cpp:4406-4409: `for (int iter = nrows - (nrows % 4); iter < nrows; iter++) { gemv<...>(..., 1 /* nrows */, ncols); }` - one whole gemv call, and therefore one whole weight pass, per leftover token."
+  },
+  {
+   "claim": "'`forward_mul_mat` quantizes activations before the kernel runs (`repack.cpp:4456-4469`)' and the 4-token vs non-multiple-of-4 dispatch.",
+   "evidence": "repack.cpp:4456-4469 read verbatim. 4460: `for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4)` calling `ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>(..., 4, ne10)`; 4465-4468: `const int64_t i11_processed = ne11 - ne11 % 4; for (...) from_float(...)`. With ne11=4 only the first loop runs; with ne11=2 only the second. INTER_SIZE=1 / PARAM_TYPE=Q8_0 confirmed from the traits instance at repack.cpp:4734 `tensor_traits<block_q1_0, 1, 64, GGML_TYPE_Q8_0> q1_0_64x1_q8_0`, so the document's `ggml_quantize_mat_t<1, GGML_TYPE_Q8_0>` is right."
+  },
+  {
+   "claim": "The measured gemm legs really did run with ne11 = 4 tokens (so the 4-token branch is the one taken).",
+   "evidence": "ggml-cpu.c:1780-1782 prints `nrows=` from `tensor->src[1]->ne[1]`, i.e. ne11. All 48 sweep-gemm-27b logs carry `nrows=4`; sweep.sh's `read_leg` awk rejects any leg whose nrows disagrees with WANT_NROWS as BAD-NROWS."
+  },
+  {
+   "claim": "'`ggml_quantize_mat_q8_0_4x1_generic` -- a **pure scalar** loop (`repack.cpp:51`, its own comment says `// scalar`): per 32-column block, 128 `fabsf` for the amax scan plus 128 `roundf`'.",
+   "evidence": "repack.cpp:51 is the function; line 58 is `// scalar`. Outer loop 63 over nb = k/32 blocks; 64-70 is 4 rows x 32 columns = 128 `fabsf` (line 69); 78-85 is `for (int j = 0; j < QK8_0 * 4; j++)` = 128 iterations each ending in `y[i].qs[j] = roundf(x0)` (line 84). No vector intrinsic anywhere in the body."
+  },
+  {
+   "claim": "'`quantize_row_q8_0`, which **is** RVV-vectorized on RISC-V (`arch/riscv/quants.c:32`, gated only on `__riscv_v`)'.",
+   "evidence": "arch/riscv/quants.c:32 is `void quantize_row_q8_0(...)`; the RVV body opens at line 39 with `#if defined(__riscv_v)` (vle32/vfabs/vfredmax/vfncvt at 45-64) and the `#else` at 66-70 falls back to `quantize_row_q8_0_ref`. No zvfh, zfh or vlen condition."
+  },
+  {
+   "claim": "'`.nrows = 1` (`ggml-cpu.c:257`) means one `vec_dot` per (weight row, token), so there is no prefill kernel upstream at all'.",
+   "evidence": "ggml-cpu.c:253-258 is the `[GGML_TYPE_Q1_0]` entry with `.nrows = 1` on line 257 exactly. That field is read at 1300 into `vec_dot_num_rows`, copied to `num_rows_per_vec_dot` at 1463, and used as the token-loop stride at 1239 and the row-loop stride at 1268-1269, so each `vec_dot` covers one weight row and one token."
+  },
+  {
+   "claim": "'the measurement build sets `-DGGML_RV_ZVFH=OFF`'.",
+   "evidence": "build.sh, function `cfg()`: `-DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_RV_ZFH=OFF -DGGML_RV_ZVFH=OFF`. cfg() is the single configure path for all six variants (pristine/baseline/prefetch/d4/d4-nopf/*-nodpref), so every leg carries it. ggml/src/ggml-cpu/CMakeLists.txt:483-484 confirms GGML_RV_ZVFH is what appends `_zvfh` to -march, i.e. what defines `__riscv_zvfh`."
+  },
+  {
+   "claim": "Every 27B cycle figure printed in the document is the number in the log.",
+   "evidence": "Cross-checked all 48 `[andesim] N cycles` lines in sweep-gemm-27b/*.log against the four cycle columns of both layer tables - exact match on all 48. `MODEL=27b NODES=\"48 49 50 51 52 53 54 55\" bash sweep.sh --md` (read-only path; the script exits before the `[ -f $GGUF ]` check and before xargs) reproduces layer 6 row-for-row and its 20.60x geomean; the layer-7 command reproduces the 4 measured rows."
+  },
+  {
+   "claim": "The whole F / T fit table ('| variant | gemm `F` | gemm `T` | gemv `F` | gemv `T` |') reproduces from the 4B logs.",
+   "evidence": "Least-squares fit of cycles = F + T*(ne1/64) on the five 4B ne0=2560 nodes (attn_q/attn_v/attn_k/ffn_gate/ffn_up) from sweep-gemm/*.log and sweep-gemv/*.log reproduces all six published pairs to the digit: gemm baseline 398,003/80,915; gemm prefetch 441,355/76,544; gemm d4 489,581/23,036; gemv baseline 13,379/133,082; gemv prefetch 27,294/85,084; gemv d4 39,491/21,638. Derived figures also check: 489,581/39,491 = 12.40x ('12.4x'), 23,036/4 = 5,759, 21,638/2 = 10,819, ratio 1.879 ('1.88x'), F/attn_v = 59.5% ('59%'), F/ffn_gate = 12.3% ('12%')."
+  },
+  {
+   "claim": "The document's causal mechanism (F is a per-activation-element cost, not a kernel cost) - corroborated by a test the document does not perform.",
+   "evidence": "I fitted the same affine model on the seven 27B nodes that share ne0 = 5120 (attn_qkv, attn_gate, ffn_gate, ffn_up, attn_q, attn_v, attn_k) from sweep-gemm-27b/*.log: F = 824,191 (baseline) / 920,157 (prefetch) / 895,692 (d4) against 4B's 398,003 / 441,355 / 489,581 at ne0 = 2560. F scales ~2.0x with a 2.0x ne0 while T collapses - exactly what a per-element activation quantizer predicts and what a fixed per-node overhead would not."
+  },
+  {
+   "claim": "'**Upstream is exactly linear in tokens.** Measured on all 12 nodes: 1.97x to 2.01x for 2x the tokens.'",
+   "evidence": "27B pristine gemm (sweep-gemm-27b/pristine-k{48..59}.log) divided by the 27B pristine gemv column of profiling_gemv_27b.md, node by node: 1.985, 1.975, 1.992, 2.008, 1.972, 1.988, 1.992, 2.012, 2.002, 1.998, 1.996, 1.977. Range 1.972-2.012, which rounds to the published 1.97x-2.01x."
+  },
+  {
+   "claim": "The 'carry' justification and the shape-agreement notes.",
+   "evidence": "ffn_gate vs ffn_up upstream 309,587,645 vs 309,915,506 = 0.106% apart ('0.11%'); at d4 14,351,598 vs 14,349,546 = 0.014% ('0.01%'); ssm_out vs attn_output upstream 122,621,082 vs 119,759,239 = 2.39% ('2.4%'). All three from the logs."
+  }
+ ],
+ "findings": [
+  {
+   "title": "There is no RISC-V vector twin of the 4x1 activation quantizer; GGML_RV_ZVFH=OFF is not what makes prefill scalar",
+   "severity": "major",
+   "kind": "evidence-gap",
+   "claim_in_doc": "Its vector twin is gated behind `__riscv_zvfh`, and the\n  measurement build sets `-DGGML_RV_ZVFH=OFF`.",
+   "what_i_checked": "`grep -rn ggml_quantize_mat_q8_0_4x1 ggml/` returns exactly four hits: the declaration (repack.h:208), the alias (arch-fallback.h:221), the call (repack.cpp:348) and the definition of the *_generic* name (repack.cpp:51). Read repack.cpp:342-352, repack.cpp:12 (`#include \"arch-fallback.h\"`), and arch-fallback.h:216-256 (the `#elif defined(__riscv)` block, reached because the preceding branches at lines 7/76/88/118/167 are GGML_CPU_GENERIC/arm/x86/ppc/loongarch). Confirmed with `git log -L 342,352:ggml/src/ggml-cpu/repack.cpp` (commit 8734bdb7e).",
+   "finding": "arch-fallback.h:221 unconditionally does `#define ggml_quantize_mat_q8_0_4x1_generic ggml_quantize_mat_q8_0_4x1` on every RISC-V build - there is no zvfh guard on that alias, and no RISC-V implementation of the vector routine exists anywhere in the tree. After preprocessing, the scalar body at repack.cpp:51 IS `ggml_quantize_mat_q8_0_4x1`, so both arms of the `#if defined(__riscv_zvfh) && defined(__riscv_v)` at repack.cpp:347-351 resolve to the same scalar function. Building with -DGGML_RV_ZVFH=ON would not give prefill a vector quantizer. The author's own opt_roadmap.md (F4d, line ~207) states this correctly - 'un-gated quantize_mat_t<1,Q8_0> from zvfh (generic 4x1 otherwise)' - and lists 'activation quantize RVV' as a remaining lever, i.e. as unwritten code.",
+   "impact": "No cycle number or speedup in either table changes - prefill genuinely does run a scalar quantizer, which is what the measurements reflect. What changes is the cause and the remedy: the document points a reader at a build flag ('the measurement build sets -DGGML_RV_ZVFH=OFF'), implying the measurement handicapped itself and that flipping one CMake option recovers the loss. It does not. The real work is writing an RVV `ggml_quantize_mat_q8_0_4x1` for RISC-V, which is what the closing sentence ('Vectorizing it is the clearest remaining prefill win') actually implies. A third party auditing the build config would conclude the run was mis-configured and dismiss the result."
+  },
+  {
+   "title": "Pristine never pays the scalar activation quantizer, so the 'before' and 'after' builds do not share the same activation path",
+   "severity": "major",
+   "kind": "fairness",
+   "claim_in_doc": "`F` is not part of the kernel. ... It is the shared\nactivation path, and the source says what it is.",
+   "what_i_checked": "build.sh: `pristine` is configured `-DGGML_CPU_REPACK=OFF`, so `ggml_backend_cpu_repack_buffer_type` is not registered and repack.cpp's `forward_mul_mat` (with its 4456-4469 quantize block) never runs. Read the upstream path instead: ggml-cpu.c:1280 `ggml_compute_forward_mul_mat`, line 1299-1300 `from_float = type_traits_cpu[vec_dot_type].from_float`, applied at 1363/1376. For vec_dot_type = GGML_
+
+#### KEY: v2:395c789c55737ace9a034a89bf7d708b725edab8813c8ad0dc0c4f51f5bd59f8
+{
+ "summary": "Lens 1 reconciles cleanly with one exception. I scripted extraction of `[andesim] N cycles` and `[roi]` from all 48 logs in sweep-gemm-27b/ and every one of the 48 published per-node cycle counts appears verbatim in its matching log, every `ne0 x ne1` matches the `[roi]` shape, every leg reports `nrows=4`, and every tensor name matches its row label. All 15 per-node totals, all 45 per-stage ratios, both geometric means (20.60x / 17.65x), the 5-node cross-path column (7.04/1.07/2.75/20.67x), the 10-node figure (6.62/1.06/2.58 = 18.15x) and all six least-squares F/T fits reproduce to the digit from logs on disk; `bash sweep.sh --md` regenerates the per-node rows byte-for-byte. The one hard error is the Layer 7 LAYER total row, whose `+repack` and `+prefetch` cells are 23.6% too large (241,152,929 vs a true 195,052,238). Two structural gaps limit third-party verification: the 27B decode half of every comparison table has no logs on disk at all (there is no sweep-gemv-27b/), and the \"Reproducing\" recipe omits the 48-binary build step. On fairness the measurement is honest and in places conservative: `pristine` runs genuine upstream third-party RVV code, not a strawman, and the ZVFH=OFF build flag handicaps only the optimized builds.",
+ "verified_ok": [
+  {
+   "claim": "Every one of the 48 published cycle numbers (4 variants x 12 nodes) appears exactly in its matching log.",
+   "evidence": "Scripted over /home/nick/work/llama.cpp/sweep-gemm-27b/*.log with `grep -oP '^\\[andesim\\] \\K[0-9]+(?= cycles)'`. Example: d4-k57.log -> 1630251 = doc line 79 attn_v +vd4dots 1,630,251; pristine-k55.log -> 382982019 = doc line 44 ffn_down upstream 382,982,019. All 48 matched, zero discrepancies."
+  },
+  {
+   "claim": "Every published 'ne0 x ne1' shape matches the '[roi] src0=... [A x B]' line, and every tensor name matches its row label.",
+   "evidence": "Same scripted pass. e.g. `[roi] MUL_MAT #55 src0=blk.6.ffn_down.weight [17408 x 5120]` == doc line 44 `| 6 | ffn_down | 17408 x 5120 |`; `#59 src0=blk.7.attn_output.weight [6144 x 5120]` == doc line 81. All 12 shapes and all 12 names matched."
+  },
+  {
+   "claim": "Path | prefill / gemm, `nrows=4` (asserted per leg from the `[roi]` line)",
+   "evidence": "All 48 logs end their `[roi]` line with `nrows=4`; none is nrows=2 or anything else. The assertion is also machine-enforced: sweep.sh:136 `if (nrows != want) { printf \"BAD-NROWS...\" }` with WANT_NROWS=4 set at sweep.sh:71 for MODE=gemm."
+  },
+  {
+   "claim": "No logs were withheld and no published number lacks a log (within the 12 measured nodes).",
+   "evidence": "`ls sweep-gemm-27b/` = exactly 48 files, {pristine,baseline,prefetch,d4}-k{48..59}. Every one is published; every published cell in the layer-6 table and the four measured layer-7 rows has a log. No orphan files, no extra runs."
+  },
+  {
+   "claim": "Layer 6's LAYER total row is arithmetically correct in all four cycle columns and in the weights column.",
+   "evidence": "python3 sum over all 8 layer-6 rows: weights 383,221,760; upstream 1,417,870,831; repack 201,715,460; prefetch 188,434,482; d4 68,835,932 -- identical to doc line 45."
+  },
+  {
+   "claim": "All 15 published per-node 'total' speedups and all 45 published per-stage ratios reproduce to two decimal places from the log cycle counts.",
+   "evidence": "python3 recomputation of u/r, r/p, p/d, u/d for every row in the doc's two per-stage tables (lines 53-62, 100-108). Zero mismatches at 2dp; e.g. attn_qkv 6.703/1.068/2.828/20.251 vs published 6.70/1.07/2.83/20.25."
+  },
+  {
+   "claim": "Geometric mean over the layer's 6 optimizable nodes: 20.60x  /  Geometric mean over the layer's 7 nodes: 17.65x",
+   "evidence": "exp(mean(log(u/d))) over the 6 gate-passing layer-6 nodes = 20.596; over the 7 layer-7 nodes = 17.646. `MODEL=27b NODES=\"48..55\" bash sweep.sh --md` independently prints **20.60x**."
+  },
+  {
+   "claim": "The 5-node head-to-head column for gemm: 7.04x / 1.07x / 2.75x / 20.67x, and its stated node set.",
+   "evidence": "Geometric means over attn_gate, ssm_out, ffn_gate, ffn_up, ffn_down from the logs = 7.037 / 1.069 / 2.747 / 20.666. The claim that decode has exactly these five nodes at all four stages is confirmed by profiling_gemv_27b.md, where only K=51,52,53,54,55 carry '4 stages'."
+  },
+  {
+   "claim": "Over prefill's full set of 10 optimizable nodes the totals are 6.62x / 1.06x / 2.58x = **18.15x**, against decode's 10-node figure of 12.20x.",
+   "evidence": "10-node (12 minus ssm_alpha/ssm_beta) geometric means from logs = 6.622 / 1.063 / 2.579, product 18.155. Decode 10-node total from profiling_gemv_27b.md numbers = 12.201."
+  },
+  {
+   "claim": "The absolute-cycles table and its two derived statements (62% of the cycles, 3.2x cheaper per token).",
+   "evidence": "45,434,691 (sweep-gemm-27b/baseline-k53.log) / 4 = 11,358,673; 73,356,044 / 2 = 36,678,022; 45,434,691/73,356,044 = 61.9%; 36,678,022/11,358,673 = 3.229."
+  },
+  {
+   "claim": "All six per-call/per-tile fits (F and T for gemm and gemv at baseline, prefetch, d4) and every number derived from them.",
+   "evidence": "numpy lstsq of cycles = F + T*tiles on the 4B logs (tiles = ne1/64 = 64,16,16,152,152 for attn_q, attn_v, attn_k, ffn_gate, ffn_up in sweep-gemm/ and sweep-gemv/) returns exactly 398,003/80,915; 441,355/76,544; 489,581/23,036; 13,379/133,082; 27,294/85,084; 39,491/21,638. Derived: 489,581/39,491 = 12.397 (12.4x); (21,638/2)/(23,036/4) = 1.879 (1.88x); 489,581/823,397 = 59.5%; 489,581/3,972,668 = 12.3%; 80,915/23,036 = 3.51x; 133,082/21,638 = 6.15x."
+  },
+  {
+   "claim": "This reproduces the 4B prefill result (6.11x / 1.04x / 2.46x)",
+   "evidence": "`bash sweep.sh --md` (read-only; verified at sweep.sh:289 that --md calls md() then exits without launching a run) printed 6.11x / 1.04x / 2.46x over 7 nodes from sweep-gemm/*.log."
+  },
+  {
+   "claim": "Upstream is exactly linear in tokens. Measured on all 12 nodes: 1.97x to 2.01x for 2x the tokens.",
+   "evidence": "gemm-pristine / gemv-pristine per node: min 1.9724 (ssm_out), max 2.0116 (ffn_down). Range is 1.97-2.01 as stated."
+  },
+  {
+   "claim": "Three small consistency claims: ssm_out vs attn_output agree to 2.4% at upstream; ffn_gate vs ffn_up 0.11% at upstream and 0.01% at d4; ssm_alpha/ssm_beta are 2.7% of the layer's optimized cycles.",
+   "evidence": "122,621,082/119,759,239 = 1.0239. 309,915,506/309,587,645 = 1.00106; 14,351,598 vs 14,349,546 = 0.014%. (938,688+945,595)/68,835,932 = 2.74%."
+  },
+  {
+   "claim": "Every source citation in the document lands on the code it says it does.",
+   "evidence": "repack.cpp:4889 is literally `if (__riscv_vlenb() * 8 >= 512 && cur->ne[1] % 64 == 0 && ...)`. repack.cpp:51 is `void ggml_quantize_mat_q8_0_4x1_generic(...)`, with `// scalar` at line 58. repack.cpp:4456-4469 brackets the ggml_quantize_mat_t call (4461) and the from_float tail (4468). arch/riscv/quants.c:32 is `void quantize_row_q8_0(`, gated `#if defined(__riscv_v)` at line 39. ggml-cpu.c:257 is `.nrows = 1` inside `[GGML_TYPE_Q1_0]`. arch/riscv/repack.cpp:1967-1972 is the inner `for (c...)` loop that builds one weight vector `w` and calls `q1_vd4dots_4acc_m2(&acc0..&acc3, w, a0,a1,a2,a3)` -- four dots per weight load, exactly as claimed."
+  },
+  {
+   "claim": "Its vector twin is gated behind `__riscv_zvfh`, and the measurement build sets `-DGGML_RV_ZVFH=OFF`.",
+   "evidence": "repack.cpp:344-351: `template <> void ggml_quantize_mat_t<1, GGML_TYPE_Q8_0>` selects ggml_quantize_mat_q8_0_4x1 under `#if defined(__riscv_zvfh) && defined(__riscv_v)`, else the _generic scalar one. build.sh line 42 passes `-DGGML_RV_ZVFH=OFF`. The two `#if defined __riscv_zvfh` blocks in arch/riscv/repack.cpp (lines 207, 898) guard only q4_0_16x1 kernels, so the flag does not touch the Q1_0 kernels themselves -- the doc's attribution of the whole 12.4x gap to the shared activation quantizer is correct."
+  },
+  {
+   "claim": "FAIRNESS: the `pristine` arm is a genuine, third-party-optimized RVV baseline, not a scalar strawman.",
+   "evidence": "pristine runs ggml_vec_dot_q1_0_q8_0 (arch/riscv/quants.c:563), which on this machine (vlen_bits=1024) dispatches to the RVV `_vl256` kernel. `git show master:ggml/src/ggml-cpu/arch/riscv/quants.c | grep -c _vl256` = 2, i.e. it is in the upstream master branch; `git log -L 563,577` attributes it to 68380ae11 'ggml-cpu: Optimized risc-v cpu q1_0 dot' by pl752, plus 3c7450cee '(#22754) extend RVV quantization vec dot to higher VLENs' -- neither authored by this work."
+  },
+  {
+   "claim": "FAIRNESS: the ZVFH=OFF flag handicaps the optimized arms, not the baseline, so the reported prefill speedups are understated rather than flattered.",
+   "evidence": "pristine's activation quantizer is from_float = quantize_row_q8_0 (arch/riscv/quants.c:32), gated only on __riscv_v, so it stays vectorized. Only the repack arms take ggml_quantize_mat_t<1,Q8_0>, which falls to the scalar _generic under ZVFH=OFF. The ~490K/node fixed cost is therefore charged entirely to the 'after' side."
+  },
+  {
+   "claim": "FAIRNESS: all 48 legs are apples-to-apples -- same model, prompt, engine, memory, thread count and node index; only the build flags differ.",
+   "evidence": "Every log carries `n_threads = 1 (n_threads_batch = 1)`, `n_ctx = 512, n_batch = 2048, n_predict = 32`, the prompt echo `The capital of France`, and identical `ENOSYS 258/435/220` startup lines. system_info shows `REPACK = 1` on all 36 baseline/prefetch/d4 legs and no REPACK field on all 12 pristine legs, confirming GGML_CPU_REPACK=OFF really took effect. app= names the matching bin-<variant>-k<N>. All four variants at a given K name the same tensor in their [roi] line."
+  },
+  {
+   "claim": "TRANSPARENCY: no evidence of reruns, discarded legs, failures or selective reporting.",
+   "evidence": "sweep-gemm-27b.out contains exactly 48 `run` lines and 48 result pairs, no `SKIP`, no `exit`, no `have` (resume) lines, and its trailing report table matches my independent per-log extraction cell-for-cell. `grep -il 'error|warn|timeout|abort|assert|fail' *.log` returns nothing. sweep-gemm-retry.out is a 4B-only rerun of two legs that had timed out, disclosed in sweep.sh:59-63."
+  },
+  {
+   "claim": "Setup metadata: Bonsai-27B-Q1_0.gguf, qwen35, 64 layers, 3.80 GB, 1.125 bits/weight, full_attention_interval=4 -> 48 SSM / 16 attention layers.",
+   "evidence": "Parsed the GGUF header directly: general.architecture=qwen35, qwen35.block_count=64, qwen35.full_attention_interval=4, embedding_length=5120, feed_forward_length=17408, ssm.inner_size=6144, ssm.time_step_rank=48. File size 3,803,452,480 B = 3.80 GB. block_q1_0 = 2 + 128/8 = 18 B per 128 weights = 1.125 bits/weight (ggml-common.h:180-185)."
+  },
+  {
+   "claim": "`ssm_alpha` and `ssm_beta` are the only two tensors in the model the kernel is never applied to.",
+   "evidence": "Enumerated all 851 tensor descriptors in the GGUF header and tested ne[1] % 64 != 0. Exactly two shapes fail: ssm_alpha (5120,48) x48 and ssm_beta (5120,48) x48. The LM head/output and token_embd pass the gate on this model."
+  }
+ ],
+ "findings": [
+  {
+   "title": "Layer 7's LAYER total row overstates +repack and +prefetch by 23.6%",
+   "severity": "major",
+   "kind": "arithmetic",
+   "claim_in_doc": "| | **LAYER** | | **372,244,480** | **1,380,604,045** | **241,152,929** | **225,336,152** | **66,024,863** | |",
+   "what_i_checked": "python3 sum of the seven layer-7 rows the doc itself prints (profiling_gemm_27b.md lines 78-84), cross-checked against sweep-gemm-27b/{pristine,baseline,prefetch,d4}-k{56,57,58,59}.log and the carried layer-6 ffn logs k53/k54/k55.",
+   "finding": "The +repack column sums to 195,052,238 (32,315,274 + 3,434,839 + 3,432,110 + 17,118,167 + 45,434,691 + 45,437,135 + 47,880,022), not 241,152,929 -- an excess of 46,100,691 (+23.63%). The +prefetch column sums to 182,336,759, not 225,336,152 -- an excess of 42,999,393 (+23.58%). The other three cells in the same row (weights 372,244,480, upstream 1,380,604,04
+
+#### KEY: v2:9d0c5f30954f2888a34bd7494820b08351b0b8f3b546f48838da6fac650eda12
+{
+ "summary": "The measured half of this document is unusually solid: all 12 RTL-measured 27B rows regenerate cell-exact from the 48 logs on disk using the doc's own `sweep.sh --md` commands (0 mismatches, script-diffed), every source-code line citation resolves, the 4B least-squares fit table reproduces to the digit, the `pristine` baseline is genuinely un-handicapped (upstream repack.cpp has no Q1_0 entry at all, so `GGML_CPU_REPACK=OFF` is behaviourally identical to upstream's default `ON` for these nodes), and the claimed VLEN 1024 is independently confirmed by the logs. The inferred half is where it breaks down. The doc's own headline command for layer 7 returns 4 rows and a 15.02x geomean, not the published 7 rows and 17.65x -- the three carried `ffn_*` rows raise it by 17.4% and are not marked in the table at all, unlike the sibling `profiling_gemv_27b.md` which carries a `source` column for exactly this. Two bolded cells in the layer-7 LAYER row are arithmetically wrong by 23.6%, the entire 27B decode column has no raw logs anywhere on disk, one of the twelve `d4` binaries is provably a different build from the other eleven, and nothing in the doc pins a commit, a toolchain, a simulator version or a model hash. Grade: (b) tables reproducible but raw runs not -- with the layer-7 table only 4/7 reproducible and the 27B decode side not reproducible at all.",
+ "verified_ok": [
+  {
+   "claim": "\"Regenerate any table with MODEL=27b NODES=\\\"...\\\" bash sweep.sh --md\" -- holds for all 12 MEASURED rows, cell for cell.",
+   "evidence": "Read sweep.sh first: `--md` dispatches to md() (line 290), which only calls read_leg() (lines 120-139), which awk-parses an existing log; it never calls run_leg. Confirmed no simulation launches -- both commands returned instantly. Ran `MODEL=27b NODES=\"48 49 50 51 52 53 54 55\" bash sweep.sh --md` and `MODEL=27b NODES=\"56 57 58 59\" bash sweep.sh --md`, then script-diffed every published row (regex-parsed profiling_gemm_27b.md lines 37-44 and 78-81) against the regenerated rows: 12 rows compared, 0 mismatches. Every cycle count, weight count, shape and total-x in the measured rows is exact."
+  },
+  {
+   "claim": "Layer 6 geometric mean 20.60x over 6 optimizable nodes.",
+   "evidence": "`MODEL=27b NODES=\"48 49 50 51 52 53 54 55\" bash sweep.sh --md` prints \"n = 6 nodes with all four stages\", total **20.60x**, stages 6.98x / 1.07x / 2.76x, and \"2 node(s) excluded: rows not a multiple of 64\". Independently recomputed in python from the log cycles: 6.9804 / 1.0689 / 2.7602, total 20.5960."
+  },
+  {
+   "claim": "Layer 6 LAYER row: 383,221,760 / 1,417,870,831 / 201,715,460 / 188,434,482 / 68,835,932.",
+   "evidence": "python3 sum of the doc's own 8 layer-6 rows reproduces all five cells exactly. (Note the LAYER row is a hand-edit: it includes ssm_alpha/ssm_beta, whereas the tool's ALL-6 row excludes them at 1,415,983,905 / 199,828,560 / 186,547,213 / 66,951,649. Both are internally consistent.)"
+  },
+  {
+   "claim": "5-node head-to-head, gemm 7.04x / 1.07x / 2.75x = 20.67x and gemv 2.24x / 1.60x / 3.54x = 12.64x, using \"those same five on both sides\".",
+   "evidence": "Recomputed geomeans over attn_gate, ssm_out, ffn_gate, ffn_up, ffn_down: gemm 7.0372 / 1.0691 / 2.7469 total 20.6657 (from sweep-gemm-27b logs); gemv 2.2352 / 1.5975 / 3.5385 total 12.6351 (from profiling_gemv_27b.md lines 36-43). Cross-checked that decode really has only those five at all four stages -- profiling_gemv_27b.md marks the other rows \"2 stages\" or \"inferred\". The node set is genuinely identical on both sides."
+  },
+  {
+   "claim": "\"Over prefill's full set of 10 optimizable nodes the totals are 6.62x / 1.06x / 2.58x = 18.15x, against decode's 10-node figure of 12.20x.\"",
+   "evidence": "Recomputed over the 10 measured optimizable nodes: 6.6223 / 1.0630 / 2.5790, total 18.1549. Decode 10-node total geomean from profiling_gemv_27b.md: 12.2009. This figure correctly EXCLUDES the three carried rows -- the doc is right here and only wrong in the per-layer figure."
+  },
+  {
+   "claim": "Layer 6/7 decode figures 12.53x and 12.17x, and the 4B prefill stage figures \"6.11x / 1.04x / 2.46x\".",
+   "evidence": "Recomputed decode: L6 6-node 12.5324, L7 7-node 12.1719. Ran `bash sweep.sh --md` (4B, sweep-gemm/ logs): prints 6.11x / 1.04x / 2.46x, total 15.64x, n = 7 -- an exact match to line 136. `MODE=gemv bash sweep.sh --md` prints 2.13x / 1.56x / 3.70x, total 12.35x."
+  },
+  {
+   "claim": "The fixed/per-tile fit tables (F and T for all six variant x path pairs), and every derived ratio around them.",
+   "evidence": "Refit `cycles = F + T*tiles` by ordinary least squares over the five 4B ne0=2560 nodes (tiles = 64,16,16,152,152) from sweep-gemm/ and sweep-gemv/ logs. Got exactly the published values to the digit: gemm baseline 398003/80915, prefetch 441355/76544, d4 489581/23036; gemv baseline 13379/133082, prefetch 27294/85084, d4 39491/21638. Derived: 489581/39491 = 12.40x (\"12.4x\"), 23036/4 = 5759 and 21638/2 = 10819 (both published), 10819/5759 = 1.879 (\"1.88x\"), F/attn_v = 59.5% (\"59%\"), F/ffn_gate = 12.3% (\"12%\"), T collapse 3.51x gemm and 6.15x gemv (\"3.5x\"/\"6.2x\")."
+  },
+  {
+   "claim": "Every source-code citation in the document resolves to what the doc says it does.",
+   "evidence": "repack.cpp:4889 = `if (__riscv_vlenb() * 8 >= 512 && cur->ne[1] % 64 == 0 && cur->ne[0] % QK1_0 == 0)`; repack.cpp:4456-4469 = the ggml_quantize_mat_t / from_float dispatch on `ne11 - ne11 % 4`; repack.cpp:51 = `ggml_quantize_mat_q8_0_4x1_generic` with the `// scalar` comment at line 58; arch/riscv/repack.cpp:1967-1972 = the loop calling q1_vd4dots_4acc_m2 on one shared weight vector, with the comment \"the 4 output rows already share one weight vector\"; arch/riscv/quants.c:32 = `void quantize_row_q8_0` gated on `__riscv_v` at line 39; ggml-cpu.c:257 = `.nrows = 1` inside `[GGML_TYPE_Q1_0]`. The `-DGGML_RV_ZVFH=OFF` claim is confirmed in every b-*/CMakeCache.txt and in build.sh."
+  },
+  {
+   "claim": "FAIRNESS: `pristine` is not a handicapped baseline.",
+   "evidence": "`git show 12127defd:ggml/src/ggml-cpu/repack.cpp | grep -n Q1_0` returns nothing -- upstream's repack.cpp has no GGML_TYPE_Q1_0 entry, so even at upstream's default `GGML_CPU_REPACK=ON` (ggml/CMakeLists.txt:152) a Q1_0 tensor gets `nullptr` from get_optimal_repack_type and falls back to the stock ggml_vec_dot_q1_0_q8_0. Setting REPACK=OFF is therefore behaviourally identical for the measured nodes. Q1_0 itself is upstream (commit 2e1f0a889, PR #21273; GGML_TYPE_Q1_0 = 41 present in ggml.h at 12127defd)."
+  },
+  {
+   "claim": "FAIRNESS: the nrows=4 (prefill) claim is asserted per leg, not assumed.",
+   "evidence": "All 48 logs in sweep-gemm-27b/ carry exactly one `[roi] MUL_MAT` line and one `[andesim] ... cycles` line; every one reads `nrows=4` and names the tensor the table attributes to that K (k48-55 -> blk.6.*, k56-59 -> blk.7.*). sweep.sh:124-138 records BAD-NROWS instead of a number when nrows disagrees with MODE, so a wrong-prompt leg cannot silently become a table cell."
+  },
+  {
+   "claim": "Setup table: engine VLEN 1024, model identity, layer mix.",
+   "evidence": "The logs report `RVV_VLEN = 128`, which looks like a contradiction but is not: ggml-cpu.c:768 sets `rvv_vlen = __riscv_vlenb()`, i.e. BYTES -- 128 bytes = 1024 bits, so the raw logs independently confirm VLEN 1024. Parsed the gguf header directly: general.name = Bonsai-27B, general.architecture = qwen35, qwen35.block_count = 64, qwen35.full_attention_interval = 4 (-> 48 SSM + 16 attention), embedding_length 5120, feed_forward_length 17408, ssm.inner_size 6144, ssm.time_step_rank 48 (explains the 5120 x 48 ssm_alpha/beta), file size 3,803,452,480 B = 3.803 GB. Every Setup-table figure checks."
+  },
+  {
+   "claim": "Assorted derived percentages in the prose all check out.",
+   "evidence": "ffn_gate vs ffn_up 0.1059% upstream / 0.0143% d4 (doc: 0.11% / 0.01%); ssm_out vs attn_output 2.39% upstream (doc: 2.4%); 45,434,691/73,356,044 = 61.9% (doc: 62%); 36,678,022/11,358,673 = 3.229 (doc: 3.2x); upstream gemm/gemv ratio across all 12 nodes ranges 1.9724 to 2.0116 (doc: \"1.97x to 2.01x\"); ssm pair = 2.74% of layer 6's d4 cycles (doc: 2.7%)."
+  },
+  {
+   "claim": "The four build variants are reconstructible.",
+   "evidence": "build.sh is tracked in git and implements exactly the four flag sets the doc's variant table names (pristine = -DGGML_CPU_REPACK=OFF; baseline = REPACK=ON + Q1_PREFETCH_DIST=0; prefetch = REPACK=ON + DIST=1; d4 = + -DGGML_RV_XANDESVDOT=ON). All 48 measurement binaries (bin-{pristine,baseline,prefetch,d4}[-k48..k59]) are present, and every b-*/CMakeCache.txt is retained, pinning the exact flags and the toolchain path. Toolchain identified from the binaries' .comment: GCC (2026-03-22_nds64le-linux-glibc-v5d-51225d7bd) 14.2.0."
+  },
+  {
+   "claim": "Log-to-binary chronology is coherent for 47 of 48 legs.",
+   "evidence": "`stat -c %y` on all logs and binaries: 4B logs 2026-08-28/29, 27B logs 2026-08-30/31, binaries 2026-08-19 and 2026-08-24. Every log postdates the binary it ran, so no log was produced by a since-replaced build -- with the single exception of bin-d4-k59 (see findings). `git status --porcelain` shows no modified tracked files, so the source tree is clean relative to HEAD."
+  }
+ ],
+ "findings": [
+  {
+   "title": "Layer 7's +repack and +prefetch LAYER totals are wrong by 23.6%",
+   "severity": "major",
+   "kind": "arithmetic",
+   "claim_in_doc": "| | **LAYER** | | **372,244,480** | **1,380,604,045** | **241,152,929** | **225,336,152** | **66,024,863** | |",
+   "what_i_checked": "profiling_gemm_27b.md:85. Summed the doc's own seven layer-7 rows (lines 78-84) in python3: weights 372,244,480 (matches), upstream 1,380,604,045 (matches), +repack 195,052,238, +prefetch 182,336,759, +vd4dots 66,024,863 (matches). Cross-checked the +repack/+prefetch sums against the regenerated `MODEL=27b NODES=\"56 57 58 59\" bash sweep.sh --md` ALL-4 row (56,300,390 / 53,185,442) plus the three carried layer-6 cells.",
+   "finding": "Two of the five bolded cells are arithmetically wrong. +repack should be 195,052,238, not 241,152,929 (published value is 1.2364x too large). +prefetch should be 182,336,759, not 225,336,152 (1.2358x too large). The other three cells in the same row sum correctly, and the identical row in the layer-6 table (line 45) sums correctly in all five columns, so this is not a definitional difference -- it is an error confined to two cells. The origin of the inflated numbers could not be traced to any other quantity in the document or in the logs.",
+   "impact": "No headline speedup changes: all published geomeans are computed per-node from the individual cells, and the LAYER row is never used as a ratio (sweep.sh:231-235 deliberately refuses to print one). But two bolded published totals are wrong by ~24%, and any reader who divides 1,380,604,045 / 241,152,929 to sanity-check the layer gets 5.73x instead of the true 7.08x."
+  },
+  {
+   "title": "The doc's own regenerate command does not reproduce the layer-7 table or its 17.65x geomean",
+   "severity": "major",
+   "kind": "reproducibility",
+   "claim_in_doc": "Every figure is a cycle-accurate RTL measurement of one MUL_MAT node; nothing here is inferred except layer 7's three `ffn_*` rows, which are noted where they appear. Regenerate any table with `MODEL=27b NODES=\"...\" bash sweep.sh --md`.",
+   "what_i_checked": "profiling_gemm_27b.md:7-10, 87, 246-247. Ran the doc's exact layer-7 command `MODEL=27b NODES=\"56 57 58 59\" bash sweep.sh --md`. Recomputed both geomeans in python3 from the log cycles.",
+   "finding": "The command emits 4 rows (attn_q, attn_v, attn_k, attn_output) and reports \"n = 4 nodes with all four stages ... **total 15.02x**\". The published table has 7 rows and reports 17.65x. There is no NODES value that regenerates the published table: k60/61/62 (layer 7's real ffn_*) were never run -- no such logs exist in sweep-gemm
+
