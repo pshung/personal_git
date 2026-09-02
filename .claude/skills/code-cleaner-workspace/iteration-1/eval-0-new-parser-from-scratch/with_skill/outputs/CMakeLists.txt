@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(cfgtool CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+enable_testing()
+add_executable(config_test tests/config_test.cpp src/config.cpp)
+target_include_directories(config_test PRIVATE src)
+add_test(NAME config_test COMMAND config_test)

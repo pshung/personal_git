@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# crap.sh -- two-stage risk gate over C/C++ functions.
+#
+#   stage 1  which functions to judge: --diff (new code) or --min-churn (old)
+#   stage 2  risk = CRAP = CC^2 * (1 - coverage)^3 + CC, over that set only
+#
+# Simple code needs no tests. Complex code that is untested explodes.
+#
+# Needs: tools/cov_hybrid.sh run first (so .gcda exist), plus pip install lizard
+#
+# Usage:
+#   tools/crap.sh --filter 'src/hybrid/' --diff
+#   tools/crap.sh --filter 'src/hybrid/' --min-churn 5 --max 30
+#   tools/crap.sh --hook --filter 'src/hybrid/'      # Claude Code Stop hook
+#
+# --hook adapts the exit codes for a Stop hook, where 2 blocks the agent and
+# anything else lets it finish:
+#   no C/C++ touched in the worktree -> 0, immediately (a chat turn costs ~10ms)
+#   over budget / stale / missing coverage data -> 2, with an actionable message
+#   clean -> 0
+# Without --hook the exit code is the usual 0 pass / 1 fail / 2 tool error.
+#
+# Other options are passed through to tools/crap.py.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GCDA_DIR="$ROOT/build-coverage"
+GCOV="${GCOV:-gcov}"
+HOOK=0
+FILTER="."
+PY_ARGS=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --gcda) GCDA_DIR="$2"; shift 2 ;;
+    --gcov) GCOV="$2"; shift 2 ;;
+    --hook) HOOK=1; shift ;;
+    --filter) FILTER="$2"; PY_ARGS+=(--filter "$2"); shift 2 ;;
+    -h|--help) sed -n '2,22p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    *) PY_ARGS+=("$1"); shift ;;
+  esac
+done
+
+# Nothing to say about a turn that touched no C/C++ inside --filter. Checked
+# before any build artifact is read, so a plain conversation never pays for the
+# gate and can never be blocked by it.
+if [ "$HOOK" = 1 ]; then
+  # Collect first, match second. Piping straight into `grep -q` lets grep close
+  # the pipe on its first hit, git dies of SIGPIPE, and `set -o pipefail` turns
+  # that success into a failure -- which would silently disable the whole gate.
+  CHANGED=$(git -C "$ROOT" status --porcelain \
+            -- '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' 2>/dev/null | cut -c4-)
+  if ! grep -qE "$FILTER" <<<"$CHANGED"; then
+    exit 0
+  fi
+  PY_ARGS+=(--diff)
+fi
+
+# Exit 2 reads as "blocked, here is what to do" under --hook and "tool broke"
+# without it. Both want the same message, so the number does not change.
+mapfile -t GCDA < <(find "$GCDA_DIR" -name '*.gcda' 2>/dev/null | sort)
+if [ "${#GCDA[@]}" -eq 0 ]; then
+  echo "crap.sh: C/C++ changed but there is no coverage data under $GCDA_DIR" >&2
+  echo "  fix: run tools/cov_hybrid.sh" >&2
+  exit 2
+fi
+
+# A .gcno rewritten by a recompile no longer matches an older .gcda: gcov warns
+# "stamp mismatch" on stderr and then silently reports 0% for the whole file.
+# Silent zero coverage inflates CRAP and sends an agent off writing pointless
+# tests, so treat it as a hard error rather than swallowing it.
+STDERR=$(mktemp)
+JSON=$(mktemp)
+trap 'rm -f "$STDERR" "$JSON"' EXIT
+
+# gcov emits one JSON object per .gcda; crap.py splits the stream back apart.
+# Run from each .gcda's own directory so gcov resolves its .gcno neighbour.
+for f in "${GCDA[@]}"; do
+  (cd "$(dirname "$f")" && "$GCOV" --json-format --stdout "$(basename "$f")" 2>>"$STDERR")
+done > "$JSON"
+
+if grep -q 'stamp mismatch' "$STDERR"; then
+  echo "crap.sh: stale coverage data -- .gcno was rebuilt but the .gcda was not:" >&2
+  grep 'stamp mismatch' "$STDERR" | sed 's/^/  /' >&2
+  echo "  fix: rerun tools/cov_hybrid.sh" >&2
+  exit 2
+fi
+
+python3 "$ROOT/tools/crap.py" --root "$ROOT" "${PY_ARGS[@]}" < "$JSON"
+rc=$?
+# crap.py: 0 clean, 1 over budget, 2 nothing matched --filter. Under --hook only
+# a real overage may block; "nothing matched" is not the agent's problem.
+if [ "$HOOK" = 1 ]; then
+  [ "$rc" = 1 ] && exit 2
+  exit 0
+fi
+exit $rc

@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(opcodes CXX)
+set(CMAKE_CXX_STANDARD 17)
+enable_testing()
+add_executable(opcode_test tests/opcode_test.cpp src/opcode.cpp)
+target_include_directories(opcode_test PRIVATE src)
+add_test(NAME opcode_test COMMAND opcode_test)

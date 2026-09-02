@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# crap.sh -- two-stage risk gate over C/C++ functions.
+#
+#   stage 1  importance = churn (commits that touched the function's lines)
+#   stage 2  risk       = CRAP  = CC^2 * (1 - coverage)^3 + CC, gated set only
+#
+# Simple code needs no tests. Complex code that keeps changing and is untested
+# explodes. Exit 1 when a gated function is over --max, so this can be wired
+# into a Claude Code Stop hook and an agent cannot call a task done while it
+# fails.
+#
+# Needs: tools/cov_hybrid.sh run first (so .gcda exist), plus pip install lizard
+#
+# Usage:
+#   tools/crap.sh --filter 'src/hybrid/'
+#   tools/crap.sh --filter 'resume_driver' --min-churn 5 --max 30
+#
+# Options are passed through to tools/crap.py except --gcda and --gcov.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GCDA_DIR="$ROOT/build-coverage"
+GCOV="${GCOV:-gcov}"
+PY_ARGS=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --gcda) GCDA_DIR="$2"; shift 2 ;;
+    --gcov) GCOV="$2"; shift 2 ;;
+    -h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    *) PY_ARGS+=("$1"); shift ;;
+  esac
+done
+
+mapfile -t GCDA < <(find "$GCDA_DIR" -name '*.gcda' 2>/dev/null | sort)
+if [ "${#GCDA[@]}" -eq 0 ]; then
+  echo "crap.sh: no .gcda under $GCDA_DIR" >&2
+  echo "  run tools/cov_hybrid.sh first." >&2
+  exit 2
+fi
+
+# A .gcno rewritten by a recompile no longer matches an older .gcda: gcov warns
+# "stamp mismatch" on stderr and then silently reports 0% for the whole file.
+# Silent zero coverage inflates CRAP and sends an agent off writing pointless
+# tests, so treat it as a hard error rather than swallowing it.
+STDERR=$(mktemp)
+trap 'rm -f "$STDERR"' EXIT
+
+# gcov emits one JSON object per .gcda; crap.py splits the stream back apart.
+# Run from each .gcda's own directory so gcov resolves its .gcno neighbour.
+for f in "${GCDA[@]}"; do
+  (cd "$(dirname "$f")" && "$GCOV" --json-format --stdout "$(basename "$f")" 2>>"$STDERR")
+done > "$STDERR.json"
+
+if grep -q 'stamp mismatch' "$STDERR"; then
+  echo "crap.sh: stale coverage data -- .gcno was rebuilt but the .gcda was not:" >&2
+  grep 'stamp mismatch' "$STDERR" | sed 's/^/  /' >&2
+  echo "  fix: re-run the affected binary, or rerun tools/cov_hybrid.sh" >&2
+  rm -f "$STDERR.json"
+  exit 2
+fi
+
+python3 "$ROOT/tools/crap.py" --root "$ROOT" "${PY_ARGS[@]}" < "$STDERR.json"
+rc=$?
+rm -f "$STDERR.json"
+exit $rc

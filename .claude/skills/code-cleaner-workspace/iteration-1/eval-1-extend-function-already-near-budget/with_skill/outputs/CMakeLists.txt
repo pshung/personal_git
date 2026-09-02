@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(dispatch CXX)
+set(CMAKE_CXX_STANDARD 17)
+enable_testing()
+add_executable(dispatch_test tests/dispatch_test.cpp src/dispatch.cpp)
+target_include_directories(dispatch_test PRIVATE src)
+add_test(NAME dispatch_test COMMAND dispatch_test)
