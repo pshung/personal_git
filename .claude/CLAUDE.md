@@ -6,5 +6,5 @@
 # When you implement the code
 * write "deep module" which provides powerful functionality behind a simple, small interface.
 * reduce CRAP score, reduce Cyclomatic Complexity and Cognitive Complexity.
-* Dispatcher,  Switch-Case, preprocessor command and Guard Clauses / Validation Chains are OK.
+* Dispatcher,  Switch-Case, preprocessor command and Guard Clauses / Validation Chains and reasonable structures are OK.
 * include @TDD.md

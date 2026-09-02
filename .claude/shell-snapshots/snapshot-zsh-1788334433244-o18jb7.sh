@@ -4,7 +4,7 @@ unalias -a 2>/dev/null || true
 # Functions
 __arguments () {
 	# undefined
-	builtin autoload -XUz /usr/share/zsh/functions/Completion/Zsh
+	builtin autoload -XUz
 }
 __nvm () {
 	declare previous_word
@@ -514,7 +514,7 @@ compdef () {
 }
 compdump () {
 	# undefined
-	builtin autoload -XUz
+	builtin autoload -XUz /usr/share/zsh/functions/Completion
 }
 compgen () {
 	local opts prefix suffix job OPTARG OPTIND ret=1 

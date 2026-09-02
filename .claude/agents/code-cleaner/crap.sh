@@ -23,15 +23,17 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-GCOV="${GCOV:-gcov}"
 HOOK=0
 FILTER="."
 GCDA_DIR=""
 PY_ARGS=()
 
-COV_GCDA_DIR=""
+COV_GCDA_DIR=""; COV_GCOV=""
 # shellcheck disable=SC1090
 [ -f "$ROOT/.crap.conf" ] && . "$ROOT/.crap.conf"
+# Which gcov: --gcov beats $GCOV in the environment beats what cov_build.sh
+# recorded (clang -> "llvm-cov gcov", cross toolchain -> its own gcov).
+GCOV="${GCOV:-${COV_GCOV:-gcov}}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -67,11 +69,23 @@ fi
 STDERR=$(mktemp); JSON=$(mktemp)
 trap 'rm -f "$STDERR" "$JSON"' EXIT
 
-# gcov emits one JSON object per .gcda; crap.py splits the stream back apart.
-# Run from each .gcda's own directory so gcov finds its .gcno neighbour.
-for f in "${GCDA[@]}"; do
-  (cd "$(dirname "$f")" && "$GCOV" --json-format --stdout "$(basename "$f")" 2>>"$STDERR")
-done > "$JSON"
+# One .gcda -> coverage text on stdout. GCC's gcov emits one JSON object per
+# .gcda and crap.py splits the stream back apart. llvm-cov has no JSON mode, so
+# it runs in intermediate mode from a scratch dir (it writes files, not stdout)
+# with a cwd: line in front so crap.py can resolve relative file: paths.
+# Either way gcov runs against the .gcda's own directory to find its .gcno.
+dump_one() {
+  local f="$1" dir; dir="$(dirname "$f")"
+  case "$GCOV" in
+    *llvm-cov*)
+      local tmp; tmp=$(mktemp -d)
+      (cd "$tmp" && $GCOV -b -i "$f" >/dev/null 2>>"$STDERR")
+      echo "cwd:$dir"; cat "$tmp"/*.gcov 2>/dev/null; rm -rf "$tmp" ;;
+    *)
+      (cd "$dir" && $GCOV -b --json-format --stdout "$(basename "$f")" 2>>"$STDERR") ;;
+  esac
+}
+for f in "${GCDA[@]}"; do dump_one "$f"; done > "$JSON"
 
 # A .gcno rewritten by a recompile no longer matches an older .gcda. gcov warns
 # on stderr and then reports 0% for the whole file -- which inflates CRAP by
