@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""CRAP score per function: complexity from lizard, coverage from gcov JSON.
+
+    CRAP(f) = CC(f)^2 * (1 - coverage(f))^3 + CC(f)
+
+A simple function needs no tests to pass. A complex one that is not covered
+explodes. That is the point: it puts the pressure where the risk is.
+
+Input  : gcov --json-format --stdout output, concatenated on stdin (one JSON
+         object per .gcda, newline separated).
+Output : a table sorted by CRAP descending, plus exit 1 if any function is
+         over --max.
+
+Functions are joined to coverage by LINE RANGE, not by name -- gcov demangles
+to `ns::C::f(args)` while lizard reports `ns::C::f`, and overloads/template
+instantiations make name matching unreliable. Line ranges always match.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from collections import defaultdict
+
+import lizard
+
+
+def read_gcov_json(stream):
+    """stdin -> {abs_source_path: {line_number: total_execution_count}}.
+
+    Counts are summed across every .gcda, so one header compiled into several
+    binaries (unit test + the real sim) merges into a single picture.
+    """
+    counts = defaultdict(lambda: defaultdict(int))
+    for chunk in stream.read().split("\n{"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if not chunk.startswith("{"):
+            chunk = "{" + chunk
+        try:
+            doc = json.loads(chunk)
+        except json.JSONDecodeError:
+            continue
+        cwd = doc.get("current_working_directory", ".")
+        for entry in doc.get("files", []):
+            path = os.path.normpath(os.path.join(cwd, entry["file"]))
+            for line in entry.get("lines", []):
+                counts[path][line["line_number"]] += line["count"]
+    return counts
+
+
+def crap(cc, coverage):
+    return cc * cc * (1.0 - coverage) ** 3 + cc
+
+
+def needed_coverage(cc, target):
+    """Coverage that would bring CC down to `target`, or None if unreachable.
+
+    Solving cc^2 * (1-c)^3 + cc = target gives c = 1 - cbrt((target-cc)/cc^2).
+    When cc >= target the function is already over budget at 100% coverage.
+    """
+    if cc >= target:
+        return None
+    return 1.0 - ((target - cc) / (cc * cc)) ** (1.0 / 3.0)
+
+
+def score_file(path, line_counts):
+    """One source file -> [(name, cc, coverage, crap, start_line, has_data)]."""
+    rows = []
+    for fn in lizard.analyze_file(path).function_list:
+        executable = [
+            ln for ln in range(fn.start_line, fn.end_line + 1) if ln in line_counts
+        ]
+        covered = [ln for ln in executable if line_counts[ln] > 0]
+        coverage = len(covered) / len(executable) if executable else 0.0
+        rows.append(
+            (fn.name, fn.cyclomatic_complexity, coverage,
+             crap(fn.cyclomatic_complexity, coverage), fn.start_line, bool(executable))
+        )
+    return rows
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--filter", default=".",
+                    help="regex; only source files whose path matches are reported")
+    ap.add_argument("--exclude", default=r"/external/|\.test\.cpp$|/tests?/",
+                    help="regex; source files matching are dropped")
+    ap.add_argument("--max", type=float, default=30.0,
+                    help="fail (exit 1) if any function scores above this")
+    ap.add_argument("--top", type=int, default=20)
+    ap.add_argument("--root", default=os.getcwd(),
+                    help="paths are printed relative to this")
+    args = ap.parse_args()
+
+    counts = read_gcov_json(sys.stdin)
+    keep = re.compile(args.filter)
+    drop = re.compile(args.exclude)
+
+    rows = []
+    for path in sorted(counts):
+        if not keep.search(path) or drop.search(path) or not os.path.exists(path):
+            continue
+        rel = os.path.relpath(path, args.root)
+        rows += [(rel,) + r for r in score_file(path, counts[path])]
+
+    if not rows:
+        print("crap: no source files matched", file=sys.stderr)
+        return 2
+
+    rows.sort(key=lambda r: -r[4])
+    print(f"{'CRAP':>7}  {'CC':>3}  {'cov':>6}  function")
+    print("-" * 78)
+    for rel, name, cc, cov, score, start, has_data in rows[: args.top]:
+        mark = "" if has_data else "  (no coverage data)"
+        print(f"{score:>7.0f}  {cc:>3}  {cov * 100:>5.1f}%  {name}")
+        print(f"{'':>7}  {'':>3}  {'':>6}  {rel}:{start}{mark}")
+
+    over = [r for r in rows if r[4] > args.max]
+    print("-" * 78)
+    print(f"{len(rows)} functions, {len(over)} over CRAP {args.max:g}")
+    sys.stdout.flush()
+    if not over:
+        return 0
+
+    # Say what to DO, not just that it failed. Adding tests only helps while
+    # coverage is the binding constraint; once CC alone exceeds --max the score
+    # cannot reach it at any coverage (CRAP == CC when coverage is 1.0), and
+    # the only fix is to split the function.
+    print(f"\nFAIL: {len(over)} function(s) over CRAP {args.max:g}", file=sys.stderr)
+    for rel, name, cc, cov, score, start, _ in over:
+        need = needed_coverage(cc, args.max)
+        if need is None:
+            fix = f"SPLIT IT: CC={cc} alone exceeds {args.max:g}; tests cannot lower this"
+        else:
+            fix = f"ADD TESTS: {cov * 100:.0f}% -> {need * 100:.0f}% coverage needed"
+        print(f"  {rel}:{start}  {name}  CRAP={score:.0f}  {fix}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

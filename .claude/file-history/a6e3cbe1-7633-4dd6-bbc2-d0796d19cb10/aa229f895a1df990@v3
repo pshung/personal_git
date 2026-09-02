@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Two-stage risk gate: rank functions by importance, then CRAP-gate the top.
+
+  Stage 1  IMPORTANCE = churn, the number of commits that touched the
+           function's lines (`git log -L start,end:file`). Code that keeps
+           changing is where bugs live. Needs no build -- lizard supplies the
+           function boundaries, git supplies the count.
+
+  Stage 2  RISK = CRAP(f) = CC(f)^2 * (1 - coverage(f))^3 + CC(f), computed
+           ONLY for the functions stage 1 kept. Needs a --coverage build that
+           has been run.
+
+Why two stages: gating every function punishes harmless code. A 70-case switch
+lookup table scores CC=70 and can never pass, but if nobody ever edits it, it
+is not where the bugs are. Churn filters it out before it wastes anyone's time.
+
+Input  : `gcov --json-format --stdout` output on stdin, one object per .gcda.
+Output : a table, and exit 1 if any GATED function is over --max.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+
+import lizard
+
+
+def read_gcov_json(stream):
+    """stdin -> {abs_source_path: {line_number: total_execution_count}}.
+
+    Counts are summed across every .gcda, so one header compiled into several
+    binaries (the unit test and the real sim) merges into a single picture.
+    """
+    counts = defaultdict(lambda: defaultdict(int))
+    for chunk in stream.read().split("\n{"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if not chunk.startswith("{"):
+            chunk = "{" + chunk
+        try:
+            doc = json.loads(chunk)
+        except json.JSONDecodeError:
+            continue
+        cwd = doc.get("current_working_directory", ".")
+        for entry in doc.get("files", []):
+            path = os.path.normpath(os.path.join(cwd, entry["file"]))
+            for line in entry.get("lines", []):
+                counts[path][line["line_number"]] += line["count"]
+    return counts
+
+
+def churn(repo, relpath, start, end):
+    """Commits that touched these lines. Verify by hand with:
+        git -C <repo> log --oneline -L <start>,<end>:<relpath>
+    """
+    out = subprocess.run(
+        ["git", "-C", repo, "log", "--format=%H", f"-L{start},{end}:{relpath}"],
+        capture_output=True, text=True,
+    )
+    if out.returncode != 0:
+        return 0
+    return sum(1 for ln in out.stdout.splitlines() if re.fullmatch(r"[0-9a-f]{40}", ln))
+
+
+def crap(cc, coverage):
+    return cc * cc * (1.0 - coverage) ** 3 + cc
+
+
+def needed_coverage(cc, target):
+    """Coverage that would bring CRAP down to `target`, or None if unreachable.
+
+    Solving cc^2 * (1-c)^3 + cc = target gives c = 1 - cbrt((target-cc)/cc^2).
+    At coverage 1.0 CRAP equals CC, so cc >= target can never pass: the only
+    remaining fix is to split the function.
+    """
+    if cc >= target:
+        return None
+    return 1.0 - ((target - cc) / (cc * cc)) ** (1.0 / 3.0)
+
+
+def coverage_of(line_counts, start, end):
+    """(coverage_fraction, had_any_instrumented_line) over an inclusive range."""
+    executable = [ln for ln in range(start, end + 1) if ln in line_counts]
+    if not executable:
+        return 0.0, False
+    covered = [ln for ln in executable if line_counts[ln] > 0]
+    return len(covered) / len(executable), True
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", default=os.getcwd(),
+                    help="source repo root; also the git repo churn is read from")
+    ap.add_argument("--filter", default=".", help="regex on source path: what to consider")
+    ap.add_argument("--exclude", default=r"/external/|\.test\.cpp$|/tests?/",
+                    help="regex on source path: what to drop")
+    ap.add_argument("--min-churn", type=int, default=3,
+                    help="stage 1: gate only functions touched by >= this many commits")
+    ap.add_argument("--max", type=float, default=30.0,
+                    help="stage 2: fail if a gated function scores above this")
+    ap.add_argument("--top", type=int, default=15, help="rows to print")
+    args = ap.parse_args()
+
+    counts = read_gcov_json(sys.stdin)
+    keep, drop = re.compile(args.filter), re.compile(args.exclude)
+    sources = [p for p in sorted(counts)
+               if keep.search(p) and not drop.search(p) and os.path.exists(p)]
+    if not sources:
+        print("crap: no source files matched --filter", file=sys.stderr)
+        return 2
+
+    rows = []
+    for path in sources:
+        rel = os.path.relpath(path, args.root)
+        for fn in lizard.analyze_file(path).function_list:
+            cov, has_data = coverage_of(counts[path], fn.start_line, fn.end_line)
+            rows.append({
+                "file": rel, "name": fn.name, "line": fn.start_line,
+                "churn": churn(args.root, rel, fn.start_line, fn.end_line),
+                "cc": fn.cyclomatic_complexity, "nloc": fn.nloc,
+                "cov": cov, "crap": crap(fn.cyclomatic_complexity, cov),
+                "has_data": has_data,
+            })
+
+    gated = [r for r in rows if r["churn"] >= args.min_churn]
+    gated.sort(key=lambda r: (-r["crap"], -r["churn"]))
+
+    print(f"stage 1: {len(rows)} functions in {len(sources)} file(s); "
+          f"{len(gated)} touched by >= {args.min_churn} commits -> gated")
+    print(f"stage 2: CRAP over the gated set, budget {args.max:g}\n")
+    print(f"{'CRAP':>6} {'churn':>6} {'CC':>4} {'cov':>7}  function")
+    print("-" * 78)
+    for r in gated[: args.top]:
+        note = "" if r["has_data"] else "  (no coverage data)"
+        print(f"{r['crap']:>6.0f} {r['churn']:>6} {r['cc']:>4} {r['cov'] * 100:>6.1f}%  {r['name']}")
+        print(f"{'':>6} {'':>6} {'':>4} {'':>7}  {r['file']}:{r['line']}{note}")
+
+    over = [r for r in gated if r["crap"] > args.max]
+    print("-" * 78)
+    print(f"{len(gated)} gated, {len(over)} over budget "
+          f"({len(rows) - len(gated)} low-churn functions not gated)")
+    sys.stdout.flush()
+    if not over:
+        return 0
+
+    # Say what to DO. Adding tests only helps while coverage is the binding
+    # constraint; past CC == --max no amount of testing can reach the budget.
+    print(f"\nFAIL: {len(over)} function(s) over CRAP {args.max:g}", file=sys.stderr)
+    for r in over:
+        need = needed_coverage(r["cc"], args.max)
+        fix = (f"SPLIT IT: CC={r['cc']} alone exceeds {args.max:g}; tests cannot lower this"
+               if need is None else
+               f"ADD TESTS: {r['cov'] * 100:.0f}% -> {need * 100:.0f}% coverage needed")
+        print(f"  {r['file']}:{r['line']}  {r['name']}  "
+              f"CRAP={r['crap']:.0f} churn={r['churn']}  {fix}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
