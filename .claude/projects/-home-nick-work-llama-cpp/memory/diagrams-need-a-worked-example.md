@@ -92,3 +92,12 @@ labels; the raw repo source stays untouched in the details blocks and the
 tests compare shown code to the source *after* the rename. The real kernel
 files were NOT renamed - offer that as a separate structural commit if he
 wants it in the repo.
+
+**Talk-over diagram, 2026-09-04:** "圖不要搭配講解 我要一張可以搭配我口說講解的
+直觀圖" - for a presentation he wants a clean diagram with NO code and NO
+explanatory text: shapes to scale, arrows, and only 1-3-word labels (weight
+row, activations, codes, signs, ± codes, Σ, ×, +, block sum, row total, out,
+"× 4 groups", "× n blocks"), loops drawn as nested frames, scales as dotted
+teal lines into the × nodes. The code-beside-picture figure was rejected for
+this purpose (that style is for reading, not for talking over). Guarded by
+test_upstream_diagram_has_no_code_and_no_sentences (<=3 words per label).

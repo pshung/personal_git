@@ -1,0 +1,615 @@
+"""Guards for the Q1_0 layout page.
+
+Every drawn width must equal the byte/lane count it is labelled with, and every
+section must stay readable at a glance (<= 7 visible blocks, rest in <details>).
+"""
+import html
+import re
+from html.parser import HTMLParser
+
+import pytest
+
+import build_page as bp
+
+VISIBLE_BLOCK_CAP = 7
+VOID = {"br", "hr", "img", "link", "meta", "input", "wbr"}
+
+
+@pytest.fixture(scope="module")
+def page():
+    return bp.build_html()
+
+
+class Outline(HTMLParser):
+    """Direct children of every <section>/<header>, plus the text of every <summary>."""
+
+    def __init__(self):
+        super().__init__()
+        self.stack = []
+        self.blocks = {}
+        self.summaries = []
+        self._cur = None
+        self._sum = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag in VOID:
+            return
+        a = dict(attrs)
+        if tag in ("section", "header"):
+            self._cur = a.get("id", tag)
+            self.blocks[self._cur] = []
+        elif self._cur and self.stack and self.stack[-1] in ("section", "header"):
+            self.blocks[self._cur].append(tag)
+        if tag == "summary":
+            self._sum = ""
+        self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        if tag in VOID:
+            return
+        if tag == "summary":
+            self.summaries.append(self._sum.strip())
+            self._sum = None
+        if tag in ("section", "header"):
+            self._cur = None
+        while self.stack and self.stack.pop() != tag:
+            pass
+
+    def handle_data(self, data):
+        if self._sum is not None:
+            self._sum += data
+
+
+def outline(page):
+    o = Outline()
+    o.feed(page)
+    return o
+
+
+def rect_attrs(page, role):
+    out = {}
+    for m in re.finditer(r"<rect ([^>]*)/>", page):
+        a = dict(re.findall(r'([\w-]+)="([^"]*)"', m.group(1)))
+        if a.get("data-role") == role:
+            out[a["data-variant"]] = a
+    return out
+
+
+def label_for(page, key):
+    m = re.search(rf'<text [^>]*data-for="{key}"[^>]*>([^<]*)</text>', page)
+    assert m, f"no label with data-for={key}"
+    return m.group(1)
+
+
+# ---- readability -----------------------------------------------------------
+
+def test_every_section_shows_at_most_seven_blocks(page):
+    o = outline(page)
+    assert len(o.blocks) >= 9
+    over = {k: v for k, v in o.blocks.items() if len(v) > VISIBLE_BLOCK_CAP}
+    assert not over, f"sections over the cap: {over}"
+
+
+def test_every_details_has_a_descriptive_summary(page):
+    o = outline(page)
+    assert o.summaries, "page has no <details> at all"
+    for s in o.summaries:
+        assert len(s.split()) >= 3 and s.lower() != "more", f"weak summary: {s!r}"
+
+
+# ---- the op-count model is what the kernels actually do --------------------
+
+def test_vector_instruction_counts_per_64x32_subtile():
+    assert bp.OPS_PER_SUBTILE == {"upstream": 320, "rvv": 96, "vd4": 32}
+
+
+def test_sign_bit_orders_are_two_permutations_of_one_tile():
+    cells = [(c, j) for c in range(bp.QK1) for j in range(bp.ROWS)]
+    for f in (bp.sign_bit_rvv, bp.sign_bit_vd4):
+        assert sorted(f(c, j) for c, j in cells) == list(range(bp.QK1 * bp.ROWS))
+    # one vlm.v footprint: rvv plane 0 = column 0 only, vd4 plane 0 = columns 0..3
+    rvv0 = {(c, j) for c, j in cells if bp.sign_bit_rvv(c, j) < 64}
+    vd40 = {(c, j) for c, j in cells if bp.sign_bit_vd4(c, j) < 256}
+    assert rvv0 == {(0, j) for j in range(64)}
+    assert vd40 == {(c, j) for c in range(4) for j in range(64)}
+    assert {c for c, _ in rvv0} == {0} and len(rvv0) == bp.FOOTPRINT_BYTES["rvv"] * 8
+    assert len(vd40) == bp.FOOTPRINT_BYTES["vd4"] * 8
+
+
+# ---- drawn geometry equals printed label ----------------------------------
+
+def test_weight_strip_footprints_are_drawn_to_scale_and_labelled(page):
+    got = rect_attrs(page, "footprint")
+    assert set(got) == set(bp.VARIANTS)
+    for v, a in got.items():
+        nbytes = bp.FOOTPRINT_BYTES[v]
+        assert int(a["data-bytes"]) == nbytes
+        assert float(a["width"]) == pytest.approx(nbytes * bp.PX_STRIP)
+        assert f"{nbytes} B" in label_for(page, f"footprint-{v}")
+
+
+def test_weight_strip_scale_regions_are_drawn_to_scale(page):
+    got = rect_attrs(page, "scales")
+    assert set(got) == {"rvv", "vd4"}
+    for a in got.values():
+        assert float(a["width"]) == pytest.approx(bp.SCALE_BYTES * bp.PX_STRIP)
+    got = rect_attrs(page, "strip")
+    for a in got.values():
+        assert float(a["width"]) == pytest.approx(bp.BLOCK_Q1X64 * bp.PX_STRIP)
+
+
+def test_hero_tile_footprints_match_one_vlm(page):
+    got = rect_attrs(page, "tilefoot")
+    assert set(got) == set(bp.VARIANTS)
+    for v, a in got.items():
+        cols, rows = bp.FOOTPRINT_CELLS[v]
+        assert float(a["width"]) == pytest.approx(cols * bp.TILE_CELL)
+        assert float(a["height"]) == pytest.approx(rows * bp.TILE_CELL)
+        assert cols * rows == bp.FOOTPRINT_BYTES[v] * 8
+        assert f"{cols * rows} sign bits" in label_for(page, f"tilefoot-{v}")
+
+
+def test_hero_register_bars_show_busy_bytes(page):
+    got = rect_attrs(page, "regbusy")
+    for v, a in got.items():
+        assert float(a["width"]) == pytest.approx(bp.REG_BUSY[v] * bp.PX_REG)
+        assert float(a["width"]) <= bp.REG_AXIS * bp.PX_REG
+
+
+def test_hero_instruction_bars_are_proportional_and_labelled(page):
+    got = rect_attrs(page, "opsbar")
+    assert set(got) == set(bp.VARIANTS)
+    for v, a in got.items():
+        n = bp.OPS_PER_SUBTILE[v]
+        assert float(a["width"]) == pytest.approx(n * bp.PX_OPS)
+        assert f"{n} vector instructions" in label_for(page, f"opsbar-{v}")
+
+
+def test_format_strips_are_drawn_to_scale(page):
+    got = rect_attrs(page, "fmt")
+    assert float(got["q1"]["width"]) == pytest.approx(bp.BLOCK_Q1 * bp.PX_FMT)
+    assert float(got["q8x4"]["width"]) == pytest.approx(4 * bp.BLOCK_Q8 * bp.PX_FMT)
+    assert float(got["q8x4"]["width"]) / float(got["q1"]["width"]) == pytest.approx(136 / 18)
+
+
+def test_activation_quads_alternate_alignment_in_the_q8_stream():
+    offs = [g * bp.BLOCK_Q8 + 2 for g in range(4)]
+    assert [o % 4 for o in offs] == [2, 0, 2, 0]
+    assert all(o % 4 == 0 for o in bp.restaged_quad_offsets())
+
+
+def test_source_excerpts_come_from_the_repo(page):
+    for needle in ("nds.vd4dots.vv %[acc], %[w0], %[s0]",
+                   "__riscv_vwredsum_vs_i8m1_i16m1",
+                   "__riscv_vadd_vx_i16m1_mu(sign, sumi, sumi",
+                   "return (c / 4) * 256 + 4 * j + (c % 4);"):
+        assert needle in page
+
+
+
+# ---- step ladders: figure + instruction, names must match ------------------
+
+STEP = re.compile(r'<li class="step" data-layout="(\w+)" data-step="(\d+)">(.*?)</li>', re.S)
+
+
+def steps(page):
+    out = []
+    for m in STEP.finditer(page):
+        body = m.group(3)
+        code = html.unescape(re.search(r"<code[^>]*>(.*?)</code>", body, re.S).group(1))
+        names = [html.unescape(t) for t in re.findall(r'<text [^>]*data-role="var"[^>]*>([^<]*)</text>', body)]
+        note = re.search(r'<p class="note">(.*?)</p>', body, re.S)
+        out.append((m.group(1), int(m.group(2)), code, names, note.group(1) if note else ""))
+    return out
+
+
+def calls(code):
+    """every __riscv_*( ... ) call with balanced parentheses"""
+    out = []
+    for m in re.finditer(r"__riscv_\w+\(", code):
+        depth = 0
+        for k in range(m.end() - 1, len(code)):
+            if code[k] == "(":
+                depth += 1
+            elif code[k] == ")":
+                depth -= 1
+                if depth == 0:
+                    out.append(code[m.start():k + 1])
+                    break
+    return out
+
+
+def norm(s):
+    return re.sub(r"\s+", " ", s)
+
+
+def test_each_layout_has_a_numbered_step_ladder(page):
+    by = {}
+    for layout, n, code, names, note in steps(page):
+        by.setdefault(layout, []).append(n)
+    assert set(by) == {"rvv", "vd4"}
+    for layout, ns in by.items():
+        assert ns == list(range(len(ns))), (layout, ns)
+        assert len(ns) >= 7, (layout, len(ns))
+
+
+def test_every_step_draws_at_least_one_named_variable_and_has_a_note(page):
+    for layout, n, code, names, note in steps(page):
+        assert names, (layout, n)
+        assert len(note.split()) >= 4, (layout, n, note)
+
+
+def test_drawn_variable_names_appear_in_that_steps_code(page):
+    for layout, n, code, names, note in steps(page):
+        for name in names:
+            assert norm(name) in norm(code), (layout, n, name)
+
+
+def test_step_intrinsics_are_verbatim_from_the_kernels(page):
+    src = {k: norm(v) for k, v in bp.renamed_sources().items()}
+    seen = 0
+    for layout, n, code, names, note in steps(page):
+        for c in calls(code):
+            assert norm(c) in src[layout], (layout, n, c)
+            seen += 1
+    assert seen >= 20
+
+
+def test_vd4_asm_lines_are_the_ones_in_the_asm_helper(page):
+    asm = bp.renamed_sources()["vd4"]
+    lines = [l.strip() for layout, n, code, names, note in steps(page) if layout == "vd4"
+             for l in code.splitlines() if l.strip().startswith(("vsetvli", "vmv.v.x", "nds.vd4dots.vv"))]
+    assert lines
+    for l in lines:
+        mnemonic = l.split()[0]
+        assert mnemonic in asm, l
+        if mnemonic == "vsetvli":
+            assert "vsetvli t0, zero, e32, m2, ta, ma" in asm
+
+
+def test_upstream_rvv_vd4_ladders_end_by_storing_the_result(page):
+    last = {}
+    for layout, n, code, names, note in steps(page):
+        last[layout] = code
+    assert "__riscv_vse32_v_f32m2(out + (size_t) tile * 64, row_totals, vl)" in last["rvv"]
+    assert "__riscv_vse32_v_f32m2(out + (size_t) tile * 64, row_totals, vl32)" in last["vd4"]
+
+
+CODE_NAMES = re.compile(r"(\b(is_not_zero|neg_qy|qy|sy|red|acc|sumf|d0|yb|vl32|ib|nb)\b|x\[|\*s|->|\[c\])")
+
+
+# ---- repack animations (layouts 2 and 3): 64 rows at once, one row followed --
+
+def reference_rows(tr):
+    """out[j] = sum_l dx[l][j] * sum_k dy[4l+k] * sum_c (bit ? code : -code), from the sample data"""
+    out = []
+    for j in range(64):
+        total = 0.0
+        for l, xb in enumerate(tr["x"]):
+            facc = 0.0
+            for k in range(4):
+                yb = tr["y"][4 * l + k]
+                bits = xb["bits"][j][32 * k:32 * k + 32]
+                facc += yb["d"] * sum(q if b else -q for q, b in zip(yb["qs"], bits))
+            total += xb["d"][j] * facc
+        out.append(total)
+    return out
+
+
+def final_state(tr):
+    st = {}
+    for s in tr["steps"]:
+        st.update(s["set"])
+    return st
+
+
+@pytest.mark.parametrize("layout", ["rvv", "vd4"])
+def test_repack_animation_trace_matches_the_dot_product_for_every_row(layout):
+    tr = bp.repack_trace(layout)
+    st = final_state(tr)
+    assert len(st["out"]) == 64
+    assert st["out"] == pytest.approx(reference_rows(tr))
+
+
+def test_both_repack_animations_compute_the_same_outputs():
+    a, b = final_state(bp.repack_trace("rvv")), final_state(bp.repack_trace("vd4"))
+    assert a["out"] == pytest.approx(b["out"])
+
+
+@pytest.mark.parametrize("layout,per_group,lines", [
+    ("rvv", 12, {5, 8, 9, 10, 11, 12, 13, 14, 16, 19, 21}),
+    ("vd4", 8, {5, 10, 11, 12, 13, 14, 18, 19, 21, 24, 26}),
+])
+def test_repack_animation_steps_follow_the_kernel_loops(layout, per_group, lines):
+    tr = bp.repack_trace(layout)
+    nb = tr["nb"]
+    assert nb == 2
+    assert len(tr["steps"]) == nb * (1 + 4 * per_group + 1) + 1
+    assert {s["line"] for s in tr["steps"]} == lines
+    assert sum(s["name"] == "facc" for s in tr["steps"]) == 4 * nb     # x activation scale, once per group
+    assert sum(s["name"] == "sumf" for s in tr["steps"]) == nb         # x weight scale, once per block
+    assert tr["steps"][-1]["name"] == "store"
+    for s in tr["steps"]:
+        assert len(s["state"].split()) >= 3
+        assert s.get("tpl") or s.get("tpls")
+
+
+def test_rvv_animation_column_steps_are_the_masked_add_subtract():
+    tr = bp.repack_trace("rvv")
+    st = {}
+    for s in tr["steps"]:
+        prev = dict(st)
+        st.update(s["set"])
+        if s["name"] == "vsub":
+            assert st["sumi"] == [p - st["yc"] for p in prev["sumi"]]
+        if s["name"] == "vadd":
+            assert st["sumi"] == [p + (2 * st["yc"] if b else 0) for p, b in zip(prev["sumi"], st["sign"])]
+        if s["name"] == "facc":
+            assert st["facc"] == pytest.approx([p + st["dy"] * q for p, q in zip(prev["facc"], st["sumi"])])
+        if s["name"] == "sumf":
+            assert st["sumf"] == pytest.approx([p + d * f for p, d, f in zip(prev["sumf"], st["dx"], st["facc"])])
+
+
+def test_vd4_animation_dot_step_is_four_products_per_row():
+    tr = bp.repack_trace("vd4")
+    st = {}
+    for s in tr["steps"]:
+        prev = dict(st)
+        st.update(s["set"])
+        if s["name"] == "dot":
+            quad = st["quadv"]
+            assert len(st["w0"]) == 256 and set(st["w0"]) <= {-1, 1} and len(quad) == 4
+            for j in range(64):
+                assert st["dot"][j] == sum(st["w0"][4 * j + r] * quad[r] for r in range(4))
+                assert st["acc"][j] == prev["acc"][j] + st["dot"][j]
+        if s["name"] == "facc":
+            assert st["facc"] == pytest.approx([p + st["dy"] * a for p, a in zip(prev["facc"], st["acc"])])
+
+
+@pytest.mark.parametrize("layout", ["rvv", "vd4"])
+def test_repack_animation_code_lines_are_verbatim_from_the_kernel(layout):
+    src = norm(bp.renamed_sources()[layout])
+    lines = bp.repack_trace(layout)["lines"]
+    assert len(lines) >= 20
+    for line in lines:
+        assert norm(line.strip()) in src, line
+
+
+TOKEN = re.compile(r"\{[^}]*\}")
+
+
+@pytest.mark.parametrize("layout,prefix", [("rvv", "anr"), ("vd4", "anv")])
+def test_repack_animation_pictures_use_plain_names(page, layout, prefix):
+    m = re.search(rf'<svg id="svg-anim-{layout}".*?</svg>', page, re.S)
+    assert m
+    texts = [html.unescape(t) for t in re.findall(r"<text [^>]*>([^<]*)</text>", m.group(0))]
+    assert len(texts) >= 12
+    bad = [t for t in texts if CODE_NAMES.search(TOKEN.sub("", t))]
+    assert not bad, bad[:8]
+    for s in bp.repack_trace(layout)["steps"]:
+        for t in [s["state"], s.get("tpl") or ""] + list((s.get("tpls") or {}).values()):
+            assert not CODE_NAMES.search(TOKEN.sub("", t)), (s["name"], t)
+    for b in ("play", "prev", "next", "reset", "speed", "follow", "data", "code"):
+        assert f'id="{prefix}-{b}"' in page
+    assert "function q1Anim" in page
+
+
+def test_animation_code_panels_show_every_kernel_line_unclipped(page):
+    # the code column sizes to its content and the figure breaks out of the text column
+    css = re.search(r"<style>(.*?)</style>", page, re.S).group(1)
+    assert re.search(r"\.anim\{[^}]*grid-template-columns:\s*minmax\(0,\s*max-content\)", css), "code column must size to its content"
+    assert re.search(r"\.animfig\{[^}]*width:\s*min\(", css), "animation figures must break out of the 960px column"
+    for prefix in ("anr", "anv"):
+        m = re.search(rf'<pre id="{prefix}-code"><code>(.*?)</code></pre>', page, re.S)
+        assert m, prefix
+        lines = [html.unescape(re.sub(r"<[^>]+>", "", l)) for l in re.findall(r'<span class="ln[^"]*"[^>]*>(.*?)</span>', m.group(1), re.S)]
+        assert lines
+        longest = max(len(l) for l in lines)
+        assert longest <= 116, (prefix, longest)
+
+
+# ---- the kernel code on the page uses meaningful names -----------------------
+
+CRYPTIC = ["is_not_zero", "qy", "neg_qy", "sy", "red", "sumi", "facc", "sumf", "yc", "dx", "aw", "aq",
+           "w0", "w1", "w2", "w3", "vneg1", "bx", "a_ptr", "ab", "yb", "d0"]
+IDENT = {name: re.compile(rf"(?<![\w.]){re.escape(name)}(?![\w])") for name in CRYPTIC}
+
+
+def shown_code(page):
+    out = []
+    for prefix in ("anr", "anv"):
+        m = re.search(rf'<pre id="{prefix}-code"><code>(.*?)</code></pre>', page, re.S)
+        out.append((prefix, html.unescape(re.sub(r"<[^>]+>", "", m.group(1)))))
+    for layout, n, code, names, note in steps(page):
+        out.append((f"{layout}-{n}", code))
+    return out
+
+
+def test_kernel_code_on_the_page_uses_meaningful_names(page):
+    for where, code in shown_code(page):
+        code_only = "\n".join(l.split("//")[0] for l in code.splitlines())
+        hits = [name for name, rx in IDENT.items() if rx.search(code_only)]
+        assert not hits, (where, hits)
+
+
+def test_rename_is_a_pure_consistent_renaming_of_the_kernel_source():
+    for layout, src in bp.kernel_sources().items():
+        renamed = bp.rename_code(layout, src)
+        # same shape: same number of lines, same intrinsic calls, same punctuation skeleton
+        assert renamed.count("\n") == src.count("\n")
+        strip = lambda s: re.sub(r"[A-Za-z_][A-Za-z0-9_]*", "", s)
+        assert strip(renamed) == strip(src)
+        expected = {"upstream": ("sign_mask", "row_total"), "rvv": ("sign_mask", "row_totals"), "vd4": ("signs0", "row_totals")}
+        for name in expected[layout]:
+            assert name in renamed, (layout, name)
+        # mnemonics are never touched
+        for mn in ("vmv.v.x", "vmv.x.s", "vfcvt.f.x.v", "nds.vd4dots.vv"):
+            assert (mn in renamed) == (mn in src)
+
+
+# ---- upstream: one figure explains the whole kernel --------------------------
+
+def test_upstream_section_has_no_animation_and_no_ladder(page):
+    assert 'id="anim-upstream"' not in page
+    assert 'data-layout="upstream"' not in page
+    sec = re.search(r'<section id="upstream">(.*?)</section>', page, re.S).group(1)
+    assert sec.count("<figure") == 2      # the one figure, plus the static overview inside <details>
+    assert 'svg-upstream-one' in sec.split("<details")[0]
+
+
+def upstream_diagram(page):
+    m = re.search(r'<svg id="svg-upstream-one".*?</svg>', page, re.S)
+    assert m, "the upstream diagram is missing"
+    return m.group(0)
+
+
+def test_upstream_diagram_has_no_code_and_no_sentences(page):
+    fig = upstream_diagram(page)
+    texts = [html.unescape(t).strip() for t in re.findall(r"<text [^>]*>([^<]*)</text>", fig)]
+    assert 8 <= len(texts) <= 30, len(texts)
+    for t in texts:
+        assert len(t.split()) <= 3, f"too wordy for a talk-over diagram: {t!r}"
+        assert not re.search(r"__riscv|->|\[|=|;|\(", t), t
+    joined = " ".join(texts)
+    for needle in ("× 4 groups", "× n blocks", "block sum", "row total", "out", "Σ", "±", "codes", "signs"):
+        assert needle in joined, needle
+
+
+def test_upstream_diagram_draws_the_register_to_scale(page):
+    fig = upstream_diagram(page)
+    lanes = [dict(re.findall(r'([\w-]+)="([^"]*)"', m)) for m in re.findall(r"<rect ([^>]*)/>", fig)]
+    codes = [a for a in lanes if a.get("data-role") == "lane" and a.get("data-reg") == "codes"]
+    assert len(codes) == 128
+    assert sum(a["data-busy"] == "1" for a in codes) == 32
+    signs = [a for a in lanes if a.get("data-role") == "lane" and a.get("data-reg") == "signs"]
+    assert len(signs) == 32
+    assert fig.count('data-role="scale-node"') == 2       # scale 1 (per group) and scale 2 (per block)
+    assert fig.count('data-role="loop"') == 2             # the group frame and the block frame
+    assert 'data-role="funnel"' in fig
+
+
+# ---- layout 2: a talk-over diagram too ----------------------------------------
+
+def rvv_diagram(page):
+    m = re.search(r'<svg id="svg-rvv-one".*?</svg>', page, re.S)
+    assert m, "the RVV repack diagram is missing"
+    return m.group(0)
+
+
+def test_rvv_diagram_has_no_code_and_no_sentences(page):
+    fig = rvv_diagram(page)
+    texts = [html.unescape(t).strip() for t in re.findall(r"<text [^>]*>([^<]*)</text>", fig)]
+    assert 8 <= len(texts) <= 30, len(texts)
+    for t in texts:
+        assert len(t.split()) <= 3, f"too wordy for a talk-over diagram: {t!r}"
+        assert not re.search(r"__riscv|->|\[|=|;|\(", t), t
+    joined = " ".join(texts)
+    for needle in ("× 32 columns", "× 4 groups", "× n blocks", "row sums", "block sums", "row totals", "out",
+                   "signs", "code", "±", "64 scales"):
+        assert needle in joined, needle
+
+
+def test_rvv_diagram_draws_64_busy_lanes_and_no_funnel(page):
+    fig = rvv_diagram(page)
+    rects = [dict(re.findall(r'([\w-]+)="([^"]*)"', m)) for m in re.findall(r"<rect ([^>]*)/>", fig)]
+    for key in ("signs", "rowsums", "blocksums", "rowtotals", "out"):
+        lanes = [a for a in rects if a.get("data-role") == "lane" and a.get("data-reg") == key]
+        assert len(lanes) == 64, key
+        assert all(a["data-busy"] == "1" for a in lanes), key
+    assert fig.count('data-role="scale-node"') == 2
+    assert fig.count('data-role="loop"') == 3
+    assert 'data-role="funnel"' not in fig
+    planes = [a for a in rects if a.get("data-role") == "plane"]
+    assert len(planes) == 128
+
+
+def test_rvv_section_opens_with_the_diagram(page):
+    sec = re.search(r'<section id="rvv">(.*?)</section>', page, re.S).group(1)
+    assert sec.index("svg-rvv-one") < sec.index('id="anim-rvv"')
+
+
+# ---- layout 3: a talk-over diagram too ----------------------------------------
+
+def vd4_diagram(page):
+    m = re.search(r'<svg id="svg-vd4-one".*?</svg>', page, re.S)
+    assert m, "the VD4DOT diagram is missing"
+    return m.group(0)
+
+
+def test_vd4_diagram_has_no_code_and_no_sentences(page):
+    fig = vd4_diagram(page)
+    texts = [html.unescape(t).strip() for t in re.findall(r"<text [^>]*>([^<]*)</text>", fig)]
+    assert 8 <= len(texts) <= 30, len(texts)
+    for t in texts:
+        assert len(t.split()) <= 3, f"too wordy for a talk-over diagram: {t!r}"
+        assert not re.search(r"__riscv|->|\[|=|;|\(", t), t
+    joined = " ".join(texts)
+    for needle in ("× 8 quads", "× 4 groups", "× n blocks", "group sums", "block sums", "row totals", "out",
+                   "signs", "quad", "dot", "64 scales"):
+        assert needle in joined, needle
+
+
+def test_vd4_diagram_draws_256_lane_operands_and_64_lane_sums(page):
+    fig = vd4_diagram(page)
+    rects = [dict(re.findall(r'([\w-]+)="([^"]*)"', m)) for m in re.findall(r"<rect ([^>]*)/>", fig)]
+    def lanes(key):
+        return [a for a in rects if a.get("data-role") == "lane" and a.get("data-reg") == key]
+    assert len(lanes("signs")) == 256 and all(a["data-busy"] == "1" for a in lanes("signs"))
+    assert len(lanes("quad")) == 256
+    for key in ("groupsums", "blocksums", "rowtotals", "out"):
+        assert len(lanes(key)) == 64 and all(a["data-busy"] == "1" for a in lanes(key)), key
+    assert len([a for a in rects if a.get("data-role") == "plane"]) == 32
+    assert fig.count('data-role="scale-node"') == 2
+    assert fig.count('data-role="loop"') == 3
+    assert 'data-role="dot-node"' in fig
+    assert 'data-role="funnel"' not in fig
+
+
+def test_vd4_section_opens_with_the_diagram(page):
+    sec = re.search(r'<section id="vd4">(.*?)</section>', page, re.S).group(1)
+    assert sec.index("svg-vd4-one") < sec.index('id="anim-vd4"')
+
+
+# ---- layout 3: the q1_vd4dots_x4_m2 helper, drawn ------------------------------
+
+def helper_diagram(page):
+    m = re.search(r'<svg id="svg-vd4-helper".*?</svg>', page, re.S)
+    assert m, "the helper diagram is missing"
+    return m.group(0)
+
+
+def test_helper_diagram_shows_the_nine_instructions_on_four_dots(page):
+    fig = helper_diagram(page)
+    texts = [html.unescape(t).strip() for t in re.findall(r"<text [^>]*>([^<]*)</text>", fig)]
+    joined = "\n".join(texts)
+    assert joined.count("vsetvli") == 1
+    assert joined.count("vmv.v.x") == 4
+    assert joined.count("nds.vd4dots.vv") == 4
+    steps_no = re.findall(r'<text [^>]*class="step-no"[^>]*>([^<]*)</text>', fig)
+    assert sorted(steps_no) == [str(n) for n in range(1, 10)], steps_no
+    rects = [dict(re.findall(r'([\w-]+)="([^"]*)"', m)) for m in re.findall(r"<rect ([^>]*)/>", fig)]
+    def lanes(key):
+        return [a for a in rects if a.get("data-role") == "lane" and a.get("data-reg") == key]
+    for k in range(4):
+        assert len(lanes(f"signs{k}")) == 256, k
+    assert len(lanes("bcast0")) == 512 and len(lanes("bcast1")) == 512      # each scratch register drawn twice: filled, then refilled
+    assert len(lanes("acc_in")) == 64 and len(lanes("acc_out")) == 64
+    assert fig.count('data-role="dot-node"') == 4
+    assert fig.count('data-role="word"') == 4
+
+
+def test_helper_diagram_lane_zoom_adds_up(page):
+    fig = helper_diagram(page)
+    ex = bp.helper_lane_example()
+    assert ex["sum"] == sum(s * c for s, c in zip(ex["signs"], ex["quad"]))
+    assert all(s in (1, -1) for s in ex["signs"])
+    zoom = re.search(r'<g data-role="lane-zoom">(.*?)</g>', fig, re.S)
+    assert zoom, "no one-lane zoom"
+    ztexts = [html.unescape(t).strip() for t in re.findall(r"<text [^>]*>([^<]*)</text>", zoom.group(1))]
+    for v in ex["products"] + [ex["sum"]]:
+        assert str(v) in ztexts, (v, ztexts)
+
+
+def test_helper_diagram_sits_between_the_vd4_diagram_and_the_animation(page):
+    sec = re.search(r'<section id="vd4">(.*?)</section>', page, re.S).group(1)
+    assert sec.index("svg-vd4-one") < sec.index("svg-vd4-helper") < sec.index('id="anim-vd4"')
