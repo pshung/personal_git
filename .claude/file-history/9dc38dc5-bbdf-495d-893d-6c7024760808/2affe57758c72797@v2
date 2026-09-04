@@ -1,0 +1,365 @@
+# ---- step ladders: one instruction, one picture, the same names ------------
+RX, RW = 170, 512          # registers start at RX and are RW px wide in every step figure
+REPACK = "ggml/src/ggml-cpu/arch/riscv/repack.cpp"
+
+
+def kernel_sources():
+    """The kernel text every step ladder is checked against."""
+    return {
+        "upstream": excerpt("ggml/src/ggml-cpu/arch/riscv/quants.c", "static NOINLINE void ggml_vec_dot_q1_0_q8_0_vl256("),
+        "rvv": excerpt(REPACK, "static void q1_gemv_64x1_vl1024(") + "\n" + excerpt(REPACK, "static inline vfloat32m2_t q1_expand_fp16_64_m2("),
+        "vd4": excerpt(REPACK, "static void q1_gemv_64_vd4dot_vl1024(") + "\n" + excerpt(REPACK, "static inline vint32m2_t q1_vd4dots_x4_m2("),
+    }
+
+
+def var(x, y, name, anchor="end", size=12):
+    return T(x, y, name, size, anchor=anchor, weight="bold", data_role="var")
+
+
+def reg(y, name, n, colors, h=14, note=None, named=True, size=12):
+    """A register of n lanes, RW px wide. colors[i] is lane i's fill, None = idle."""
+    pitch = RW / n
+    gap = 0.6 if pitch >= 3 else 0
+    out = [var(RX - 10, y + h - 3, name, size=size) if named else T(RX - 10, y + h - 3, name, 11, anchor="end", fill=MUTED)]
+    out.append(R(RX, y, RW, h, TRACK))
+    for i, c in enumerate(colors):
+        if c:
+            out.append(R(RX + i * pitch, y, max(pitch - gap, 0.5), h, c))
+    if note:
+        out.append(T(RX + RW + 10, y + h - 3, note, 10, fill=MUTED))
+    return "".join(out)
+
+
+def groups(y, n, every, h):
+    """Thin separators every `every` lanes, e.g. the 4-lane rows of an e8/m2 dot operand."""
+    pitch = RW / n
+    return "".join(L(RX + i * pitch, y, RX + i * pitch, y + h, stroke=PAPER, width=0.8) for i in range(0, n + 1, every))
+
+
+def ticks(y, n, marks):
+    pitch = RW / n
+    return "".join(T(RX + i * pitch + (pitch / 2 if len(t) <= 6 else 0), y, t, 9,
+                     anchor="middle" if len(t) <= 6 else "start", fill=MUTED) for i, t in marks.items())
+
+
+def mem(x, y, nbytes, px, fill, name, h=18, sub=None, named=True, below=False):
+    out = [R(x, y, nbytes * px, h, fill)]
+    ly = y + h + 12 if below else y - 5
+    out.append(var(x, ly, name, anchor="start") if named else T(x, ly, name, 10, fill=MUTED))
+    if sub:
+        out.append(T(x + nbytes * px / 2, y + h - 5, sub, 9, anchor="middle", fill="var(--on-mark)"))
+    return "".join(out)
+
+
+def quad(x, y, name, px=8, below=False):
+    """one 4-byte activation quad, the four codes in the four row tints"""
+    return "".join(R(x + i * px, y, px - 0.5, 18, ACT_ROW[i]) for i in range(4)) + var(x, y + 30 if below else y - 5, name, anchor="start")
+
+
+def box(x, y, name, w=90, h=20, sub=None):
+    out = [R(x, y, w, h, TRACK, stroke=INK, stroke_width=1), var(x + w / 2, y + h - 6, name, anchor="middle")]
+    if sub:
+        out.append(T(x + w / 2, y + h + 12, sub, 9, anchor="middle", fill=MUTED))
+    return "".join(out)
+
+
+def right(x1, y, x2, label=None):
+    s = L(x1, y, x2, y, arrow=True)
+    if label:
+        s += T((x1 + x2) / 2, y - 6, label, 10, anchor="middle", fill=MUTED)
+    return s
+
+
+def funnel(y1, y2, lanes_from, to_x, to_w, fill):
+    x1, x2 = RX, RX + lanes_from
+    return f'<polygon points="{x1:g},{y1:g} {x2:g},{y1:g} {to_x + to_w:g},{y2:g} {to_x:g},{y2:g}" fill="{fill}" fill-opacity="0.7"/>'
+
+
+def steps_html(layout, steps):
+    items = []
+    for n, (code, (h, body, label), note) in enumerate(steps):
+        fig = svg(f"svg-{layout}-{n}", W, h, ("", body), label)
+        items.append(f'<li class="step" data-layout="{layout}" data-step="{n}"><div class="body">'
+                     f'{pre(code)}<div class="stepfig">{fig}</div><p class="note">{note}</p></div></li>')
+    return f'<ol class="steps">{"".join(items)}</ol>'
+
+
+def steps_upstream():
+    bits = sample_bits(32, 1)
+    up, up_lt = COL["upstream"], COL_LT["upstream"]
+    idle = [None] * 96
+    maskc = [up if b else up_lt for b in bits] + idle
+    S = []
+    S.append(("""const block_q1_0 * x = vx;                        // this output row: one 18-B block per 128 K
+const block_q8_0 * y = vy;                        // the activation row: one 34-B block per 32 K
+const size_t vl32 = __riscv_vsetvl_e8m1(32);      // every vector op below works on 32 lanes
+for (int ib = 0; ib < nb; ++ib) {                 // 128-K block ib: x[ib].d, x[ib].qs
+    const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);
+    for (int k = 0; k < 4; ++k) {                 // 32-K group k: sign bits x[ib].qs + 4 * k
+        const block_q8_0 * yb = &y[ib * 4 + k];   // yb->d, yb->qs""",
+        (84, mem(0, 28, 2, 8, SCALE, "x[ib].d", sub="d", below=True)
+             + mem(16, 28, 16, 8, up, "x[ib].qs", sub="qs[0 .. 15] · 16 B")
+             + R(16, 28, 32, 18, "none", stroke=INK, stroke_width=2)
+             + T(16, 74, "outlined: x[ib].qs + 4 * k, the 4 B of group k (k = 0 drawn)", 10, fill=MUTED)
+             + mem(330, 28, 2, 8, SCALE, "yb->d", sub="d", below=True)
+             + mem(346, 28, 32, 8, ACT, "yb->qs", sub="qs[0 .. 31] · 32 B")
+             + T(346, 74, "yb = &y[ib * 4 + k]: group k of the activation row", 10, fill=MUTED),
+         "Memory for one 32-K group: the 18-byte weight block x[ib] and the 34-byte activation block yb."),
+        "One output row at a time. Block ib holds 128 weights; group k is 32 of them and pairs with one activation block yb."))
+    S.append(("const vbool8_t is_not_zero = __riscv_vlm_v_b8(x[ib].qs + 4 * k, vl32);",
+        (94, mem(0, 26, 4, 8, up, "x[ib].qs + 4 * k", sub="4 B")
+             + down(16, 44, 60, "vlm.v: 4 bytes → 32 mask bits")
+             + reg(60, "is_not_zero", 128, maskc, h=12, note="bit c = sign of column 32k + c")
+             + ticks(86, 128, {0: "bit 0", 31: "bit 31", 40: "bits 32 .. 127 unused (vl32 = 32)"}),
+         "vlm.v loads 4 bytes as the 32-bit mask is_not_zero."),
+        "The 4 sign bytes become a mask. Bit c is 1 when weight c is +d, 0 when it is −d. Only 32 of the 128 mask bits are used."))
+    S.append(("const vint8m1_t qy = __riscv_vle8_v_i8m1(yb->qs, vl32);",
+        (94, mem(0, 26, 32, 8, ACT, "yb->qs", sub="32 B")
+             + down(128, 44, 60, "vle8.v: 32 int8 → lanes 0 .. 31")
+             + reg(60, "qy", 128, [ACT] * 32 + idle, note="e8, m1: 128 lanes, 32 busy")
+             + ticks(86, 128, {0: "qs[0]", 31: "qs[31]", 40: "lanes 32 .. 127 idle"}),
+         "vle8.v loads the 32 activation codes into the first 32 of 128 lanes of qy."),
+        "The 32 activation codes fill lanes 0 to 31 of qy. At VLEN = 1024 the register has 128 int8 lanes, so 96 lanes stay idle."))
+    S.append(("const vint8m1_t neg_qy = __riscv_vneg_v_i8m1(qy, vl32);",
+        (72, reg(8, "qy", 128, [ACT] * 32 + idle)
+             + down(RX + 64, 22, 40, "vneg.v")
+             + reg(40, "neg_qy", 128, [ACT_LT] * 32 + idle, note="lane c = −qy[c]")
+             + ticks(66, 128, {0: "−qs[0]", 31: "−qs[31]"}),
+         "vneg.v negates every lane of qy into neg_qy."),
+        "neg_qy holds the negative of every code. Both signs are now ready, so the next step can pick one per lane."))
+    S.append(("const vint8m1_t sy = __riscv_vmerge_vvm_i8m1(neg_qy, qy, is_not_zero, vl32);",
+        (126, reg(8, "is_not_zero", 128, maskc, h=10)
+              + reg(26, "qy", 128, [ACT] * 32 + idle, h=12)
+              + reg(46, "neg_qy", 128, [ACT_LT] * 32 + idle, h=12)
+              + down(RX + 64, 60, 88, "vmerge.vvm: mask bit 1 → take qy, bit 0 → take neg_qy")
+              + reg(88, "sy", 128, [ACT if b else ACT_LT for b in bits] + idle, note="sy[c] = ±qs[c]")
+              + ticks(114, 128, {0: "lane 0", 31: "lane 31"}),
+         "vmerge.vvm selects qy or neg_qy per lane under the mask is_not_zero, giving sy."),
+        "sy[c] is +qs[c] where the sign bit is 1 and −qs[c] where it is 0. That is weight × activation for 32 columns, with the scale still to come."))
+    S.append(("""const vint16m1_t red = __riscv_vwredsum_vs_i8m1_i16m1(sy, zero, vl32);
+// zero = __riscv_vmv_v_x_i16m1(0, 1): the i16 seed of the sum""",
+        (100, reg(8, "sy", 128, [ACT if b else ACT_LT for b in bits] + idle)
+              + funnel(22, 60, 128, RX, 8, up_lt)
+              + T(RX + 150, 46, "vwredsum.vs: zero[0] + sy[0] + sy[1] + … + sy[31], widened to i16", 10, fill=MUTED)
+              + reg(60, "red", 64, [up] + [None] * 63, note="one i16 result, in lane 0")
+              + ticks(86, 64, {0: "red[0]"}),
+         "vwredsum.vs sums the 32 lanes of sy into red[0]."),
+        "The horizontal reduction. 32 lanes collapse into one number, red[0]. This happens once per row per 32 K."))
+    S.append(("acc += GGML_CPU_FP16_TO_FP32(yb->d) * (float) __riscv_vmv_x_s_i16m1_i16(red);",
+        (84, reg(8, "red", 64, [up] + [None] * 63, h=12)
+             + box(RX, 40, "red", w=70, sub="lane 0 → GPR (vmv.x.s)")
+             + right(RX + 70, 50, RX + 150, "× (float)")
+             + mem(RX + 150, 40, 2, 8, SCALE, "yb->d", sub="d", below=True)
+             + right(RX + 166, 50, RX + 246, "+=")
+             + box(RX + 246, 40, "acc", w=70, sub="scalar float"),
+         "red[0] moves to a scalar register, is scaled by yb->d and added to acc."),
+        "The group sum leaves the vector unit. It is multiplied by this group's activation scale yb->d and added to the scalar acc."))
+    S.append(("""    }   // k = 0 .. 3 done: acc holds this row's 128-K block, scaled by the four yb->d
+    sumf += d0 * acc;                             // × the weight scale of block ib
+}       // ib
+*s = sumf;                                        // one float: this output row""",
+        (64, box(RX, 20, "acc", w=70)
+             + right(RX + 70, 30, RX + 140, "× d0")
+             + box(RX + 140, 20, "d0", w=60, sub="x[ib].d as float")
+             + right(RX + 200, 30, RX + 270, "+=")
+             + box(RX + 270, 20, "sumf", w=70)
+             + right(RX + 340, 30, RX + 410, "store")
+             + box(RX + 410, 20, "*s", w=60, sub="one output value"),
+         "acc is scaled by d0 and accumulated into sumf, which is stored to *s."),
+        "One row is finished. The whole kernel is called again for the next row, so 64 rows cost 64 × 4 × 5 = 320 vector instructions per 32 K."))
+    return S
+
+
+def steps_rvv():
+    bits = sample_bits(64, 2)
+    bl, bl_lt = COL["rvv"], COL_LT["rvv"]
+    maskc = [bl if b else bl_lt for b in bits]
+    S = []
+    S.append(("""const block_q1_0x64 * bx = (const block_q1_0x64 *) vx + (size_t) x * nb;   // 64 output rows: 1152 B per 128 K
+const size_t vl = 64;                                                     // one lane per output row
+for (int l = 0; l < nb; ++l) {                                            // 128-K block l: bx[l].d, bx[l].qs
+    for (int k = 0; k < 4; ++k) {                                         // 32-K group k
+        const block_q8_0 * ab = &a_ptr[l * (QK1_0 / QK8_0) + k];          // ab->d, ab->qs
+        for (int c = 0; c < QK8_0; ++c) {                                 // one column: bx[l].qs[k * QK8_0 + c]""",
+        (86, mem(0, 28, 128, 0.5, SCALE, "bx[l].d", sub="d[64]")
+             + mem(64, 28, 1024, 0.5, bl, "bx[l].qs", sub="qs[128][8] · 1024 B = 128 planes of 8 B")
+             + R(64 + 5 * 4, 28, 4, 18, "none", stroke=INK, stroke_width=2)
+             + T(0, 74, "outlined: bx[l].qs[k * QK8_0 + c], one 8-B plane = column c of rows 0 .. 63 (k = 0, c = 5 drawn)", 10, fill=MUTED)
+             + mem(624, 28, 2, 8, SCALE, "ab->d", sub="d", below=True)
+             + mem(640, 28, 32, 8, ACT, "ab->qs", sub="qs[0 .. 31]")
+             + R(640 + 5 * 8, 28, 8, 18, "none", stroke=INK, stroke_width=2)
+             + T(640, 74, "outlined: ab->qs[c] (c = 5 drawn)", 10, fill=MUTED),
+         "Memory for one column: the 1152-byte repacked block bx[l] and the activation block ab."),
+        "64 output rows at once. bx[l] is one 128-K block of 64 rows. Each column c of that block is one 8-byte plane, and pairs with one activation code ab->qs[c]."))
+    S.append(("const vfloat32m2_t dx = q1_expand_fp16_64_m2(bx[l].d);   // once per 128-K block: vle16.v, then integer fp16 → f32",
+        (94, mem(RX, 26, 128, 4, SCALE, "bx[l].d", sub="64 × fp16 = 128 B")
+             + down(RX + 256, 44, 60, "vle16.v, zero-extend, shift and or → 64 × f32")
+             + reg(60, "dx", 64, [SCALE_LT] * 64, note="e32, m2: 64 lanes, dx[j] = scale of row j")
+             + ticks(86, 64, {0: "dx[0]", 63: "dx[63]"}),
+         "The 64 weight scales bx[l].d are loaded with one vle16.v and expanded to the f32 vector dx."),
+        "All 64 weight scales come in with one vector load. dx[j] is the scale of row j and waits until the block is finished."))
+    S.append(("vint16m1_t sumi = __riscv_vmv_v_x_i16m1(0, vl);   // vl = 64: one i16 accumulator per output row",
+        (46, reg(8, "sumi", 64, [bl_lt] * 64, note="e16, m1: 64 lanes, all 0")
+             + ticks(34, 64, {0: "row 0", 63: "row 63"}),
+         "sumi starts at zero: 64 int16 lanes, one per output row."),
+        "sumi is the integer accumulator for this 32-K group. Lane j belongs to output row j."))
+    S.append(("const int16_t yc = ab->qs[c];   // one activation code, read as a scalar (lb)",
+        (62, mem(0, 22, 1, 8, ACT, "ab->qs[c]")
+             + right(12, 31, 100, "lb, sign-extend")
+             + box(100, 21, "yc", w=60, sub="GPR, int16")
+             + T(180, 31 + 4, "the same yc is used by all 64 rows", 10, fill=MUTED),
+         "The activation code ab->qs[c] is read into the scalar yc."),
+        "The activation side is one scalar byte. It does not need a vector register, because all 64 rows multiply the same code."))
+    S.append(("const vbool16_t sign = __riscv_vlm_v_b16(bx[l].qs[k * QK8_0 + c], vl);",
+        (94, mem(0, 26, 8, 8, bl, "bx[l].qs[k * QK8_0 + c]", sub="8 B")
+             + down(32, 44, 60, "vlm.v: 8 bytes → 64 mask bits")
+             + reg(60, "sign", 64, maskc, h=12, note="bit j = sign of (row j, column 32k + c)")
+             + ticks(86, 64, {0: "bit 0 = row 0", 63: "row 63"}),
+         "vlm.v loads the 8-byte column plane as the 64-bit mask sign."),
+        "One load gives the sign of column c for all 64 rows. The repack put those 64 bits next to each other exactly for this instruction."))
+    S.append(("sumi = __riscv_vsub_vx_i16m1(sumi, yc, vl);   // every row: sumi[j] −= yc",
+        (46, reg(8, "sumi", 64, [bl_lt] * 64, note="all 64 lanes: −yc")
+             + ticks(34, 64, {0: "−yc", 63: "−yc"}),
+         "vsub.vx subtracts the scalar yc from all 64 lanes of sumi."),
+        "First every row subtracts yc, as if every sign were −1."))
+    S.append(("sumi = __riscv_vadd_vx_i16m1_mu(sign, sumi, sumi, (int16_t) (2 * yc), vl);   // rows with sign bit 1: += 2 · yc",
+        (100, reg(8, "sign", 64, maskc, h=10)
+              + down(RX + 256, 20, 44, "vadd.vx with mask: lane j += 2 · yc only where sign[j] = 1")
+              + reg(44, "sumi", 64, maskc, note="net: +yc (dark) or −yc (light)")
+              + ticks(70, 64, {0: "row 0", 63: "row 63"})
+              + T(RX, 92, "−yc + 2·yc = +yc where the sign bit is 1, −yc where it is 0: sign(j, c) · a[c] for all 64 rows in two instructions", 10, fill=MUTED),
+         "The masked vadd.vx adds 2·yc only in lanes whose sign bit is 1, so sumi gains +yc or −yc per row."),
+        "Rows with sign 1 add 2·yc and end at +yc. Rows with sign 0 stay at −yc. Two instructions did 64 multiply-adds. No reduction is needed: each row's sum grows in its own lane."))
+    S.append(("""        }   // c = 0 .. 31 done: sumi[j] = Σ_c sign(j, c) · ab->qs[c]
+        facc = __riscv_vfmacc_vf_f32m2(facc, GGML_CPU_FP16_TO_FP32(ab->d),
+                   __riscv_vfcvt_f_x_v_f32m2(__riscv_vsext_vf2_i32m2(sumi, vl), vl), vl);""",
+        (112, reg(8, "sumi", 64, [bl] * 64, h=12)
+              + down(RX + 256, 20, 44, "vsext.vf2: i16 → i32, then vfcvt.f.x.v: i32 → f32")
+              + reg(44, "(float) sumi", 64, [bl_lt] * 64, h=12, named=False)
+              + mem(RX + RW + 20, 44, 2, 8, SCALE, "ab->d", sub="d")
+              + down(RX + 256, 56, 84, "vfmacc.vf: facc[j] += (float) ab->d × lane j")
+              + reg(84, "facc", 64, [bl] * 64, note="e32, m2: 64 × f32"),
+         "After the 32 columns, sumi is widened to f32 and multiplied by the activation scale ab->d into facc."),
+        "One group is done. The 64 integer sums become floats and are scaled by this group's activation scale, all 64 rows in one vfmacc.vf."))
+    S.append(("""    }   // k = 0 .. 3 done: facc[j] = this block's sum for row j, scaled by the four ab->d
+    sumf = __riscv_vfmacc_vv_f32m2(sumf, dx, facc, vl);           // × dx[j]: the weight scale of row j
+}       // l
+__riscv_vse32_v_f32m2(s + (size_t) x * 64, sumf, vl);            // 64 floats: rows 64x .. 64x + 63""",
+        (124, reg(8, "dx", 64, [SCALE_LT] * 64, h=12)
+              + reg(28, "facc", 64, [bl] * 64, h=12)
+              + down(RX + 256, 40, 64, "vfmacc.vv: sumf[j] += dx[j] × facc[j]")
+              + reg(64, "sumf", 64, [bl] * 64, h=12)
+              + down(RX + 256, 76, 100, "vse32.v")
+              + mem(RX, 100, 256, 2, bl_lt, "s + (size_t) x * 64", sub="64 × f32 = 256 B"),
+         "The block sum facc is scaled by the 64 weight scales dx into sumf, and sumf is stored as 64 results."),
+        "The weight scale is applied once per 128 K with a vector FMA. After all blocks, one store writes 64 output rows. Per 64 rows × 32 K: 32 columns × 3 = 96 vector instructions."))
+    return S
+
+
+def steps_vd4():
+    bits = sample_bits(256, 3)
+    org, org_lt = COL["vd4"], COL_LT["vd4"]
+    wc = [org if b else org_lt for b in bits]
+    tints = [ACT_ROW[i % 4] for i in range(256)]
+    S = []
+    S.append(("""int8_t * aq = (int8_t *) __builtin_alloca((size_t) ng * QK8_0);            // aligned copy of the codes, 32 B per group
+for (int g = 0; g < ng; ++g) {
+    __riscv_vse8_v_i8m1(aq + (size_t) g * QK8_0, __riscv_vle8_v_i8m1(a_ptr[g].qs, QK8_0), QK8_0);
+}
+const vint8m2_t vneg1 = __riscv_vmv_v_x_i8m2(-1, vl8);                       // vl8 = 256: −1 in every i8 lane""",
+        (142, "".join(R(RX + g * 136, 26, 8, 18, SCALE) + R(RX + g * 136 + 8, 26, 128, 18, ACT) for g in range(4))
+              + var(RX + 8, 21, "a_ptr[g].qs", anchor="start")
+              + T(RX + 8 + 64, 39, "34-B records, codes at byte 2", 9, anchor="middle", fill="var(--on-mark)")
+              + down(RX + 72, 44, 66, "vle8.v then vse8.v, 32 codes per group; the scales are not copied")
+              + mem(RX, 66, 128, 4, ACT, "aq", sub="aq + g * QK8_0: 32 B per group, 4-byte aligned")
+              + "".join(L(RX + i * 16, 66, RX + i * 16, 84, stroke=PAPER, width=0.8) for i in range(33))
+              + reg(104, "vneg1", 256, [org_lt] * 256, h=12, note="e8, m2: 256 lanes of −1")
+              + ticks(130, 256, {0: "−1", 250: "−1"}),
+         "Once per call: the activation codes are copied into the aligned buffer aq, and vneg1 is filled with −1."),
+        "Two things are prepared once. The codes are copied so that every 4-code quad starts at a 4-byte aligned address. vneg1 is the −1 side of the sign expansion."))
+    S.append(("""const uint8_t *  planes = (const uint8_t *) bx[l].qs;                       // the block's 32 planes of 32 B
+const uint32_t * aw     = (const uint32_t *) (aq + (size_t) g * QK8_0);     // group g = 4l + k: 8 quads of 4 codes
+vint32m2_t       acc    = __riscv_vmv_v_x_i32m2(0, vl32);                    // vl32 = 64: one i32 lane per row
+const uint8_t *  p      = planes + (size_t) (k * (QK8_0 / 4) + q) * 32;      // planes 8k+q .. 8k+q+3  (q = 0, then 4)""",
+        (134, mem(RX, 26, 1024, 0.5, org, "planes", sub="32 planes × 32 B = bx[l].qs")
+              + "".join(L(RX + i * 16, 26, RX + i * 16, 44, stroke=PAPER, width=0.8) for i in range(33))
+              + R(RX, 26, 64, 18, "none", stroke=INK, stroke_width=2)
+              + var(RX, 58, "p", anchor="start")
+              + T(RX + 14, 58, ".. p + 127: the four planes of this step (k = 0, q = 0 drawn)", 10, fill=MUTED)
+              + mem(RX, 76, 32, 8, ACT, "aw", sub="aq + g * QK8_0 · 32 B = 8 quads of 4 codes")
+              + "".join(L(RX + i * 32, 76, RX + i * 32, 94, stroke=PAPER, width=0.8) for i in range(9))
+              + R(RX, 76, 128, 18, "none", stroke=INK, stroke_width=2)
+              + T(RX + 262, 89, "outlined: aw[q .. q+3], the four uint32 quads of this step", 10, fill=MUTED)
+              + reg(114, "acc", 64, [org_lt] * 64, h=12, note="e32, m2: 64 × i32, all 0"),
+         "Pointers for one step: p is the first of four 32-byte planes, aw the eight quads of the group, and acc the zeroed row accumulators."),
+        "One step covers 4 planes = 16 columns of all 64 rows. p points at the planes, aw[q .. q+3] are the matching 4-code quads, and acc has one int32 lane per row."))
+    S.append(("""const vint8m2_t w0 = __riscv_vmerge_vxm_i8m2(vneg1, 1, __riscv_vlm_v_b4(p +  0, vl8), vl8);
+const vint8m2_t w1 = __riscv_vmerge_vxm_i8m2(vneg1, 1, __riscv_vlm_v_b4(p + 32, vl8), vl8);
+const vint8m2_t w2 = __riscv_vmerge_vxm_i8m2(vneg1, 1, __riscv_vlm_v_b4(p + 64, vl8), vl8);
+const vint8m2_t w3 = __riscv_vmerge_vxm_i8m2(vneg1, 1, __riscv_vlm_v_b4(p + 96, vl8), vl8);""",
+        (170, mem(0, 26, 32, 4, org, "p +  0", sub="32 B")
+              + down(64, 44, 60, "vlm.v: 32 bytes → 256 mask bits")
+              + reg(60, "vlm_v_b4(p + 0)", 256, wc, h=10, named=False) + groups(60, 256, 4, 10)
+              + down(RX + 256, 72, 92, "vmerge.vxm(vneg1, 1, mask): bit 1 → +1, bit 0 → −1 (from vneg1)")
+              + reg(92, "w0", 256, wc, note="256 × i8 = 64 rows × 4 columns") + groups(92, 256, 4, 14)
+              + ticks(118, 256, {0: "lanes 0 .. 3 = row 0, columns 4q .. 4q+3", 248: "row 63"})
+              + reg(128, "w1", 256, [org if b else org_lt for b in sample_bits(256, 4)], h=8, size=10, note="p + 32: columns 4q+4 .. 4q+7")
+              + reg(140, "w2", 256, [org if b else org_lt for b in sample_bits(256, 5)], h=8, size=10, note="p + 64")
+              + reg(152, "w3", 256, [org if b else org_lt for b in sample_bits(256, 6)], h=8, size=10, note="p + 96"),
+         "Each 32-byte plane is loaded as a 256-bit mask and expanded with vmerge.vxm into w0 .. w3, 256 signed bytes each."),
+        "The 256 sign bits of one plane become 256 int8 lanes of +1 or −1. Lanes 4j to 4j+3 are row j, columns 4q to 4q+3: exactly the shape the dot instruction wants."))
+    S.append(("""acc = q1_vd4dots_x4_m2(acc, w0, w1, w2, w3, aw[q + 0], aw[q + 1], aw[q + 2], aw[q + 3]);
+// inside the helper, one asm block; u0 .. u3 are aw[q + 0] .. aw[q + 3] in general registers
+vsetvli t0, zero, e32, m2, ta, ma        // one vtype for the whole 32-bit half
+vmv.v.x s0, u0                           // s0[j] = aw[q + 0] in every 32-bit lane j
+vmv.v.x s1, u1""",
+        (118, quad(0, 26, "aw[q + 0]")
+              + right(40, 35, 100, "lw")
+              + box(100, 25, "u0", w=50, sub="GPR")
+              + down(125, 46, 60, "vmv.v.x: the same 32-bit word in all 64 lanes")
+              + reg(60, "s0", 256, tints, note="e8 view: 64 × the 4 codes") + groups(60, 256, 4, 14)
+              + ticks(86, 256, {0: "lanes 0 .. 3 = a[4q .. 4q+3]", 248: "same"})
+              + reg(96, "s1", 256, tints, h=8, size=10, note="= aw[q + 1] in every lane") + groups(96, 256, 4, 8),
+         "The 4-byte quad aw[q + 0] is read into a scalar register and broadcast by vmv.v.x into every 32-bit lane of s0."),
+        "The activation side is one 32-bit word: four codes. vmv.v.x copies it into all 64 lanes of s0, so row j meets the same four codes in lanes 4j to 4j+3."))
+    S.append(("nds.vd4dots.vv acc, w0, s0        // acc[j] += w0[4j]·s0[4j] + w0[4j+1]·s0[4j+1] + w0[4j+2]·s0[4j+2] + w0[4j+3]·s0[4j+3]",
+        (140, reg(8, "w0", 256, wc) + groups(8, 256, 4, 14)
+              + reg(34, "s0", 256, tints) + groups(34, 256, 4, 14)
+              + "".join(L(RX + (4 * j + r) * 2 + 1, 48, RX + j * 8 + 4, 90, stroke=INK, width=0.6, dash="2 2") for j in (0, 63) for r in range(4))
+              + down(RX + 256, 52, 90, "nds.vd4dots.vv: 4 int8 products per lane, summed into the i32 lane")
+              + reg(90, "acc", 64, [org] * 64, note="acc[j] = row j, 4 columns so far")
+              + ticks(116, 64, {0: "acc[0]", 63: "acc[63]"}),
+         "nds.vd4dots.vv multiplies w0 and s0 byte by byte and adds each group of four products into the matching int32 lane of acc."),
+        "One instruction: 256 multiplies and the 4-way sums, for all 64 rows. The dotted lines show lanes 0 and 63: four bytes of w0 and four of s0 land in one lane of acc."))
+    S.append(("""nds.vd4dots.vv acc, w1, s1               // columns 4q+4 .. 4q+7
+vmv.v.x s0, u2
+vmv.v.x s1, u3
+nds.vd4dots.vv acc, w2, s0               // columns 4q+8 .. 4q+11
+nds.vd4dots.vv acc, w3, s1               // columns 4q+12 .. 4q+15
+// then q = 4 repeats steps 1 .. 5 for columns 16 .. 31 of this group""",
+        (48, reg(8, "acc", 64, [org] * 64, note="after q = 0 and q = 4: acc[j] = Σ over 32 K, row j")
+             + ticks(34, 64, {0: "row 0", 63: "row 63"}),
+         "Three more dots with w1, w2, w3 complete 16 columns; the second pass completes the 32-K group in acc."),
+        "The other three planes go the same way, reusing s0 and s1. After two passes acc holds the full 32-K sum of every row: 8 quads × 4 instructions = 32 per 64 rows × 32 K."))
+    S.append(("facc = __riscv_vfmacc_vf_f32m2(facc, GGML_CPU_FP16_TO_FP32(a_ptr[g].d), __riscv_vfcvt_f_x_v_f32m2(acc, vl32), vl32);",
+        (86, reg(8, "acc", 64, [org] * 64, h=12)
+             + mem(RX + RW + 20, 44, 2, 8, SCALE, "a_ptr[g].d", sub="d")
+             + down(RX + 256, 20, 56, "vfcvt.f.x.v: i32 → f32, then vfmacc.vf: facc[j] += (float) a_ptr[g].d × lane j")
+             + reg(56, "facc", 64, [org_lt] * 64, note="e32, m2: 64 × f32"),
+         "acc is converted to f32 and scaled by the activation scale a_ptr[g].d into facc."),
+        "Same as the RVV repack: the group's integer sums become floats and take the activation scale, 64 rows at once."))
+    S.append(("""    }   // k = 0 .. 3 done
+    sumf = __riscv_vfmacc_vv_f32m2(sumf, dx, facc, vl32);            // × dx[j] = (float) bx[l].d[j], dx = q1_expand_fp16_64_m2(bx[l].d)
+}       // l
+__riscv_vse32_v_f32m2(s + (size_t) x * 64, sumf, vl32);             // 64 floats: rows 64x .. 64x + 63""",
+        (124, reg(8, "dx", 64, [SCALE_LT] * 64, h=12)
+              + reg(28, "facc", 64, [org] * 64, h=12)
+              + down(RX + 256, 40, 64, "vfmacc.vv: sumf[j] += dx[j] × facc[j]")
+              + reg(64, "sumf", 64, [org] * 64, h=12)
+              + down(RX + 256, 76, 100, "vse32.v")
+              + mem(RX, 100, 256, 2, org_lt, "s + (size_t) x * 64", sub="64 × f32 = 256 B"),
+         "facc is scaled by the 64 weight scales dx into sumf, and sumf is stored as 64 results."),
+        "The end is identical to the RVV repack: weight scales once per 128 K, then one store of 64 output rows."))
+    return S
+
+

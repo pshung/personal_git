@@ -53,3 +53,14 @@ artifact back to the first version, no reason given. So: the complaint stands
 (scale positions were not visible) but the byte-map + structs page is NOT an
 accepted answer either. Ask what he wants to see before redrawing; the v2
 generator is kept in the session scratchpad `q1_layout/v2/` only.
+
+**Fourth round, 2026-09-04, accepted direction:** "layout 1, 2, 3, 用圖搭配
+instruction 解說, 請再做細緻一點 變數要對的起來". For per-layout kernel
+explanations he wants a numbered step ladder: one instruction (verbatim from
+the kernel) + one picture of the registers it touches + one plain sentence,
+and every name drawn in the picture must be the kernel's own variable name
+(is_not_zero, qy, neg_qy, sy, red / sign, yc, sumi, facc, dx, sumf / planes,
+p, aw, w0..w3, s0, s1, acc). Guard it: a test that every <text data-role=var>
+appears in that step's code and every __riscv_*() call is verbatim in the
+extracted source. Built as steps_upstream/steps_rvv/steps_vd4 in
+q1_0_layout_page/build_page.py.

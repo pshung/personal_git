@@ -1,0 +1,242 @@
+# ---- upstream animation: every arithmetic step of one row --------------------
+import json
+
+UPSTREAM_LINES = [
+    "for (int ib = 0; ib < nb; ++ib) {",
+    "    const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d);",
+    "    float acc = 0;",
+    "    for (int k = 0; k < 4; ++k) {",
+    "        const block_q8_0 * GGML_RESTRICT yb = &y[ib * 4 + k];",
+    "        const vbool8_t is_not_zero = __riscv_vlm_v_b8(x[ib].qs + 4 * k, vl32);",
+    "        const vint8m1_t qy = __riscv_vle8_v_i8m1(yb->qs, vl32);",
+    "        const vint8m1_t neg_qy = __riscv_vneg_v_i8m1(qy, vl32);",
+    "        const vint8m1_t sy = __riscv_vmerge_vvm_i8m1(neg_qy, qy, is_not_zero, vl32);",
+    "        const vint16m1_t red = __riscv_vwredsum_vs_i8m1_i16m1(sy, zero, vl32);",
+    "        acc += GGML_CPU_FP16_TO_FP32(yb->d) * (float)__riscv_vmv_x_s_i16m1_i16(red);",
+    "    }",
+    "    sumf += d0 * acc;",
+    "}",
+    "*s = sumf;",
+]
+
+STEP_LABEL = {
+    "block": "new block: d0 = x[ib].d, acc = 0", "yb": "new group: yb", "mask": "vlm.v", "qy": "vle8.v",
+    "neg_qy": "vneg.v", "sy": "vmerge.vvm", "red": "vwredsum.vs", "acc": "acc += yb->d × red[0]  (scale 1)",
+    "sumf": "sumf += d0 × acc  (scale 2)", "store": "*s = sumf",
+}
+
+
+def upstream_trace(nb=2, seed=7):
+    """Every step of ggml_vec_dot_q1_0_q8_0_vl256 for one output row of nb 128-K blocks, with sample data."""
+    rnd = random.Random(seed)
+    xd = [0.5, 0.25, 0.75, 0.125]
+    yd = [0.1, 0.2, 0.15, 0.05, 0.1, 0.3, 0.05, 0.2, 0.25, 0.1, 0.2, 0.15, 0.1, 0.05, 0.3, 0.2]
+    x = [{"d": xd[ib % len(xd)], "bits": [rnd.randint(0, 1) for _ in range(QK1)]} for ib in range(nb)]
+    y = [{"d": yd[g % len(yd)], "qs": [rnd.randint(-9, 9) for _ in range(QK8)]} for g in range(4 * nb)]
+    ALL = ["mask", "qy", "neg", "sy", "red"]
+    st = dict(mask=[""] * 32, qy=[""] * 32, neg=[""] * 32, sy=[""] * 32, red="", acc=0.0, sumf=0.0,
+              dy=None, d0=None, ib=0, k=0, s_text="")
+    steps = []
+
+    def fmt(v):
+        return "" if v is None else f"{v:g}"
+
+    def emit(name, line, hot, stale, text):
+        steps.append(dict(
+            name=name, line=line, hot=hot, stale=list(stale), text=text,
+            state=f"block ib = {st['ib']} · group k = {st['k']} · {STEP_LABEL[name]}",
+            ib=st["ib"], k=st["k"],
+            mask=list(st["mask"]), qy=list(st["qy"]), neg=list(st["neg"]), sy=list(st["sy"]),
+            red=st["red"], red_text=str(st["red"]),
+            acc=st["acc"], acc_text=f"{st['acc']:.2f}",
+            dy=st["dy"], dy_text=fmt(st["dy"]), d0=st["d0"], d0_text=fmt(st["d0"]),
+            sumf=st["sumf"], sumf_text=f"{st['sumf']:.3f}", s_text=st["s_text"]))
+
+    for ib in range(nb):
+        st["ib"], st["k"] = ib, 0
+        st["d0"], st["acc"] = x[ib]["d"], 0.0
+        emit("block", 1, "xd", ALL, f"d0 = x[{ib}].d = {x[ib]['d']:g}, acc = 0")
+        for k in range(4):
+            st["k"] = k
+            yb = y[4 * ib + k]
+            st["dy"] = yb["d"]
+            stale = list(ALL)
+            emit("yb", 4, "yb", stale, f"yb = &y[{4 * ib + k}]: d = {yb['d']:g} and 32 codes")
+            st["mask"] = x[ib]["bits"][32 * k:32 * k + 32]
+            stale.remove("mask")
+            emit("mask", 5, "mask", stale, f"is_not_zero = sign bits {32 * k} .. {32 * k + 31} of x[{ib}].qs")
+            st["qy"] = list(yb["qs"])
+            stale.remove("qy")
+            emit("qy", 6, "qy", stale, "qy[c] = yb->qs[c] for c = 0 .. 31")
+            st["neg"] = [-v for v in yb["qs"]]
+            stale.remove("neg")
+            emit("neg_qy", 7, "neg", stale, "neg_qy[c] = −qy[c]")
+            st["sy"] = [q if m else -q for q, m in zip(st["qy"], st["mask"])]
+            stale.remove("sy")
+            emit("sy", 8, "sy", stale, "sy[c] = is_not_zero[c] ? qy[c] : neg_qy[c]")
+            st["red"] = sum(st["sy"])
+            stale.remove("red")
+            emit("red", 9, "red", stale, f"red[0] = sy[0] + sy[1] + … + sy[31] = {st['red']}")
+            old = st["acc"]
+            st["acc"] = old + yb["d"] * st["red"]
+            emit("acc", 10, "acc", stale, f"acc = {old:.2f} + {yb['d']:g} × {st['red']} = {st['acc']:.2f}")
+        old = st["sumf"]
+        st["sumf"] = old + x[ib]["d"] * st["acc"]
+        emit("sumf", 12, "sumf", [], f"sumf = {old:.3f} + {x[ib]['d']:g} × {st['acc']:.2f} = {st['sumf']:.3f}")
+    st["s_text"] = f"{st['sumf']:.3f}"
+    emit("store", 14, "store", [], f"*s = sumf = {st['sumf']:.3f}")
+    return dict(nb=nb, x=x, y=y, steps=steps, lines=UPSTREAM_LINES, gx=[110 + 52 * k + 25 for k in range(4)])
+
+
+ANIM_JS = r"""
+(function () {
+  var data = JSON.parse(document.getElementById('an-data').textContent);
+  var steps = data.steps, n = steps.length, cur = n - 1, timer = null, speed = 1;
+  var reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var ROWS = ['xd', 'yb', 'mask', 'qy', 'neg', 'sy', 'red', 'acc', 'sumf', 'store'];
+  function $(id) { return document.getElementById(id); }
+  function txt(id, t) { var e = $(id); if (e) e.textContent = t; }
+  function cls(id, c, on) { var e = $(id); if (e) e.classList.toggle(c, !!on); }
+  function show(i) {
+    cur = i;
+    var s = steps[i];
+    txt('an-state', s.state); txt('an-formula', s.text);
+    txt('an-xlabel', 'x[' + s.ib + ']'); txt('an-xd', 'd ' + s.d0_text);
+    txt('an-ylabel', 'yb = &y[' + (s.ib * 4 + s.k) + ']'); txt('an-yd', 'd ' + s.dy_text);
+    for (var k = 0; k < 4; k++) cls('an-xg' + k, 'an-on', k === s.k);
+    for (var c = 0; c < 32; c++) {
+      txt('an-mt' + c, s.mask[c]); cls('an-m' + c, 'one', s.mask[c] === 1);
+      txt('an-qt' + c, s.qy[c]); txt('an-nt' + c, s.neg[c]); txt('an-st' + c, s.sy[c]);
+      cls('an-s' + c, 'one', s.mask[c] === 1);
+    }
+    txt('an-red', s.red_text); txt('an-red2', s.red_text);
+    txt('an-acc', s.acc_text); txt('an-acc2', s.acc_text);
+    txt('an-dy', s.dy_text); txt('an-d0', s.d0_text);
+    txt('an-sumf', s.sumf_text); txt('an-s', s.s_text);
+    for (var r = 0; r < ROWS.length; r++) {
+      cls('an-row-' + ROWS[r], 'stale', s.stale.indexOf(ROWS[r]) >= 0);
+      cls('an-row-' + ROWS[r], 'hot', s.hot === ROWS[r]);
+      cls('an-ar-' + ROWS[r], 'flow', s.hot === ROWS[r]);
+    }
+    var lines = document.querySelectorAll('#an-code .ln');
+    for (var j = 0; j < lines.length; j++) lines[j].classList.toggle('active', j === s.line);
+    var ar = $('an-ar-mask');
+    if (ar) ar.setAttribute('d', 'M' + data.gx[s.k] + ',62 L' + data.gx[s.k] + ',82');
+    txt('an-pos', (i + 1) + ' / ' + n);
+  }
+  function stop() { if (timer) { clearInterval(timer); timer = null; } $('an-play').textContent = '▶ Play'; }
+  function play() {
+    if (timer) { stop(); return; }
+    if (cur >= n - 1) show(0);
+    $('an-play').textContent = '⏸ Pause';
+    timer = setInterval(function () { if (cur >= n - 1) { stop(); return; } show(cur + 1); }, (reduced ? 1500 : 850) / speed);
+  }
+  $('an-play').onclick = play;
+  $('an-prev').onclick = function () { stop(); show(Math.max(0, cur - 1)); };
+  $('an-next').onclick = function () { stop(); show(Math.min(n - 1, cur + 1)); };
+  $('an-reset').onclick = function () { stop(); show(0); };
+  $('an-speed').onchange = function () { speed = parseFloat(this.value); if (timer) { stop(); play(); } };
+  show(n - 1);
+})();
+"""
+
+
+def fig_upstream_anim():
+    tr = upstream_trace()
+    last = tr["steps"][-1]
+    LX, P = 80, 15
+    up, up_lt = COL["upstream"], COL_LT["upstream"]
+    om = "var(--on-mark)"
+    b = []
+    b.append(T(0, 12, last["state"], 11, weight="bold", id="an-state"))
+    b.append(T(0, 27, last["text"], 10, fill=MUTED, id="an-formula"))
+    # memory: the weight block and the activation block of the current group
+    b.append('<g id="an-row-xd" class="an-row">'
+             + T(LX, 38, f"x[{last['ib']}]", 11, weight="bold", id="an-xlabel")
+             + R(LX, 42, 44, 20, SCALE)
+             + T(LX + 22, 56, "d " + last["d0_text"], 9, anchor="middle", fill=om, id="an-xd") + "</g>")
+    for k in range(4):
+        b.append(R(110 + 52 * k, 42, 50, 20, up, id=f"an-xg{k}", **{"class": "an-g" + (" an-on" if k == last["k"] else "")}))
+        b.append(T(110 + 52 * k + 25, 56, f"qs k{k}", 9, anchor="middle", fill=om))
+    b.append('<g id="an-row-yb" class="an-row">'
+             + T(340, 38, f"yb = &y[{4 * last['ib'] + last['k']}]", 11, weight="bold", id="an-ylabel")
+             + R(340, 42, 44, 20, SCALE)
+             + T(362, 56, "d " + last["dy_text"], 9, anchor="middle", fill=om, id="an-yd")
+             + R(388, 42, 150, 20, ACT) + T(463, 56, "qs[32]", 9, anchor="middle", fill=om) + "</g>")
+    gx = tr["gx"][last["k"]]
+    b.append(f'<path id="an-ar-mask" class="an-ar" d="M{gx},62 L{gx},82"/>')
+    b.append('<path id="an-ar-qy" class="an-ar" d="M538,52 L572,52 L572,128 L563,128"/>')
+
+    def row(y, rid, label, tp, rp, values, colors, h=16):
+        out = [f'<g id="an-row-{rid}" class="an-row">', T(LX - 6, y + h - 4, label, 11, anchor="end", weight="bold")]
+        for c in range(32):
+            out.append(R(LX + c * P, y, P - 1, h, colors[c], id=f"an-{rp}{c}"))
+            out.append(T(LX + c * P + (P - 1) / 2, y + h - 5, str(values[c]), 8, anchor="middle", fill=om, id=f"an-{tp}{c}"))
+        out.append("</g>")
+        return "".join(out)
+
+    m = last["mask"]
+    b.append(row(84, "mask", "is_not_zero", "mt", "m", m, [up if v == 1 else up_lt for v in m], h=14))
+    b.append(row(120, "qy", "qy", "qt", "q", last["qy"], [ACT] * 32))
+    b.append(f'<path id="an-ar-neg" class="an-ar" d="M{LX + 240},136 L{LX + 240},152"/>')
+    b.append(row(154, "neg", "neg_qy", "nt", "n", last["neg"], [ACT_LT] * 32))
+    b.append(f'<path id="an-ar-sy" class="an-ar" d="M{LX + 240},170 L{LX + 240},186"/>')
+    b.append(row(188, "sy", "sy", "st", "s", last["sy"], [ACT if v == 1 else ACT_LT for v in m]))
+    # horizontal reduction
+    b.append(f'<path id="an-ar-red" class="an-ar an-funnel" d="M{LX},204 L{LX + 480},204 L{LX + 40},232 L{LX},232 Z"/>')
+    b.append('<g id="an-row-red" class="an-row">'
+             + T(LX - 6, 244, "red[0]", 11, anchor="end", weight="bold")
+             + R(LX, 232, 40, 16, up) + T(LX + 20, 243, last["red_text"], 9, anchor="middle", fill=om, id="an-red")
+             + T(LX + 48, 243, "= sy[0] + sy[1] + … + sy[31]   (vwredsum.vs: 32 lanes → 1 int16)", 10, fill=MUTED) + "</g>")
+    # scale 1
+    b.append(f'<path id="an-ar-acc" class="an-ar" d="M{LX + 20},248 L{LX + 20},270"/>')
+    b.append('<g id="an-row-acc" class="an-row">'
+             + T(LX, 268, "red[0]", 9, fill=MUTED) + R(LX, 272, 56, 18, TRACK, stroke=INK, stroke_width=1)
+             + T(LX + 28, 285, last["red_text"], 10, anchor="middle", id="an-red2")
+             + T(LX + 66, 286, "×", 12, anchor="middle")
+             + T(LX + 76, 268, "yb->d", 9, fill=MUTED) + R(LX + 76, 272, 56, 18, SCALE)
+             + T(LX + 104, 285, last["dy_text"], 10, anchor="middle", fill=om, id="an-dy")
+             + right(LX + 138, 281, LX + 178, "+=")
+             + T(LX + 178, 268, "acc", 9, fill=MUTED) + R(LX + 178, 272, 64, 18, TRACK, stroke=INK, stroke_width=1)
+             + T(LX + 210, 285, last["acc_text"], 10, anchor="middle", id="an-acc")
+             + T(LX + 254, 285, "scale 1: the activation scale yb->d, once per 32-K group", 10, fill=MUTED) + "</g>")
+    # scale 2
+    b.append(f'<path id="an-ar-sumf" class="an-ar" d="M{LX + 210},290 L{LX + 210},312 L{LX + 36},312"/>')
+    b.append('<g id="an-row-sumf" class="an-row">'
+             + T(LX, 318, "acc", 9, fill=MUTED) + R(LX, 322, 64, 18, TRACK, stroke=INK, stroke_width=1)
+             + T(LX + 32, 335, last["acc_text"], 10, anchor="middle", id="an-acc2")
+             + T(LX + 74, 336, "×", 12, anchor="middle")
+             + T(LX + 84, 318, "d0 = x[ib].d", 9, fill=MUTED) + R(LX + 84, 322, 56, 18, SCALE)
+             + T(LX + 112, 335, last["d0_text"], 10, anchor="middle", fill=om, id="an-d0")
+             + right(LX + 146, 331, LX + 186, "+=")
+             + T(LX + 186, 318, "sumf", 9, fill=MUTED) + R(LX + 186, 322, 72, 18, TRACK, stroke=INK, stroke_width=1)
+             + T(LX + 222, 335, last["sumf_text"], 10, anchor="middle", id="an-sumf")
+             + T(LX + 270, 335, "scale 2: the weight scale d0, once per 128-K block", 10, fill=MUTED) + "</g>")
+    # store
+    b.append(f'<path id="an-ar-store" class="an-ar" d="M{LX + 222},340 L{LX + 222},362"/>')
+    b.append('<g id="an-row-store" class="an-row">'
+             + T(LX + 186, 368, "*s", 9, fill=MUTED) + R(LX + 186, 372, 72, 18, up)
+             + T(LX + 222, 385, last["s_text"], 10, anchor="middle", fill=om, id="an-s")
+             + T(LX + 270, 385, "after the last block: one float, this output row", 10, fill=MUTED) + "</g>")
+    b.append(legend(0, 406, [(SCALE, "scale: fp16 d"), (up, "weight parameters: sign bits"), (ACT, "activation parameters: int8 codes")]))
+    picture = svg("svg-anim-upstream", 580, 414, ("", "".join(b)),
+                  "Animated: one output row through the upstream kernel, block by block and group by group: mask, load, negate, "
+                  "select, reduce, scale by yb->d, then scale by d0 and store.")
+    code = "".join(f'<span class="ln{" active" if i == last["line"] else ""}" data-line="{i}">{esc(l)}</span>' for i, l in enumerate(tr["lines"]))
+    payload = json.dumps(tr, separators=(",", ":")).replace("</", "<\\/")
+    controls = ('<div class="an-controls"><button id="an-play" type="button">▶ Play</button>'
+                '<button id="an-prev" type="button">◀ Step</button><button id="an-next" type="button">Step ▶</button>'
+                '<button id="an-reset" type="button">Reset</button>'
+                '<label>speed <select id="an-speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option>'
+                '<option value="2">2×</option></select></label>'
+                f'<span class="an-pos" id="an-pos">{len(tr["steps"])} / {len(tr["steps"])}</span></div>')
+    caption = (f"All arithmetic of the upstream kernel for one output row of {tr['nb']} × 128 K, on sample data: "
+               "sign bits x[ib].qs, codes yb->qs, scales x[ib].d and yb->d. Press Play, or step with the buttons. "
+               "The active kernel line is highlighted on the left; grey rows still hold the previous group. "
+               "Scale 1 (yb->d) is applied after every 32-K group, scale 2 (d0) after every 128-K block.")
+    return (f'<figure id="anim-upstream" class="animfig">{controls}<div class="anim">'
+            f'<pre id="an-code"><code>{code}</code></pre><div class="stepfig">{picture}</div></div>'
+            f'<figcaption>{caption}</figcaption>'
+            f'<script type="application/json" id="an-data">{payload}</script><script>{ANIM_JS}</script></figure>')
+
+
