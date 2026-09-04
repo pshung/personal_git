@@ -64,3 +64,20 @@ p, aw, w0..w3, s0, s1, acc). Guard it: a test that every <text data-role=var>
 appears in that step's code and every __riscv_*() call is verbatim in the
 extracted source. Built as steps_upstream/steps_rvv/steps_vd4 in
 q1_0_layout_page/build_page.py.
+
+**Naming split, 2026-09-04:** for the upstream-kernel animation he said the
+picture on the right must NOT use the code's variable names ("很難懂, 給一個
+general name"). So: kernel names only in the code panel, plain names in the
+picture (sign mask, activation codes, negated codes, signed values, group
+sum, block sum, row total, output, weight scale, activation scale), and the
+mapping once in the caption. The per-instruction step ladders keep the code
+names because he asked for that there ("變數要對的起來") - the two requests
+are about different figures, not a contradiction. Guarded by
+test_upstream_animation_picture_uses_plain_names_not_code_names.
+
+**Code beside a picture, 2026-09-04:** "不要擋住左邊 kernel code 我要完整看到
+kernel" - a code panel next to a figure must show every kernel line whole, no
+horizontal scroll or clipping. Fix used: the figure breaks out of the 960-px
+text column (width min(1440px, 100vw-40px)), the code column is
+minmax(0, max-content), kernel indentation halved to 2 spaces, stack below
+1000 px. Guard: test_animation_code_panels_show_every_kernel_line_unclipped.

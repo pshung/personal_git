@@ -1,0 +1,463 @@
+# ---- repack animations: layouts 2 and 3, 64 rows at once, one row followed ----
+RVV_LINES = [
+    "for (int x = 0; x < nc / 64; ++x) {",
+    "    const block_q1_0x64 * bx = (const block_q1_0x64 *) vx + (size_t) x * nb;",
+    "    vfloat32m2_t sumf = __riscv_vfmv_v_f_f32m2(0.0f, vl);",
+    "    for (int l = 0; l < nb; ++l) {",
+    "        q1_prefetch_block(bx, l, nb);",
+    "        const vfloat32m2_t dx   = q1_expand_fp16_64_m2(bx[l].d);",
+    "        vfloat32m2_t       facc = __riscv_vfmv_v_f_f32m2(0.0f, vl);",
+    "        for (int k = 0; k < QK1_0 / QK8_0; ++k) {",
+    "            const block_q8_0 * ab = &a_ptr[l * (QK1_0 / QK8_0) + k];",
+    "            vint16m1_t sumi = __riscv_vmv_v_x_i16m1(0, vl);",
+    "            for (int c = 0; c < QK8_0; ++c) {",
+    "                const int16_t   yc   = ab->qs[c];",
+    "                const vbool16_t sign = __riscv_vlm_v_b16(bx[l].qs[k * QK8_0 + c], vl);",
+    "                sumi = __riscv_vsub_vx_i16m1(sumi, yc, vl);",
+    "                sumi = __riscv_vadd_vx_i16m1_mu(sign, sumi, sumi, (int16_t) (2 * yc), vl);",
+    "            }",
+    "            facc = __riscv_vfmacc_vf_f32m2(facc, GGML_CPU_FP16_TO_FP32(ab->d),",
+    "                __riscv_vfcvt_f_x_v_f32m2(__riscv_vsext_vf2_i32m2(sumi, vl), vl), vl);",
+    "        }",
+    "        sumf = __riscv_vfmacc_vv_f32m2(sumf, dx, facc, vl);",
+    "    }",
+    "    __riscv_vse32_v_f32m2(s + (size_t) x * 64, sumf, vl);",
+    "}",
+]
+
+VD4_LINES = [
+    "for (int x = 0; x < nc / 64; ++x) {",
+    "    const block_q1_0x64 * bx = (const block_q1_0x64 *) vx + (size_t) x * nb;",
+    "    vfloat32m2_t sumf = __riscv_vfmv_v_f_f32m2(0.0f, vl32);",
+    "    for (int l = 0; l < nb; ++l) {",
+    "        q1_prefetch_block(bx, l, nb);",
+    "        const vfloat32m2_t dx     = q1_expand_fp16_64_m2(bx[l].d);",
+    "        const uint8_t *    planes = (const uint8_t *) bx[l].qs;",
+    "        vfloat32m2_t       facc   = __riscv_vfmv_v_f_f32m2(0.0f, vl32);",
+    "        for (int k = 0; k < QK1_0 / QK8_0; ++k) {",
+    "            const int        g  = l * (QK1_0 / QK8_0) + k;",
+    "            const uint32_t * aw = (const uint32_t *) (aq + (size_t) g * QK8_0);",
+    "            vint32m2_t       acc = __riscv_vmv_v_x_i32m2(0, vl32);",
+    "            for (int q = 0; q < QK8_0 / 4; q += 4) {",
+    "                const uint8_t * p = planes + (size_t) (k * (QK8_0 / 4) + q) * 32;",
+    "                const vint8m2_t w0 = __riscv_vmerge_vxm_i8m2(vneg1, 1, __riscv_vlm_v_b4(p +  0, vl8), vl8);",
+    "                const vint8m2_t w1 = __riscv_vmerge_vxm_i8m2(vneg1, 1, __riscv_vlm_v_b4(p + 32, vl8), vl8);",
+    "                const vint8m2_t w2 = __riscv_vmerge_vxm_i8m2(vneg1, 1, __riscv_vlm_v_b4(p + 64, vl8), vl8);",
+    "                const vint8m2_t w3 = __riscv_vmerge_vxm_i8m2(vneg1, 1, __riscv_vlm_v_b4(p + 96, vl8), vl8);",
+    "                acc = q1_vd4dots_x4_m2(acc, w0, w1, w2, w3,",
+    "                    aw[q + 0], aw[q + 1], aw[q + 2], aw[q + 3]);",
+    "            }",
+    "            facc = __riscv_vfmacc_vf_f32m2(facc, GGML_CPU_FP16_TO_FP32(a_ptr[g].d),",
+    "                __riscv_vfcvt_f_x_v_f32m2(acc, vl32), vl32);",
+    "        }",
+    "        sumf = __riscv_vfmacc_vv_f32m2(sumf, dx, facc, vl32);",
+    "    }",
+    "    __riscv_vse32_v_f32m2(s + (size_t) x * 64, sumf, vl32);",
+    "}",
+]
+
+AN_LX, AN_P64, AN_LANES = 96, 6.5, 416          # lanes span AN_LX .. AN_LX + 416
+AN_PLANES_X, AN_CODES_X = AN_LX + 60, 484        # memory bars
+AN_FOLLOW = 5
+
+
+def repack_data(nb=2, seed=11):
+    """Sample data shared by both repack animations: 64 rows x nb blocks of Q1_0, nb x 4 groups of Q8_0."""
+    rnd = random.Random(seed)
+    dxc = [0.25, 0.5, 0.75, 1.0]
+    dyc = [0.1, 0.2, 0.25, 0.5, 0.1, 0.2, 0.25, 0.5]
+    x = [{"d": [rnd.choice(dxc) for _ in range(64)],
+          "bits": [[rnd.randint(0, 1) for _ in range(QK1)] for _ in range(64)]} for _ in range(nb)]
+    y = [{"d": dyc[g % len(dyc)], "qs": [rnd.randint(-4, 4) for _ in range(QK8)]} for g in range(4 * nb)]
+    return x, y
+
+
+def repack_trace(layout, nb=2):
+    x, y = repack_data(nb)
+    steps = []
+
+    def emit(name, line, hot, stale, state, tpl=None, tpls=None, tplby=None, **setv):
+        d = dict(name=name, line=line, hot=hot, stale=list(stale), state=state, set=setv)
+        if tpl:
+            d["tpl"] = tpl
+        if tpls:
+            d["tpls"], d["tplby"] = tpls, tplby
+        steps.append(d)
+
+    sumf = [0.0] * 64
+    if layout == "rvv":
+        for l in range(nb):
+            dx = x[l]["d"]
+            facc = [0.0] * 64
+            emit("dx", 5, "dx", ["sign", "sumi"], f"block {l} · load the 64 weight scales, reset the 64 block sums",
+                 tpl="row {j}: weight scale = {dx:2}, block sum = 0", l=l, dx=dx, facc=list(facc), sumf=list(sumf))
+            for k in range(4):
+                g = 4 * l + k
+                codes, dy = y[g]["qs"], y[g]["d"]
+                pre = f"block {l} · group {k} · "
+                emit("ab", 8, "yb", ["sign", "sumi"], pre + "next activation group: scale and 32 codes",
+                     tpl="group {k}: activation scale = {dy:2}, 32 codes", k=k, g=g, dy=dy, codes=codes)
+                sumi = [0] * 64
+                emit("sumi0", 9, "sumi", ["sign"], pre + "reset the 64 partial sums",
+                     tpl="row {j}: partial sum = 0", sumi=list(sumi))
+                for c in range(QK8):
+                    yc = codes[c]
+                    col = 32 * k + c
+                    sign = [x[l]["bits"][j][col] for j in range(64)]
+                    detail = c < 2
+                    if detail:
+                        emit("yc", 11, "yb", ["sign"], pre + f"column {c}: read one code",
+                             tpl="column {c}: code = {yc}, the same for all 64 rows",
+                             c=c, yc=yc, colx=AN_PLANES_X + col * 2, codex=AN_CODES_X + c * 3.5)
+                        emit("sign", 12, "sign", [], pre + f"column {c}: load the 64 sign bits",
+                             tpl="row {j}: sign bit of column {c} = {sign}", sign=sign)
+                    sumi = [v - yc for v in sumi]
+                    if detail:
+                        emit("vsub", 13, "sumi", [], pre + f"column {c}: every row minus the code",
+                             tpl="row {j}: partial sum = {prev:sumi} − {yc} = {sumi}", sumi=list(sumi))
+                    sumi = [v + (2 * yc if b else 0) for v, b in zip(sumi, sign)]
+                    if detail:
+                        emit("vadd", 14, "sumi", [], pre + f"column {c}: rows with sign 1 plus 2 × the code",
+                             tpls={"1": "row {j}: sign 1 → {prev:sumi} + 2 × {yc} = {sumi}   (net: + code)",
+                                   "0": "row {j}: sign 0 → unchanged, {sumi}   (net: − code)"},
+                             tplby="sign", sumi=list(sumi))
+                emit("ff", 10, "sumi", [], pre + "columns 2 .. 31 the same way",
+                     tpl="row {j}: after all 32 columns the partial sum is {sumi}",
+                     c=31, yc=codes[31], sign=sign, sumi=list(sumi),
+                     colx=AN_PLANES_X + (32 * k + 31) * 2, codex=AN_CODES_X + 31 * 3.5)
+                facc = [f + dy * v for f, v in zip(facc, sumi)]
+                emit("facc", 16, "facc", [], pre + "× activation scale → block sums  (scale 1)",
+                     tpl="row {j}: block sum = {prev:facc:2} + {dy:2} × {sumi} = {facc:2}", facc=list(facc))
+            sumf = [s + d * f for s, d, f in zip(sumf, dx, facc)]
+            emit("sumf", 19, "sumf", [], f"block {l} · × weight scales → row totals  (scale 2)",
+                 tpl="row {j}: row total = {prev:sumf:2} + {dx:2} × {facc:2} = {sumf:2}", sumf=list(sumf))
+        emit("store", 21, "out", [], "all blocks done · store the 64 outputs",
+             tpl="row {j}: output = {out:2}", out=list(sumf))
+        lines = RVV_LINES
+    else:
+        for l in range(nb):
+            dx = x[l]["d"]
+            facc = [0.0] * 64
+            emit("dx", 5, "dx", ["w0", "dot", "acc"], f"block {l} · load the 64 weight scales, reset the 64 block sums",
+                 tpl="row {j}: weight scale = {dx:2}, block sum = 0", l=l, dx=dx, facc=list(facc), sumf=list(sumf))
+            for k in range(4):
+                g = 4 * l + k
+                codes, dy = y[g]["qs"], y[g]["d"]
+                pre = f"block {l} · group {k} · "
+                emit("aw", 10, "yb", ["w0", "dot", "acc"], pre + "next activation group: scale and 8 quads of 4 codes",
+                     tpl="group {k}: activation scale = {dy:2}, 8 quads of 4 codes", k=k, g=g, dy=dy, codes=codes)
+                acc = [0] * 64
+                emit("acc0", 11, "acc", ["w0", "dot"], pre + "reset the 64 group sums",
+                     tpl="row {j}: group sum = 0", acc=list(acc))
+                for qi in range(8):
+                    c0 = 4 * qi
+                    w0 = [1 if x[l]["bits"][j][32 * k + c0 + r] else -1 for j in range(64) for r in range(4)]
+                    quad = codes[c0:c0 + 4]
+                    dot = [sum(w0[4 * j + r] * quad[r] for r in range(4)) for j in range(64)]
+                    acc = [a + d for a, d in zip(acc, dot)]
+                    mark = dict(qi=qi, c0=c0, c3=c0 + 3, planex=AN_PLANES_X + (8 * k + qi) * 8, quadx=AN_CODES_X + qi * 14,
+                                quad=", ".join(str(v) for v in quad), quadv=quad)
+                    if qi == 0:
+                        emit("p", 13, "xd", ["w0", "dot"], pre + "pass 1 of 2: point at 4 planes = 16 columns",
+                             tpl="planes for columns {c0} .. {c1} of this group", c1=15, **mark)
+                        emit("w0", 14, "w0", ["dot"], pre + "plane 0 → 256 signs: 4 columns × 64 rows",
+                             tpl="row {j}: signs of columns {c0} .. {c3} = {w0@4}", w0=w0)
+                        emit("s0", 19, "s0", ["dot"], pre + "quad 0 → its 4 codes in every row")
+                        steps[-1]["tpl"] = "quad {qi}: codes {quad} in every row"
+                        emit("dot", 18, "acc", [], pre + "one dot instruction: 4 products per row, added to the group sum",
+                             tpl="row {j}: ({w0@4}) · ({quad}) = {dot} → group sum {prev:acc} + {dot} = {acc}",
+                             dot=dot, acc=list(acc))
+                emit("ff", 12, "acc", [], pre + "the other 7 quads the same way (two passes of 4 planes)",
+                     tpl="row {j}: after all 8 quads the group sum is {acc}", w0=w0, dot=dot, acc=list(acc), **mark)
+                facc = [f + dy * a for f, a in zip(facc, acc)]
+                emit("facc", 21, "facc", [], pre + "× activation scale → block sums  (scale 1)",
+                     tpl="row {j}: block sum = {prev:facc:2} + {dy:2} × {acc} = {facc:2}", facc=list(facc))
+            sumf = [s + d * f for s, d, f in zip(sumf, dx, facc)]
+            emit("sumf", 24, "sumf", [], f"block {l} · × weight scales → row totals  (scale 2)",
+                 tpl="row {j}: row total = {prev:sumf:2} + {dx:2} × {facc:2} = {sumf:2}", sumf=list(sumf))
+        emit("store", 26, "out", [], "all blocks done · store the 64 outputs",
+             tpl="row {j}: output = {out:2}", out=list(sumf))
+        lines = VD4_LINES
+    return dict(layout=layout, nb=nb, x=x, y=y, steps=steps, lines=lines, follow=AN_FOLLOW)
+
+
+ANIM_ENGINE_JS = r"""
+function q1Anim(prefix) {
+  var data = JSON.parse(document.getElementById(prefix + '-data').textContent);
+  var steps = data.steps, n = steps.length, cur = n - 1, timer = null, speed = 1, j = data.follow;
+  var reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function $(id) { return document.getElementById(prefix + '-' + id); }
+  function txt(id, t) { var e = $(id); if (e) e.textContent = t; }
+  function cls(id, c, on) { var e = $(id); if (e) e.classList.toggle(c, !!on); }
+  function stateAt(i) { var st = {}; for (var k = 0; k <= i; k++) { var set = steps[k].set; for (var key in set) st[key] = set[key]; } return st; }
+  function fmt(v, dec) {
+    if (v === undefined || v === null) return null;
+    if (typeof v === 'number') return dec !== undefined ? v.toFixed(dec) : (Number.isInteger(v) ? String(v) : v.toFixed(2));
+    return String(v);
+  }
+  function pick(st, key, dec) { var v = st[key]; if (v === undefined) return null; return Array.isArray(v) ? fmt(v[j], dec) : fmt(v, dec); }
+  function quad4(st, key) { var a = st[key]; if (!a) return null; var o = []; for (var r = 0; r < 4; r++) o.push(fmt(a[4 * j + r])); return o.join(', '); }
+  function fill(tpl, st, prev) {
+    var missing = false;
+    var out = tpl.replace(/\{([^}]+)\}/g, function (_, tok) {
+      var v;
+      if (tok === 'j') { v = String(j); }
+      else {
+        var parts = tok.split(':'), src = st;
+        if (parts[0] === 'prev') { src = prev; parts.shift(); }
+        var key = parts[0], dec = parts.length > 1 ? parseInt(parts[1], 10) : undefined;
+        v = key.slice(-2) === '@4' ? quad4(src, key.slice(0, -2)) : pick(src, key, dec);
+      }
+      if (v === null) { missing = true; return ''; }
+      return v;
+    });
+    return missing ? '' : out;
+  }
+  function colourOf(row, v) {
+    if (row.by === 'sign') return row.fills[v > 0 ? 'p' : (v < 0 ? 'n' : 'z')];
+    return row.fills[String(v)];
+  }
+  function show(i) {
+    cur = i;
+    var s = steps[i], st = stateAt(i), prev = i > 0 ? stateAt(i - 1) : {};
+    txt('state', s.state);
+    var tpl = s.tpl || '';
+    if (s.tpls) { var byv = st[s.tplby]; var key = Array.isArray(byv) ? byv[j] : byv; tpl = s.tpls[String(key)] || tpl; }
+    txt('formula', fill(tpl, st, prev));
+    for (var r = 0; r < data.rows.length; r++) {
+      var row = data.rows[r], arr = st[row.key];
+      if (arr && row.fills) for (var c = 0; c < row.n; c++) { var e = $(row.key + '-' + c); if (e) { var f = colourOf(row, arr[c]); if (f) e.setAttribute('fill', f); } }
+      var v = row.valkey ? pick(st, row.valkey) : (row.show === '@4' ? quad4(st, row.key) : (arr ? fmt(arr[j], row.dec) : null));
+      txt(row.key + '-val', v === null ? '' : v);
+      var fl = $(row.key + '-fl'); if (fl) fl.setAttribute('x', parseFloat(fl.getAttribute('data-x0')) + j * parseFloat(fl.getAttribute('data-pitch')));
+    }
+    for (var t = 0; t < data.texts.length; t++) txt(data.texts[t].id, fill(data.texts[t].tpl, st, prev));
+    for (var a = 0; a < data.attrs.length; a++) { var e2 = $(data.attrs[a].id), v2 = fill(data.attrs[a].tpl, st, prev); if (e2 && v2) e2.setAttribute(data.attrs[a].attr, v2); }
+    for (var g = 0; g < data.groups.length; g++) {
+      var gk = data.groups[g];
+      cls('row-' + gk, 'stale', (s.stale || []).indexOf(gk) >= 0);
+      cls('row-' + gk, 'hot', s.hot === gk);
+      cls('ar-' + gk, 'flow', s.hot === gk);
+    }
+    var lines = document.querySelectorAll('#' + prefix + '-code .ln');
+    for (var q = 0; q < lines.length; q++) lines[q].classList.toggle('active', q === s.line);
+    txt('pos', (i + 1) + ' / ' + n);
+    var fi = $('follow'); if (fi && fi.value !== String(j)) fi.value = j;
+  }
+  function stop() { if (timer) { clearInterval(timer); timer = null; } $('play').textContent = '▶ Play'; }
+  function play() {
+    if (timer) { stop(); return; }
+    if (cur >= n - 1) show(0);
+    $('play').textContent = '⏸ Pause';
+    timer = setInterval(function () { if (cur >= n - 1) { stop(); return; } show(cur + 1); }, (reduced ? 1500 : 850) / speed);
+  }
+  $('play').onclick = play;
+  $('prev').onclick = function () { stop(); show(Math.max(0, cur - 1)); };
+  $('next').onclick = function () { stop(); show(Math.min(n - 1, cur + 1)); };
+  $('reset').onclick = function () { stop(); show(0); };
+  $('speed').onchange = function () { speed = parseFloat(this.value); if (timer) { stop(); play(); } };
+  $('follow').onchange = function () { var v = parseInt(this.value, 10); if (!isNaN(v)) { j = Math.max(0, Math.min(63, v)); show(cur); } };
+  var pic = document.getElementById('svg-anim-' + data.layout);
+  if (pic) pic.addEventListener('click', function (ev) {
+    var t = ev.target, c = t.getAttribute && t.getAttribute('data-lane');
+    if (c === null || c === undefined) return;
+    var nl = parseInt(t.getAttribute('data-n'), 10);
+    j = nl === 256 ? Math.floor(parseInt(c, 10) / 4) : parseInt(c, 10);
+    show(cur);
+  });
+  show(n - 1);
+}
+"""
+
+
+def _py_fmt(v, dec=None):
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return str(int(v))
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return f"{v:.{dec if dec is not None else 2}f}"
+    return str(v)
+
+
+def _py_fill(tpl, st, prev, j):
+    """The resting-state twin of the JS fill(): same tokens, same formatting."""
+    missing = [False]
+
+    def one(m):
+        tok = m.group(1)
+        if tok == "j":
+            return str(j)
+        parts = tok.split(":")
+        src = st
+        if parts[0] == "prev":
+            src = prev
+            parts = parts[1:]
+        key = parts[0]
+        dec = int(parts[1]) if len(parts) > 1 else None
+        if key.endswith("@4"):
+            a = src.get(key[:-2])
+            v = None if a is None else ", ".join(_py_fmt(a[4 * j + r]) for r in range(4))
+        else:
+            v = src.get(key)
+            if isinstance(v, list):
+                v = v[j]
+            v = _py_fmt(v, dec)
+        if v is None:
+            missing[0] = True
+            return ""
+        return v
+    out = re.sub(r"\{([^}]+)\}", one, tpl)
+    return "" if missing[0] else out
+
+
+def fig_repack_anim(layout):
+    tr = repack_trace(layout)
+    p = {"rvv": "anr", "vd4": "anv"}[layout]
+    col, col_lt = COL[layout], COL_LT[layout]
+    om = "var(--on-mark)"
+    j = tr["follow"]
+    st, prev = {}, {}
+    for s in tr["steps"]:
+        prev = dict(st)
+        st.update(s["set"])
+    last = tr["steps"][-1]
+    LX, P = AN_LX, AN_P64
+    AR = f'fill="none" stroke="{LINE}" stroke-width="1.4" marker-end="url(#arrow)"'
+    ids = lambda k: f"{p}-{k}"
+    b = []
+    b.append(T(0, 12, last["state"], 11, weight="bold", id=ids("state")))
+    b.append(T(0, 27, _py_fill(last["tpl"], st, prev, j), 10, fill=MUTED, id=ids("formula")))
+    # memory
+    texts = [dict(id="xlabel", tpl="weights, block {l}"), dict(id="ylabel", tpl="activations, group {k}"),
+             dict(id="dycell", tpl="scale {dy:2}")]
+    b.append(f'<g id="{ids("row-xd")}" class="an-row">'
+             + T(LX, 38, _py_fill("weights, block {l}", st, prev, j), 11, weight="bold", id=ids("xlabel"))
+             + R(LX, 42, 56, 20, SCALE) + T(LX + 28, 56, "64 scales", 9, anchor="middle", fill=om)
+             + R(AN_PLANES_X, 42, 256, 20, col)
+             + T(AN_PLANES_X + 128, 56, "128 column planes of 8 B" if layout == "rvv" else "32 planes of 32 B (4 columns each)", 9, anchor="middle", fill=om)
+             + "</g>")
+    b.append(f'<g id="{ids("row-yb")}" class="an-row">'
+             + T(424, 38, _py_fill("activations, group {k}", st, prev, j), 11, weight="bold", id=ids("ylabel"))
+             + R(424, 42, 56, 20, SCALE) + T(452, 56, _py_fill("scale {dy:2}", st, prev, j), 9, anchor="middle", fill=om, id=ids("dycell"))
+             + R(AN_CODES_X, 42, 112, 20, ACT) + T(AN_CODES_X + 56, 56, "32 codes" if layout == "rvv" else "8 quads of 4 codes", 9, anchor="middle", fill=om)
+             + "</g>")
+    if layout == "rvv":
+        attrs = [dict(id="colmark", attr="x", tpl="{colx}"), dict(id="codemark", attr="x", tpl="{codex}"),
+                 dict(id="ar-sign", attr="d", tpl="M{colx},62 L{colx},82")]
+        b.append(R(st["colx"], 42, 2, 20, "none", stroke=INK, stroke_width=1.5, id=ids("colmark")))
+        b.append(R(st["codex"], 42, 3.5, 20, "none", stroke=INK, stroke_width=1.5, id=ids("codemark")))
+        texts.append(dict(id="info", tpl="column {c}: code = {yc}   (one scalar, used by all 64 rows)"))
+        b.append(T(LX, 76, _py_fill("column {c}: code = {yc}   (one scalar, used by all 64 rows)", st, prev, j), 10, fill=MUTED, id=ids("info")))
+        rows = [
+            dict(key="sign", label="sign mask", y=84, h=12, n=64, fills={"1": col, "0": col_lt}),
+            dict(key="sumi", label="partial sums", y=108, h=16, n=64, by="sign", fills={"p": col, "n": col_lt, "z": TRACK}),
+            dict(key="facc", label="block sums", y=144, h=16, n=64, by="sign", fills={"p": col, "n": col_lt, "z": TRACK}, dec=2),
+            dict(key="dx", label="weight scales", y=180, h=16, n=64, by="sign", fills={"p": SCALE, "n": SCALE, "z": TRACK}, dec=2),
+            dict(key="sumf", label="row totals", y=216, h=16, n=64, by="sign", fills={"p": col, "n": col_lt, "z": TRACK}, dec=2),
+            dict(key="out", label="output", y=252, h=16, n=64, by="sign", fills={"p": COL["upstream"], "n": COL_LT["upstream"], "z": TRACK}, dec=2),
+        ]
+        arrows = [("sign", f"M{st['colx']},62 L{st['colx']},82"), ("sumi", f"M{LX + 208},98 L{LX + 208},106"),
+                  ("facc", f"M{LX + 208},126 L{LX + 208},142"), ("sumf", f"M520,162 L520,214"), ("out", f"M{LX + 208},234 L{LX + 208},250")]
+        groups = ["xd", "yb", "sign", "sumi", "facc", "dx", "sumf", "out"]
+        H = 292
+        ylegend = 282
+    else:
+        attrs = [dict(id="planemark", attr="x", tpl="{planex}"), dict(id="quadmark", attr="x", tpl="{quadx}"),
+                 dict(id="ar-w0", attr="d", tpl="M{planex},62 L{planex},82"),
+                 dict(id="ar-s0", attr="d", tpl="M{quadx},62 L{quadx},68 L520,68 L520,108")]
+        b.append(R(st["planex"], 42, 32, 20, "none", stroke=INK, stroke_width=1.5, id=ids("planemark")))
+        b.append(R(st["quadx"], 42, 14, 20, "none", stroke=INK, stroke_width=1.5, id=ids("quadmark")))
+        texts.append(dict(id="info", tpl="quad {qi}: codes {quad}   (one 32-bit word, broadcast to all 64 rows)"))
+        b.append(T(LX, 76, _py_fill("quad {qi}: codes {quad}   (one 32-bit word, broadcast to all 64 rows)", st, prev, j), 10, fill=MUTED, id=ids("info")))
+        rows = [
+            dict(key="w0", label="signs, 4 columns × 64 rows", y=84, h=14, n=256, fills={"1": col, "-1": col_lt}, show="@4"),
+            dict(key="s0", label="codes, repeated", y=110, h=14, n=256, valkey="quad"),
+            dict(key="dot", label="4-product sums", y=136, h=16, n=64, by="sign", fills={"p": col, "n": col_lt, "z": TRACK}),
+            dict(key="acc", label="group sums", y=172, h=16, n=64, by="sign", fills={"p": col, "n": col_lt, "z": TRACK}),
+            dict(key="facc", label="block sums", y=208, h=16, n=64, by="sign", fills={"p": col, "n": col_lt, "z": TRACK}, dec=2),
+            dict(key="dx", label="weight scales", y=244, h=16, n=64, by="sign", fills={"p": SCALE, "n": SCALE, "z": TRACK}, dec=2),
+            dict(key="sumf", label="row totals", y=280, h=16, n=64, by="sign", fills={"p": col, "n": col_lt, "z": TRACK}, dec=2),
+            dict(key="out", label="output", y=316, h=16, n=64, by="sign", fills={"p": COL["upstream"], "n": COL_LT["upstream"], "z": TRACK}, dec=2),
+        ]
+        arrows = [("w0", f"M{st['planex']},62 L{st['planex']},82"), ("s0", f"M{st['quadx']},62 L{st['quadx']},68 L520,68 L520,108"),
+                  ("dot", f"M{LX + 208},124 L{LX + 208},134"), ("acc", f"M{LX + 208},154 L{LX + 208},170"),
+                  ("facc", f"M{LX + 208},190 L{LX + 208},206"), ("sumf", f"M520,226 L520,278"), ("out", f"M{LX + 208},298 L{LX + 208},314")]
+        groups = ["xd", "yb", "w0", "s0", "dot", "acc", "facc", "dx", "sumf", "out"]
+        H = 356
+        ylegend = 346
+    for key, d in arrows:
+        b.append(f'<path id="{ids("ar-" + key)}" class="an-ar" {AR} d="{d}"/>')
+    tints = [ACT_ROW[i % 4] for i in range(256)]
+    for row in rows:
+        key, n, y, h = row["key"], row["n"], row["y"], row["h"]
+        pitch = AN_LANES / n
+        arr = st.get(key)
+        b.append(f'<g id="{ids("row-" + key)}" class="an-row">')
+        b.append(T(LX - 6, y + h - 4, row["label"], 11, anchor="end", weight="bold"))
+        for c in range(n):
+            if key == "s0":
+                f = tints[c]
+            elif arr is None or "fills" not in row:
+                f = TRACK
+            elif row.get("by") == "sign":
+                v = arr[c]
+                f = row["fills"]["p" if v > 0 else "n" if v < 0 else "z"]
+            else:
+                f = row["fills"].get(str(arr[c]), TRACK)
+            b.append(R(LX + c * pitch, y, max(pitch - (0.5 if pitch >= 2 else 0), 0.5), h, f,
+                       id=ids(f"{key}-{c}"), data_lane=c, data_n=n))
+        b.append(R(LX + j * P, y, P, h, "none", stroke=INK, stroke_width=1.5, id=ids(key + "-fl"), data_x0=LX, data_pitch=P))
+        if row.get("valkey"):
+            val = _py_fmt(st.get(row["valkey"]))
+        elif row.get("show") == "@4":
+            val = ", ".join(_py_fmt(arr[4 * j + r]) for r in range(4)) if arr else ""
+        else:
+            val = _py_fmt(arr[j], row.get("dec")) if arr else ""
+        b.append(R(528, y, 68, h, TRACK, stroke=LINE, stroke_width=1))
+        b.append(T(562, y + h - 4, val or "", 9, anchor="middle", id=ids(key + "-val")))
+        b.append("</g>")
+    b.append(T(562, 80, f"row {j}", 9, anchor="middle", fill=MUTED, id=ids("followhdr")))
+    texts.append(dict(id="followhdr", tpl="row {j}"))
+    b.append(legend(0, ylegend, [(SCALE, "scale: fp16 d"), (col, "weight parameters: sign bits"), (ACT, "activation parameters: int8 codes"), (None, "the row you follow")]))
+    label = ("Animated: 64 output rows through the RVV repack kernel, one column at a time: sign mask, masked add and subtract, "
+             "block sums times the activation scale, row totals times the weight scales, store."
+             if layout == "rvv" else
+             "Animated: 64 output rows through the VD4DOT kernel: a 32-byte plane becomes 256 signs, a 4-code quad is broadcast, "
+             "one dot instruction adds 4 products per row, then the activation scale and the weight scales.")
+    picture = svg(f"svg-anim-{layout}", 600, H, ("", "".join(b)), label)
+    code = "".join(f'<span class="ln{" active" if i == last["line"] else ""}" data-line="{i}">{esc(l)}</span>' for i, l in enumerate(tr["lines"]))
+    data = dict(layout=layout, follow=j, steps=tr["steps"], rows=[{k: v for k, v in r.items() if k not in ("label", "y", "h")} for r in rows],
+                texts=texts, attrs=attrs, groups=groups)
+    payload = json.dumps(data, separators=(",", ":")).replace("</", "<\\/")
+    nsteps = len(tr["steps"])
+    controls = (f'<div class="an-controls"><button id="{p}-play" type="button">▶ Play</button>'
+                f'<button id="{p}-prev" type="button">◀ Step</button><button id="{p}-next" type="button">Step ▶</button>'
+                f'<button id="{p}-reset" type="button">Reset</button>'
+                f'<label>speed <select id="{p}-speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option>'
+                f'<option value="2">2×</option><option value="4">4×</option></select></label>'
+                f'<label>follow row <input id="{p}-follow" type="number" min="0" max="63" value="{j}"></label>'
+                f'<span class="an-pos" id="{p}-pos">{nsteps} / {nsteps}</span></div>')
+    if layout == "rvv":
+        caption = ("All arithmetic of the RVV repack kernel for 64 output rows over 2 × 128 K, on sample data (the same data as the "
+                   "VD4DOT animation below, so both end with the same 64 outputs). Every lane is one output row; the outlined lane is "
+                   "the row whose numbers are printed on the right and in the caption line. Click any lane or type a row number to "
+                   "follow another row. Columns 0 and 1 of each group are shown step by step, then the other 30 columns are applied at once. "
+                   "Scale 1 (activation scale) is applied once per 32-K group with one vector multiply-add, scale 2 (the 64 weight "
+                   "scales) once per 128-K block. Plain names in the picture, kernel names in the code: sign mask = sign, partial sums = sumi, "
+                   "block sums = facc, weight scales = dx, row totals = sumf, code = yc, activation scale = ab->d.")
+    else:
+        caption = ("All arithmetic of the VD4DOT kernel for the same 64 rows and the same sample data as the RVV animation above. "
+                   "The 256-lane rows are 64 rows × 4 columns: a 32-byte plane becomes 256 signs, and one 4-code quad is broadcast "
+                   "to every row. One nds.vd4dots.vv adds 4 products into each row's group sum. Quad 0 of each group is shown step by "
+                   "step, then the other 7 quads are applied at once. Scale 1 (activation scale) once per 32-K group, scale 2 (the 64 "
+                   "weight scales) once per 128-K block. Plain names in the picture, kernel names in the code: signs = w0, codes = s0, "
+                   "group sums = acc, block sums = facc, weight scales = dx, row totals = sumf, activation scale = a_ptr[g].d.")
+    return (f'<figure id="anim-{layout}" class="animfig">{controls}<div class="anim">'
+            f'<pre id="{p}-code"><code>{code}</code></pre><div class="stepfig">{picture}</div></div>'
+            f'<figcaption>{caption}</figcaption>'
+            f'<script type="application/json" id="{p}-data">{payload}</script><script>q1Anim("{p}");</script></figure>')
+
+
