@@ -81,3 +81,14 @@ horizontal scroll or clipping. Fix used: the figure breaks out of the 960-px
 text column (width min(1440px, 100vw-40px)), the code column is
 minmax(0, max-content), kernel indentation halved to 2 spaces, stack below
 1000 px. Guard: test_animation_code_panels_show_every_kernel_line_unclipped.
+
+**Renamed code, 2026-09-04:** "直接把kernel code 變數改有意義的名稱" - he wants the
+kernel code SHOWN on the page to use meaningful variable names (weights,
+act_group, sign_mask, codes, neg_codes, signed_codes, group_sum, block_sum,
+row_total; row_sums/block_sums/weight_scales/row_totals; quads, planes,
+signs0..3, bcast0/1, group_sums). Done as a rename map applied at build time
+(RENAMES / rename_code in build_page.py) to code panels, ladders and picture
+labels; the raw repo source stays untouched in the details blocks and the
+tests compare shown code to the source *after* the rename. The real kernel
+files were NOT renamed - offer that as a separate structural commit if he
+wants it in the repo.
