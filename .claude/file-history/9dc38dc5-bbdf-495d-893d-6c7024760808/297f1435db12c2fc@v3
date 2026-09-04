@@ -1,0 +1,260 @@
+"""Guards for the Q1_0 layout page.
+
+Every drawn width must equal the byte/lane count it is labelled with, and every
+section must stay readable at a glance (<= 7 visible blocks, rest in <details>).
+"""
+import html
+import re
+from html.parser import HTMLParser
+
+import pytest
+
+import build_page as bp
+
+VISIBLE_BLOCK_CAP = 7
+VOID = {"br", "hr", "img", "link", "meta", "input", "wbr"}
+
+
+@pytest.fixture(scope="module")
+def page():
+    return bp.build_html()
+
+
+class Outline(HTMLParser):
+    """Direct children of every <section>/<header>, plus the text of every <summary>."""
+
+    def __init__(self):
+        super().__init__()
+        self.stack = []
+        self.blocks = {}
+        self.summaries = []
+        self._cur = None
+        self._sum = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag in VOID:
+            return
+        a = dict(attrs)
+        if tag in ("section", "header"):
+            self._cur = a.get("id", tag)
+            self.blocks[self._cur] = []
+        elif self._cur and self.stack and self.stack[-1] in ("section", "header"):
+            self.blocks[self._cur].append(tag)
+        if tag == "summary":
+            self._sum = ""
+        self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        if tag in VOID:
+            return
+        if tag == "summary":
+            self.summaries.append(self._sum.strip())
+            self._sum = None
+        if tag in ("section", "header"):
+            self._cur = None
+        while self.stack and self.stack.pop() != tag:
+            pass
+
+    def handle_data(self, data):
+        if self._sum is not None:
+            self._sum += data
+
+
+def outline(page):
+    o = Outline()
+    o.feed(page)
+    return o
+
+
+def rect_attrs(page, role):
+    out = {}
+    for m in re.finditer(r"<rect ([^>]*)/>", page):
+        a = dict(re.findall(r'([\w-]+)="([^"]*)"', m.group(1)))
+        if a.get("data-role") == role:
+            out[a["data-variant"]] = a
+    return out
+
+
+def all_rects(page):
+    return [dict(re.findall(r'([\w-]+)="([^"]*)"', m.group(1))) for m in re.finditer(r"<rect ([^>]*)/>", page)]
+
+
+def label_for(page, key):
+    m = re.search(rf'<text [^>]*data-for="{key}"[^>]*>([^<]*)</text>', page)
+    assert m, f"no label with data-for={key}"
+    return m.group(1)
+
+
+# ---- readability -----------------------------------------------------------
+
+def test_every_section_shows_at_most_seven_blocks(page):
+    o = outline(page)
+    assert len(o.blocks) >= 9
+    over = {k: v for k, v in o.blocks.items() if len(v) > VISIBLE_BLOCK_CAP}
+    assert not over, f"sections over the cap: {over}"
+
+
+def test_every_details_has_a_descriptive_summary(page):
+    o = outline(page)
+    assert o.summaries, "page has no <details> at all"
+    for s in o.summaries:
+        assert len(s.split()) >= 3 and s.lower() != "more", f"weak summary: {s!r}"
+
+
+# ---- the op-count model is what the kernels actually do --------------------
+
+def test_vector_instruction_counts_per_64x32_subtile():
+    assert bp.OPS_PER_SUBTILE == {"upstream": 320, "rvv": 96, "vd4": 32}
+
+
+def test_sign_bit_orders_are_two_permutations_of_one_tile():
+    cells = [(c, j) for c in range(bp.QK1) for j in range(bp.ROWS)]
+    for f in (bp.sign_bit_rvv, bp.sign_bit_vd4):
+        assert sorted(f(c, j) for c, j in cells) == list(range(bp.QK1 * bp.ROWS))
+    # one vlm.v footprint: rvv plane 0 = column 0 only, vd4 plane 0 = columns 0..3
+    rvv0 = {(c, j) for c, j in cells if bp.sign_bit_rvv(c, j) < 64}
+    vd40 = {(c, j) for c, j in cells if bp.sign_bit_vd4(c, j) < 256}
+    assert rvv0 == {(0, j) for j in range(64)}
+    assert vd40 == {(c, j) for c in range(4) for j in range(64)}
+    assert {c for c, _ in rvv0} == {0} and len(rvv0) == bp.FOOTPRINT_BYTES["rvv"] * 8
+    assert len(vd40) == bp.FOOTPRINT_BYTES["vd4"] * 8
+
+
+# ---- drawn geometry equals printed label ----------------------------------
+
+def test_bytemap_footprints_are_drawn_to_scale_and_labelled(page):
+    got = rect_attrs(page, "footprint")
+    assert set(got) == set(bp.VARIANTS)
+    for v, a in got.items():
+        nbytes = bp.FOOTPRINT_BYTES[v]
+        assert int(a["data-bytes"]) == nbytes
+        assert float(a["width"]) == pytest.approx(nbytes * bp.PX_MAP)
+        assert float(a["height"]) == pytest.approx(bp.MAP_CELL_H)
+        assert f"{nbytes} B" in label_for(page, f"footprint-{v}")
+
+
+def test_bytemap_panels_hold_the_whole_1152_byte_tile(page):
+    got = rect_attrs(page, "map")
+    assert set(got) == set(bp.VARIANTS)
+    for a in got.values():
+        assert float(a["width"]) == pytest.approx(bp.MAP_WRAP * bp.PX_MAP)
+        assert float(a["height"]) == pytest.approx(bp.BLOCK_Q1X64 / bp.MAP_WRAP * bp.MAP_CELL_H)
+
+
+def test_repack_scales_are_one_block_of_128_bytes(page):
+    got = rect_attrs(page, "scales")
+    assert set(got) == {"rvv", "vd4"}
+    for a in got.values():
+        assert float(a["width"]) == pytest.approx(bp.MAP_WRAP * bp.PX_MAP)
+        assert float(a["height"]) == pytest.approx(bp.SCALE_BYTES / bp.MAP_WRAP * bp.MAP_CELL_H)
+
+
+def test_upstream_scales_sit_every_18_bytes(page):
+    cells = [a for a in all_rects(page) if a.get("data-role") == "scale" and a.get("data-variant") == "upstream"]
+    assert len(cells) == bp.ROWS
+    x0 = float(rect_attrs(page, "map")["upstream"]["x"])
+    y0 = float(rect_attrs(page, "map")["upstream"]["y"])
+    for j, a in enumerate(sorted(cells, key=lambda a: int(a["data-byte"]))):
+        b = int(a["data-byte"])
+        assert b == j * bp.BLOCK_Q1
+        assert float(a["width"]) == pytest.approx(2 * bp.PX_MAP)
+        assert float(a["x"]) == pytest.approx(x0 + (b % bp.MAP_WRAP) * bp.PX_MAP)
+        assert float(a["y"]) == pytest.approx(y0 + (b // bp.MAP_WRAP) * bp.MAP_CELL_H)
+
+
+def test_first_parameter_byte_inset_names_the_right_row_and_column(page):
+    where = {
+        "upstream": lambda i: (0, i),                       # record 0, qs[0]: columns 0..7 of row 0
+        "rvv": lambda i: (i, 0),                            # plane 0 byte 0: rows 0..7 of column 0
+        "vd4": lambda i: (i // 4, i % 4),                   # plane 0 byte 0: rows 0..1, columns 0..3
+    }
+    for v, f in where.items():
+        for i in range(8):
+            j, c = f(i)
+            if v == "rvv":
+                assert bp.sign_bit_rvv(c, j) == i
+            if v == "vd4":
+                assert bp.sign_bit_vd4(c, j) == i
+            assert label_for(page, f"bit-{v}-{i}") == f"r{j}c{c}"
+
+
+def test_every_memory_figure_has_a_scale_and_parameter_legend(page):
+    for fid in ("fig-hero", "fig-formats", "fig-bytemap", "fig-up", "fig-rvv", "fig-vd4", "fig-act-gemv", "fig-act-gemm"):
+        m = re.search(rf'<svg id="{fid}".*?</svg>', page, re.S)
+        assert m, fid
+        legend = re.findall(r'<text [^>]*data-role="legend"[^>]*>([^<]*)</text>', m.group(0))
+        assert legend, f"{fid} has no legend"
+        joined = " ".join(legend).lower()
+        assert "scale" in joined and "parameter" in joined, f"{fid}: {joined}"
+
+
+def test_hero_draws_the_scales_at_bit_scale(page):
+    got = rect_attrs(page, "tilescale")
+    assert set(got) == set(bp.VARIANTS)
+    bits = {"upstream": (16, 64), "rvv": (128, 8), "vd4": (128, 8)}   # (bit columns, rows) = 1024 bits each
+    for v, a in got.items():
+        w, h = bits[v]
+        assert w * h == bp.SCALE_BYTES * 8
+        assert float(a["width"]) == pytest.approx(w * bp.TILE_CELL)
+        assert float(a["height"]) == pytest.approx(h * bp.TILE_CELL)
+
+
+def test_hero_tile_footprints_match_one_vlm(page):
+    got = rect_attrs(page, "tilefoot")
+    assert set(got) == set(bp.VARIANTS)
+    for v, a in got.items():
+        cols, rows = bp.FOOTPRINT_CELLS[v]
+        assert float(a["width"]) == pytest.approx(cols * bp.TILE_CELL)
+        assert float(a["height"]) == pytest.approx(rows * bp.TILE_CELL)
+        assert cols * rows == bp.FOOTPRINT_BYTES[v] * 8
+        assert f"{cols * rows} sign bits" in label_for(page, f"tilefoot-{v}")
+
+
+def test_hero_register_bars_show_busy_bytes(page):
+    got = rect_attrs(page, "regbusy")
+    for v, a in got.items():
+        assert float(a["width"]) == pytest.approx(bp.REG_BUSY[v] * bp.PX_REG)
+        assert float(a["width"]) <= bp.REG_AXIS * bp.PX_REG
+
+
+def test_hero_instruction_bars_are_proportional_and_labelled(page):
+    got = rect_attrs(page, "opsbar")
+    assert set(got) == set(bp.VARIANTS)
+    for v, a in got.items():
+        n = bp.OPS_PER_SUBTILE[v]
+        assert float(a["width"]) == pytest.approx(n * bp.PX_OPS)
+        assert f"{n} vector instructions" in label_for(page, f"opsbar-{v}")
+
+
+def test_format_strips_are_drawn_to_scale(page):
+    got = rect_attrs(page, "fmt")
+    assert float(got["q1"]["width"]) == pytest.approx(bp.BLOCK_Q1 * bp.PX_FMT)
+    assert float(got["q8x4"]["width"]) == pytest.approx(4 * bp.BLOCK_Q8 * bp.PX_FMT)
+    assert float(got["q8x4"]["width"]) / float(got["q1"]["width"]) == pytest.approx(136 / 18)
+
+
+def test_activation_quads_alternate_alignment_in_the_q8_stream():
+    offs = [g * bp.BLOCK_Q8 + 2 for g in range(4)]
+    assert [o % 4 for o in offs] == [2, 0, 2, 0]
+    assert all(o % 4 == 0 for o in bp.restaged_quad_offsets())
+
+
+def test_source_excerpts_come_from_the_repo(page):
+    for needle in ("nds.vd4dots.vv %[acc], %[w0], %[s0]",
+                   "__riscv_vwredsum_vs_i8m1_i16m1",
+                   "__riscv_vadd_vx_i16m1_mu(sign, sumi, sumi",
+                   "return (c / 4) * 256 + 4 * j + (c % 4);"):
+        assert needle in page
+
+
+def test_struct_listing_is_visible_with_types_and_byte_offsets(page):
+    sec = re.search(r'<section id="structs">(.*?)</section>', page, re.S)
+    assert sec, "no structs section"
+    visible = re.sub(r"<details.*?</details>", "", sec.group(1), flags=re.S)
+    pres = re.findall(r"<pre>.*?</pre>", visible, re.S)
+    assert pres, "struct listing must be visible, not behind <details>"
+    text = html.unescape(" ".join(pres))
+    for needle in ("ggml_half d;", "uint8_t   qs[16];", "ggml_half d[64];", "uint8_t   qs[128][8];",
+                   "int8_t    qs[32];", "ggml_half d[4];", "int8_t    qs[128];",
+                   "18 B", "1152 B", "34 B", "136 B", "bytes 2..17", "bytes 128..1151", "bytes 8..135"):
+        assert needle in text, needle

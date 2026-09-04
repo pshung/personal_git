@@ -42,3 +42,14 @@ explanation.
 
 Related: [[q1_0-wide-vlen-repack-rowparallel]],
 [[xandesvdot-nds-vd4dots-usable]], [[keep-writeups-scoped-to-the-optimization]]
+
+**Third rejection, 2026-09-04 (layout page):** a 1152-byte strip at 0.75 px/byte
+made the 2-byte scales 1.5 px wide - "圖沒有劃出 parameter and scale 的位置 我看不出來".
+I answered with a byte map (8 px/byte, 32 B per row, every scale a visible
+cell), a per-bit inset, legends on every figure, and a visible C-struct
+section with types and byte offsets (he had asked "把他們的資料結構struct
+include type 呈現出來"). He then said "退回上一版本好了" and I rolled the
+artifact back to the first version, no reason given. So: the complaint stands
+(scale positions were not visible) but the byte-map + structs page is NOT an
+accepted answer either. Ask what he wants to see before redrawing; the v2
+generator is kept in the session scratchpad `q1_layout/v2/` only.

@@ -1,0 +1,807 @@
+#!/usr/bin/env python3
+"""Generate the "One Q1_0 Tile, Three Layouts" page.
+
+Every drawn width on the page derives from the constants below, and every
+source excerpt is cut from the repo at build time, so the page cannot drift
+from the kernels it explains.
+"""
+from pathlib import Path
+import html
+import random
+
+REPO = Path("/home/nick/work/llama.cpp")
+OUT = Path(__file__).with_name("q1_0_layout_page.html")
+
+# ---- format and machine constants ------------------------------------------
+QK1, QK8, ROWS = 128, 32, 64
+VLENB = 128                              # VLEN = 1024 bits
+BLOCK_Q1 = 2 + QK1 // 8                  # 18 B: fp16 d + 128 sign bits
+BLOCK_Q8 = 2 + QK8                       # 34 B: fp16 d + 32 int8
+BLOCK_Q8X4 = 4 * 2 + 4 * QK8             # 136 B: 4 fp16 d + 4 x 32 int8 (interleaved)
+BLOCK_Q1X64 = ROWS * BLOCK_Q1            # 1152 B
+SCALE_BYTES = ROWS * 2                   # 128 B of fp16 scales at the block front
+SIGN_BYTES = BLOCK_Q1X64 - SCALE_BYTES   # 1024 B = 64 x 128 bits
+
+
+def sign_bit_rvv(c, j):
+    """repack.h q1_0x64_sign_bit, default order: column-major planes."""
+    return c * ROWS + j
+
+
+def sign_bit_vd4(c, j):
+    """repack.h q1_0x64_sign_bit, Q1_VD4DOT order: 4 columns per lane."""
+    return (c // 4) * 256 + 4 * j + (c % 4)
+
+
+VARIANTS = ["upstream", "rvv", "vd4"]
+NAME = {"upstream": "Upstream", "rvv": "RVV repack", "vd4": "VD4DOT repack"}
+COL = {"upstream": "var(--up)", "rvv": "var(--rvv)", "vd4": "var(--vd4)"}
+COL_LT = {"upstream": "var(--up-lt)", "rvv": "var(--rvv-lt)", "vd4": "var(--vd4-lt)"}
+SCALE, SCALE_LT = "var(--scale)", "var(--scale-lt)"
+ACT, ACT_LT = "var(--act)", "var(--act-lt)"
+ACT_ROW = ["var(--m0)", "var(--m1)", "var(--m2)", "var(--m3)"]
+TRACK, LINE, INK, MUTED, PAPER = "var(--track)", "var(--line)", "currentColor", "var(--muted)", "var(--paper)"
+
+# what ONE vlm.v pulls from the sign region
+FOOTPRINT_BYTES = {"upstream": 4, "rvv": 8, "vd4": 32}
+FOOTPRINT_CELLS = {"upstream": (32, 1), "rvv": (1, 64), "vd4": (4, 64)}   # (columns, rows)
+
+# vector instructions per 64 rows x 32 K, read off the kernel inner loops
+UNIT_OPS = {
+    "upstream": (["vlm.v", "vle8.v", "vneg.v", "vmerge.vvm", "vwredsum.vs"], ROWS),   # per row
+    "rvv":      (["vlm.v", "vsub.vx", "vadd.vx (masked)"], QK8),                      # per column
+    "vd4":      (["vlm.v", "vmerge.vxm", "vmv.v.x", "nds.vd4dots.vv"], QK8 // 4),     # per 4-column quad
+}
+OPS_PER_SUBTILE = {v: len(ops) * n for v, (ops, n) in UNIT_OPS.items()}
+
+# register bytes carrying useful lanes per instruction, VLEN = 1024
+REG_AXIS = 2 * VLENB                                     # an m2 group, 256 B
+REG_GROUP = {"upstream": VLENB, "rvv": VLENB, "vd4": 2 * VLENB}
+REG_BUSY = {"upstream": 32, "rvv": 128, "vd4": 256}
+REG_LABEL = {
+    "upstream": "e8, m1: 32 of 128 lanes busy",
+    "rvv": "e16, m1: 64 lanes, all busy",
+    "vd4": "e8, m2: 256 lanes, all busy",
+}
+OUTCOME = {
+    "upstream": "then vwredsum.vs: 32 lanes → 1 sum, for 1 row",
+    "rvv": "64 row sums, each advances by 1 column",
+    "vd4": "64 row sums, each advances by 4 columns",
+}
+
+# ---- drawing scales --------------------------------------------------------
+W = 920
+TILE_CELL = 2.25                      # hero: one sign bit
+PX_REG = 288 / REG_AXIS               # hero: register byte
+PX_OPS = 288 / max(OPS_PER_SUBTILE.values())
+PX_STRIP = 0.75                       # weight memory strip byte
+PX_FMT = 6                            # format strips byte
+PX_FLOW = 8                           # flow figures: memory byte
+PX_LANE8 = 2                          # flow figures: one i8 lane of an m2 group
+
+
+def restaged_quad_offsets():
+    """Byte offsets of the 32-bit activation quads in the aligned copy the vd4 gemv makes."""
+    return [g * QK8 + 4 * q for g in range(4) for q in range(QK8 // 4)]
+
+
+# ---- source excerpts -------------------------------------------------------
+def excerpt(rel, start, end="}"):
+    lines = (REPO / rel).read_text().splitlines()
+    i = next(n for n, l in enumerate(lines) if start in l)
+    j = next(n for n in range(i + 1, len(lines)) if lines[n] == end)
+    return "\n".join(lines[i:j + 1])
+
+
+def excerpt_range(rel, first, last):
+    lines = (REPO / rel).read_text().splitlines()
+    return "\n".join(lines[first - 1:last])
+
+
+# ---- svg helpers -----------------------------------------------------------
+def esc(s):
+    return html.escape(str(s), quote=True)
+
+
+def _attrs(a):
+    return "".join(f' {k.replace("_", "-")}="{esc(v)}"' for k, v in a.items())
+
+
+def R(x, y, w, h, fill, **a):
+    return f'<rect x="{x:g}" y="{y:g}" width="{w:g}" height="{h:g}" fill="{fill}"{_attrs(a)}/>'
+
+
+def T(x, y, s, size=12, anchor="start", fill=INK, weight="normal", **a):
+    return (f'<text x="{x:g}" y="{y:g}" font-size="{size}" text-anchor="{anchor}" fill="{fill}" '
+            f'font-weight="{weight}"{_attrs(a)}>{esc(s)}</text>')
+
+
+def L(x1, y1, x2, y2, stroke=INK, width=1, dash=None, arrow=False):
+    d = f' stroke-dasharray="{dash}"' if dash else ""
+    m = ' marker-end="url(#arrow)"' if arrow else ""
+    return f'<line x1="{x1:g}" y1="{y1:g}" x2="{x2:g}" y2="{y2:g}" stroke="{stroke}" stroke-width="{width}"{d}{m}/>'
+
+
+def ARROW_DEF():
+    return ('<marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">'
+            '<path d="M0,0 L8,4 L0,8 z" fill="currentColor"/></marker>')
+
+
+def down(x, y1, y2, label=None, lx=None):
+    s = L(x, y1, x, y2, arrow=True)
+    if label:
+        s += T((lx if lx is not None else x + 6), (y1 + y2) / 2 + 4, label, 11, fill=MUTED)
+    return s
+
+
+def svg(fid, w, h, body, label):
+    return (f'<svg id="{fid}" viewBox="0 0 {w + 20} {h}" role="img" aria-label="{esc(label)}">'
+            f'<defs>{ARROW_DEF()}{body[0]}</defs>{body[1]}</svg>')
+
+
+def sample_bits(n, seed):
+    rnd = random.Random(seed)
+    return [rnd.random() < 0.5 for _ in range(n)]
+
+
+def lanes(x, y, n, pitch, h, colors, gap=0.5):
+    """n adjacent lane cells; colors is a list of fills, one per lane."""
+    return "".join(R(x + i * pitch, y, max(pitch - gap, 0.5), h, colors[i]) for i in range(n))
+
+
+# ---- figures ---------------------------------------------------------------
+def fig_hero():
+    colw, gap = 288, 28
+    tw, th = QK1 * TILE_CELL, ROWS * TILE_CELL
+    y_title, y_tile = 14, 26
+    y_foot = y_tile + th + 16
+    y_reg = y_foot + 12
+    y_regl = y_reg + 28
+    y_out = y_regl + 20
+    y_bar = y_out + 14
+    y_barl = y_bar + 28
+    H = y_barl + 8
+    defs = (f'<pattern id="grid8" width="{8 * TILE_CELL:g}" height="{8 * TILE_CELL:g}" patternUnits="userSpaceOnUse">'
+            f'<path d="M {8 * TILE_CELL:g} 0 L 0 0 0 {8 * TILE_CELL:g}" fill="none" stroke="{LINE}" stroke-width="0.6"/></pattern>')
+    body = []
+    for i, v in enumerate(VARIANTS):
+        x0 = i * (colw + gap)
+        body.append(R(x0, y_title - 10, 10, 10, COL[v]))
+        body.append(T(x0 + 16, y_title, NAME[v], 13, weight="bold"))
+        body.append(T(x0 + colw, y_title, "64 rows × 128 K", 11, anchor="end", fill=MUTED))
+        body.append(R(x0, y_tile, tw, th, TRACK))
+        body.append(R(x0, y_tile, tw, th, "url(#grid8)"))
+        cols, rows = FOOTPRINT_CELLS[v]
+        body.append(R(x0, y_tile, cols * TILE_CELL, rows * TILE_CELL, COL[v],
+                      data_role="tilefoot", data_variant=v, data_cols=cols, data_rows=rows))
+        body.append(T(x0, y_foot, f"one vlm.v = {cols * rows} sign bits: {rows} row{'s' if rows > 1 else ''} × {cols} column{'s' if cols > 1 else ''}",
+                      11, data_for=f"tilefoot-{v}"))
+        # register: 256-byte axis for all three
+        body.append(R(x0, y_reg, REG_AXIS * PX_REG, 14, TRACK))
+        body.append(R(x0, y_reg, REG_BUSY[v] * PX_REG, 14, COL[v], data_role="regbusy", data_variant=v, data_bytes=REG_BUSY[v]))
+        body.append(R(x0, y_reg, REG_GROUP[v] * PX_REG, 14, "none", stroke=INK, stroke_width=1))
+        body.append(T(x0, y_regl, REG_LABEL[v], 11, fill=MUTED))
+        body.append(T(x0, y_out, OUTCOME[v], 11))
+        n = OPS_PER_SUBTILE[v]
+        body.append(R(x0, y_bar, n * PX_OPS, 14, COL[v], data_role="opsbar", data_variant=v, data_ops=n))
+        body.append(T(x0, y_barl, f"{n} vector instructions per 64 rows × 32 K", 11, weight="bold", data_for=f"opsbar-{v}"))
+    return svg("fig-hero", W, H, (defs, "".join(body)),
+               "One vlm.v covers a 1x32 sliver upstream, a 64x1 column after the RVV repack and a 64x4 band after the "
+               "VD4DOT repack; the register goes from 32 busy lanes to 256, and the instruction count per 64x32 sub-tile from 320 to 32.")
+
+
+def fig_formats():
+    p = PX_FMT
+    y1, y2, hh = 30, 104, 22
+    body = []
+    body.append(T(0, y1 - 9, "block_q1_0 · 18 B · 128 weights: 1 fp16 scale + 128 sign bits", 12, weight="bold"))
+    body.append(R(0, y1, BLOCK_Q1 * p, hh, "none", data_role="fmt", data_variant="q1"))
+    body.append(R(0, y1, 2 * p, hh, SCALE))
+    body.append(T(p, y1 + 15, "d", 10, anchor="middle", fill="var(--on-mark)"))
+    for k in range(4):
+        x = 2 * p + k * 4 * p
+        body.append(R(x, y1, 4 * p - 0.5, hh, COL["upstream"]))
+        body.append(T(x + 2 * p, y1 + 15, f"k{k}", 10, anchor="middle", fill="var(--on-mark)"))
+    body.append(T(BLOCK_Q1 * p + 8, y1 + 15, "qs[16]: byte b holds K = 8b .. 8b+7, LSB first (an RVV mask image)", 11, fill=MUTED))
+    body.append(R(0, y2, 4 * BLOCK_Q8 * p, hh, "none", data_role="fmt", data_variant="q8x4"))
+    for k in range(4):
+        x = k * BLOCK_Q8 * p
+        body.append(R(x, y2, 2 * p, hh, SCALE))
+        body.append(T(x + p, y2 + 15, "d", 10, anchor="middle", fill="var(--on-mark)"))
+        body.append(R(x + 2 * p, y2, QK8 * p - 0.5, hh, ACT))
+        body.append(T(x + 2 * p + QK8 * p / 2, y2 + 15, f"qs[32] of block k{k} · K {32 * k} .. {32 * k + 31}", 10, anchor="middle", fill="var(--on-mark)"))
+        # pairing lines: Q1 sub-segment k -> Q8 block k
+        xa = 2 * p + k * 4 * p + 2 * p
+        xb = x + 2 * p + QK8 * p / 2
+        body.append(L(xa, y1 + hh, xb, y2, stroke=MUTED, width=0.8, dash="3 3"))
+    body.append(T(0, y2 + hh + 16, "4 × block_q8_0 · 136 B · 128 activations: 4 fp16 scales + 128 int8 codes", 12, weight="bold"))
+    body.append(T(0, y2 + hh + 42, "y[j] = Σₖ d_w[j] · d_a[k] · Σ_{c ∈ k} sign(j, c) · a[c]      sign = +1 or −1, k = the 32-K group", 12))
+    body.append(T(0, y2 + hh + 62, "Weights are 7.5× smaller than the activations they multiply. Each 32-K int sum is scaled by d_a[k] before groups merge.", 11, fill=MUTED))
+    return svg("fig-formats", W, y2 + hh + 72, ("", "".join(body)),
+               "A block_q1_0 is 18 bytes for 128 weights; the four block_q8_0 it pairs with are 136 bytes for 128 activations. "
+               "Each 4-byte sub-segment of the Q1_0 sign bits pairs with one Q8_0 block.")
+
+
+def fig_weight_strips():
+    p = PX_STRIP
+    x0 = 56
+    hh = 34
+    ys = {"upstream": 46, "rvv": 134, "vd4": 208}
+    axis_y = ys["vd4"] + hh + 22
+    rec = BLOCK_Q1 * p
+    defs = (
+        f'<pattern id="pat-up" width="{rec:g}" height="{hh}" patternUnits="userSpaceOnUse">'
+        f'<rect width="{2 * p:g}" height="{hh}" fill="{SCALE}"/>'
+        f'<rect x="{2 * p:g}" width="{16 * p:g}" height="{hh}" fill="{COL["upstream"]}"/>'
+        f'<rect x="{rec - 0.4:g}" width="0.4" height="{hh}" fill="{PAPER}"/></pattern>'
+        f'<pattern id="pat-rvv" width="{8 * p:g}" height="{hh}" patternUnits="userSpaceOnUse">'
+        f'<rect width="{8 * p:g}" height="{hh}" fill="{COL["rvv"]}"/>'
+        f'<rect width="0.5" height="{hh}" fill="{PAPER}"/></pattern>'
+        f'<pattern id="pat-vd4" width="{32 * p:g}" height="{hh}" patternUnits="userSpaceOnUse">'
+        f'<rect width="{32 * p:g}" height="{hh}" fill="{COL["vd4"]}"/>'
+        f'<rect width="0.7" height="{hh}" fill="{PAPER}"/></pattern>'
+    )
+    body = []
+    # upstream: 64 records of 18 B
+    y = ys["upstream"]
+    body.append(T(x0, y - 8, "Upstream · 64 × block_q1_0, row-major · scale of row j is inside record j", 12, weight="bold"))
+    body.append(R(x0, y, BLOCK_Q1X64 * p, hh, "url(#pat-up)", data_role="strip", data_variant="upstream"))
+    fx = x0 + 2 * p
+    body.append(R(fx, y, FOOTPRINT_BYTES["upstream"] * p, hh, "none", stroke=INK, stroke_width=1.5,
+                  data_role="footprint", data_variant="upstream", data_bytes=FOOTPRINT_BYTES["upstream"]))
+    body.append(L(fx + 1.5, y + hh, fx + 40, y + hh + 12, stroke=INK, width=0.8))
+    body.append(T(fx + 44, y + hh + 16, "one vlm.v reads 4 B = 32 signs of row 0 · the 64 scales are 64 scalar 2-B reads, one per record", 11, data_for="footprint-upstream"))
+    # rvv
+    y = ys["rvv"]
+    body.append(T(x0, y - 8, "RVV repack · block_q1_0x64 · d[64] then 128 column planes of 8 B", 12, weight="bold"))
+    body.append(R(x0, y, BLOCK_Q1X64 * p, hh, "none", data_role="strip", data_variant="rvv"))
+    body.append(R(x0, y, SCALE_BYTES * p, hh, SCALE, data_role="scales", data_variant="rvv"))
+    body.append(R(x0 + SCALE_BYTES * p, y, SIGN_BYTES * p, hh, "url(#pat-rvv)"))
+    fx = x0 + SCALE_BYTES * p
+    body.append(R(fx, y, FOOTPRINT_BYTES["rvv"] * p, hh, "none", stroke=INK, stroke_width=1.5,
+                  data_role="footprint", data_variant="rvv", data_bytes=FOOTPRINT_BYTES["rvv"]))
+    body.append(T(x0 + SCALE_BYTES * p / 2, y + 21, "d[0..63]", 10, anchor="middle", fill="var(--on-mark)"))
+    body.append(T(fx + FOOTPRINT_BYTES["rvv"] * p + 8, y + 21, "one vlm.v reads 8 B = column 0 of rows 0..63 · one vle16.v reads all 64 scales", 11, fill="var(--on-mark)", data_for="footprint-rvv"))
+    # vd4
+    y = ys["vd4"]
+    body.append(T(x0, y - 8, "VD4DOT repack · block_q1_0x64 · d[64] then 32 planes of 32 B, one plane = 4 columns", 12, weight="bold"))
+    body.append(R(x0, y, BLOCK_Q1X64 * p, hh, "none", data_role="strip", data_variant="vd4"))
+    body.append(R(x0, y, SCALE_BYTES * p, hh, SCALE, data_role="scales", data_variant="vd4"))
+    body.append(R(x0 + SCALE_BYTES * p, y, SIGN_BYTES * p, hh, "url(#pat-vd4)"))
+    fx = x0 + SCALE_BYTES * p
+    body.append(R(fx, y, FOOTPRINT_BYTES["vd4"] * p, hh, "none", stroke=INK, stroke_width=1.5,
+                  data_role="footprint", data_variant="vd4", data_bytes=FOOTPRINT_BYTES["vd4"]))
+    body.append(T(x0 + SCALE_BYTES * p / 2, y + 21, "d[0..63]", 10, anchor="middle", fill="var(--on-mark)"))
+    body.append(T(fx + FOOTPRINT_BYTES["vd4"] * p + 8, y + 21, "one vlm.v reads 32 B = columns 0..3 of rows 0..63 · same scales", 11, fill="var(--on-mark)", data_for="footprint-vd4"))
+    # byte axis
+    for b in range(0, BLOCK_Q1X64 + 1, 128):
+        x = x0 + b * p
+        body.append(L(x, axis_y - 6, x, axis_y, stroke=MUTED, width=0.8))
+        body.append(T(x, axis_y + 12, f"{b}", 10, anchor="middle", fill=MUTED))
+    body.append(L(x0, axis_y, x0 + BLOCK_Q1X64 * p, axis_y, stroke=MUTED, width=0.8))
+    body.append(T(x0 + BLOCK_Q1X64 * p, axis_y + 26, "byte offset inside the 1152-B tile", 10, anchor="end", fill=MUTED))
+    # legend
+    lx = x0
+    body.append(R(lx, 8, 10, 10, SCALE)); body.append(T(lx + 14, 17, "fp16 weight scale bytes", 11, fill=MUTED))
+    body.append(R(lx + 180, 8, 10, 10, COL["rvv"])); body.append(T(lx + 194, 17, "sign bytes (colour = layout)", 11, fill=MUTED))
+    body.append(R(lx + 400, 8, 10, 10, "none", stroke=INK, stroke_width=1.5)); body.append(T(lx + 414, 17, "bytes one vlm.v reads", 11, fill=MUTED))
+    return svg("fig-strips", W, axis_y + 32, (defs, "".join(body)),
+               "The same 1152 bytes drawn three times: upstream interleaves a 2-byte scale into every 18-byte record and a mask load "
+               "reads 4 bytes; both repacks put all 64 scales first and a mask load reads 8 or 32 contiguous bytes.")
+
+
+def fig_upstream_flow():
+    p = PX_FLOW
+    body = []
+    y_mem, hh = 36, 20
+    # memory
+    body.append(T(0, 10, "memory", 11, fill=MUTED, weight="bold"))
+    body.append(R(0, y_mem, 2 * p, hh, SCALE)); body.append(T(p, y_mem + 14, "d", 10, anchor="middle", fill="var(--on-mark)"))
+    body.append(R(2 * p, y_mem, 16 * p, hh, COL["upstream"]))
+    body.append(T(2 * p + 8 * p, y_mem + 14, "block_q1_0.qs · 16 B", 10, anchor="middle", fill="var(--on-mark)"))
+    body.append(R(2 * p, y_mem, 4 * p, hh, "none", stroke=INK, stroke_width=2))
+    body.append(T(2 * p, y_mem - 6, "qs[4k .. 4k+3] · 4 B", 11))
+    xa = 300
+    body.append(R(xa, y_mem, 2 * p, hh, SCALE)); body.append(T(xa + p, y_mem + 14, "d", 10, anchor="middle", fill="var(--on-mark)"))
+    body.append(R(xa + 2 * p, y_mem, QK8 * p, hh, ACT))
+    body.append(T(xa + 2 * p + QK8 * p / 2, y_mem + 14, "block_q8_0.qs · 32 B = a[32k .. 32k+31]", 10, anchor="middle", fill="var(--on-mark)"))
+    body.append(T(xa, y_mem - 6, "one Q8_0 group of row y", 11))
+    # registers
+    y_reg = 100
+    body.append(down(2 * p + 16, y_mem + hh, y_reg, "vlm.v: 4 B → 32 mask bits"))
+    mask_x, lane = 0, 4
+    bits = sample_bits(32, 1)
+    body.append(lanes(mask_x, y_reg, 32, lane, 14, [COL["upstream"] if b else COL_LT["upstream"] for b in bits]))
+    body.append(T(0, y_reg + 26, "m: 32 sign bits", 11))
+    vx = xa + 2 * p
+    body.append(down(vx + 40, y_mem + hh, y_reg, "vle8.v: 32 i8 into a 128-lane register"))
+    body.append(R(vx, y_reg, VLENB * lane, 14, TRACK))
+    body.append(lanes(vx, y_reg, 32, lane, 14, [ACT] * 32))
+    body.append(T(vx + 32 * lane + 6, y_reg + 11, "lanes 32 .. 127 idle", 10, fill=MUTED))
+    body.append(T(vx, y_reg + 26, "qy: 32 of 128 lanes", 11))
+    # select
+    y_sel = 156
+    body.append(down(vx + 40, y_reg + 30, y_sel, "vneg.v, then vmerge.vvm with m: lane c = m[c] ? +a[c] : −a[c]"))
+    body.append(L(mask_x + 64, y_reg + 30, vx + 30, y_sel - 2, stroke=COL["upstream"], width=1, dash="4 3", arrow=True))
+    body.append(R(vx, y_sel, VLENB * lane, 14, TRACK))
+    body.append(lanes(vx, y_sel, 32, lane, 14, [ACT if b else ACT_LT for b in bits]))
+    body.append(T(vx, y_sel + 26, "sy: 32 signed products, one row, 32 K", 11))
+    # reduce
+    y_red = 216
+    body.append(f'<polygon points="{vx:g},{y_sel + 30:g} {vx + 32 * lane:g},{y_sel + 30:g} {vx + 68:g},{y_red:g} {vx + 60:g},{y_red:g}" fill="{COL_LT["upstream"]}"/>')
+    body.append(R(vx + 60, y_red, 8, 14, COL["upstream"]))
+    body.append(T(vx + 76, y_red + 11, "vwredsum.vs: 32 lanes → 1 i16 (horizontal reduction), vmv.x.s → scalar", 11))
+    y_sc = y_red + 40
+    body.append(T(vx, y_sc, "acc += d_a[k] · sum          (scalar float, once per 32 K)", 11))
+    body.append(T(vx, y_sc + 18, "s[y] += d_w · acc            (scalar float, once per 128 K)", 11))
+    body.append(T(0, y_sc + 48, f"Repeat for every output row: 64 rows × 4 groups × 5 = {OPS_PER_SUBTILE['upstream']} vector instructions per 64 rows × 32 K, plus 64 reductions.", 11, weight="bold"))
+    return svg("fig-up", W, y_sc + 60, ("", "".join(body)),
+               "Upstream: a 4-byte mask load and a 32-byte activation load fill 32 of 128 lanes, a merge selects the sign, "
+               "and a horizontal reduction collapses the 32 lanes to one scalar per row per 32 K.")
+
+
+def fig_rvv_flow():
+    p = PX_FLOW
+    lane = 6
+    c = 5
+    body = []
+    y_mem, hh = 36, 20
+    body.append(T(0, 10, "memory", 11, fill=MUTED, weight="bold"))
+    body.append(R(0, y_mem, 8 * p, hh, COL["rvv"]))
+    body.append(T(4 * p, y_mem + 14, "8 B", 10, anchor="middle", fill="var(--on-mark)"))
+    body.append(T(0, y_mem - 6, "plane c = qs[32k + c] · column c of rows 0..63", 11))
+    xa = 480
+    body.append(R(xa, y_mem, 2 * p, hh, SCALE)); body.append(T(xa + p, y_mem + 14, "d", 10, anchor="middle", fill="var(--on-mark)"))
+    body.append(R(xa + 2 * p, y_mem, QK8 * p, hh, ACT))
+    body.append(R(xa + 2 * p + c * p, y_mem, p, hh, "none", stroke=INK, stroke_width=2))
+    body.append(T(xa + 2 * p + QK8 * p / 2, y_mem + 14, "block_q8_0.qs · 32 B", 10, anchor="middle", fill="var(--on-mark)"))
+    body.append(T(xa, y_mem - 6, "Q8_0 stream, unchanged: qs[c] is read as one scalar byte", 11))
+    # mask
+    y_msk = 100
+    body.append(down(4 * p, y_mem + hh, y_msk, "vlm.v: 8 B → 64 mask bits, bit j = row j"))
+    bits = sample_bits(64, 2)
+    body.append(lanes(0, y_msk, 64, lane, 12, [COL["rvv"] if b else COL_LT["rvv"] for b in bits]))
+    body.append(T(0, y_msk + 24, "sign: 64-lane mask", 11))
+    gx = xa + 2 * p + c * p
+    body.append(down(gx + 4, y_mem + hh, y_msk, "lb: 1 B → GPR yc = a[c]"))
+    body.append(R(gx - 20, y_msk, 48, 14, TRACK, stroke=INK, stroke_width=1))
+    body.append(T(gx + 4, y_msk + 11, "yc", 10, anchor="middle"))
+    # accumulate
+    y_acc = 160
+    body.append(down(32, y_msk + 16, y_acc, "vsub.vx sumi, yc: all 64 rows −a[c]   ·   vadd.vx sumi, 2·yc (masked): rows with sign 1 get +2a[c]  ⇒  ±a[c] per row", lx=40))
+    body.append(L(gx + 4, y_msk + 16, 64 * lane - 40, y_acc - 2, stroke=ACT, width=1, dash="4 3", arrow=True))
+    body.append(lanes(0, y_acc, 64, lane, 18, [COL["rvv"] if b else COL_LT["rvv"] for b in bits]))
+    body.append(T(0, y_acc + 32, "sumi: 64 × i16 = one accumulator per output row (e16, m1: 128 B, all lanes busy)", 11))
+    # scaling
+    y_f = y_acc + 62
+    body.append(down(32, y_acc + 36, y_f, "after 32 columns: vsext.vf2 → vfcvt.f.x.v → vfmacc.vf with d_a[k]", lx=40))
+    body.append(lanes(0, y_f, 64, lane, 12, [COL_LT["rvv"]] * 64))
+    body.append(T(0, y_f + 24, "facc: 64 × f32 (e32, m2)   ·   after 4 groups: vfmacc.vv with dx = expand(d[0..63]) → sumf  ·  vse32.v → s[0..63]", 11))
+    body.append(T(0, y_f + 50, f"32 columns × 3 = {OPS_PER_SUBTILE['rvv']} vector instructions per 64 rows × 32 K. No horizontal reduction: the K sum grows inside each row's lane.", 11, weight="bold"))
+    return svg("fig-rvv", W, y_f + 62, ("", "".join(body)),
+               "RVV repack: one 8-byte mask load gives the signs of one column for all 64 rows; a masked add/subtract with the "
+               "scalar activation advances 64 row accumulators by one column, with no reduction.")
+
+
+def fig_vd4_flow():
+    p = PX_FLOW
+    l8 = PX_LANE8
+    body = []
+    y_mem, hh = 36, 20
+    body.append(T(0, 10, "memory", 11, fill=MUTED, weight="bold"))
+    body.append(R(0, y_mem, 32 * p, hh, COL["vd4"]))
+    body.append(T(16 * p, y_mem + 14, "plane q · 32 B · columns 4q .. 4q+3 of rows 0..63", 10, anchor="middle", fill="var(--on-mark)"))
+    body.append(T(0, y_mem - 6, "plane q = qs[(8k + q) · 32 ..] · bit 4j + r = sign(row j, column 4q + r)", 11))
+    xa = 560
+    body.append(R(xa, y_mem, 4 * p, hh, ACT))
+    body.append(T(xa + 2 * p, y_mem + 14, "4 B", 10, anchor="middle", fill="var(--on-mark)"))
+    body.append(T(xa, y_mem - 6, "aq[32k + 4q]: quad a[4q .. 4q+3], 4-B aligned", 11))
+    # mask
+    y_msk = 100
+    body.append(down(16 * p, y_mem + hh, y_msk, "vlm.v: 32 B → 256 mask bits; bits 4j .. 4j+3 belong to row j"))
+    bits = sample_bits(256, 3)
+    body.append(lanes(0, y_msk, 256, l8, 10, [COL["vd4"] if b else COL_LT["vd4"] for b in bits], gap=0))
+    for j in range(0, 257, 4):
+        body.append(L(j * l8, y_msk, j * l8, y_msk + 10, stroke=PAPER, width=0.7))
+    body.append(T(0, y_msk + 22, "m: 256 sign bits", 11))
+    # w
+    y_w = y_msk + 50
+    body.append(down(16 * p, y_msk + 24, y_w, "vmerge.vxm(−1, +1, m): each bit becomes an i8 lane, −1 or +1"))
+    body.append(lanes(0, y_w, 256, l8, 14, [COL["vd4"] if b else COL_LT["vd4"] for b in bits], gap=0))
+    for j in range(0, 257, 4):
+        body.append(L(j * l8, y_w, j * l8, y_w + 14, stroke=PAPER, width=0.7))
+    body.append(T(0, y_w + 26, "w: 256 × i8 = 64 rows × 4 columns · lane 4j + r = sign(j, 4q + r)", 11))
+    # s
+    y_s = y_w + 58
+    body.append(down(xa + 2 * p, y_mem + hh, y_s))
+    body.append(T(xa + 2 * p + 8, y_s - 8, "lw → GPR → vmv.v.x (e32, m2): the quad in all 64 lanes", 11, fill=MUTED))
+    body.append(lanes(0, y_s, 256, l8, 14, [ACT_ROW[i % 4] for i in range(256)], gap=0))
+    body.append(T(0, y_s + 26, "s: 256 × i8 = a[4q], a[4q+1], a[4q+2], a[4q+3] repeated 64 times", 11))
+    # acc
+    y_a = y_s + 60
+    body.append(down(16 * p, y_s + 30, y_a, "nds.vd4dots.vv acc, w, s"))
+    body.append(lanes(0, y_a, 64, 4 * l8, 16, [COL["vd4"]] * 64, gap=1))
+    for j in (0, 63):
+        for r in range(4):
+            body.append(L((4 * j + r) * l8 + 1, y_w + 14, (4 * j + r) * l8 + 1, y_s, stroke=INK, width=0.6, dash="2 2"))
+            body.append(L((4 * j + r) * l8 + 1, y_s + 14, 4 * j * l8 + 4, y_a, stroke=INK, width=0.6, dash="2 2"))
+    body.append(T(0, y_a + 30, "acc: 64 × i32 · acc[j] += w[4j]·s[4j] + w[4j+1]·s[4j+1] + w[4j+2]·s[4j+2] + w[4j+3]·s[4j+3]  = row j advances by 4 columns", 11))
+    y_end = y_a + 56
+    body.append(T(0, y_end, "after 8 quads (32 K): vfcvt.f.x.v → vfmacc.vf with d_a[k] → facc · after 4 groups: vfmacc.vv with dx = expand(d[0..63]) → sumf", 11))
+    body.append(T(0, y_end + 22, f"8 quads × 4 = {OPS_PER_SUBTILE['vd4']} vector instructions per 64 rows × 32 K. The 4-term sum is inside the instruction.", 11, weight="bold"))
+    return svg("fig-vd4", W, y_end + 34, ("", "".join(body)),
+               "VD4DOT repack: one 32-byte mask load becomes 256 signed i8 lanes, the 4-byte activation quad is broadcast into "
+               "every 32-bit lane, and nds.vd4dots.vv adds four products into each of the 64 row accumulators.")
+
+
+def fig_act_gemv():
+    p = PX_FMT
+    x0 = 0
+    y1, y2, hh = 40, 118, 20
+    body = []
+    body.append(T(x0, y1 - 22, "Q8_0 stream as quantized · 34-B records, codes start at byte 2 of each record", 12, weight="bold"))
+    for g in range(4):
+        x = x0 + g * BLOCK_Q8 * p
+        body.append(R(x, y1, 2 * p, hh, SCALE)); body.append(T(x + p, y1 + 14, "d", 10, anchor="middle", fill="var(--on-mark)"))
+        body.append(R(x + 2 * p, y1, QK8 * p - 0.5, hh, ACT))
+        off = g * BLOCK_Q8 + 2
+        body.append(T(x + 2 * p + QK8 * p / 2, y1 + 14, f"qs at byte {off} · {off} mod 4 = {off % 4}", 10, anchor="middle", fill="var(--on-mark)"))
+    for b in range(0, 4 * BLOCK_Q8 + 1, 4):
+        x = x0 + b * p
+        body.append(L(x, y1 - 6, x, y1, stroke=MUTED, width=0.6))
+    body.append(T(x0, y1 - 9, "4-byte address grid", 9, fill=MUTED))
+    body.append(R(x0 + 2 * p, y1, 4 * p, hh, "none", stroke=INK, stroke_width=2))
+    body.append(T(x0 + 2 * p, y1 + hh + 14, "first quad a[0..3] sits at bytes 2..5: it crosses a 4-byte boundary. Groups 0 and 2 are 2 mod 4, groups 1 and 3 are 0 mod 4.", 11))
+    body.append(T(x0, y2 - 22, "Aligned copy made once per call: vle8.v / vse8.v, 32 B per group · every quad is 4-byte aligned · scales stay in the stream", 12, weight="bold"))
+    for g in range(4):
+        x = x0 + g * QK8 * p
+        for q in range(QK8 // 4):
+            body.append(R(x + q * 4 * p, y2, 4 * p - 0.5, hh, ACT))
+        body.append(T(x + QK8 * p / 2, y2 + 14, f"aq[{g * 32} .. {g * 32 + 31}]", 10, anchor="middle", fill="var(--on-mark)"))
+    body.append(R(x0, y2, 4 * p, hh, "none", stroke=INK, stroke_width=2))
+    body.append(T(x0, y2 + hh + 14, "aw[q] = *(uint32 *)(aq + 32k + 4q) → GPR → vmv.v.x   (a 32-bit vector element load on this core must be 4-byte aligned)", 11))
+    return svg("fig-act-gemv", W, y2 + hh + 24, ("", "".join(body)),
+               "The Q8_0 stream puts codes at byte 2 of every 34-byte record, so the 4-byte activation quads are 4-byte aligned only "
+               "in every other group; the vd4 gemv copies the codes once into an aligned 32-byte-per-group buffer.")
+
+
+def fig_act_gemm():
+    p = PX_FMT
+    x0 = 0
+    y1, y2, hh = 40, 152, 20
+    body = []
+    body.append(T(x0, y1 - 22, "block_q8_0x4 · 136 B · 4 activation rows of one 32-K group, interleaved by 1 byte: qs[c·4 + m]", 12, weight="bold"))
+    for m in range(4):
+        body.append(R(x0 + m * 2 * p, y1, 2 * p - 0.5, hh, SCALE))
+        body.append(T(x0 + m * 2 * p + p, y1 + 14, f"d{m}", 9, anchor="middle", fill="var(--on-mark)"))
+    xq = x0 + 8 * p
+    for c in range(QK8):
+        for m in range(4):
+            body.append(R(xq + (c * 4 + m) * p, y1, p - 0.4, hh, ACT_ROW[m]))
+    body.append(T(xq, y1 + hh + 14, "byte c·4 + m: column c of row m · the 4 rows' codes for one column sit side by side", 11))
+    for m in range(4):
+        body.append(R(x0 + m * 130, y1 + hh + 24, 10, 10, ACT_ROW[m]))
+        body.append(T(x0 + m * 130 + 14, y1 + hh + 33, f"row m = {m}", 11, fill=MUTED))
+    body.append(T(x0, y1 + hh + 52, "the standard RVV gemm reads qs[c·4 + m] as scalars and needs no copy", 11, fill=MUTED))
+    body.append(T(x0, y2 - 22, "VD4DOT gemm de-interleaves once per row tile: vle32.v (32 × u32) → vnsrl.wx 0 / 16 → vnsrl.wx 0 / 8 → vse8.v × 4", 12, weight="bold"))
+    rowh = 14
+    for m in range(4):
+        y = y2 + m * (rowh + 3)
+        body.append(T(x0, y + 11, f"aq[{m}·n + ..]", 10, anchor="start", fill=MUTED))
+        for q in range(QK8 // 4):
+            body.append(R(x0 + 90 + q * 4 * p, y, 4 * p - 0.5, rowh, ACT_ROW[m]))
+        body.append(T(x0 + 90 + QK8 * p + 8, y + 11, f"row {m}: 32 contiguous codes = 8 aligned quads → a{m}[c / 4]", 10, fill=MUTED))
+    y_end = y2 + 4 * (rowh + 3) + 20
+    body.append(T(x0, y_end, "one weight vector w then feeds four dots: nds.vd4dots.vv acc0..acc3, w, splat(a0..a3[c/4]) → the weight stream is read once for 4 output rows", 11))
+    return svg("fig-act-gemm", W, y_end + 12, ("", "".join(body)),
+               "The gemm activation block interleaves four rows byte by byte; the VD4DOT gemm peels them apart once with narrowing "
+               "shifts so each row's 32 codes are contiguous and form aligned 4-byte quads.")
+
+
+# ---- page ------------------------------------------------------------------
+CSS = r"""
+:root{
+  --paper:#F6F7F9; --track:#E9EDF1; --ink:#1F2A3A; --muted:#5B6979; --line:#D4DAE2; --code-bg:#EDF0F4;
+  --up:#7E8C9E; --up-lt:#CBD3DC;
+  --rvv:#2B6CB0; --rvv-lt:#B9D2EE;
+  --vd4:#C2611A; --vd4-lt:#F1CBA8;
+  --scale:#1E8577; --scale-lt:#B6E1D9;
+  --act:#6B4FBB; --act-lt:#D9D0F1;
+  --m0:#5A3FA8; --m1:#8069C9; --m2:#A896DE; --m3:#CFC4EF;
+  --on-mark:#FFFFFF; --focus:#1D4ED8;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#0F141B; --track:#1A2230; --ink:#E6EBF2; --muted:#98A5B6; --line:#2A3542; --code-bg:#151D28;
+    --up:#9AA8BA; --up-lt:#3B4756;
+    --rvv:#6FA8E8; --rvv-lt:#24466B;
+    --vd4:#E8955A; --vd4-lt:#6B3F1C;
+    --scale:#4FC3B2; --scale-lt:#1C4F47;
+    --act:#A995E6; --act-lt:#3A2F63;
+    --m0:#C3B4F2; --m1:#A08BE0; --m2:#7B64C4; --m3:#55439A;
+    --on-mark:#0F141B; --focus:#7AA2F7;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#0F141B; --track:#1A2230; --ink:#E6EBF2; --muted:#98A5B6; --line:#2A3542; --code-bg:#151D28;
+  --up:#9AA8BA; --up-lt:#3B4756;
+  --rvv:#6FA8E8; --rvv-lt:#24466B;
+  --vd4:#E8955A; --vd4-lt:#6B3F1C;
+  --scale:#4FC3B2; --scale-lt:#1C4F47;
+  --act:#A995E6; --act-lt:#3A2F63;
+  --m0:#C3B4F2; --m1:#A08BE0; --m2:#7B64C4; --m3:#55439A;
+  --on-mark:#0F141B; --focus:#7AA2F7;
+}
+*{box-sizing:border-box}
+html{background:var(--paper)}
+body{margin:0; background:var(--paper); color:var(--ink); font:16px/1.6 var(--sans)}
+h1,h2,h3,.eyebrow,code,pre,table,svg text,.stat b,summary{font-family:var(--mono); font-variant-numeric:tabular-nums}
+main{max-width:960px; margin:0 auto; padding:44px 20px 96px}
+.eyebrow{font-size:12px; letter-spacing:.14em; text-transform:uppercase; color:var(--vd4); margin:0 0 10px}
+h1{font-size:30px; line-height:1.2; margin:0 0 10px; font-weight:700; text-wrap:balance}
+h2{font-size:19px; margin:0 0 6px; font-weight:700; text-wrap:balance}
+h3{font-size:14px; margin:18px 0 4px}
+.sub{color:var(--muted); max-width:66ch; margin:0 0 28px}
+p{max-width:70ch; margin:10px 0}
+section,header{margin:0}
+section{padding:36px 0 0; margin-top:36px; border-top:1px solid var(--line)}
+a{color:var(--vd4); text-underline-offset:3px}
+:focus-visible{outline:2px solid var(--focus); outline-offset:2px; border-radius:3px}
+.stats{display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin:22px 0 0}
+.stat{border-top:3px solid var(--c); padding:10px 0 0}
+.stat b{display:block; font-size:24px; font-weight:700}
+.stat span{font-size:13px; color:var(--muted)}
+@media (max-width:640px){ .stats{grid-template-columns:1fr} }
+figure{margin:18px 0; padding:0; overflow-x:auto}
+figure svg{display:block; width:100%; max-width:100%; height:auto; min-width:640px}
+figcaption{font-size:13px; color:var(--muted); margin-top:8px; max-width:72ch}
+pre{background:var(--code-bg); border:1px solid var(--line); border-radius:6px; padding:12px 14px; font-size:12.5px; line-height:1.55; overflow-x:auto; margin:14px 0}
+code{background:var(--code-bg); border-radius:4px; padding:1px 5px; font-size:.9em}
+pre code{background:none; padding:0}
+.cm{color:var(--muted)}
+.k-up{color:var(--up)} .k-rvv{color:var(--rvv)} .k-vd4{color:var(--vd4)} .k-act{color:var(--act)} .k-sc{color:var(--scale)}
+table{border-collapse:collapse; width:100%; font-size:13.5px; margin:14px 0}
+th,td{text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top}
+th{font-weight:700; color:var(--muted); font-size:12px; letter-spacing:.04em; text-transform:uppercase}
+td.n{text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap}
+.tw{overflow-x:auto}
+details.more{border:1px solid var(--line); border-radius:6px; padding:0 14px; margin:14px 0}
+details.more summary{cursor:pointer; padding:10px 0; font-size:13px; color:var(--muted)}
+details.more[open] summary{border-bottom:1px solid var(--line); margin-bottom:8px}
+details.more pre{margin:10px 0 14px}
+.chip{display:inline-block; padding:0 7px; border-radius:4px; font-family:var(--mono); font-size:12px; color:var(--on-mark)}
+.chip.up{background:var(--up)} .chip.rvv{background:var(--rvv)} .chip.vd4{background:var(--vd4)}
+.legend{display:flex; gap:18px; flex-wrap:wrap; font-size:13px; color:var(--muted); margin:6px 0 0}
+.legend i{display:inline-block; width:11px; height:11px; margin-right:6px; vertical-align:-1px}
+@media (prefers-reduced-motion: no-preference){ details.more summary{transition:color .15s} }
+"""
+
+
+def pre(code, lang="c"):
+    return f'<pre><code class="lang-{lang}">{esc(code)}</code></pre>'
+
+
+def figure(svg_markup, caption):
+    return f"<figure>{svg_markup}<figcaption>{caption}</figcaption></figure>"
+
+
+def more(summary, inner):
+    return f'<details class="more"><summary>{summary}</summary>{inner}</details>'
+
+
+UPSTREAM_INNER = """// one output row y, one Q8_0 group k (32 K)                          register use at VLEN=1024
+vbool8_t   m   = __riscv_vlm_v_b8(x[ib].qs + 4*k, 32);              // 4 B  -> 32 mask bits
+vint8m1_t  qy  = __riscv_vle8_v_i8m1(yb->qs, 32);                   // 32 B -> lanes 0..31 of 128
+vint8m1_t  nqy = __riscv_vneg_v_i8m1(qy, 32);                       // -a
+vint8m1_t  sy  = __riscv_vmerge_vvm_i8m1(nqy, qy, m, 32);           // m ? +a : -a
+vint16m1_t r   = __riscv_vwredsum_vs_i8m1_i16m1(sy, zero, 32);      // 32 lanes -> 1 (horizontal)
+acc  += FP16_TO_FP32(yb->d) * (float) __riscv_vmv_x_s_i16m1_i16(r); // x d_a[k], scalar
+// after the 4 groups of this 128-K block:
+sumf += FP16_TO_FP32(x[ib].d) * acc;                                // x d_w, scalar"""
+
+RVV_INNER = """// 64 output rows at once, one Q8_0 group k (32 K)
+vint16m1_t sumi = __riscv_vmv_v_x_i16m1(0, 64);
+for (int c = 0; c < 32; ++c) {
+    const int16_t   yc   = ab->qs[c];                                        // 1 B scalar
+    const vbool16_t sign = __riscv_vlm_v_b16(bx[l].qs[k*32 + c], 64);        // 8 B -> 64-lane mask
+    sumi = __riscv_vsub_vx_i16m1(sumi, yc, 64);                              // every row:  -a[c]
+    sumi = __riscv_vadd_vx_i16m1_mu(sign, sumi, sumi, (int16_t)(2*yc), 64);  // sign rows: +2a[c]
+}
+facc = __riscv_vfmacc_vf_f32m2(facc, FP16_TO_FP32(ab->d),                    // x d_a[k] on 64 lanes
+           __riscv_vfcvt_f_x_v_f32m2(__riscv_vsext_vf2_i32m2(sumi, 64), 64), 64);
+// after the 4 groups of this 128-K block:
+sumf = __riscv_vfmacc_vv_f32m2(sumf, dx, facc, 64);                          // x d_w[0..63], one vector"""
+
+VD4_INNER = """// 64 output rows at once, 4 quads = 16 K of group k
+const uint8_t * p = planes + (k*8 + q) * 32;                                   // 4 planes x 32 B
+vint8m2_t w0 = __riscv_vmerge_vxm_i8m2(vneg1, 1, __riscv_vlm_v_b4(p +  0, 256), 256); // 256 signs -> +-1 i8
+vint8m2_t w1 = __riscv_vmerge_vxm_i8m2(vneg1, 1, __riscv_vlm_v_b4(p + 32, 256), 256);
+vint8m2_t w2 = __riscv_vmerge_vxm_i8m2(vneg1, 1, __riscv_vlm_v_b4(p + 64, 256), 256);
+vint8m2_t w3 = __riscv_vmerge_vxm_i8m2(vneg1, 1, __riscv_vlm_v_b4(p + 96, 256), 256);
+acc = q1_vd4dots_x4_m2(acc, w0, w1, w2, w3, aw[q], aw[q+1], aw[q+2], aw[q+3]);  // aw: uint32 quads
+
+// q1_vd4dots_x4_m2: GCC 14.2 has no intrinsic for the dot, so the e32 half is one asm block
+vsetvli t0, zero, e32, m2, ta, ma      // one vtype covers the four dots and their broadcasts
+vmv.v.x        s0, u0                  // 4-byte activation quad -> all 64 i32 lanes (from a GPR)
+vmv.v.x        s1, u1
+nds.vd4dots.vv acc, w0, s0             // acc[j] += sum_{r<4} w0[4j+r] * s0[4j+r]
+nds.vd4dots.vv acc, w1, s1
+vmv.v.x        s0, u2
+vmv.v.x        s1, u3
+nds.vd4dots.vv acc, w2, s0
+nds.vd4dots.vv acc, w3, s1
+// after 8 quads: facc = vfmacc_vf(facc, d_a[k], vfcvt_f_x(acc));  after 4 groups: sumf = vfmacc_vv(sumf, dx, facc)"""
+
+
+def build_html():
+    src_q1 = excerpt_range("ggml/src/ggml-common.h", 180, 185)
+    src_q8 = "typedef struct {\n    ggml_half d;       // delta\n    int8_t  qs[QK8_0]; // quants\n} block_q8_0;          // 34 B"
+    src_x64 = excerpt_range("ggml/src/ggml-cpu/repack.h", 136, 162)
+    src_writer = excerpt("ggml/src/ggml-cpu/repack.cpp", "static int repack_q1_0_to_q1_0_64_bl(")
+    src_up = excerpt("ggml/src/ggml-cpu/arch/riscv/quants.c", "static NOINLINE void ggml_vec_dot_q1_0_q8_0_vl256(")
+    src_rvv = excerpt("ggml/src/ggml-cpu/arch/riscv/repack.cpp", "static void q1_gemv_64x1_vl1024(")
+    src_rvv_gemm = excerpt("ggml/src/ggml-cpu/arch/riscv/repack.cpp", "static void q1_gemm_64x1_vl1024(")
+    src_vd4_asm = excerpt("ggml/src/ggml-cpu/arch/riscv/repack.cpp", "static inline vint32m2_t q1_vd4dots_x4_m2(")
+    src_vd4_asm4 = excerpt("ggml/src/ggml-cpu/arch/riscv/repack.cpp", "static inline void q1_vd4dots_4acc_m2(")
+    src_vd4 = excerpt("ggml/src/ggml-cpu/arch/riscv/repack.cpp", "static void q1_gemv_64_vd4dot_vl1024(")
+    src_vd4_gemm = excerpt("ggml/src/ggml-cpu/arch/riscv/repack.cpp", "static void q1_gemm_64_vd4dot_vl1024(")
+    src_expand = excerpt("ggml/src/ggml-cpu/arch/riscv/repack.cpp", "static inline vfloat32m2_t q1_expand_fp16_64_m2(")
+    src_q8x4 = excerpt("ggml/src/ggml-cpu/repack.cpp", "void ggml_quantize_mat_q8_0_4x1_generic(")
+    src_dispatch = excerpt("ggml/src/ggml-cpu/arch/riscv/repack.cpp", "void ggml_gemv_q1_0_64x1_q8_0(")
+
+    parts = []
+    parts.append(f"""<title>One Q1_0 Tile, Three Layouts</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;700&family=IBM+Plex+Sans:wght@400;600&display=swap">
+<style>{CSS}</style>
+<main>
+<header id="hero">
+<p class="eyebrow">Q1_0 weights × Q8_0 activations · RISC-V RVV, VLEN = 1024</p>
+<h1>One Q1_0 tile, three memory layouts</h1>
+<p class="sub">The same 64-row × 128-K weight tile is stored three ways. Each layout is shaped for the one vector instruction that reads it: a per-row mask upstream, a per-column mask for the RVV repack, and a 4-columns-per-lane plane for <code>nds.vd4dots.vv</code>. The bytes never change size; only their order does, and that order decides how many lanes one instruction can fill.</p>
+{figure(fig_hero(), "Top: what one mask load (vlm.v) covers in the logical 64 × 128 sign tile, drawn to scale. Middle: how much of a 256-byte register group one instruction uses. Bottom: vector instructions needed to advance 64 rows by 32 K, from the kernel inner loops.")}
+<div class="stats">
+<div class="stat" style="--c:var(--up)"><b>{OPS_PER_SUBTILE['upstream']}</b><span>vector instructions per 64 rows × 32 K, upstream (plus 64 horizontal reductions)</span></div>
+<div class="stat" style="--c:var(--rvv)"><b>{OPS_PER_SUBTILE['rvv']}</b><span>after the RVV repack: 3 per column, all 64 rows at once</span></div>
+<div class="stat" style="--c:var(--vd4)"><b>{OPS_PER_SUBTILE['vd4']}</b><span>after the VD4DOT repack: 4 per 4-column quad, 4-term dot inside the instruction</span></div>
+</div>
+</header>
+""")
+
+    parts.append(f"""<section id="overview">
+<h2>What changes from one layout to the next</h2>
+<p>Three things move together: the order of the sign bits in memory, the shape of the activation operand, and the instruction that joins them. The scales do not move; they are only read differently.</p>
+<div class="tw"><table>
+<tr><th></th><th><span class="chip up">Upstream</span></th><th><span class="chip rvv">RVV repack</span></th><th><span class="chip vd4">VD4DOT repack</span></th></tr>
+<tr><td>weight unit</td><td>one 128-K block of one row, 18 B</td><td>one 128-K block of 64 rows, 1152 B</td><td>one 128-K block of 64 rows, 1152 B</td></tr>
+<tr><td>sign order</td><td>row-major: bit c of row j at record j, bit c</td><td>column planes: bit <code>c·64 + j</code></td><td>4-column planes: bit <code>(c/4)·256 + 4j + c%4</code></td></tr>
+<tr><td>one vlm.v reads</td><td>4 B: 32 K of 1 row</td><td>8 B: 1 K of 64 rows</td><td>32 B: 4 K of 64 rows</td></tr>
+<tr><td>weight scale</td><td>fp16 inside each record, scalar</td><td>d[64] at block front, one vector</td><td>d[64] at block front, one vector</td></tr>
+<tr><td>activation operand</td><td>32 int8 in a vector</td><td>1 int8 as a scalar (.vx)</td><td>4 int8 as one 32-bit GPR, splat</td></tr>
+<tr><td>activation scale</td><td>fp16 per 32 K, scalar multiply</td><td>fp16 per 32 K, vfmacc.vf on 64 lanes</td><td>fp16 per 32 K, vfmacc.vf on 64 lanes</td></tr>
+<tr><td>inner instruction</td><td>vmerge + vwredsum</td><td>vsub.vx + vadd.vx (masked)</td><td>nds.vd4dots.vv</td></tr>
+<tr><td>K reduction</td><td>horizontal, 32 → 1, per row per 32 K</td><td>none: vertical over time</td><td>4 terms inside the dot, then vertical</td></tr>
+<tr><td>per 64 rows × 32 K</td><td class="n">{OPS_PER_SUBTILE['upstream']} vector instr.</td><td class="n">{OPS_PER_SUBTILE['rvv']} vector instr.</td><td class="n">{OPS_PER_SUBTILE['vd4']} vector instr.</td></tr>
+<tr><td>needs</td><td>VLEN ≥ 256</td><td>VLEN ≥ 512, K % 128 = 0, rows % 64 = 0</td><td>VLEN ≥ 1024, XAndesVDot, same shape gate</td></tr>
+</table></div>
+<p>Both repacks keep the exact Q1_0 values and the exact 1152 bytes per tile. They differ only in which of the 8192 sign bits sits at which bit position, so a buffer written for one cannot be read by the other.</p>
+</section>
+""")
+
+    parts.append(f"""<section id="format">
+<h2>The data both sides share</h2>
+<p>A Q1_0 weight is one sign bit; the value is <code>+d</code> or <code>−d</code> with one fp16 <code>d</code> per 128 weights. Activations are Q8_0: one int8 code and one fp16 scale per 32 values. One weight block therefore lines up with four activation blocks.</p>
+{figure(fig_formats(), "Drawn at 6 px per byte. The teal cells are fp16 scales. The four dashed lines show which 4-byte piece of the sign bits multiplies which Q8_0 block.")}
+<p>Every kernel on this page computes the same sum: an integer dot inside each 32-K group, scaled by the activation scale of that group, then by the weight scale of the row. What differs is how many rows and how many K one instruction advances.</p>
+{more("Block structs as declared in the source (block_q1_0, block_q8_0, block_q1_0x64 and the sign-bit index)",
+      pre(src_q1) + pre(src_q8) + pre(src_x64))}
+</section>
+""")
+
+    parts.append(f"""<section id="weights">
+<h2>Weight memory: 1152 bytes, three orders</h2>
+<p>Upstream stores 64 independent records of 18 bytes. Both repacks gather the 64 records of one 128-K block into one <code>block_q1_0x64</code>: all 64 scales first, then 1024 bytes of sign bits in the order the reader wants.</p>
+{figure(fig_weight_strips(), "Same 1152 bytes, 0.75 px per byte. The outlined box is what one mask load takes: 4, 8 or 32 bytes. Upstream also spreads the 64 scales through the tile, one every 18 bytes; the repacks make them one 128-byte vector load.")}
+<p>The repack is done once, when the CPU backend builds its weight buffer. It is a pure permutation of bits: for every sign bit at (row j, column c) it computes a destination bit index and ORs the bit in. The two orders come from one function, so the writer and every reader agree by construction.</p>
+{more("Bit-index formulas with the repack writer that applies them (repack.h, repack.cpp)",
+      "<p>Default order: <code>c·64 + j</code>, so column c is one 64-bit mask. VD4DOT order: <code>(c/4)·256 + 4j + c%4</code>, so a 256-bit plane holds four columns and mask bit <code>4j + r</code> becomes byte lane <code>4j + r</code> after expansion, which is exactly the operand shape of the dot.</p>" + pre(src_writer))}
+</section>
+""")
+
+    parts.append(f"""<section id="upstream">
+<h2>Layout 1 · Upstream: one row at a time</h2>
+<p>The model file stores Q1_0 row by row, so the upstream dot product works on one output row. For each 32-K group it loads 32 sign bits as a mask, loads the 32 activation codes as a vector, selects <code>+a</code> or <code>−a</code> per lane, and then reduces the 32 lanes to one number. At VLEN = 1024 a register holds 128 int8 lanes, so 96 of them idle in every step.</p>
+{figure(fig_upstream_flow(), "Upstream data flow for one row and one 32-K group. Lane colour: purple = activation lanes in use, grey = idle. The funnel is the horizontal reduction that ends every group.")}
+{pre(UPSTREAM_INNER)}
+<p>Cost drivers: the 32-lane vector width is fixed by the 4-byte mask, the horizontal reduction runs once per row per 32 K, and both scales are applied with scalar float multiplies. Nothing here is shared across rows.</p>
+{more("Full upstream kernel source (ggml_vec_dot_q1_0_q8_0_vl256, arch/riscv/quants.c)", pre(src_up))}
+</section>
+""")
+
+    parts.append(f"""<section id="rvv">
+<h2>Layout 2 · RVV repack: one column across 64 rows</h2>
+<p>The repack turns the work axis by 90 degrees. One 8-byte mask load now brings the sign of column c for all 64 rows. The activation code <code>a[c]</code> is one scalar byte, broadcast by the <code>.vx</code> form of add and subtract. Each of the 64 lanes is one output row's accumulator, so the K sum grows vertically over the loop and the horizontal reduction disappears.</p>
+{figure(fig_rvv_flow(), "RVV repack data flow for one column of one 32-K group. Mask bit j and accumulator lane j line up, so the masked add applies the sign per row. Blue = sign bit 1, light blue = sign bit 0 (sample bits).")}
+{pre(RVV_INNER)}
+<p>The subtract-then-masked-add pair computes <code>±a[c]</code> without materialising a signed vector: all lanes take <code>−a</code>, then lanes whose sign bit is 1 add <code>2a</code>. The weight scales are one <code>vle16.v</code> plus an integer fp16-to-f32 expand, applied once per 128 K with a vector FMA.</p>
+{more("Full RVV repack gemv and gemm kernels at VLEN = 1024 (q1_gemv_64x1_vl1024, q1_gemm_64x1_vl1024)",
+      pre(src_rvv) + pre(src_rvv_gemm) + "<p>The fp16 scale expand used by every repacked kernel:</p>" + pre(src_expand))}
+</section>
+""")
+
+    parts.append(f"""<section id="vd4">
+<h2>Layout 3 · VD4DOT repack: four columns in every lane</h2>
+<p><code>nds.vd4dots.vv</code> multiplies four adjacent int8 pairs and adds the four products into one int32 lane. So the repack groups four columns first: a 32-byte plane holds columns 4q..4q+3 of all 64 rows, with bits 4j..4j+3 belonging to row j. After one mask load and one merge, the register is 256 signed bytes = 64 rows × 4 columns. The four activation codes are read as one 32-bit word and broadcast into every lane. One instruction then advances all 64 rows by four columns.</p>
+{figure(fig_vd4_flow(), "VD4DOT data flow for one 4-column quad. The dotted lines show lane 0 and lane 63: bytes 4j..4j+3 of w and s meet in int32 lane j. Orange = sign +1, light orange = sign −1 (sample bits); purple tints = the four activation bytes of the quad.")}
+{pre(VD4_INNER, "asm")}
+<p>Two shape rules keep the instruction fed. The activation quad is broadcast with <code>vmv.v.x</code> from a general register, so the 32-bit operand comes from an aligned scalar load. All e32 work sits in one asm block, so one <code>vsetvli</code> covers four dots and their four broadcasts, and the e8 mask work is grouped ahead of it.</p>
+{more("Full VD4DOT gemv kernel and both asm helpers (q1_gemv_64_vd4dot_vl1024, q1_vd4dots_x4_m2, q1_vd4dots_4acc_m2)",
+      pre(src_vd4_asm) + pre(src_vd4_asm4) + pre(src_vd4))}
+</section>
+""")
+
+    parts.append(f"""<section id="activations">
+<h2>Activation memory: where the codes and scales come from</h2>
+<p>The activation row is quantized once per matmul. For a single row (gemv, decode) it is a stream of 34-byte <code>block_q8_0</code>. For four rows at once (gemm, prefill) it is a 136-byte <code>block_q8_0x4</code> that interleaves the four rows byte by byte. Upstream and the RVV repack read these as they are. The VD4DOT kernels need 4-byte aligned quads of one row, so each prepares the codes once per call.</p>
+{figure(fig_act_gemv(), "gemv: the Q8_0 stream at 6 px per byte, with the 4-byte address grid on top. The scales (teal) push the codes to byte 2 of each record. Below: the aligned copy the VD4DOT gemv reads its quads from.")}
+<p>The copy costs one byte-vector load and store per 32-K group and is reused by every 64-row tile of the call. The activation scales are not copied: they are read as scalars from the stream when the group's sum is scaled.</p>
+{figure(fig_act_gemm(), "gemm: block_q8_0x4 stores column c of all four rows side by side. The VD4DOT gemm peels the rows apart once with narrowing shifts (vnsrl), after which each row's codes are contiguous and every quad is aligned. The standard RVV gemm reads the interleaved bytes as scalars directly.")}
+<p>In the gemm the de-interleaved rows pay off twice: the four rows share every weight vector, so the 1152-byte weight tile is read once for four output rows, and each of the four dots takes its own quad from its own row.</p>
+{more("Activation quantizer for the x4 block and the VD4DOT gemm kernel with its de-interleave (ggml_quantize_mat_q8_0_4x1_generic, q1_gemm_64_vd4dot_vl1024)",
+      pre(src_q8x4) + pre(src_vd4_gemm))}
+</section>
+""")
+
+    parts.append(f"""<section id="scales">
+<h2>Where the two scales are applied</h2>
+<p>The integer sums are exact; the scales enter as float multiplies at group and block edges. The repacks move both multiplies from scalar code onto 64 lanes and read the 64 weight scales with one vector load.</p>
+<div class="tw"><table>
+<tr><th></th><th>weight scale d_w (fp16 per 128 K per row)</th><th>activation scale d_a (fp16 per 32 K)</th></tr>
+<tr><td><span class="chip up">Upstream</span></td><td>inside each 18-B record; scalar convert; <code>sumf += d_w · acc</code> once per 128 K per row</td><td>at byte 0 of each 34-B block; <code>acc += d_a · sum</code>, scalar, once per 32 K per row</td></tr>
+<tr><td><span class="chip rvv">RVV repack</span></td><td><code>d[64]</code> at the block front; <code>vle16.v</code> + integer expand to 64 × f32 once per block; <code>vfmacc.vv sumf, dx, facc</code></td><td>scalar fp16 → f32; <code>vfmacc.vf facc, d_a, vfcvt(sumi)</code> on 64 lanes once per 32 K</td></tr>
+<tr><td><span class="chip vd4">VD4DOT gemv</span></td><td>same as RVV repack</td><td>same as RVV repack, on the int32 dot accumulator</td></tr>
+<tr><td><span class="chip vd4">VD4DOT gemm</span></td><td colspan="2">the two scales are folded: <code>vfmul.vf dx, d_a[m]</code> then <code>vfmacc.vv sumf_m, (dx·d_a[m]), vfcvt(acc_m)</code> once per group. Four rows need 4 sumf + 4 acc + dx + w + s + vneg1 = 24 of 32 registers, so there is no room for a per-row facc; the fold gives the same sum with one extra vfmul.</td></tr>
+</table></div>
+</section>
+""")
+
+    parts.append(f"""<section id="measured">
+<h2>Measured on the 27B model</h2>
+<p>Cycle counts on the Andes hybrid simulator, layer 7, geometric mean over the five nodes that have every stage on both paths. The RVV repack step includes the weight-stream prefetch that ships with it.</p>
+<div class="tw"><table>
+<tr><th>step</th><th class="n">gemv, decode</th><th class="n">gemm, prefill</th></tr>
+<tr><td>upstream → RVV repack</td><td class="n">2.24×</td><td class="n">7.04×</td></tr>
+<tr><td>RVV repack → + prefetch</td><td class="n">1.60×</td><td class="n">1.07×</td></tr>
+<tr><td>+ prefetch → VD4DOT repack</td><td class="n">3.54×</td><td class="n">2.75×</td></tr>
+<tr><td><b>total</b></td><td class="n"><b>12.64×</b></td><td class="n"><b>20.67×</b></td></tr>
+</table></div>
+<p>Decode is instruction-issue bound, so its gain follows the instruction count in the hero figure. Prefill gains most from the layout itself, because the gemm shares every weight vector across four activation rows.</p>
+</section>
+""")
+
+    parts.append(f"""<section id="appendix">
+<h2>Appendix</h2>
+{more("Dispatch: which kernel runs at which VLEN and build flag (ggml_gemv_q1_0_64x1_q8_0)",
+      "<p>The repack path is chosen for Q1_0 tensors with K divisible by 128 and rows divisible by 64. The RVV repack has 64-row kernels from VLEN = 512 (i16 m2 / f32 m4) and VLEN = 1024 (i16 m1 / f32 m2). The VD4DOT kernels exist at VLEN = 1024 and are built with <code>GGML_RV_XANDESVDOT=ON</code>, which also switches the sign-bit order.</p>" + pre(src_dispatch))}
+{more("Source pointers for every excerpt on this page",
+      "<ul>"
+      "<li><code>ggml/src/ggml-common.h</code>: block_q1_0, block_q8_0</li>"
+      "<li><code>ggml/src/ggml-cpu/repack.h</code>: block_q1_0x64, q1_0x64_sign_bit, block_q8_0x4</li>"
+      "<li><code>ggml/src/ggml-cpu/repack.cpp</code>: repack_q1_0_to_q1_0_64_bl, ggml_quantize_mat_q8_0_4x1_generic</li>"
+      "<li><code>ggml/src/ggml-cpu/arch/riscv/quants.c</code>: ggml_vec_dot_q1_0_q8_0_vl256</li>"
+      "<li><code>ggml/src/ggml-cpu/arch/riscv/repack.cpp</code>: q1_gemv_64x1_vl1024, q1_gemm_64x1_vl1024, q1_vd4dots_x4_m2, q1_vd4dots_4acc_m2, q1_gemv_64_vd4dot_vl1024, q1_gemm_64_vd4dot_vl1024, q1_expand_fp16_64_m2</li>"
+      "<li>measurements: <code>profiling_gemv_27b.md</code>, <code>profiling_gemm_27b.md</code></li>"
+      "</ul>")}
+{more("How the figures were drawn and checked",
+      "<p>Every width is a byte, bit or lane count times one fixed scale per figure: 0.75 px per byte in the weight strips, 6 px per byte in the format and activation strips, 2.25 px per sign bit in the hero tiles, 2 px per i8 lane in the VD4DOT flow. A test suite reads the SVG back and checks each drawn width against the number printed next to it, and that no section shows more than seven blocks before its details.</p>")}
+</section>
+</main>
+""")
+    return "".join(parts)
+
+
+if __name__ == "__main__":
+    OUT.write_text(build_html())
+    print(OUT, OUT.stat().st_size, "bytes")
