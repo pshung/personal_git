@@ -15,3 +15,4 @@
 - [llama.cpp RISC-V checkout](llama-cpp-riscv-checkout.md) — /home/nick/work/llama.cpp: Bonsai-4B (qwen3, 572MB) verified working via run-rv64-qemu.sh; build-rv64* dirs explained.
 - [riscv64-linux-gdb is broken](riscv64-linux-gdb-broken.md) — vendor LINUX_TOOLCHAIN gdb can't run (stale Jenkins python paths); use handler.c's trap-frame dump or QEMU -d exec instead.
 - [CM-build halted cache-enable wedge](cm-build-halted-cache-enable-wedge.md) - hybrid-only silent in-ROI output / aperture timeouts on NDS_CACHE_COHERENCE engines; restore must OR DC_COHEN; bisect via state-file write_mask + drained GPRs.
+- [Gitea issue tracker](gitea-issue-tracker.md) — andesim tickets = Gitea issues on origin; create via REST API + ~/.git-credentials (no tea/gh CLI).
