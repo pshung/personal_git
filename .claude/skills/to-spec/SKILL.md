@@ -8,15 +8,115 @@ disable-model-invocation: true
 
 # To Spec
 
-Turn the decisions already settled in the current session into one or more **behavioral specifications**, then publish them as **Gitea issues** for a coder to implement.
+Turn the decisions already settled in the **current session conversation** into one or more behavioral specifications, then publish them as **Gitea issues** for a coder to implement.
 
 This skill acts as a **specifier**.
 
 It defines the contract that the finished system must satisfy.
 
+It does NOT investigate the project.
+
 It does NOT design the implementation.
 
-## Core Principle
+It does NOT supplement the conversation with assumptions from other project artifacts.
+
+---
+
+# Absolute Source-of-Truth Rule
+
+The **current session conversation is the only source of specification content**.
+
+Use only conclusions, requirements, constraints, examples, edge cases, and decisions that were established in the current session.
+
+Do NOT consult or derive specification content from:
+
+* roadmaps,
+* project plans,
+* backlogs,
+* existing issues,
+* source code,
+* tests,
+* repository structure,
+* README files,
+* design documents,
+* `CONTEXT.md`,
+* `CONTEXT-MAP.md`,
+* ADRs,
+* commit history,
+* branches,
+* pull requests,
+* previous specifications,
+* external documentation,
+* or assumptions about how the existing system works.
+
+Do NOT explore the codebase.
+
+Do NOT inspect the roadmap.
+
+Do NOT use existing implementation behavior to fill gaps in the specification.
+
+Do NOT infer requirements from what the code currently does.
+
+Do NOT add requirements simply because they appear elsewhere in the project.
+
+The specification must represent:
+
+> **What was decided in this session, and nothing else.**
+
+External information may only be used mechanically to publish the issue, such as:
+
+* Gitea repository identity,
+* issue tracker configuration,
+* required triage labels,
+* authentication or connection details.
+
+Such information must never introduce, modify, or resolve product requirements.
+
+---
+
+# No Hidden Context
+
+The Gitea issue must be **self-contained**.
+
+The coder should not need access to:
+
+* this conversation,
+* the decision tree,
+* a roadmap,
+* another issue,
+* the codebase history,
+* an ADR,
+* or undocumented background knowledge
+
+in order to understand what behavior is required.
+
+If context is necessary to understand the requirement, write that context **directly into the issue ticket**.
+
+If terminology needs explanation, explain it directly in the issue.
+
+If a constraint matters, state it directly in the issue.
+
+If an example is necessary to remove ambiguity, include the example directly in the issue.
+
+If an edge case was settled in the session, describe it directly in the issue.
+
+If a previous decision affects the required behavior, restate the relevant effect directly in the issue.
+
+Never write instructions such as:
+
+* "See the conversation for details."
+* "Follow the existing roadmap."
+* "As discussed previously."
+* "Use the existing implementation as reference."
+* "See ADR-..."
+* "Refer to the current code."
+* "Follow the existing behavior."
+
+Instead, make the issue independently understandable.
+
+---
+
+# Core Principle
 
 Specify:
 
@@ -26,127 +126,176 @@ Do not specify:
 
 > **HOW the coder should make it true.**
 
-However, in systems software, externally required behavior may include low-level properties.
+The coder owns implementation decisions.
 
-A property is valid specification material when the requirement itself makes that property part of the contract.
+The specifier owns the required observable contract.
 
-Examples include:
+---
+
+# Systems Software Interpretation
+
+For systems software, observable behavior is not limited to UI behavior.
+
+A valid specification may describe externally or contractually observable properties such as:
 
 * command-line behavior,
+* compiler input/output behavior,
 * compiler diagnostics,
-* generated machine instructions when instruction selection is explicitly required,
+* generated machine instructions when instruction selection itself is a requirement,
+* executable behavior,
+* object or binary properties,
 * ABI behavior,
 * calling conventions,
-* binary or object-file properties,
 * protocol behavior,
+* wire formats,
 * memory ordering,
 * register preservation,
+* target-machine behavior,
+* semantic equivalence,
 * compatibility requirements,
-* execution semantics,
-* resource limits,
 * deterministic behavior,
-* performance thresholds,
-* hardware-visible behavior.
+* resource limits,
+* performance requirements,
+* and failure behavior.
 
-These are not considered implementation details when they are themselves required observable outcomes.
+A low-level property is valid specification content when the current session explicitly established that property as part of the required contract.
 
-Do not prescribe internal choices such as:
+For example:
 
-* module structure,
+> "Generated code must contain instruction X"
+
+is valid when producing instruction X is itself the feature requirement.
+
+It is not valid merely because the specifier believes instruction X would be a good implementation.
+
+---
+
+# Implementation Boundary
+
+Do NOT prescribe implementation choices such as:
+
+* modules,
 * classes,
 * internal functions,
-* internal interfaces,
-* private data structures,
+* private interfaces,
+* source files,
+* internal APIs,
 * internal compiler passes,
 * algorithms,
+* internal IR structures,
 * helper abstractions,
-* source file layout,
+* data structures,
+* libraries,
+* frameworks,
+* internal state representation,
+* mocking strategy,
+* internal test architecture,
 * refactoring strategy,
-* implementation sequence,
-* or internal test architecture.
+* code organization,
+* or implementation sequence.
 
-Those decisions belong to the coder.
+Do not turn observations from the session into implementation instructions unless the session explicitly made that property part of the external contract.
 
-## Source of Truth
+A good specification should remain correct if the coder completely changes the internal implementation while preserving all specified behavior.
 
-Use the current session as the primary source.
+---
 
-Capture decisions already settled through the session's decision tree or equivalent discussion.
+# Session Decision Rule
+
+Review the current session and identify what has actually been settled.
+
+Separate conversation content into:
+
+* settled requirements,
+* settled behavioral decisions,
+* observable constraints,
+* compatibility requirements,
+* examples,
+* boundary conditions,
+* failure behavior,
+* performance requirements,
+* explicitly excluded behavior,
+* and unresolved decisions.
 
 Do NOT interview the user again.
 
 Do NOT reopen settled decisions.
 
-Do NOT invent answers to unresolved decisions.
+Do NOT resolve unanswered branches yourself.
 
-Separate the session into:
+Do NOT guess.
 
-* settled requirements,
-* behavioral constraints,
-* compatibility requirements,
-* edge cases,
-* failure behavior,
-* explicitly excluded behavior,
-* and unresolved decisions.
+Do NOT use the roadmap or codebase to resolve an unanswered question.
 
-Only fully settled behavior may receive `ready-for-agent`.
+If a decision remains unresolved and prevents correct specification, do not silently choose an answer.
 
-Use terminology from the project's domain model and respect existing ADR constraints.
+Either:
 
-## Specification Boundary
+* omit the unresolved behavior from a `ready-for-agent` issue, or
+* explicitly mark that issue as not ready.
 
-Choose the highest externally meaningful verification boundary appropriate for the feature.
+Only behavior supported by the current session may become part of a ready implementation contract.
 
-For systems software this may be:
+---
 
-1. execution of the complete system or tool,
-2. public command-line interface,
-3. public API,
-4. compiler or linker input/output behavior,
-5. generated executable/object/binary artifacts,
-6. protocol or wire behavior,
-7. target-machine behavior,
-8. externally observable performance or resource behavior.
+# Preserve Decision-Tree Results
 
-Do not descend into internal components merely because they are easier to test.
+When the session used a decision tree, treat the settled leaves and branches as specification inputs.
 
-The specification should survive a complete rewrite of the internal implementation as long as the required external contract remains satisfied.
+The issue does not need to reproduce the conversational decision-tree structure unless that structure itself helps explain the behavior.
 
-## Issue Granularity
+Instead, convert the settled decisions into:
 
-Split Gitea issues by independently meaningful behavior.
+* explicit required behavior,
+* acceptance scenarios,
+* constraints,
+* examples,
+* failure cases,
+* and out-of-scope statements.
 
-Good issue boundaries include:
+The final Gitea issue must contain the resulting conclusions directly.
+
+The coder must not need to reconstruct the decision tree.
+
+---
+
+# Issue Granularity
+
+Create one or more Gitea issues.
+
+Split issues according to **independently meaningful observable behavior**, not according to implementation components.
+
+Good boundaries may include:
 
 * one compiler capability,
-* one language or ISA behavior,
+* one ISA behavior,
 * one externally visible optimization outcome,
 * one compatibility requirement,
 * one diagnostic behavior,
 * one runtime behavior,
 * one protocol capability,
-* or one independently verifiable system property.
+* one independently verifiable system property,
+* or one coherent user/developer workflow.
 
-Do NOT split issues according to internal implementation components.
-
-Bad examples:
+Do NOT create implementation-task issues such as:
 
 * Add LLVM pass
+* Add database table
 * Modify scheduler
 * Add helper class
+* Create service layer
 * Change internal IR node
 * Refactor register allocator
 
-Good examples:
+unless the session explicitly established the named artifact itself as the required deliverable.
 
-* Support operation X for RVV targets
-* Emit the required diagnostic for unsupported configuration Y
-* Preserve ABI behavior when feature Z is enabled
-* Allow workloads larger than VL=32 on VLEN=1024 targets
+Prefer the smallest number of issues that still gives each issue a coherent acceptance contract.
 
-## Acceptance Scenarios
+---
 
-Express behavioral acceptance criteria using Gherkin when Given/When/Then clearly represents the requirement.
+# Acceptance Scenarios
+
+Express behavioral acceptance criteria using **Gherkin** when Given/When/Then clearly represents the requirement.
 
 Example:
 
@@ -154,16 +303,24 @@ Example:
 Feature: Vector operation supports VLEN 1024
 
 Scenario: Process an input larger than the previous VL limitation
-  Given a target with VLEN 1024
-  And an input containing 64 rows
-  When the workload is compiled and executed
+  Given the target has VLEN 1024
+  And the workload contains 64 rows
+  When the workload is processed
   Then all 64 rows are processed correctly
-  And the result matches the reference result
+  And the result matches the agreed reference result
 ```
 
-Scenarios must describe observable contracts.
+Every statement must come from a decision or requirement established in the current session.
 
-Avoid implementation assertions such as:
+Do not introduce new behavior merely to make a scenario look complete.
+
+---
+
+# Observable Assertions
+
+Scenarios should assert externally meaningful behavior.
+
+Avoid:
 
 ```gherkin
 Then optimization pass X invokes helper Y
@@ -172,22 +329,24 @@ Then optimization pass X invokes helper Y
 Prefer:
 
 ```gherkin
-Then the generated program produces the expected result
+Then the resulting program produces the expected result
 ```
 
-If the required behavior explicitly concerns generated code, that may be specified:
+When generated code itself is part of the requirement, it may be asserted:
 
 ```gherkin
 Then the generated code contains the required target instruction
 ```
 
-only when instruction selection itself is part of the settled requirement.
+but only when that requirement was explicitly established in the current session.
 
-## Scenario Matrices
+---
 
-Systems software frequently has parameterized behavior.
+# Scenario Matrices
 
-Use `Scenario Outline` and example tables instead of repeating nearly identical scenarios.
+Systems software often has parameterized behavior.
+
+Use `Scenario Outline` and example tables when several settled cases differ only by parameters.
 
 Example:
 
@@ -196,8 +355,8 @@ Scenario Outline: Operation behaves correctly across supported vector configurat
   Given SEW is <sew>
   And LMUL is <lmul>
   And VLEN is <vlen>
-  When the program is compiled and executed
-  Then the result matches the reference implementation
+  When the workload is processed
+  Then the result matches the agreed reference result
 
 Examples:
   | sew | lmul | vlen |
@@ -207,78 +366,100 @@ Examples:
   | 32  | 4    | 1024 |
 ```
 
-Large conformance spaces may be expressed as a test matrix rather than hundreds of individual scenarios.
+Only include combinations actually established or implied unambiguously by decisions in the current session.
 
-## Correctness Dimensions
+Do not expand the matrix based on what the codebase appears to support.
 
-Consider which of the following dimensions were explicitly settled in the session:
+---
 
-### Functional behavior
+# Correctness Dimensions
 
-Does the system produce the correct semantic result?
+Include a dimension only when it was relevant to and settled in the current session.
 
-### Compatibility
+Possible dimensions include:
 
-Does behavior remain compatible with required:
+## Functional behavior
 
-* targets,
+What semantic result must be produced?
+
+## Compatibility
+
+What compatibility contract must be preserved?
+
+Examples may include:
+
 * architectures,
+* ISA variants,
 * ABI versions,
-* formats,
-* existing programs,
-* or previously supported configurations?
+* input formats,
+* output formats,
+* existing supported configurations.
 
-### Failure behavior
+## Failure behavior
 
-For invalid or unsupported inputs:
+For invalid or unsupported input, what externally observable behavior is required?
 
-* must the operation fail,
-* produce a diagnostic,
+For example:
+
+* reject,
+* diagnose,
 * fall back,
-* or preserve existing behavior?
+* preserve prior behavior,
+* terminate with a particular result.
 
-### Determinism
+## Determinism
 
-If determinism is required, specify which observable results must remain deterministic.
+If determinism was explicitly required, specify what observable results must remain deterministic.
 
-### Concurrency
+## Concurrency
 
-If concurrent behavior is relevant, specify externally observable ordering, atomicity, synchronization, or progress guarantees.
+If concurrency behavior was decided, specify externally observable:
 
-Do not prescribe the synchronization implementation.
+* ordering,
+* atomicity,
+* synchronization guarantees,
+* progress guarantees.
 
-### Resource behavior
+Do not specify the internal synchronization mechanism.
 
-If part of the requirement, specify observable limits such as:
+## Resource behavior
 
-* memory consumption,
-* stack use,
+When explicitly required, specify measurable properties such as:
+
+* memory usage,
+* stack usage,
 * code size,
 * latency,
 * throughput,
-* or hardware resources.
+* hardware resource use.
 
-### Performance
+## Performance
 
-Performance may be part of the specification when the session explicitly defines a performance objective.
+Performance belongs in the specification only when the session established it as a requirement.
 
-Do not invent performance thresholds.
+Do NOT invent:
 
-Prefer measurable conditions.
+* thresholds,
+* baselines,
+* benchmark configurations,
+* allowed regressions,
+* performance targets.
 
 For example:
 
 ```gherkin
-Then performance must not regress by more than 2% against the agreed baseline
+Then execution performance must not regress by more than 2% against the specified baseline
 ```
 
-only when that threshold and baseline have already been established.
+is valid only if the session already established both the 2% threshold and the baseline.
 
-## Reference Behavior
+---
 
-For algorithms, compilers, runtimes, numeric software, or architecture features, prefer semantic comparison against an agreed reference when appropriate.
+# Reference Behavior
 
-Example:
+For compilers, runtimes, numeric software, architecture features, and transformations, semantic comparison against an agreed reference may be used when the current session established that reference.
+
+Examples:
 
 ```gherkin
 Then the result matches the scalar reference implementation
@@ -290,60 +471,111 @@ or:
 Then observable program behavior is identical with and without the optimization enabled
 ```
 
-Reference behavior should be used when it expresses correctness more robustly than exact internal output.
+Do not select a reference implementation yourself.
 
-Do not require exact generated code unless exact generated code is itself part of the requirement.
+Do not inspect the repository to discover one.
 
-## QA Procedure
+If the session did not establish the reference, do not invent it.
 
-Every issue must contain a **QA Procedure**.
+---
 
-The QA procedure demonstrates that the completed system satisfies the specification through an externally meaningful interface.
+# QA Procedure
 
-Unlike application software, a graphical UI is NOT preferred by default.
+Every ready Gitea issue must contain a **QA Procedure**.
 
-Use the natural interface of the system.
+The QA Procedure demonstrates that the finished system satisfies the specification through the natural externally meaningful interface of that system.
 
-Examples include:
+For systems software this may include:
 
 * invoking a compiler,
-* executing a binary,
-* running a command-line tool,
-* submitting an input file,
-* communicating through a public protocol,
+* invoking a command-line tool,
+* processing an input,
+* executing a resulting binary,
 * running on target hardware,
 * running under an emulator,
+* communicating through a public protocol,
 * inspecting externally defined binary properties,
-* measuring an agreed performance metric.
+* measuring an explicitly agreed metric.
 
-A QA procedure may contain commands when commands are the normal way a human exercises the system.
+A graphical UI is not preferred unless the feature actually uses one.
 
-Example:
+The QA Procedure must derive entirely from the current session's agreed contract.
 
-1. Prepare the specified test input.
-2. Compile it for the RVV target with VLEN 1024.
-3. Execute the resulting program on the supported target or emulator.
-4. Compare its output against the reference implementation.
+Do not inspect the codebase to discover how QA "should" be performed.
+
+Do not invent project-specific commands, scripts, filenames, test targets, paths, or infrastructure that were not established in the session.
+
+When exact mechanics are unknown, describe the procedure at the behavioral level rather than guessing commands.
+
+For example:
+
+1. Prepare an input matching the agreed 64-row case.
+2. Process it for a target configured with VLEN 1024.
+3. Execute the resulting program on a supported execution environment.
+4. Compare the output with the agreed reference result.
 5. Verify that all 64 rows are processed.
-6. Repeat with the optimization disabled.
-7. Verify that observable results are equivalent.
 
-QA must exercise the integrated behavior.
+The procedure must be understandable without knowledge of the implementation.
 
-It must not require understanding internal implementation details.
+---
 
-## Gitea Issue Template
+# Detail Must Live in the Issue
+
+The Gitea issue is the complete handoff artifact.
+
+Do not keep important explanation only in:
+
+* chat,
+* hidden reasoning,
+* temporary notes,
+* a decision tree,
+* another document,
+* or an unpublished draft.
+
+Whenever additional explanation is necessary for the coder to implement or verify the requirement correctly, put that explanation **directly into the relevant Gitea issue**.
+
+This includes:
+
+* definitions,
+* motivation necessary to interpret behavior,
+* examples,
+* terminology,
+* precise meanings,
+* distinctions between similar cases,
+* boundary conditions,
+* expected failure behavior,
+* compatibility requirements,
+* scenario assumptions,
+* reference behavior,
+* QA expectations,
+* and explicit exclusions.
+
+Prefer a slightly longer self-contained issue over a short issue that depends on undocumented context.
+
+However, do not add background material that does not help define or verify the required behavior.
+
+---
+
+# Gitea Issue Template
 
 ````markdown
 ## Problem
 
 Describe the observable problem or missing capability.
 
+Include enough context for the coder to understand the problem without access to the original conversation.
+
+Do not describe implementation.
+
 ## Required Behavior
 
-Describe the contract that must hold when the work is complete.
+State the complete observable contract.
 
-Do not describe how it should be implemented.
+Explain terminology or distinctions here when necessary.
+
+Include all relevant conclusions from the current session directly in this ticket.
+
+Do not rely on roadmap, codebase, ADRs, previous discussions, or other documents to supply missing meaning.
 
 ## Acceptance Scenarios
 
@@ -358,60 +590,105 @@ Scenario: ...
 
 Use Scenario Outlines or behavioral matrices where appropriate.
 
+Every scenario must represent behavior established in the current session.
+
 ## Compatibility and Constraints
 
-List only externally required constraints already settled in the session.
+List externally required constraints established in the current session.
 
-Examples:
+Examples may include:
 
 * supported targets,
-* ABI compatibility,
-* required input/output formats,
+* ABI requirements,
 * semantic invariants,
+* input/output contracts,
+* resource limits,
 * performance requirements,
-* resource limits.
+* required low-level observable behavior.
 
-Do not list internal architectural constraints unless an existing project-level ADR already makes them mandatory.
+Do not add constraints discovered from the implementation.
 
 ## QA Procedure
 
-Provide a human-executable procedure that exercises the real system through its natural external interface.
+Provide a human-executable procedure that demonstrates the real required behavior through the system's natural external interface.
+
+Do not assume undocumented repository-specific commands or infrastructure.
 
 ## Out of Scope
 
-List related behavior explicitly excluded by the current decisions.
+List related behavior explicitly excluded by the decisions made in the current session.
 
 ## Notes
 
-Include only information needed to preserve requirement intent.
+Add any remaining explanation required to make this ticket fully self-contained.
 
-Do not suggest implementation.
+Do not reference hidden conversation context.
+
+Do not provide implementation suggestions.
 
 ````
 
-## Relationship to the Coder
+---
+
+# Publishing to Gitea
+
+Publish each completed behavioral specification as a Gitea issue.
+
+The issue itself must contain the complete specification.
+
+Do not publish a short issue that links elsewhere for the actual requirements.
+
+Apply the `ready-for-agent` label only when the issue contains enough settled information for a coder to implement without guessing product intent.
+
+Issue-tracker configuration may be read only as necessary to determine:
+
+- which Gitea repository receives the issue,
+- how to create the issue,
+- and which configured triage label corresponds to `ready-for-agent`.
+
+Issue-tracker metadata must not be treated as a source of requirements.
+
+If the required Gitea project or triage configuration has not been provided, tell the user to run:
+
+`/setup-matt-pocock-skills`
+
+Do not perform additional triage.
+
+---
+
+# Relationship to the Coder
 
 The responsibility boundary is:
 
 ```text
-Current session
-      ↓
-Decision tree
-      ↓
-   to-spec
-      ↓
-Observable contract
-Gherkin / matrices
-QA Procedure
-      ↓
- Gitea Issues
-      ↓
-    Coder
-      ↓
-Implementation design
-Internal tests
-Production code
+Current session conversation
+          ↓
+   settled decision tree
+          ↓
+        to-spec
+          ↓
+ self-contained behavioral contract
+     Gherkin + QA Procedure
+          ↓
+       Gitea Issues
+          ↓
+         Coder
+          ↓
+   investigates codebase
+   chooses architecture
+   chooses implementation
+   writes tests and code
 ````
+
+The important separation is:
+
+### to-spec may know
+
+Only what the current session established about required behavior.
+
+### coder may investigate
+
+The actual repository, architecture, existing implementation, tests, APIs, constraints, and appropriate implementation strategy.
 
 `to-spec` owns:
 
@@ -419,37 +696,48 @@ Production code
 
 The coder owns:
 
-> **How to achieve that behavior.**
+> **How the existing system should be changed to achieve it.**
 
-The coder may choose any internal implementation that satisfies the complete observable contract.
+---
 
-## Definition of Ready
+# Definition of Ready
 
 Apply `ready-for-agent` only when:
 
-* relevant product decisions are settled,
+* the relevant decisions were settled in the current session,
 * the observable contract is unambiguous,
+* the issue itself contains all necessary requirement context,
 * normal behavior is specified,
-* important boundary and failure cases are specified,
-* required compatibility constraints are known,
-* required system-level properties are known,
-* QA can verify the behavior,
-* and no unresolved requirement requires the coder to guess product intent.
+* important settled boundary cases are specified,
+* important settled failure cases are specified,
+* required compatibility constraints are explicit,
+* required system-level properties are explicit,
+* QA can determine whether the behavior works,
+* the coder does not need the original conversation to understand the requirement,
+* the coder does not need to consult a roadmap to discover missing requirements,
+* and no unresolved product decision requires the coder to guess intent.
 
-The coder may still make implementation and architectural decisions.
+The coder may still need to investigate the codebase and make implementation or architectural decisions.
 
-That is expected.
+That is expected and is outside the responsibility of `to-spec`.
 
-## Definition of Done for This Skill
+---
 
-The skill is complete when:
+# Definition of Done for This Skill
 
-1. Settled decisions from the session have been captured.
-2. They are expressed as observable system contracts.
-3. Gherkin scenarios or behavioral matrices capture acceptance behavior.
-4. Relevant compatibility, failure, and system-level constraints are recorded.
-5. Each issue contains an executable QA procedure.
-6. No unnecessary implementation decisions have been prescribed.
-7. Completed specifications are published as Gitea issues.
-8. Ready specifications receive `ready-for-agent`.
+This skill is complete when:
+
+1. Only decisions from the current session have been used as specification content.
+2. No roadmap has been consulted for requirements.
+3. No codebase has been consulted for requirements.
+4. No external project artifact has been used to fill specification gaps.
+5. Settled decisions have been converted into observable contracts.
+6. Necessary details have been written directly into the relevant Gitea issue.
+7. Gherkin scenarios or behavioral matrices capture the acceptance behavior.
+8. Relevant settled compatibility, failure, performance, and system-level constraints are explicit.
+9. Each ready issue contains a self-contained QA Procedure.
+10. No unnecessary implementation decisions have been prescribed.
+11. The coder can understand the required behavior without access to the original session.
+12. Completed specifications have been published as Gitea issues.
+13. Ready specifications receive `ready-for-agent`.
 
