@@ -16,3 +16,4 @@
 - [riscv64-linux-gdb is broken](riscv64-linux-gdb-broken.md) — vendor LINUX_TOOLCHAIN gdb can't run (stale Jenkins python paths); use handler.c's trap-frame dump or QEMU -d exec instead.
 - [CM-build halted cache-enable wedge](cm-build-halted-cache-enable-wedge.md) - hybrid-only silent in-ROI output / aperture timeouts on NDS_CACHE_COHERENCE engines; restore must OR DC_COHEN; bisect via state-file write_mask + drained GPRs.
 - [Gitea issue tracker](gitea-issue-tracker.md) — andesim tickets = Gitea issues on origin; create via REST API + ~/.git-credentials (no tea/gh CLI).
+- [vsim submodule pins must be pushed](vsim-submodule-pins-must-be-pushed.md) — unpushed submodule pins break every clean clone / the image build; test a pin with `git fetch --depth 1`, not `ls-remote`.
