@@ -18,3 +18,4 @@
 - [Gitea issue tracker](gitea-issue-tracker.md) — andesim tickets = Gitea issues on origin; create via REST API + ~/.git-credentials (no tea/gh CLI).
 - [vsim submodule pins must be pushed](vsim-submodule-pins-must-be-pushed.md) — unpushed submodule pins break every clean clone / the image build; test a pin with `git fetch --depth 1`, not `ls-remote`.
 - [User image-verification dir](user-image-verification-dir.md) — /home/nick/work/build_andesim = "user with only the image"; run release-ticket QA there, untag/retag to fake a missing image.
+- [Guards are not arithmetic](guards-not-arithmetic.md) — before computing a value to satisfy someone else's check, ask what happens when that check FAILS; always satisfying it deletes the guard (issue #28).
