@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Issue #22 -- `--help` is layered, and it is COMPLETE.
+#
+#   * `andesim --help` is an OVERVIEW: what the tool is and which commands it
+#     has. It does not reprint every option of every command.
+#   * `andesim <cmd> --help` carries that command's COMPLETE option list, plus
+#     runnable examples.
+#   * Every option a command ACCEPTS appears in that command's help. An option
+#     the tool takes but never names cannot be found by a user.
+#
+# The accepted set is not a list this file keeps in step by hand. It is
+# harvested from the option table's own source, and then each candidate is
+# offered to each command and the BINARY says whether it took it: the parser
+# finishes before `--help` is honoured, so the probe starts no engine and
+# needs no ELF.
+set -uo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+. "$SCRIPT_DIR/../lib/log.sh"
+
+require_driver
+[ -x "$BIN" ] || fail "missing andesim binary: $BIN"
+
+COMMANDS="run profile list doctor"
+
+# --- the candidate options --------------------------------------------------
+# Every `"--flag"` literal in the parser's own sources. Harvested rather than
+# listed, so an option added to the parser and forgotten in the help is caught
+# by this test instead of by a user. `-h` is added by hand: it is the one
+# single-dash spelling, and no `--` regex can find it.
+SRCS=()
+for f in "$ROOT/driver/options.cpp" "$ROOT/driver/cli.cpp"; do
+  [ -f "$f" ] && SRCS+=("$f")
+done
+[ "${#SRCS[@]}" -gt 0 ] || fail "no parser source to harvest options from"
+
+FLAGS=$( { grep -ohE '"--[a-z0-9][a-z0-9-]*"' "${SRCS[@]}" | tr -d '"'
+           echo "-h"; } | sort -u )
+[ -n "$FLAGS" ] || fail "harvested no options from ${SRCS[*]}"
+echo "[info] candidate options: $(echo $FLAGS | tr '\n' ' ')"
+
+# --- the two questions asked of each (command, option) pair -----------------
+
+# accepts CMD FLAG -- true when the PARSER takes FLAG for CMD. A dummy value
+# follows so a value-taking option is satisfied; a switch simply gains a
+# positional that `--help` then makes irrelevant. /dev/null is the dummy
+# because --log-file opens whatever it is handed.
+accepts() {
+  local cmd="$1" flag="$2" out
+  out=$("$BIN" "$cmd" "$flag" /dev/null --help 2>&1 </dev/null)
+  ! printf '%s\n' "$out" | grep -qE -- "unknown option: $flag\$|$flag is not a"
+}
+
+# documented CMD FLAG -- true when CMD's help names FLAG as a whole word, so
+# `--gdb` is not satisfied by `--gdb-port` and `--llm` is not by `--no-llm`.
+documented() {
+  local cmd="$1" flag="$2"
+  "$BIN" "$cmd" --help 2>&1 </dev/null \
+    | grep -qE -- "(^|[^a-z0-9-])$flag([^a-z0-9-]|\$)"
+}
+
+# --- 1. every accepted option is discoverable -------------------------------
+missing=""
+for cmd in $COMMANDS; do
+  for flag in $FLAGS; do
+    accepts "$cmd" "$flag" || continue
+    documented "$cmd" "$flag" || missing="$missing"$'\n'"  $cmd accepts $flag, '$cmd --help' does not name it"
+  done
+done
+[ -z "$missing" ] || fail "options accepted but undocumented:$missing"
+ok "every option a command accepts appears in that command's help"
+
+# --- 2. each command's help carries runnable examples -----------------------
+for cmd in $COMMANDS; do
+  H=$("$BIN" "$cmd" --help 2>&1 </dev/null)
+  printf '%s\n' "$H" | grep -qE '^[[:space:]]*andesim ' \
+    || fail "'$cmd --help' has no runnable example (a line starting 'andesim ...'):"$'\n'"$H"
+done
+ok "every command's help carries at least one runnable example"
+
+# --- 3. the top level is an overview, not every option ----------------------
+TOP=$("$BIN" --help 2>&1 </dev/null)
+for cmd in $COMMANDS; do
+  printf '%s\n' "$TOP" | grep -qE "^$cmd " \
+    || fail "the overview does not list the command '$cmd':"$'\n'"$TOP"
+done
+# A command's own knobs belong in that command's help. Their presence here is
+# what "lists every option of every subcommand" looks like.
+for flag in --pc-start --kanata --gdb-port --min-iters --addr2line --raw; do
+  printf '%s\n' "$TOP" | grep -qE -- "(^|[^a-z0-9-])$flag([^a-z0-9-]|\$)" \
+    && fail "the overview reprints a command's own option '$flag':"$'\n'"$TOP"
+done
+printf '%s\n' "$TOP" | grep -q -- '--help' \
+  || fail "the overview does not point at the per-command help:"$'\n'"$TOP"
+ok "the top level is an overview: the commands, not every command's options"
+
+ok "layered, complete --help (issue #22)"

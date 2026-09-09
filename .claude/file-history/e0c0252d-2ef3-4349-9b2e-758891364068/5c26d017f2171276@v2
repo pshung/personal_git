@@ -1,0 +1,234 @@
+// andesim -- multi-engine driver for the Andes simulators (QEMU, Verilator,
+// and future backends). One C++20 binary that selects a model (fast / cycle
+// / hybrid), resolves engines at runtime, and either passes through to a single
+// engine or orchestrates a hybrid round-trip.
+//
+// This file owns argument dispatch and the help TREE: which commands exist,
+// what each is for, and one runnable example set per command. The options
+// themselves are described once, in options.cpp, and printed from there.
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <string>
+#include <string_view>
+
+#include "cli.hpp"
+#include "dev_mode.hpp"
+#include "log.hpp"
+#include "options.hpp"
+
+namespace andes_sim {
+int cmd_list(const Cli& cli);
+int cmd_doctor(const Cli& cli);
+int cmd_run(const Cli& cli);
+int cmd_profile(const Cli& cli);
+int cmd_version();
+}  // namespace andes_sim
+
+namespace {
+
+using andes_sim::Cli;
+using andes_sim::cmd_doctor;
+using andes_sim::cmd_list;
+using andes_sim::cmd_profile;
+using andes_sim::cmd_run;
+using andes_sim::cmd_version;
+using andes_sim::is_dev_mode;
+using andes_sim::kDoctorCmd;
+using andes_sim::kListCmd;
+using andes_sim::kProfileCmd;
+using andes_sim::kRunCmd;
+using andes_sim::print_command_options;
+using andes_sim::print_global_options;
+
+// The known command names live in cli.cpp (is_subcommand): the parser needs
+// them for the default-command rule, so parse_cli only ever yields run/
+// profile/list/doctor (or "" for no args / top-level help). Developer
+// build/test tooling lives in scripts/, not the binary.
+
+// ---- help model ------------------------------------------------------------
+//
+// Two layers, and they answer different questions. `andesim --help` answers
+// "what can this tool do": the commands, and what each is for. `andesim <cmd>
+// --help` answers "how do I drive THIS command": its complete option list and
+// examples to copy. The overview does not reprint the option lists -- that is
+// how it stopped being readable.
+
+// A command's indented children: run's modes, list's targets. `dev` marks a
+// developer-only child, shown only under ANDESIM_DEV.
+struct ChildRow {
+  const char* name;
+  const char* brief;
+  bool dev;
+};
+constexpr ChildRow kRunModes[] = {
+    {"fast", "QEMU only -- functional, full speed", false},
+    {"cycle", "one cycle-accurate engine, from reset", false},
+    {"hybrid", "QEMU fast-forwards, then vsim measures the ROI", false},
+};
+// `fixtures` (internal test ELFs) is a developer target; the product lists
+// the user-facing models/engines.
+constexpr ChildRow kListTargets[] = {
+    {"models", "the modes and their engines", false},
+    {"engines", "discovered cycle-accurate engines", false},
+    {"fixtures", "internal test ELFs (developer target)", true},
+};
+
+// One command: its name and brief for the overview, its children, its usage
+// line, and the examples its own help ends with.
+struct CommandRow {
+  const char* name;
+  unsigned bit;
+  const char* brief;
+  const ChildRow* children;
+  size_t child_count;
+  const char* childheading;
+  const char* usage;
+  const char* const* examples;
+  size_t example_count;
+};
+
+constexpr const char* kRunExamples[] = {
+    "andesim run --mode fast prog.elf",
+    "andesim --mode fast prog.elf                       # 'run' may be omitted",
+    "andesim run --mode cycle --engine vsim:ax46mpv_fpga_l3 prog.elf",
+    "andesim run --mode hybrid --trigger marker prog.elf",
+    "andesim run --mode hybrid --trigger pc --pc-start kernel --pc-end kernel_end prog.elf",
+    "andesim run --mode hybrid --trigger marker --runtime linux --mem-size 2G app.elf -- --threads 1",
+    "andesim run --mode fast prog.elf -- -d in_asm     # QEMU's own flags, verbatim",
+};
+constexpr const char* kProfileExamples[] = {
+    "andesim profile prog.elf",
+    "andesim profile --limit 10 --min-iters 100 prog.elf",
+    "andesim profile --no-llm --no-optimize-rvv prog.elf",
+};
+constexpr const char* kListExamples[] = {
+    "andesim list models",
+    "andesim list engines",
+};
+constexpr const char* kDoctorExamples[] = {
+    "andesim doctor",
+};
+
+constexpr CommandRow kCommands[] = {
+    {"run", kRunCmd, "run one simulation (the default: 'run' may be omitted)",
+     kRunModes, std::size(kRunModes), "modes:",
+     "usage: andesim [run] [options] <ELF> [-- <engine args>]", kRunExamples,
+     std::size(kRunExamples)},
+    {"profile", kProfileCmd,
+     "find the hot loops under QEMU, configured like the engine "
+     "(it reports the ROI windows a hybrid run needs)",
+     nullptr, 0, "", "usage: andesim profile [options] <ELF> [-- <QEMU args>]",
+     kProfileExamples, std::size(kProfileExamples)},
+    {"list", kListCmd, "list what is available", kListTargets,
+     std::size(kListTargets), "targets:", "usage: andesim list <target>",
+     kListExamples, std::size(kListExamples)},
+    {"doctor", kDoctorCmd, "check toolchain + fixtures are present", nullptr, 0,
+     "", "usage: andesim doctor", kDoctorExamples, std::size(kDoctorExamples)},
+};
+
+// A command line at column 0: `name   brief`.
+void print_major(std::FILE* out, const CommandRow& c) {
+  std::fprintf(out, "%-7s %s\n", c.name, c.brief);
+}
+
+// A command's children, indented two: `  name   brief`.
+void print_children(std::FILE* out, const CommandRow& c) {
+  for (size_t i = 0; i < c.child_count; ++i) {
+    if (c.children[i].dev && !is_dev_mode()) continue;
+    std::fprintf(out, "  %-9s %s\n", c.children[i].name, c.children[i].brief);
+  }
+}
+
+void print_examples(std::FILE* out, const CommandRow& c) {
+  std::fputs("examples:\n", out);
+  for (size_t i = 0; i < c.example_count; ++i)
+    std::fprintf(out, "  %s\n", c.examples[i]);
+}
+
+// Top-level `andesim --help`: the overview. What the tool is, then every
+// command with its children -- and a pointer at the per-command help, which is
+// where a command's options live.
+void print_usage(std::FILE* out) {
+  std::fputs("usage: andesim <command> [options] <ELF> [-- <engine args>]\n\n",
+             out);
+  std::fputs("Multi-engine driver for the Andes simulators (QEMU + vsim).\n",
+             out);
+  std::fputs("64-bit RISC-V only: 32-bit workloads and engines are not "
+             "supported.\n\n",
+             out);
+  for (const CommandRow& c : kCommands) {
+    print_major(out, c);
+    print_children(out, c);
+    std::fputs("\n", out);
+  }
+  print_global_options(out);
+  std::fputs("'andesim <command> --help' lists that command's own options, "
+             "with examples.\n",
+             out);
+}
+
+// Per-command `andesim <cmd> --help`: everything needed to drive that one
+// command. parse_cli admits only run/list/doctor/profile, so `run` is the
+// fallthrough.
+void print_subcommand_help(std::string_view name, std::FILE* out) {
+  const CommandRow* cmd = &kCommands[0];
+  for (const CommandRow& c : kCommands)
+    if (name == c.name) cmd = &c;
+
+  std::fprintf(out, "%s\n\n%s\n\n", cmd->usage, cmd->brief);
+  if (cmd->child_count) {
+    std::fprintf(out, "%s\n", cmd->childheading);
+    print_children(out, *cmd);
+    std::fputs("\n", out);
+  }
+  print_command_options(out, cmd->bit);
+  print_global_options(out);
+  print_examples(out, *cmd);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  using namespace andes_sim;
+
+  Cli cli = parse_cli(argc, argv);
+  if (!cli.error.empty()) {
+    std::fprintf(stderr, "andesim: %s\n", cli.error.c_str());
+    return 2;
+  }
+
+  if (cli.version) return cmd_version();
+
+  if (!set_log_threshold(cli.log_level)) {
+    std::fprintf(stderr,
+                 "andesim: invalid --log-level '%s' (0=trace 1=debug 2=info "
+                 "3=warn 4=error 5=critical 6=off)\n",
+                 cli.log_level.c_str());
+    return 2;
+  }
+  if (!set_log_file(cli.log_file)) {
+    std::fprintf(stderr, "andesim: cannot open --log-file '%s' for append\n",
+                 cli.log_file.c_str());
+    return 2;
+  }
+
+  if (cli.subcommand.empty()) {  // no command, or top-level -h
+    if (cli.help) {
+      print_usage(stdout);
+      return 0;
+    }
+    print_usage(stderr);
+    return 2;
+  }
+
+  if (cli.help) {
+    print_subcommand_help(cli.subcommand, stdout);
+    return 0;
+  }
+
+  if (cli.subcommand == "list") return cmd_list(cli);
+  if (cli.subcommand == "doctor") return cmd_doctor(cli);
+  if (cli.subcommand == "profile") return cmd_profile(cli);
+  return cmd_run(cli);  // parse_cli admits only run/list/doctor/profile
+}

@@ -1,0 +1,196 @@
+# The AndeSim Linux runtime
+
+`andesim run --runtime linux <program>` runs a Linux program instead of a
+bare-metal ELF. There is no Linux kernel. A small proxy kernel, vlinux,
+boots first, loads your program, builds the Linux initial stack (argv and
+auxv), and answers the system calls of the program.
+
+This page covers a Linux workload from end to end, including llama.cpp.
+It assumes that you already built the image, as the top-level
+[README.md](../../README.md) describes.
+
+## What you must supply
+
+**An Andes RISC-V Linux toolchain (glibc, rv64).** The directory must
+contain `bin/riscv64-linux-gcc`. This is a different toolchain from the
+bare-metal one, which builds the AndeSim runtime library.
+
+**Your program, linked statically.** vlinux has no dynamic loader.
+
+**Every data file that the program reads.** The image holds no
+application and no model.
+
+## Rule: keep everything below the directory that you run from
+
+A run happens inside a container. `./andesim` mounts the current
+directory at the same path in the image, and mounts nothing else. Put the
+program, its data files and its output below the directory that you run
+from. A path outside that directory does not exist for the program.
+
+## A first Linux program
+
+Put this in `hello.c`:
+
+```c
+#include <stdio.h>
+
+int main(int argc, char **argv)
+{
+        printf("hello from vlinux, argc=%d\n", argc);
+        for (int i = 1; i < argc; i++)
+                printf("  argv[%d] = %s\n", i, argv[i]);
+        fflush(stdout);   /* flush before exit: see "Limits" below */
+        return 0;
+}
+```
+
+Compile it and run it:
+
+```sh
+export LINUX_TOOLCHAIN=/path/to/riscv-linux-toolchain
+$LINUX_TOOLCHAIN/bin/riscv64-linux-gcc -march=rv64gc -mabi=lp64d -O2 \
+    -static hello.c -o hello.elf
+
+./andesim run --mode fast --runtime linux hello.elf -- one two
+```
+
+Everything after `--` becomes the argv of your program:
+
+```
+vlinux: ENOSYS 258
+hello from vlinux, argc=3
+  argv[1] = one
+  argv[2] = two
+```
+
+The `ENOSYS` line is normal. See "Limits" below.
+
+## llama.cpp
+
+### 1. Get the source
+
+```sh
+git clone https://github.com/ggml-org/llama.cpp
+```
+
+### 2. Build it for the target
+
+```sh
+cmake -S llama.cpp -B build-rv64-static \
+    -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=riscv64 \
+    -DCMAKE_C_COMPILER=$LINUX_TOOLCHAIN/bin/riscv64-linux-gcc \
+    -DCMAKE_CXX_COMPILER=$LINUX_TOOLCHAIN/bin/riscv64-linux-g++ \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=OFF -DCMAKE_EXE_LINKER_FLAGS=-static \
+    -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DLLAMA_CURL=OFF \
+    -DGGML_RV_ZFH=OFF -DGGML_RV_ZVFH=OFF \
+    -DCMAKE_C_FLAGS=-mext-zvlsseg -DCMAKE_CXX_FLAGS=-mext-zvlsseg
+
+cmake --build build-rv64-static --target llama-completion -j"$(nproc)"
+```
+
+Each flag earns its place:
+
+- `-static` and `BUILD_SHARED_LIBS=OFF`: vlinux has no dynamic loader.
+- `-mext-zvlsseg`: the RISC-V segment load and store intrinsics that
+  ggml uses. Without this flag the Andes toolchain does not declare
+  them, and the build stops in `ggml-cpu/arch/riscv/repack.cpp`.
+- `GGML_NATIVE=OFF`: the host is not the target.
+- `GGML_OPENMP=OFF`: vlinux runs one hart and one thread.
+- `GGML_RV_ZFH=OFF` and `GGML_RV_ZVFH=OFF`: half-precision floating
+  point. Turn these on only for an engine that has them.
+
+### 3. Supply a model
+
+AndeSim ships no model. Download a GGUF file, and put it below the
+directory that you run from:
+
+```sh
+mkdir -p models
+# copy or download your .gguf file into models/
+```
+
+Bonsai-4B-Q1_0 (572 MB) is a good first model. It is small enough to
+load in a few minutes.
+
+### 4. Run it
+
+```sh
+./andesim run --mode fast --runtime linux --mem-size 2G \
+    build-rv64-static/bin/llama-completion \
+    -- -m models/Bonsai-4B-Q1_0.gguf -no-cnv \
+       --prompt "The capital of France is" -n 8 -c 512 -t 1
+```
+
+The program generates real text. Be patient: QEMU emulates the vector
+instructions, so a 4B-parameter model needs minutes for the load and
+minutes more for each few tokens.
+
+## Memory
+
+`--runtime linux` gives 1G of guest RAM when you name no size. A model
+needs more: the mapped model file plus the KV cache. Bonsai-4B at
+`-c 512` needs `--mem-size 2G`. If the program stops with an allocation
+error, raise the size.
+
+## Measure a region
+
+To get a cycle count for one part of a Linux program, mark the region in
+the source, exactly as the top-level README does for a bare-metal
+program:
+
+```c
+#include <andesim/ROI.h>
+...
+andesim_ROI_begin();
+        /* the part to measure */
+andesim_ROI_end();
+```
+
+Add the header directory to the compiler flags:
+
+```
+-I /path/to/andesim/build/runtime/include
+```
+
+Then measure it:
+
+```sh
+./andesim run --mode hybrid --trigger marker --runtime linux \
+    --mem-size 2G --step-timeout-ms 900000 \
+    build-rv64-static/bin/llama-completion \
+    -- -m models/Bonsai-4B-Q1_0.gguf -no-cnv \
+       --prompt "The capital of France is" -n 8 -c 512 -t 1
+```
+
+The answer is the last line, `[andesim] <N> cycles`.
+
+Raise `--step-timeout-ms`. The default of 90000 is too short: the
+cycle-accurate leg of a model kernel takes many minutes, and AndeSim
+stops a leg that is silent for longer than this timeout.
+
+AndeSim measures the FIRST time that the marked region runs, and then it
+stops the run. Put the markers around one node of one layer. Markers in a
+function that every layer calls give you the cycles of one call, and the
+program never reaches the end of the model.
+
+## Limits
+
+- **Static binaries only.** vlinux has no dynamic loader.
+- **One hart and one thread.** `clone` is not available. Give
+  `-t 1` to llama.cpp.
+- **The environment is empty.** `getenv()` finds nothing, so an option
+  that comes from an environment variable never reaches the program. Use
+  a command-line argument, or a compile-time value.
+- **`vlinux: ENOSYS <number>` is not an error.** vlinux answers the
+  system calls that a static glibc needs. Any other number returns
+  `-ENOSYS` and prints one line, exactly as a real kernel does for a
+  system call that it does not have. Number 258 is `riscv_hwprobe`, and
+  glibc continues with generic code.
+- **Flush your output before the program ends.** On the Andes glibc
+  toolchain, `exit()` faults while it walks its own handler list. The
+  fault comes after all the work of the program, but before glibc
+  flushes `stdout`, so buffered output is lost. Call `fflush(stdout)`,
+  or use `_exit()`. AndeSim prints the fault as
+  `mcause: 0x2`. This is a known gap of the toolchain, not of vlinux:
+  every system call up to that point is correct.

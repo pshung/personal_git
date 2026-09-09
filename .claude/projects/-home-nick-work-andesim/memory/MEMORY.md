@@ -19,3 +19,4 @@
 - [vsim submodule pins must be pushed](vsim-submodule-pins-must-be-pushed.md) — unpushed submodule pins break every clean clone / the image build; test a pin with `git fetch --depth 1`, not `ls-remote`.
 - [User image-verification dir](user-image-verification-dir.md) — /home/nick/work/build_andesim = "user with only the image"; run release-ticket QA there, untag/retag to fake a missing image.
 - [Guards are not arithmetic](guards-not-arithmetic.md) — before computing a value to satisfy someone else's check, ask what happens when that check FAILS; always satisfying it deletes the guard (issue #28).
+- [e2e JOBS oversubscription](e2e-jobs-oversubscription.md) — run_e2e.sh defaults JOBS=nproc; ~42/53 rc-124 timeouts on this host, JOBS=8 is green.

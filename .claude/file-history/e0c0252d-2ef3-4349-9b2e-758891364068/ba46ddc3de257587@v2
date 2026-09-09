@@ -1,0 +1,152 @@
+# AndeSim
+
+AndeSim gives a cycle count for code that you write yourself.
+
+Put two markers in your C function, around the part that you want to
+measure. AndeSim runs the program in QEMU at full speed, then measures
+the marked region on a cycle-accurate model of an Andes RISC-V core.
+The result is one number: the cycles between the two markers.
+
+## Prerequisites
+
+Get these four things before you start.
+
+### A docker image
+**A container runtime.** A run always happens inside the AndeSim image.
+Use podman to build and run the image.
+
+### Andes RISC-V Toolchain
+**An Andes RISC-V bare-metal toolchain (rv64).** The toolchain directory
+must contain `bin/riscv64-unknown-elf-gcc`. 
+toolchain. Your toolchain compiles your program, and the image build
+uses it too. The build mounts the toolchain read-only, and never copies
+it into the image.
+
+### Disk space and time.
+The image is about 1.8 GB. The build compiles
+QEMU, and it makes a simulator from the RTL of the core, so it takes
+for a while. You do this one time.
+
+## 1. Build the image
+
+```sh
+git clone https://gitea.andestech.com/nick/hybrid_sim.git andesim
+cd andesim
+scripts/build_image.sh --toolchain /path/to/riscv-toolchain
+```
+
+The build makes an image with the name `andesim:v0.1.0`.
+
+All the other steps below start in this `andesim` directory.
+
+## 2. Build the runtime library
+
+```sh
+export HYBRID_TOOLCHAIN=/path/to/riscv-toolchain
+scripts/build_runtime.sh
+```
+
+This step takes seconds. It makes `build/runtime/`, which holds the C
+runtime that your program links against, and the marker header
+`andesim/ROI.h`.
+
+## 3. Write a function to measure
+
+Put this in `kernel.c`:
+
+```c
+#include <stdio.h>
+#include <andesim/ROI.h>
+
+#define N 256
+static int a[N], b[N];
+
+/* noinline keeps the loop inside the measured region: the markers hold
+   memory accesses in place, but not work that stays in registers. */
+__attribute__((noinline)) static long dot(const int *x, const int *y, int n)
+{
+        long s = 0;
+        for (int i = 0; i < n; i++)
+                s += (long)x[i] * y[i];
+        return s;
+}
+
+int main(void)
+{
+        for (int i = 0; i < N; i++) { a[i] = i; b[i] = N - i; }
+
+        andesim_ROI_begin();
+        long s = dot(a, b, N);
+        andesim_ROI_end();
+
+        printf("dot = %ld\n", s);
+        return 0;
+}
+```
+
+The two markers are RISC-V HINT instructions. Every core reads them as a
+NOP, so the same binary also runs on other simulators and on silicon.
+
+## 4. Compile it
+
+```sh
+$HYBRID_TOOLCHAIN/bin/riscv64-unknown-elf-gcc \
+    -march=rv64gc -mabi=lp64d -O2 \
+    -I build/runtime/include -B build/runtime -specs=andesim.specs \
+    kernel.c -o kernel.elf
+```
+
+The two flags `-B build/runtime -specs=andesim.specs` link the AndeSim
+runtime. They give you `printf`, `exit` and the other standard C
+functions.
+
+## 5. Measure it
+
+```sh
+./andesim run --mode hybrid --trigger marker kernel.elf
+```
+
+The answer is the last line:
+
+```
+[andesim] 1622 cycles
+```
+
+`./andesim` starts the container for you. It mounts the current
+directory at the same path inside the image, so a relative path such as
+`kernel.elf` works as usual.
+
+Hybrid mode stops at the end marker, so the program does not reach its
+`printf`. To see the output of the program, run it in fast mode:
+
+```sh
+./andesim run --mode fast kernel.elf
+```
+
+## Run modes
+
+| Mode | What it does | What you get |
+|------|--------------|--------------|
+| `fast` | QEMU runs the whole program. | The output of the program, at full speed. |
+| `cycle` | The cycle-accurate engine runs the whole program from reset. | The output of the program, and the cycles of the whole run. |
+| `hybrid` | QEMU runs up to the start marker, then the cycle-accurate engine measures the region. | The cycles of the marked region only. |
+
+Use `--trigger pc --pc-start <symbol> --pc-end <symbol>` to mark a region
+by address instead of by marker, when you cannot edit the source.
+
+`andesim profile prog.elf` finds the hot loops of a program and reports
+the regions that are worth a hybrid measurement.
+
+## Linux programs
+
+To run a Linux program (a static glibc binary such as `llama-completion`)
+instead of a bare-metal ELF, read
+[runtime/linux/README.md](runtime/linux/README.md).
+
+## Help
+
+```sh
+./andesim --help            # the commands
+./andesim run --help        # every option of run, with examples
+```
+
