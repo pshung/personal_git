@@ -1,0 +1,143 @@
+{
+  bsv,
+  build,
+  host ? build,
+}:
+let
+  lib = bsv.lib;
+  repositories = import ../repositories.nix;
+
+  targetList =
+    (
+      if host.triple == "x86_64-pc-linux-gnu" || host.triple == "aarch64-unknown-linux-gnu" then
+        [
+          "riscv32-linux-user"
+          "riscv64-linux-user"
+        ]
+      else
+        [ ]
+    )
+    ++ [
+      "riscv32-softmmu"
+      "riscv64-softmmu"
+    ];
+in
+lib.bwrapDerivation rec {
+  name = "${build.system}.${host.name}.andes.qemu";
+
+  root = [
+    build.stdenv
+    build.meson
+    build.ninja
+    build."${host.name}-pkgconf"
+    build.python_3_12
+    host.dtc
+    host.libffi
+    host.libslirp
+    host.glib
+    host.pcre2
+    host.zlib
+  ]
+  ++ (if build.triple != host.triple then [ build."${host.name}-toolchain" ] else [ ])
+  ++ (
+    if host.triple == "x86_64-w64-mingw32" then
+      [
+        host.dlfcn-win32
+        host.gettext
+        host.libiconv
+      ]
+    else
+      [ ]
+  );
+
+  env = rec {
+    inherit (build) PATH;
+    src = repositories.qemu;
+
+    keycodemapdb = lib.fetchGit {
+      url = "https://gitlab.com/qemu-project/keycodemapdb";
+      ref = "master";
+      rev = "f5772a62ec52591ff6870b7e8ef32482371f22c6";
+    };
+
+    berkeley_softfloat_3 = lib.fetchGit {
+      url = "https://gitlab.com/qemu-project/berkeley-softfloat-3.git";
+      ref = "master";
+      rev = "b64af41c3276f97f0e181920400ee056b9c88037";
+    };
+
+    berkeley_testfloat_3 = lib.fetchGit {
+      url = "https://gitlab.com/qemu-project/berkeley-testfloat-3.git";
+      ref = "master";
+      rev = "e7af9751d9f9fd3b47911f51a5cfd08af256a9ab";
+    };
+
+    CC = host.CC;
+    CFLAGS = "${host.CFLAGS} -DLIBSLIRP_STATIC -fcanon-prefix-map -ffile-prefix-map=/build=${src}";
+    LDFLAGS = host.LDFLAGS;
+  };
+
+  builder = lib.configureMake {
+    preConfigure = ''
+      cp --archive $src/. .
+      chmod --recursive u+w .
+
+      patch --forward --strip=1 < ${./fix-decodetree-non-determinism.patch}
+
+      ln --symbolic --force $keycodemapdb ./subprojects/keycodemapdb
+      cp --archive $berkeley_softfloat_3/. ./subprojects/berkeley-softfloat-3
+      chmod --recursive u+w ./subprojects/berkeley-softfloat-3
+      cp --archive ./subprojects/{packagefiles,}/berkeley-softfloat-3/.
+      cp --archive $berkeley_testfloat_3/. ./subprojects/berkeley-testfloat-3
+      chmod --recursive u+w ./subprojects/berkeley-testfloat-3
+      cp --archive ./subprojects/{packagefiles,}/berkeley-testfloat-3/.
+
+      mkdir --parents build && cd build
+    '';
+
+    configureCommand = "../configure";
+
+    configureFlags = [
+      "-Dwrap_mode=nodownload"
+      "--enable-plugins"
+      "--enable-slirp"
+      "--enable-tools"
+      "--enable-vhost-net"
+      "--prefix=${host.prefix}"
+      "--target-list=${builtins.concatStringsSep "," targetList}"
+      "--with-pkgversion=${env.src.rev or "unknown"}"
+      "--without-default-features"
+    ]
+    ++ (
+      if host.triple == "x86_64-pc-linux-gnu" then
+        [
+          "--enable-multiprocess"
+          "--enable-vhost-kernel"
+          "--enable-vhost-user"
+        ]
+      else
+        [ ]
+    )
+    ++ (
+      if build.triple != host.triple then
+        [
+          "--cross-prefix=${host.triple}-"
+          "--host-cc=${build.CC}"
+          "-Dbindir=bin"
+        ]
+      else
+        [ ]
+    );
+
+    makeCommand = "ninja --verbose -j $NIX_BUILD_CORES";
+
+    # Need to use DESTDIR as environment variable for ninja install.
+    # So we set addDestdir to be false and then use DESTDIR by ourself.
+    addDestdir = false;
+    installCommand = "DESTDIR=$out ninja install";
+  };
+
+  unsafeDiscardReferences.out = true;
+
+  system = build.system;
+}
