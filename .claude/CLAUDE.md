@@ -8,3 +8,9 @@
 * reduce CRAP score, reduce Cyclomatic Complexity and Cognitive Complexity.
 * Dispatcher,  Switch-Case, preprocessor command and Guard Clauses / Validation Chains and reasonable structures are OK.
 * include @TDD.md
+
+
+# Preference
+* Don't mess up the project folder. Put temp files under "tmp" folder
+* When creating a new file, give it a clear file name.
+* Alway use ASD-STE100 Simplified Technical English when it's suitable, like ticket issue, user guide, answer technical questions.
