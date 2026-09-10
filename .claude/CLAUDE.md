@@ -3,6 +3,9 @@
 * I'm a English-as-Second-Lanaguage learner, always use simple English to explain.
 * 
 
+
+# When you trace the code base, never believe the comment, always trace the real implementation.
+
 # When you implement the code
 * write "deep module" which provides powerful functionality behind a simple, small interface.
 * reduce CRAP score, reduce Cyclomatic Complexity and Cognitive Complexity.
