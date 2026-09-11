@@ -1,0 +1,1 @@
+- [VsimCore is the only product; no standalone vsim](andesim-vsimcore-only-no-standalone.md) — core only, devices are FastSim modules, standalone binary deletable
