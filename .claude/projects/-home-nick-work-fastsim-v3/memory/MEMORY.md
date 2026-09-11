@@ -1,1 +1,2 @@
 - [VsimCore is the only product; no standalone vsim](andesim-vsimcore-only-no-standalone.md) — core only, devices are FastSim modules, standalone binary deletable
+- [AndeSim-on-FastSim build recipe and environment](andesim-fastsim-build-recipe.md) — PORTING.md holds the recipe; session builds in /tmp do not persist
